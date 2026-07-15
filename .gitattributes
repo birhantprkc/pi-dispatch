@@ -1,0 +1,32 @@
+# Normalise everything to LF in the repository and in the working tree.
+#
+# This project is authored on Windows and deployed to Linux + systemd, and the job
+# image does `COPY entrypoint.sh /entrypoint.sh` — Docker copies from the working
+# tree, not from git. A CRLF `#!/bin/sh` becomes `bad interpreter` inside the
+# container: a confusing error with a boring cause. `eol=lf` (not just `text=auto`)
+# keeps the working copy LF too, which is what Docker actually reads.
+* text=auto eol=lf
+
+# Files where LF is not cosmetic — these break at runtime with CRLF.
+*.sh        text eol=lf
+*.bash      text eol=lf
+Dockerfile  text eol=lf
+*.dockerfile text eol=lf
+entrypoint  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# Binary: never touch these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+
+# Screenshots produced by the frontend verification loop (REQ-FRONTEND-VISUAL-VERIFY)
+# are attached to pull requests, not committed — but mark them anyway so a stray
+# one is never line-ending-mangled into corruption.
+*.webp binary
