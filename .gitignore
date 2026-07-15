@@ -1,0 +1,49 @@
+# Local research artifact; its content lives in specs/.
+# The leading slash is required: unanchored, and with core.ignorecase=true, this
+# pattern also matches specs/design.md.
+/DESIGN.md
+
+# Working plans. Provenance, not product.
+plans/
+
+# Local agent/editor tooling. specs/ is the source of truth for this project.
+.claude/
+
+# Job artifacts. Container stdout is streamed to logs/<JOB_ID>.log and job dirs
+# hold a clone plus the /job inputs. Both contain agent output driven by untrusted
+# issue text, and a job dir transiently holds a scoped GITHUB_TOKEN's working tree.
+# Never commit either.
+logs/
+jobs/
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+*.tsbuildinfo
+.eslintcache
+coverage/
+*.tgz
+.env
+.env.*
+!.env.example
+
+# Python — bytecode and tool caches from the skill scripts under .claude/skills/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Editors and OS. This is a public repo with contributors on other platforms.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
