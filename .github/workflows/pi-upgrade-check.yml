@@ -18,12 +18,14 @@ on:
   push:
     paths:
       - "image/**"
+      - "worker/**"
       - "guardrails/**"
       - "package.json"
       - ".github/workflows/pi-upgrade-check.yml"
   pull_request:
     paths:
       - "image/**"
+      - "worker/**"
       - "guardrails/**"
       - "package.json"
       - ".github/workflows/pi-upgrade-check.yml"
@@ -78,9 +80,10 @@ jobs:
       # PI_DISPATCH_REQUIRE_LOADER_TESTS=1 turns a skip into a hard failure. A skipped assertion is
       # an UNVERIFIED assertion, and "skipped = pass" is precisely the reasoning that lets a
       # guardrail-less agent ship green.
-      - name: Guardrails present, hostile AGENTS.md absent, exit codes correct
+      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist (all required)
         env:
           PI_DISPATCH_REQUIRE_LOADER_TESTS: "1"
+          PI_DISPATCH_REQUIRE_WORKER_TESTS: "1"
         run: npm test
 
   image:
