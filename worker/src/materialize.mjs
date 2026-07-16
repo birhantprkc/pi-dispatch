@@ -26,20 +26,41 @@ const exec = promisify(execFile);
  */
 
 const PI_DIR = ".pi";
-// Exactly the two shapes we accept. Anything else in .pi/ is ignored, not materialised.
 const APPEND_SYSTEM = `${PI_DIR}/APPEND_SYSTEM.md`;
-const SKILL_RE = /^\.pi\/skills\/[A-Za-z0-9._-]+\/SKILL\.md$/;
+// A skill directory name: lowercase kebab/underscore, 1-64 chars, no dots (so no "..") and no
+// slashes. This is what makes a traversal name impossible at the source. Matched against the
+// CAPTURED segment only, never the whole path.
+const SKILL_PATH_RE = /^\.pi\/skills\/([a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?)\/SKILL\.md$/;
+const SKILL_NAME_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
 
-/** A git tree path we are willing to materialise. Rejects traversal and unexpected shapes. */
+/**
+ * Classify a git tree path into the destination we will WRITE, or null to reject.
+ *
+ * Critically, the returned `outRel` is built from a FIXED TEMPLATE using the validated skill name,
+ * never from the raw git path. gitshow-research proved `git ls-tree` can emit path strings
+ * containing literal `../` segments (git does not sanitise tree-entry names), so deriving the
+ * output path from git's string is unsafe even behind a containment check. The name is the only
+ * attacker-influenced input, and it is validated to a charset that cannot express traversal.
+ */
+export function classifyPiPath(path) {
+	if (path === APPEND_SYSTEM) return { outRel: "pi/APPEND_SYSTEM.md" };
+	const m = SKILL_PATH_RE.exec(path);
+	if (!m) return null;
+	const name = m[1];
+	if (!SKILL_NAME_RE.test(name)) return null; // redundant with the capture group; belt and braces
+	return { outRel: `pi/skills/${name}/SKILL.md` };
+}
+
+/** Back-compat predicate used by callers/tests that only care whether a path is accepted. */
 export function isAllowedPiPath(path) {
-	if (path === APPEND_SYSTEM) return true;
-	return SKILL_RE.test(path);
+	return classifyPiPath(path) !== null;
 }
 
 /**
  * Parse `git ls-tree -r -z` output into entries, keeping ONLY regular blobs (100644) at allowed
- * paths. Symlinks (120000), submodules (160000), executables (100755), and anything outside the
- * allowlist are dropped here -- the single choke point for the reject-by-mode rule.
+ * paths, each carrying its template-derived output path. Symlinks (120000), submodules (160000),
+ * executables (100755), and anything outside the allowlist are dropped here -- the single choke
+ * point for the reject-by-mode rule.
  */
 export function selectEntries(lsTreeZ) {
 	const entries = [];
@@ -51,8 +72,9 @@ export function selectEntries(lsTreeZ) {
 		const [mode, type, oid] = record.slice(0, tab).split(/\s+/);
 		const path = record.slice(tab + 1);
 		if (mode !== "100644" || type !== "blob") continue; // rejects symlink/submodule/exec
-		if (!isAllowedPiPath(path)) continue;
-		entries.push({ oid, path });
+		const classified = classifyPiPath(path);
+		if (!classified) continue;
+		entries.push({ oid, path, outRel: classified.outRel });
 	}
 	return entries;
 }
@@ -62,11 +84,11 @@ export function selectEntries(lsTreeZ) {
  * Uses path.relative rather than string-prefix so it is correct on Windows too -- the worker is
  * cross-platform and destDir may be a Windows path with backslash separators.
  */
-function safeJoin(root, relPath) {
-	const resolved = join(root, relPath);
+function safeJoin(root, ...segments) {
+	const resolved = join(root, ...segments);
 	const rel = relative(root, resolved);
 	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
-		throw new Error(`path escapes destination: ${relPath}`);
+		throw new Error(`path escapes destination: ${segments.join("/")}`);
 	}
 	return resolved;
 }
@@ -82,16 +104,16 @@ export async function materializePiDir({ gitDir, sha, destDir, git = defaultGit 
 	const entries = selectEntries(lsTreeZ);
 
 	const written = [];
-	for (const { oid, path } of entries) {
+	for (const { oid, outRel } of entries) {
 		const content = await git(gitDir, ["cat-file", "blob", oid], { raw: true });
-		// path is ".pi/skills/x/SKILL.md" (git always uses forward slashes); strip the leading
-		// ".pi/" so it lands under destDir/pi.
-		const relPosix = `pi/${path.slice(PI_DIR.length + 1)}`;
-		const out = safeJoin(destDir, relPosix);
+		// outRel is TEMPLATE-derived from a validated name, never the raw git path -- so it cannot
+		// contain traversal. safeJoin re-checks containment as defence in depth, and splits the posix
+		// outRel into host path segments so it is correct on Windows too.
+		const out = safeJoin(destDir, ...outRel.split("/"));
 		mkdirSync(dirname(out), { recursive: true });
-		writeFileSync(out, content);
+		writeFileSync(out, content, { mode: 0o444 });
 		// Report posix-style: this names a CONTAINER path (/job/pi/...), stable across host OSes.
-		written.push(relPosix);
+		written.push(outRel);
 	}
 	return written;
 }

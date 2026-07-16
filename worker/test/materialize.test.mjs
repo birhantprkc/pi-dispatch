@@ -4,17 +4,31 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { isAllowedPiPath, materializePiDir, selectEntries } from "../src/materialize.mjs";
+import { classifyPiPath, isAllowedPiPath, materializePiDir, selectEntries } from "../src/materialize.mjs";
 
 // --- pure selection logic: runs everywhere ---
 
 test("isAllowedPiPath accepts exactly the persona and skill shapes", () => {
 	assert.ok(isAllowedPiPath(".pi/APPEND_SYSTEM.md"));
 	assert.ok(isAllowedPiPath(".pi/skills/bug-fix/SKILL.md"));
+	assert.ok(isAllowedPiPath(".pi/skills/bug_fix2/SKILL.md"));
 	assert.ok(!isAllowedPiPath(".pi/skills/bug-fix/notes.md"));
 	assert.ok(!isAllowedPiPath(".pi/settings.json"));
-	assert.ok(!isAllowedPiPath(".pi/skills/../../etc/passwd/SKILL.md")); // traversal in the name
 	assert.ok(!isAllowedPiPath(".pi/APPEND_SYSTEM.md.evil"));
+});
+
+test("a skill name that could express traversal is rejected -- git ls-tree can emit `..` segments", () => {
+	// gitshow-research: git does not sanitise tree-entry names, so ls-tree can report a path with
+	// literal ../ in it. The name charset (no dots, no slashes) makes traversal impossible here.
+	assert.equal(classifyPiPath(".pi/skills/../SKILL.md"), null);
+	assert.equal(classifyPiPath(".pi/skills/../../etc/SKILL.md"), null);
+	assert.equal(classifyPiPath(".pi/skills/a.b/SKILL.md"), null); // dots barred (no `..`)
+	assert.equal(classifyPiPath(".pi/skills/UPPER/SKILL.md"), null); // case-sensitive, JS regex
+});
+
+test("the destination is built from a fixed template, never the raw git path", () => {
+	assert.deepEqual(classifyPiPath(".pi/skills/bug-fix/SKILL.md"), { outRel: "pi/skills/bug-fix/SKILL.md" });
+	assert.deepEqual(classifyPiPath(".pi/APPEND_SYSTEM.md"), { outRel: "pi/APPEND_SYSTEM.md" });
 });
 
 test("selectEntries rejects symlinks (120000), submodules (160000), and executables (100755)", () => {
