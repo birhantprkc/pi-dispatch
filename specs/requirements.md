@@ -7,9 +7,21 @@ Evidence convention as in `constitution.md`: `Evidence (upstream)` is authoritat
 
 ## Scope
 
-Run pi as an always-on automation harness that triggers on GitHub issue activity, follows a predefined
-flow, executes each job in an isolated container, supports frontend work with visual verification, and
-survives burst load without dropping work.
+Run pi as a self-hosted harness that executes each job in an isolated container, follows a predefined
+flow, supports frontend work with visual verification, and survives burst load without dropping work.
+
+A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
+
+- **Targets**: a **local folder** on the operator's machine (edited in place — the primary self-hosted
+  use, needs only a provider key), or a **GitHub repo** (cloned, worked, opened as a PR — needs a GitHub
+  App).
+- **Triggers**: the **CLI** / **panel** (operator-initiated, `DES-CLI-TRIGGER-FOR-LOCAL`), a **webhook**
+  (GitHub issue activity), or **cron** (a schedule).
+
+Everything below the trigger is identical: budget check → `/job:ro` inputs → one container → the runner
+→ an exit code. What differs is authz (a label/collaborator gate for webhooks vs panel/CLI access for
+local), the credential (a 1h scoped token for GitHub jobs vs none for local), and the completion signal
+(an issue comment vs the console/panel — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`).
 
 **Out of scope**: being a hosted service; multi-tenancy; merging anything.
 
@@ -165,15 +177,38 @@ survives burst load without dropping work.
 
 ## REQ-JOB-STATUS-COMMENTS
 
-- **Statement**: Each job shall comment on its triggering issue at start, and on completion or failure.
+- **Statement**: Each **GitHub-backed** job shall comment on its triggering issue at start, and on
+  completion or failure.
+- **Scope**: GitHub jobs only. A local-folder job has no issue to comment on; its equivalent is
+  `REQ-LOCAL-JOB-VISIBILITY`. Stated explicitly because the original requirement assumed every job is a
+  GitHub issue — it is not.
 - **Why**: State must be visible where the human already is. The queue dashboard sits behind basic auth
   on a home box and nobody opens it; the issue thread is where the requester is already looking, and is
   the only surface a non-maintainer ever sees. It is also the **only** signal for
   `CONST-PI-VERSION-PINNED`'s silent-no-op failure mode: if an upstream break makes every job a no-op,
   the queue still reports success — a missing completion comment is what a human would actually notice.
 - **Traces to**: `CONST-MERGE-NEVER-AUTOMATIC`, `CONST-PI-VERSION-PINNED`
-- **Acceptance**: Given any job reaching a terminal state, exactly one completion or failure comment
-  exists on the issue.
+- **Acceptance**: Given any GitHub job reaching a terminal state, exactly one completion or failure
+  comment exists on the issue.
+
+## REQ-LOCAL-JOB-VISIBILITY
+
+- **Statement**: A local-folder job shall surface its outcome where the operator is already looking — the
+  worker's console — at start and on completion or failure, and (once built) in the panel's job view. The
+  container's own output shall stream to that console during the run.
+- **Why**: The local counterpart of `REQ-JOB-STATUS-COMMENTS`, and it carries the same load: it is the
+  signal for `CONST-PI-VERSION-PINNED`'s silent-no-op failure mode. A local job has no issue thread, so
+  without a console signal a broken run would still report success to the queue and a human would notice
+  nothing. Streaming the container output is not a debug nicety — on the operator's own machine, watching
+  the agent work on their own folder is the primary feedback surface, and a missing completion line is
+  what tells them a run did nothing.
+- **Note on logs**: this is the operator's own terminal for their own folder, not a persistent multi-user
+  log; `no-pii-in-logs` still applies to any *stored* worker logs (log the stable job id and outcome,
+  not task bodies).
+- **Traces to**: `CONST-PI-VERSION-PINNED`, `DES-CLI-TRIGGER-FOR-LOCAL`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
+- **Acceptance**: Given a local job reaching a terminal state, the worker console shows exactly one
+  completion or failure line carrying the job id and outcome; during the run, the container's output is
+  visible there.
 
 ---
 
@@ -195,3 +230,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | Date | Change |
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
+| 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |

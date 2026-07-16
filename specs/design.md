@@ -236,8 +236,79 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `CONST-RETRY-INFRA-ONLY`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-RUNNER-TURN-BUDGET`,
   `REQ-QUEUE-BURST-NO-DROP`
 
+## DES-CLI-TRIGGER-FOR-LOCAL
+
+- **Decision**: Local-folder jobs are triggered by a **CLI** (`pi-dispatch run <folder> --task … [--flow …]`)
+  as the first interface, in addition to the panel that `DES-PANEL-SEPARATE-FROM-RECEIVER` describes. Both
+  are producers that call one `enqueueLocalJob`; the CLI is the leaner, dev-native path and the panel
+  reuses the same enqueue.
+- **Why**: For a self-hosted tool that mostly runs on people's own machines, the terminal is the natural
+  first interface — no web server, no bigger build before anything runs — and it is what makes the local
+  path usable ahead of the panel. The spec build order reaches a usable *local* experience only at the
+  panel, which sits after the receiver; a CLI closes that gap without the GitHub-webhook receiver a local
+  user does not need.
+- **Consistency check** (this was verified, not assumed): the CLI trigger violates no constraint.
+  `CONST-TRIGGER-AUTHOR-GATE` is webhook/comment-scoped by construction, and local jobs are ungated by
+  design (`SECURITY.md`: panel/CLI access *is* the trust boundary for local). Critically,
+  **`CONST-BUDGET-BEFORE-TOKENS` still holds**: the cap is checked and incremented in the *worker's
+  processor*, immediately before the container starts — never in the trigger. A producer that enqueues a
+  job cannot bypass the budget, because the budget gate lives on the consumer side, after prepare and
+  before `runContainer`. The CLI is only a producer; it spends nothing.
+- **Safety**: a local job edits the folder in place with no undo, so the CLI refuses a **dirty git working
+  tree** unless `--force` — a cheap guard the panel should mirror.
+- **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-PANEL-SEPARATE-FROM-RECEIVER`,
+  `REQ-LOCAL-JOB-VISIBILITY`
+
+## DES-WORKER-ON-HOST
+
+- **Decision**: The worker runs **on the host** (a Node process, `pi-dispatch worker` / `npm start`), not
+  in a container. It launches job containers by shelling out to the real `docker` CLI.
+  `docker-compose` runs **only Valkey**; the worker is a host process alongside it.
+- **Why**: This is the reversal of `DES-JOB-FILES-VIA-VOLUME-SUBPATH` (below, superseded), forced by two
+  findings and the local-first target.
+  **(1) The `docker` CLI translates host paths; the daemon does not.** On Docker Desktop the daemon is a
+  *Linux* daemon behind a Windows named pipe (`docker context` shows `npipe://…` with `docker info`
+  reporting `linux/x86_64`), so `C:\Users\…` is not a path a Linux kernel can bind-mount. Translation is
+  client-side — corroborated by compose's `COMPOSE_CONVERT_WINDOWS_PATHS` rewriting paths even against a
+  remote non-Windows daemon. So a **containerised** worker calling the Engine API must construct the
+  VM-internal path itself, and **that prefix has already moved between Docker Desktop versions**
+  (`/host_mnt/c/…` → `/run/desktop/mnt/host/c/…`). Pinning bespoke path math to an undocumented,
+  *moving* internal is `CONST-PI-VERSION-PINNED`'s failure class with a different vendor — it would break
+  on a silent Docker Desktop auto-update. A host worker shelling out to `docker` inherits Docker's own
+  cross-platform-tested translation for free. This is `library-first` one level up: do not reimplement
+  Docker Desktop's path translation.
+  **(2) Local-folder jobs *require* a host bind mount.** The named-volume trick in the superseded entry
+  dissolves the path problem only because no host path crosses the boundary — which is exactly what a
+  local-folder job cannot do: the operator's own folder must be bind-mounted as `/workspace`, edited in
+  place. There is no volume to hide behind. Since local folders are the primary self-hosted experience,
+  the deployment model must support the bind mount, and the host worker does so with zero path math.
+  **Isolation is unaffected.** `CONST-ISOLATION-CONTAINER-PER-JOB` is about the **job** container being
+  the boundary — pi still never runs on the host. And a container holding `/var/run/docker.sock` is
+  already root-equivalent on the host, so containerising the worker bought *no* isolation; it only bought
+  deployment tidiness, which is what this trades away.
+- **What this deletes**: the named-volume + `volume-subpath` machinery, the `≥26.1.0` Engine floor, the
+  socket mount, and the `docker-socket-proxy`. The worker binds `/job:ro` and `/workspace` (the folder)
+  directly.
+- **Accepted cost, stated plainly**: Node on the host, not only Docker. `docker compose up` alone no
+  longer runs everything; the operator also runs `pi-dispatch worker`. That is the honest price of
+  local-folder jobs working on Windows/macOS/Linux without fragile path math. The receiver and panel are
+  Node too, so it is one install story (`npm ci`), with Docker running Valkey and the job containers.
+- **Evidence**: verified first-hand this session — `docker context` (`npipe` endpoint, `linux/x86_64`
+  daemon) · `moby/for-win#14271` (VM prefix `/run/desktop/mnt/host/…`) and `docker/compose#5563`
+  (older `/host_mnt/…`), i.e. the prefix moved · `docker/compose#4240`
+  (`COMPOSE_CONVERT_WINDOWS_PATHS` is unconditional client-side rewriting) · a constructed `docker run`
+  argv launched the real job image with a host-native folder path, cross-platform, with no translation.
+- **Rejected**: containerised worker + `volume-subpath` (cannot bind-mount a local folder; pins moving
+  path math) — see the superseded entry for its full reasoning, kept as the record of why it was tried.
+- **Traces to**: `INT-CONTAINER-JOB-INPUTS`, `INT-CONTAINER-RUNTIME-CONTRACT`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`
+
 ## DES-JOB-FILES-VIA-VOLUME-SUBPATH
 
+- **Status**: **SUPERSEDED by `DES-WORKER-ON-HOST`.** Kept in place because IDs are permanent and its
+  research (subpath semantics, the socket-proxy hardening) stays relevant if a GitHub-only deployment
+  ever re-containerises the worker. The decision below is **not** what the code does: the worker runs on
+  the host and bind-mounts directly.
 - **Decision**: The worker hands `/workspace` and `/job` to the job container via a **plain named volume
   per job** plus `--mount type=volume,…,volume-subpath=…`. Never a host bind mount. Docker Engine
   **≥26.1.0**. A `tecnativa/docker-socket-proxy` sits between the worker and the Docker socket.
@@ -273,8 +344,10 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   Docker Desktop FAQ: *"Mac and Windows WSL 2 users can connect via Unix socket at
   `unix:///var/run/docker.sock`"* · `Tecnativa/docker-socket-proxy` README (per-API-section allowlist;
   `POST`/`AUTH`/`SECRETS` revoked by default)
-- **Rejected**: same-path bind mount (breaks on native Windows) · worker-on-host (abandons compose) ·
-  `docker cp` (cannot enforce read-only `/job`; kept as fallback)
+- **Rejected** *(at the time of this superseded entry)*: same-path bind mount (breaks on native Windows) ·
+  worker-on-host — **this rejection was itself reversed by `DES-WORKER-ON-HOST`**, which found that
+  local-folder jobs make a host bind mount unavoidable and that the containerised alternative pins moving
+  path math · `docker cp` (cannot enforce read-only `/job`; kept as fallback)
 - **Open**: `readonly` combined with `volume-subpath` is documented as an orthogonal field but **no worked
   example was found combining them** — smoke-test it in CI before relying on it, because
   `INT-CONTAINER-JOB-INPUTS` is a security boundary, not a convenience. Likewise `--rm` is believed not to
@@ -407,7 +480,9 @@ pi-dispatch/
   image/          # Dockerfile + entrypoint + /runner (SDK job runner)
   flows/          # frontend-fix.md, bug-fix.md, triage.md — DEFAULTS, seeded into the data volume
   persona/        # hard rules; baked into the image. Not runtime-editable
-  deploy/         # docker-compose (Valkey + receiver + worker + panel); systemd units as examples
+  deploy/         # docker-compose runs Valkey only; worker/receiver/panel are host Node processes
+                  #   (DES-WORKER-ON-HOST). systemd units ship as untested examples.
+  .env.example    # provider key, spend/concurrency knobs, VALKEY_URL, PI_JOB_IMAGE
   docs/
 ```
 
@@ -436,3 +511,4 @@ a tunnel.
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted) §2, §3, §4, §5, §9, §11. That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — **verified against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points. `DES-PERSONA-VIA-APPEND-SYSTEM-MD` is materially rewritten: the source doc's decisions #1 and #2 were mutually exclusive as written. `DES-NAME-KEEP-PI-DISPATCH` is new. `pi-harness` and `pi-sentry` were absent from the source doc's alternatives and are added. §5.7's "caches roll at midnight" caveat is **dropped** — 0.80.7 removed the date from the default system prompt. |
 | 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |
+| 2026-07-16 | **Resolved a spec/code contradiction.** `DES-WORKER-ON-HOST` added and `DES-JOB-FILES-VIA-VOLUME-SUBPATH` marked SUPERSEDED: the worker runs on the host (the `docker` CLI translates host paths, the daemon does not, and the VM prefix moved between Docker Desktop versions; local-folder jobs also *require* a host bind mount a named volume cannot give). The committed spec had rejected worker-on-host while the code already did it -- caught by a spec-conformance scan. `DES-CLI-TRIGGER-FOR-LOCAL` added: the CLI producer was built (user-directed) but unspecified; recorded with the check that `CONST-BUDGET-BEFORE-TOKENS` still holds because the cap is enforced in the processor, not the trigger. Repo-layout `deploy/` line corrected (compose runs Valkey only). |

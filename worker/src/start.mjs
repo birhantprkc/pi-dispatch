@@ -36,6 +36,16 @@ export function startWorker(env = process.env) {
 		},
 	});
 
+	// REQ-LOCAL-JOB-VISIBILITY: exactly one terminal line per job, carrying the job id and outcome,
+	// where the operator is already looking. This is the local counterpart of the GitHub issue
+	// comment and the signal for CONST-PI-VERSION-PINNED's silent-no-op mode -- a missing line is
+	// what tells a human a run did nothing. The container's own output already streams via
+	// runContainer's onOutput during the run.
+	worker.on("completed", (job, result) => log("job_completed", { jobId: job?.id, outcome: result?.outcome }));
+	worker.on("failed", (job, err) =>
+		log("job_failed", { jobId: job?.id, attempt: job?.attemptsMade, reason: String(err?.message ?? err).slice(0, 120) }),
+	);
+
 	log("worker_started", {
 		queue: "pi-jobs",
 		concurrency: config.concurrency,
