@@ -52,9 +52,18 @@ that always fires is one nobody reads.
 
 ## CONST-NO-CONTEXT-FILES-MANDATORY
 
-- **Statement**: Every job shall run with `--no-context-files` (`-nc`). `AGENTS.md` / `CLAUDE.md`
-  discovery shall be disabled unconditionally, for every repository, without exception.
-- **Why**: A cloned repository's `AGENTS.md` is **not trust-gated**. pi gates project `.pi/*` resources
+- **Statement**: Every job shall run with context-file discovery disabled — unconditionally, for every
+  repository, without exception. On the CLI that is `--no-context-files` (`-nc`). **In the SDK, which is
+  what the runner uses, it is `noContextFiles: true` on a `DefaultResourceLoader` that the caller
+  constructs and passes as `resourceLoader`.** There is no session-level option and no default that
+  satisfies this.
+- **Why**: **This constraint is violated by *omission*, not only by commission.** When no
+  `resourceLoader` is passed, `createAgentSession` builds its own `DefaultResourceLoader` — which does
+  **not** set `noContextFiles`, and therefore loads `AGENTS.md`. There is no flag to forget; there is an
+  entire object to forget to build, and forgetting it fails open. Worse, constructing that loader is also
+  what obliges the caller to `await loader.reload()` themselves, which is a second silent trap — see
+  `INT-SDK-SESSION-OPTIONS`.
+  A cloned repository's `AGENTS.md` is **not trust-gated**. pi gates project `.pi/*` resources
   behind `isProjectTrusted()`, but `AGENTS.md` and `CLAUDE.md` are absent from that list — they load from
   every ancestor directory of cwd and are concatenated **into the system prompt** inside
   `<project_context>`, landing *after* our persona in the same trusted region. Since this harness clones
@@ -67,10 +76,12 @@ that always fires is one nobody reads.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/trust-manager.ts:29-37 → TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`
   (lists `settings.json`, `extensions`, `skills`, `prompts`, `themes`, `SYSTEM.md`, `APPEND_SYSTEM.md`;
   `AGENTS.md`/`CLAUDE.md` absent) · `→ resource-loader.ts:463-470 → noContextFiles` (sole gate) ·
+  `→ sdk.ts:176-180` (default loader is constructed **without** `noContextFiles` when none is passed) ·
   `→ system-prompt.ts:145-152 → <project_context>` (emitted after the append section at `140-142`)
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `REQ-UPSTREAM-CONTRACT-TESTS`, `INT-SDK-SESSION-OPTIONS`
 - **Acceptance**: Given a cloned repo whose `AGENTS.md` contains a sentinel string, when a job runs, the
-  sentinel appears nowhere in the assembled system prompt.
+  sentinel appears nowhere in the assembled system prompt. Assertable offline at the loader boundary:
+  `getAgentsFiles().agentsFiles` is empty.
 
 ## CONST-ISSUE-TEXT-IS-DATA
 
@@ -147,9 +158,60 @@ that always fires is one nobody reads.
   throw-versus-return behaviour so it is a code contract rather than a convention someone forgets at
   3am. This is why `INT-RUNNER-EXIT-CODE-PROTOCOL` exists at all: the exit code is the only channel the
   worker has to tell "agent said no" from "container died".
-- **Traces to**: `INT-RUNNER-EXIT-CODE-PROTOCOL`, `CONST-BUDGET-BEFORE-TOKENS`
+  **We are not the only retrier.** pi auto-retries internally, **enabled by default, `maxRetries: 3`,
+  exponential backoff from 2000ms** — and there is a *second*, provider-level retry layer beneath it
+  (`getProviderRetrySettings`). Each session-level retry re-sends the whole context, so each is a full
+  paid request. Our queue-level `attempts: 2` **multiplies** with it: one job can become ~8 paid provider
+  calls, and the daily cap counts the **job**, not the calls. That gap between "bounds spend" and "counts
+  jobs" is now named rather than discovered on a bill. Consequence for the runner: **pin pi's retry
+  settings explicitly rather than inheriting the defaults** — same reasoning as `CONST-PI-VERSION-PINNED`,
+  since an upstream default change would silently move our spend with no signal.
+  **Third retrier: BullMQ's stalled-job recovery, on by default.** A job whose worker dies without
+  renewing its lock (reboot, OOM) is moved back to `wait` and, at the default `maxStalledCount: 1`,
+  **re-run — the processor executes again: a second paid agent run and a second pull request on one
+  issue.** The source design document explicitly wanted this ("interrupted active jobs → stalled-job
+  handling re-queues (attempt 2)") without costing it. It is *defensible* here — a reboot is genuinely
+  infrastructure — but it is neither free nor idempotent: the agent may already have pushed a branch and
+  opened a PR before dying. **Set `maxStalledCount: 0` explicitly.** At 0 the first stall exceeds the
+  limit, which stores a *deferred failure* on the job so it is failed **at pickup, without the processor
+  ever running** — costing nothing — leaving a human to re-label if a retry is genuinely wanted. A
+  re-label is a deliberate act; a silent re-run is not. Do not leave this to the default in either
+  direction — the decision must be visible in code.
+  **`maxStalledCount` does NOT cover scheduled jobs — and cron is the trigger nobody is watching.**
+  `moveStalledJobsToWait` derives `isRepeatableJob` from the job's `rjk` field and skips the stall-fail
+  for it entirely: `if stalledCount > maxStalledJobCount and not isRepeatableJob then`. The `defa` marker
+  is never set, `moveJobToWait` runs unconditionally, and the job is **re-processed — paid — on every
+  stall, indefinitely**, for as long as its scheduler exists. For a recurring flow that is forever. The
+  exemption's intent is defensible (one stall should not permanently kill a schedule), and 5.80.x
+  tightened it to at least fail *orphaned* jobs whose scheduler was deleted — but for a **live** schedule
+  it holds, and our double-spend protection dies with it.
+  **So for scheduled jobs the runner's turn budget (`REQ-RUNNER-TURN-BUDGET`) is the real backstop, not
+  the queue.** It bounds one run's cost; nothing in BullMQ bounds how many times a wedged scheduled run
+  is retried. The worker must additionally count stalls per scheduler (a scheduler job's `id` begins
+  `repeat:`) and `removeJobScheduler` — or alert — past a threshold. **BullMQ will never do this for
+  us.** A cron silently re-running a wedging job is exactly the runaway `CONST-BUDGET-BEFORE-TOKENS`
+  exists to prevent, except unattended and overnight.
+- **Evidence (upstream)**: `taskforcesh/bullmq @ v5.80.4 → src/commands/moveStalledJobsToWait-9.lua:76-97`
+  — `local jobSchedulerId = rcall("HGET", jobKey, "rjk")` … `if rcall("EXISTS", schedulerKey) == 1 then
+  isRepeatableJob = true`; then `if stalledCount > maxStalledJobCount and not isRepeatableJob then` —
+  **the scheduler carve-out** (gate added 5.80.x, PR #4222 / issue #4220; previously *any* scheduler job
+  looped forever, even orphaned ones) ·
+  `→ src/commands/moveStalledJobsToWait-9.lua:76,97-103`
+  — `stalledCount = HINCRBY(jobKey,"stc",1)`; `if stalledCount > maxStalledJobCount … HSET(jobKey,"defa",…)`;
+  note `moveJobToWait` is called **unconditionally** afterwards, so exceeding the limit does *not* stop the
+  requeue — it only marks it · `→ src/classes/job.ts:133-136 → deferredFailure` — verbatim: *"Stores a
+  failed message and marks this job to be failed directly as soon as the job is picked up by a worker"*
+  (this is what makes `maxStalledCount: 0` cost nothing rather than merely fail late) ·
+  `→ src/interfaces/worker-options.ts` — defaults `stalledInterval: 30000`, `maxStalledCount: 1`
+- **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/settings-manager.ts:813-819 → getRetrySettings`
+  — `maxRetries: this.settings.retry?.maxRetries ?? 3`, `baseDelayMs: … ?? 2000` ·
+  `→ settings-manager.ts:834 → getProviderRetrySettings` (second layer) ·
+  `→ core/agent-session.ts:2628-2643 → _prepareRetry` (`delayMs = baseDelayMs * 2 ** (attempt-1)`) ·
+  `→ agent-session.ts:647-659 → _willRetryAfterAgentEnd` · `→ agent-session.ts:161` (`auto_retry_start`
+  carries `attempt`/`maxAttempts` — the runner can observe retries via `subscribe()`)
+- **Traces to**: `INT-RUNNER-EXIT-CODE-PROTOCOL`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-RUNNER-TURN-BUDGET`
 - **Acceptance**: Given a runner exiting 0 after concluding no fix is possible, the queue records
-  success and does not re-run.
+  success and does not re-run. pi's own retry settings are set explicitly by the runner, not inherited.
 
 ## CONST-PERSONA-IN-CACHED-PREFIX
 
@@ -205,3 +267,4 @@ that always fires is one nobody reads.
 | Date | Change |
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted). That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — but verified **against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points, two of them architecture-breaking. Hence the evidence convention above: source is authoritative, docs are a hint. |
+| 2026-07-15 | `CONST-NO-CONTEXT-FILES-MANDATORY` amended: it named only the CLI flag (`-nc`), but the runner uses the **SDK**, where the mechanism is `noContextFiles: true` on a caller-constructed `DefaultResourceLoader` — and it is **off by default**. The constraint therefore fails **open by omission**: there is no flag to forget, there is an entire object to forget to build. Statement and Evidence corrected; Acceptance unchanged (it was right; the named mechanism was wrong). This is the distinction the evidence convention exists to catch — the *requirement* was verified, the *mechanism* was assumed. |

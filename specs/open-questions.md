@@ -63,17 +63,29 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   `registry.npmjs.org`) on a dedicated Docker network. At that point it graduates to a `CONST-`.
 - **Needs**: maintainer ratification that shipping v1 this way is acceptable.
 
-## OQ-005 — pi's `[Unreleased]` `modelRuntime` migration will break SDK model/auth wiring
+## OQ-005 — pi's `modelRuntime` migration: partly landed at the pin, rest still incoming
 
-- **Status**: **WATCH**
-- **Not a question — a scheduled landmine.** pi's changelog carries an unreleased breaking change:
-  `authStorage` and `modelRegistry` are *replaced* by an async `modelRuntime`. `createAgentSession`'s
-  option set changes with it. The tip commit at the verified sha is that migration in flight.
+- **Status**: **WATCH — PARTIALLY LANDED**
+- **Not a question — a scheduled landmine, and it is already half-detonated.** pi's changelog carries the
+  breaking change under `[Unreleased]`: `authStorage` and `modelRegistry` *replaced* by an async
+  `modelRuntime`.
+- **Correction (2026-07-15)**: **`modelRuntime` is already present in `CreateAgentSessionOptions` at the
+  pinned sha**, and `createAgentSession` itself already does
+  `options.modelRuntime ?? (await ModelRuntime.create({authPath, modelsPath}))`. So the migration is not
+  pending arrival — part of it has shipped inside the version we pin, while the changelog still files it
+  under `[Unreleased]`. **The changelog is not a reliable signal for when this lands**, which is the same
+  lesson as the evidence convention in `constitution.md`: read `sdk.ts`, not the release notes. The
+  runner is written against `modelRuntime` from day one rather than against the older wiring, so the
+  remaining migration should be additive for us rather than breaking.
 - **Why it cannot be a test**: `REQ-UPSTREAM-CONTRACT-TESTS` gates *our* assumptions against a *pinned*
-  version, and it will catch this the moment the pin moves. But you cannot test for a change that has
-  not shipped. This row is the one thing a human must actually read a changelog for.
-- **Action on release**: re-verify `sdk.ts` option set at the new version before bumping the pin.
-- **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → CHANGELOG.md:5-10`
+  version, and it will catch the rest the moment the pin moves. But you cannot test for a change that has
+  not shipped. This row is the one thing a human must actually read source for.
+- **Action on release**: re-verify the `sdk.ts` option set at the new version before bumping the pin.
+  Specifically: whether `model` remains a `Model<any>` obtained from `modelRuntime.getModel()`, and
+  whether `authPath`/`modelsPath` are still derived only when `agentDir` is passed.
+- **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → CHANGELOG.md:5-10` (`[Unreleased]`) ·
+  `→ packages/coding-agent/src/core/sdk.ts:33-80` (`modelRuntime?: ModelRuntime` **present**) ·
+  `→ sdk.ts:171` (async `ModelRuntime.create`) · `→ model-runtime.ts:293 → getModel`
 
 ---
 
@@ -111,3 +123,4 @@ adversarial passes did.
 | Date | Change |
 |---|---|
 | 2026-07-15 | Initial. Replaces `DESIGN.md` v0.1 §10. Collapsed from ~10 checklist items to 5 rows: source-verification at `earendil-works/pi @ 5e336cf` answered most of them. The register's value inverted in the process — from "holds ten unknowns" to "holds one known-incoming breaking change" (`OQ-005`). |
+| 2026-07-15 | `OQ-005` corrected to **WATCH — PARTIALLY LANDED**. `modelRuntime` is **already in `CreateAgentSessionOptions` at the pinned sha**, while pi's changelog still files the migration under `[Unreleased]`. The row previously said it "will break" wiring; part of it had already shipped inside the version we pin. **The changelog is not a reliable signal for when this lands** — the same lesson as the evidence convention, one layer out: release notes are docs too. Mitigation is favourable: the runner is written against `modelRuntime` from day one, so the remainder should be additive rather than breaking. |

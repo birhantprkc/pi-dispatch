@@ -45,7 +45,17 @@ survives burst load without dropping work.
   than leaving it as unexplained ballast.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf` — repo-wide search of `packages/*/src` for
   `maxTurns|max_turns|maxSteps|max_steps|maxIterations|stepLimit|turnLimit` returns **zero hits** ·
-  `→ packages/agent/src/agent-loop.ts:170 → while (true)` · `→ agent-session.ts:1530 → abort()`
+  `→ packages/agent/src/agent-loop.ts:170 → while (true)` — an outer `while (true)` wrapping an inner
+  `while (hasMoreToolCalls || pendingMessages.length > 0)`; both unbounded except by the `AbortSignal` ·
+  `→ core/agent-session.ts:1530 → abort()` (the only control surface) ·
+  `→ packages/agent/src/types.ts:420 → | { type: "turn_start" }` — **the event carries no turn index**,
+  so the runner must keep its own counter. Note `agent-session.ts:706-712` builds a *different*
+  `TurnStartEvent` **with** `turnIndex` — but that is emitted only to the **extension** runner, whereas
+  `subscribe()` receives the bare `AgentEvent` (`agent-session.ts:136` —
+  `AgentSessionEvent = Exclude<AgentEvent, {type:"agent_end"}> | …`). Counting `turn_start` off
+  `subscribe()` is correct; expecting `turnIndex` there is not ·
+  `→ agent-loop.ts:176` (first turn's `turn_start` is emitted before the loop, subsequent ones inside —
+  so the count is the true turn count)
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `REQ-JOB-TIMEOUT-30M`, `REQ-UPSTREAM-CONTRACT-TESTS`
 - **Acceptance**: Given a flow that would exceed the turn maximum, the runner aborts at the threshold and
   exits with the policy code, not the infra code.
@@ -63,11 +73,28 @@ survives burst load without dropping work.
   that fail silently** — a crash is self-reporting and needs no test. Each assertion below maps to a
   point where the design document was wrong and nothing would have told us:
   - the baked `APPEND_SYSTEM.md` **and** a per-flow append both appear in the assembled prompt
-    (the `??` trap drops the persona with no error);
-  - a hostile `AGENTS.md` fixture's sentinel appears **nowhere** in the assembled prompt (`-nc` holds);
+    (the `??` trap drops the persona with no error, as does a forgotten `reload()`);
+  - a hostile `AGENTS.md` fixture's sentinel appears **nowhere** in the assembled prompt (`-nc` holds —
+    and note it is off by default, so this asserts against an *omission*);
   - Chromium launches as the non-root runtime user (the `PLAYWRIGHT_BROWSERS_PATH` collision);
   - `pi -p` exits 0 (catches a flag rename);
-  - the runner's turn budget fires at N.
+  - the runner's turn budget fires at N **and exits 2** — not 0;
+  - **a simulated provider error exits 1 — not 0.** Inside the agent loop pi does **not** throw: an
+    abort, a 429, a 5xx and a dead network all resolve `prompt()` normally, so a `try`/`catch`-only
+    runner reports success for every infra failure. This assertion is the only thing standing between us
+    and a queue that cheerfully records success for jobs that did nothing.
+  - **a missing API key exits 2 — not 1, and does not crash.** Preflight **does** throw (pi's own JSDoc
+    says so), so a `stopReason`-only runner dies of an unhandled rejection and exits Node's default `1`
+    — which this protocol defines as *retryable*, making the queue pay to retry a job that can never
+    succeed. The two assertions above are deliberately a **pair**: each catches the failure the other's
+    implementation causes. See `INT-RUNNER-EXIT-CODE-PROTOCOL`.
+  - **`stopReason: "length"` exits 0 and is logged** — all five stop reasons are enumerated. A
+    default-to-0 branch maps a truncated run to silent success.
+
+  **Cost note — these are nearly all free.** The loader-boundary assertions are pure. The assembled-prompt
+  assertions run through an inline extension on `before_agent_start`, which fires strictly before any
+  provider HTTP call. No API key, no tokens, no flake. There is no excuse for not running them on every
+  build.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → CHANGELOG.md:5-10` (`[Unreleased]` breaking
   change in flight)
 - **Traces to**: `CONST-PI-VERSION-PINNED`, `CONST-NO-CONTEXT-FILES-MANDATORY`, `INT-SDK-SESSION-OPTIONS`,
@@ -78,14 +105,27 @@ survives burst load without dropping work.
 ## REQ-DEDUP-BY-DELIVERY-GUID
 
 - **Statement**: `jobId` shall be the `X-GitHub-Delivery` GUID, giving exactly-once semantics per
-  delivery under redelivery.
+  delivery **for as long as the job key is retained**. `removeOnComplete` / `removeOnFail` retention
+  shall therefore be set to meet or exceed GitHub's redelivery window.
 - **Why**: GitHub redelivers on timeout. A redelivered job is a second paid agent run **and** a second
   pull request on one issue — visible, embarrassing, and billed. The GUID rather than `repo#issue`
   because it is exactly-per-delivery and GitHub-generated, so no coordination is needed and the queue
   can reject the duplicate without a lookup. Semantic dedup on `repo#issue:flow` is a separate, additive
   window for coalescing label-spam, not a replacement.
-- **Traces to**: `REQ-QUEUE-BURST-NO-DROP`
-- **Acceptance**: Given the same delivery GUID twice, the second add is ignored and exactly one job runs.
+  **The guarantee is retention-bounded, not absolute** — this qualifier is load-bearing and was missing.
+  BullMQ's dedup is literally `if rcall("EXISTS", jobIdKey) == 1 then return handleDuplicatedJob(...)`:
+  it is a key-existence test and nothing more. Once `removeOnComplete` deletes the job hash, the same
+  GUID is added **fresh**, with no memory that it ever ran. The source design document paired a 7-day
+  `removeOnComplete` with a claim of exactly-once; GitHub retains deliveries for roughly 30 days and
+  permits manual redelivery throughout, so days 8–30 were an unguarded gap. Retention is not
+  housekeeping here — **it *is* the dedup window**, and shortening it silently shortens the guarantee.
+- **Evidence (upstream)**: `taskforcesh/bullmq @ v5.80.4 → src/commands/addStandardJob-9.lua:88-93`
+  (`EXISTS jobIdKey` → `handleDuplicatedJob`; a duplicate add is a silent no-op, not a throw)
+- **Traces to**: `REQ-QUEUE-BURST-NO-DROP`, `CONST-RETRY-INFRA-ONLY`
+- **Acceptance**: Given the same delivery GUID twice **within the retention window**, the second add is
+  ignored and exactly one job runs. Given a redelivery after retention has expired, a new job runs — this
+  is accepted and documented, not a defect, but it must be a *chosen* window rather than an inherited
+  default.
 
 ## REQ-TRIGGER-AUTHOR-GATE
 

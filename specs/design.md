@@ -11,29 +11,37 @@ Evidence convention as in `constitution.md`: `Evidence (upstream)` is authoritat
 ```
 GitHub repo(s)
   │  webhooks: issues [opened, labeled], issue_comment [created]   (HMAC-signed)
-  ▼
+  ▼   ── PUBLIC EDGE ──────────────────────────────────────────────
 ┌──────────────────────────────┐
 │ receiver  (always-on, tiny)  │  verify signature → filter (label allowlist,
-│ Node + Express, systemd      │  trusted-sender check) → enqueue job
+│ Node + Express               │  trusted-sender check) → enqueue job
+│ binds 0.0.0.0 — MUST be      │  NO dashboard, NO admin surface here.
+│ internet-reachable           │
 └──────────────┬───────────────┘
                ▼
-┌──────────────────────────────┐
-│ Redis + BullMQ  "pi-jobs"    │  ← THE WAIT-LIST: 50 triggers = 50 pending jobs
-│ concurrency N, rate limiter, │    drained at fixed concurrency; dedup by
-│ retries, daily budget cap,   │    delivery GUID; Bull Board dashboard
-│ Bull Board UI                │
-└──────────────┬───────────────┘
-               ▼  one job per worker slot
-┌──────────────────────────────┐
-│ worker (BullMQ Worker proc)  │  fresh clone → docker run (limits, scoped env)
-└──────────────┬───────────────┘
+┌──────────────────────────────┐        ┌──────────────────────────────┐
+│ Valkey + BullMQ  "pi-jobs"   │◀──────▶│ panel  (admin)               │
+│ THE WAIT-LIST: 50 triggers   │        │ binds 127.0.0.1 by default   │
+│ = 50 pending jobs, drained   │        │ on/off (pause/resume),       │
+│ at fixed concurrency; dedup  │        │ settings, model, flows,      │
+│ by delivery GUID; retries;   │        │ Bull Board, setup            │
+│ daily budget cap             │        │ ── NEVER on the public edge  │
+└──────────────┬───────────────┘        └──────────────┬───────────────┘
+               ▼  one job per worker slot              │ reads/writes
+┌──────────────────────────────┐        ┌──────────────▼───────────────┐
+│ worker (BullMQ Worker proc)  │───────▶│ data volume                  │
+│ fresh clone → docker run     │  reads │ config.json + flows/*.md     │
+└──────────────┬───────────────┘        └──────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────┐
 │ pi-job container (ephemeral, per job)       │
 │  • pi (SDK runner) + git + gh               │
 │  • Playwright + headless Chromium           │
-│  • prompt = flow + issue payload            │
-│  • persona baked into the image             │
+│  • /job:ro  = flow + issue payload          │
+│  • persona BAKED INTO THE IMAGE             │
+│    (hard rules; unreachable from panel      │
+│     or from /job — see INT-CONTAINER-       │
+│     JOB-INPUTS)                             │
 │  edit → screenshot → iterate → commit →     │
 │  push branch → gh pr create → issue comment │
 └─────────────────────────────────────────────┘
@@ -105,8 +113,29 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Deployment note**: default the compose file to **Valkey** (BSD-3, Linux Foundation) rather than
   Redis. Redis ≥8.0 is tri-licensed AGPLv3 / SSPLv1 / RSALv2; the AGPL does not reach this project —
   we speak RESP over a socket and do not link Redis — but Valkey means the conversation never happens
-  for downstream self-hosters either. **Verify BullMQ-on-Valkey before shipping it**; fall back to
-  Redis 8 if it fails.
+  for downstream self-hosters either.
+  **Valkey status — good enough to proceed, not proven.** BullMQ's own marketing page lists Valkey among
+  supported backends, but its compatibility *documentation* commits only to *"full Redis™ compliant with
+  version 6.2.0 or newer… not all the alternatives are going to work properly"*. The widely-repeated
+  claim that BullMQ's test suite runs against Valkey is **UNVERIFIED** — it traces to secondary sources,
+  not to BullMQ, and must not be cited as fact. What *is* solid: BullMQ talks RESP through ioredis with no
+  Redis-specific handshake, and the only Valkey-related upstream issues are feature requests for a
+  Valkey **Glide** adapter — not bug reports about basic compatibility. No Lua incompatibility reports
+  exist, which matters because BullMQ is Lua-heavy. Proceed on Valkey; **keep Redis 8 as the documented
+  fallback** and treat any queue weirdness as a Valkey suspect first.
+- **Consequences worth knowing before sizing anything** — all source- or doc-verified:
+  - **The rate limiter is global, not per worker.** *"The rate limiter is global, so if you have for
+    example 10 workers for one queue with the above settings, still only 10 jobs will be processed by
+    second."* Do **not** multiply `limiter.max` by worker count. `concurrency` is the opposite — it is
+    per-Worker-instance. Two adjacent options with opposite scoping is a trap worth writing down.
+  - **`queue.pause()` is durable and global**, implemented as a Redis-side rename of the `wait` key to
+    `paused` — so it survives a restart, which is what makes it usable as the panel's on/off switch.
+    New jobs are still accepted while paused (they land in `paused`); in-flight jobs run to completion.
+    That is the correct semantics for `DES-PANEL-SEPARATE-FROM-RECEIVER`'s switch: **off means "stop
+    starting work", not "start dropping work"** — dropping would violate `REQ-QUEUE-BURST-NO-DROP`.
+  - **Stalled-job recovery re-runs paid jobs by default** — see `CONST-RETRY-INFRA-ONLY`.
+- **Reference** (no authority): `docs.bullmq.io/guide/rate-limiting`, `/guide/workers/pausing-queues`,
+  `/guide/redis-tm-compatibility`.
 
 ## DES-PERSONA-VIA-APPEND-SYSTEM-MD
 
@@ -165,6 +194,147 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   re-tuning after measurement should be a deploy, not a code change.
 - **Traces to**: `OQ-002`, `REQ-QUEUE-BURST-NO-DROP`
 
+## DES-CRON-VIA-BULLMQ-SCHEDULER
+
+- **Decision**: Scheduled triggers use BullMQ **Job Schedulers** (`upsertJobScheduler`). We do not build a
+  cron, and we do not use the deprecated `repeat:` API. **A schedule is a trigger, not a job kind** — it
+  produces an ordinary job aimed at either a GitHub repo or a local folder.
+- **Why**: pi has no cron (`DES-TRIGGER-OUTSIDE-PI`), and hand-rolling one means reimplementing cron
+  parsing, persistence, missed-tick policy and overlap control — four mechanisms, the exact drowning
+  `DES-QUEUE-BULLMQ-OVER-CUSTOM` refused. BullMQ's scheduler is a **Redis object, not a JS timer**
+  (`ZADD repeat <nextMillis> <id>` + `HMSET`), so it survives a worker restart with nothing to lose and a
+  Redis restart under the AOF we already require. Three of its properties are exactly what a
+  money-spending harness needs, and all three are verified rather than assumed:
+  - **No backfill.** Six hours down with an hourly schedule costs **one** paid run on restart, not six —
+    the `every` path aligns forward to a single next slot; the `pattern` path asks cron-parser for one
+    `next`. Neither loops. This is the difference between a reboot and a bill.
+  - **No overlap, structurally.** The next job is only created when the current one *starts processing*,
+    so a 30-minute flow on a 10-minute schedule yields one job every 30 minutes rather than three
+    concurrent agent runs. The cost is silent under-firing — actual cadence degrades below the configured
+    one under load, so the panel should surface `next` drift rather than let it look healthy.
+  - **Deterministic `jobId`** — `repeat:<schedulerId>:<nextMillis>` — so scheduler jobs get
+    `REQ-DEDUP-BY-DELIVERY-GUID`-equivalent dedup for free, with no GUID to supply.
+  **Legacy `repeat:` is deprecated and slated for removal in v6** — starting on it would be adopting a
+  known-dead API.
+- **Evidence (upstream)**: `taskforcesh/bullmq @ v5.80.4 → src/classes/queue.ts:468-495 → upsertJobScheduler`
+  · `→ queue.ts:651` — `@deprecated … will be removed in v6. Use removeJobScheduler instead` ·
+  `→ src/commands/includes/getJobSchedulerEveryNextMillis.lua` — `nextMillis = prevMillis + every` then,
+  verbatim, `-- check if we may have missed some iterations`, resolving to a **single** aligned slot ·
+  `→ src/commands/addJobScheduler-11.lua:144` — `local jobId = "repeat:" .. jobSchedulerId .. ":" .. nextMillis`
+  · `→ addJobScheduler-11.lua:164,191` — returns `-11` `SchedulerJobSlotsBusy` / `-10`
+  `SchedulerJobIdCollision` · `→ src/commands/includes/storeJobScheduler.lua` (Redis-resident schedule) ·
+  `→ src/classes/queue.ts:603-696` — `getJobScheduler` / `getJobSchedulers(start,end,asc)` /
+  `getJobSchedulersCount` / `removeJobScheduler`
+- **Rejected**: a hand-rolled cron (four mechanisms, see above) · the legacy `repeat:` API (deprecated,
+  v6 removal) · an in-process timer (dies with the process; the flaw that made the closest existing tool
+  unusable — `DES-BUILD-NOT-EXTEND-PI-ROUTINES`)
+- **Must handle**: `-10` / `-11` return codes. Swallowing them makes a schedule edit **silently no-op**,
+  which looks identical to success.
+- **Carve-out that is not optional**: scheduler jobs **bypass `maxStalledCount`** — see
+  `CONST-RETRY-INFRA-ONLY`. This is the one place BullMQ's stall protection does not hold, and it is
+  precisely the trigger that runs while nobody is watching.
+- **Traces to**: `CONST-RETRY-INFRA-ONLY`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-RUNNER-TURN-BUDGET`,
+  `REQ-QUEUE-BURST-NO-DROP`
+
+## DES-JOB-FILES-VIA-VOLUME-SUBPATH
+
+- **Decision**: The worker hands `/workspace` and `/job` to the job container via a **plain named volume
+  per job** plus `--mount type=volume,…,volume-subpath=…`. Never a host bind mount. Docker Engine
+  **≥26.1.0**. A `tecnativa/docker-socket-proxy` sits between the worker and the Docker socket.
+- **Why**: The worker is containerised and launches **sibling** containers through the Docker socket, so
+  every bind-mount path it passes to `docker run` is resolved in the **daemon's** filesystem namespace,
+  not its own. `-v ${JOB_DIR}/workspace:/workspace` therefore mounts an empty directory or the wrong one
+  — silently. This is the classic docker-out-of-docker footgun and it was this project's largest named
+  unknown for cross-platform support.
+  **A named volume dissolves the problem rather than managing it**: a volume is a daemon-side handle, so
+  no host path string ever crosses the boundary and there is nothing to translate. Every competing option
+  manages the mismatch per-platform instead of removing it, and each breaks somewhere: *same-path bind
+  mounts* work on Linux and mostly on macOS but **break on native Windows**, where the daemon lives in a
+  VM with a POSIX namespace and drive-letter paths are translated rather than passed through — they only
+  hold if the whole stack runs inside WSL2, which is a discipline, not a guarantee. *Worker on the host*
+  is technically fine but abandons the compose deployment model and reintroduces "install Node correctly
+  on three operating systems" as a support burden. *`docker cp`* avoids paths too but cannot give `/job`
+  a kernel-enforced read-only mount, which `INT-CONTAINER-JOB-INPUTS` depends on — it is the viable
+  fallback, not the default.
+  **Two constraints are not optional.** The volume must be **plain**: a "parameterized" named volume that
+  is a disguised bind (`driver_opts: {type: local, o: bind, device: …}`) mis-concatenates the subpath into
+  the mount options and fails. And the subpath **must already exist inside the volume** before the
+  container starts — there is no auto-create; the worker creates `workspace/` and `job/` as job prep.
+  The socket makes the **worker** the root-equivalent asset — not the agent, which never receives it. That
+  residual risk is supply-chain, not injection (worker code never reads issue text, per
+  `CONST-ISSUE-TEXT-IS-DATA`), and the socket proxy bounds it: allowlist `CONTAINERS`/`IMAGES`/`POST`,
+  leave `EXEC`, `SECRETS`, `SWARM`, `PLUGINS` denied by default.
+- **Evidence (upstream)**: `moby/moby#45687` ("volumes: Implement subpath mount", Engine **26.0.0**;
+  symlinks cannot escape the volume base; TOCTOU-protected) · `docker/cli#4331` (CLI flag) ·
+  `moby/moby#47842` (subpath **must pre-exist**; fails `lstat …: no such file or directory`) ·
+  `moby/moby#47711` (subpath dropped in Swarm; fixed **26.1.0** — hence the ≥26.1.0 floor even though we
+  do not use Swarm) · `forums.docker.com/t/volume-subpath-in-docker-compose/143463` (bind-backed named
+  volume breaks subpath: `invalid mode: rw,nocopy,tftp`; reproduced on 26.0.1–27.1.2) ·
+  Docker Desktop FAQ: *"Mac and Windows WSL 2 users can connect via Unix socket at
+  `unix:///var/run/docker.sock`"* · `Tecnativa/docker-socket-proxy` README (per-API-section allowlist;
+  `POST`/`AUTH`/`SECRETS` revoked by default)
+- **Rejected**: same-path bind mount (breaks on native Windows) · worker-on-host (abandons compose) ·
+  `docker cp` (cannot enforce read-only `/job`; kept as fallback)
+- **Open**: `readonly` combined with `volume-subpath` is documented as an orthogonal field but **no worked
+  example was found combining them** — smoke-test it in CI before relying on it, because
+  `INT-CONTAINER-JOB-INPUTS` is a security boundary, not a convenience. Likewise `--rm` is believed not to
+  touch named volumes (it removes only *anonymous* ones) — inferred, not verified.
+- **Traces to**: `INT-CONTAINER-JOB-INPUTS`, `INT-CONTAINER-RUNTIME-CONTRACT`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`
+
+## DES-PANEL-SEPARATE-FROM-RECEIVER
+
+- **Decision**: The admin panel is a **separate process on a separate port**, binding `127.0.0.1` by
+  default. Bull Board mounts on the panel. The receiver carries **no** dashboard and no admin surface.
+- **Why**: The panel sets the model, the budgets, and what the agent is told to do — it is the most
+  dangerous surface in the system, and a compromise of it is a compromise of everything downstream of it.
+  The receiver is the one process that **must** bind `0.0.0.0`, because GitHub has to POST to it from the
+  internet. **Mounting the panel on the receiver therefore publishes the admin surface to the internet**
+  — the two processes have exactly opposite reachability requirements, so they cannot share a port.
+  This is a **correction**: the source design document mounted Bull Board on the receiver behind basic
+  auth. That was defensible when the dashboard was read-only; it is not once the same surface can change
+  the model and rewrite flows. Basic auth on a public port is not the control that should stand between
+  the internet and "edit the agent's instructions".
+  Note the deliberate asymmetry with `DES-BUILD-NOT-EXTEND-PI-ROUTINES`, which criticises that project
+  for hard-binding `127.0.0.1`. That criticism was of a **webhook trigger endpoint**, which is useless if
+  unreachable. For an **admin panel** the same bind is correct. The lesson is that reachability is a
+  per-surface decision, not a project-wide default — which is exactly why they are different processes.
+- **Rejected**:
+  - *Panel mounted on the receiver behind basic auth* — publishes admin to the internet; see above.
+  - *Panel on the same process, different port* — one crash, one dependency upgrade, or one unhandled
+    rejection takes down webhook ingress with the admin UI. The wait-list should not depend on the UI.
+- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-JOB-STATUS-COMMENTS`
+
+## DES-FLOWS-ARE-DATA-PERSONA-IS-CODE
+
+- **Decision**: Split the agent's instructions by mutability. **The persona is baked into the image** and
+  carries the *hard rules* — never merge, issue text is data, work only in `/workspace`. **Flows are user
+  data** in a mounted volume, seeded from repo defaults on first run, and carry the *task recipe* —
+  screenshot, iterate, open a PR. The panel may edit flows. It may never touch the persona.
+- **Why**: The panel requirement ("set prompts and which flow runs, from the UI") collides head-on with
+  this project's earlier decision to keep flows as reviewed repo markdown — *versioned, reviewable,
+  pi-version-proof*. The resolution is not a compromise between the two; it is the observation that
+  **those two properties were being asked of one file that was doing two jobs.**
+  The rules the agent must not be talked out of need immutability, and `INT-CONTAINER-JOB-INPUTS` already
+  mounts `/job` read-only and bakes the persona *precisely* so that a total compromise of `/job` cannot
+  reach the system prompt. That same reasoning extends one step: a panel compromise must not reach it
+  either. Meanwhile the task recipe is genuinely configuration — the thing an operator legitimately
+  wants to tune at 11pm without a rebuild — and gains nothing from being immutable.
+  So the security property survives *and* the panel gets real power, because the boundary now falls where
+  the risk actually changes rather than where the filesystem happened to.
+  **Accepted cost**: edited flows lose git review and versioning. That is the honest trade for runtime
+  editability, and it is bounded — a flow cannot revoke a hard rule, because the hard rules are not in it.
+- **Rejected**:
+  - *Panel edits `flows/` in the repo* — two sources of truth between a git checkout and a running
+    system, and the classic "why did my change vanish on redeploy".
+  - *Everything baked, panel read-only* — satisfies the specs and not the user; a panel that cannot
+    change anything is a dashboard.
+  - *Everything panel-editable including hard rules* — makes `CONST-MERGE-NEVER-AUTOMATIC` and
+    `CONST-ISSUE-TEXT-IS-DATA` runtime-mutable state. They are constitutional precisely because they are
+    not negotiable at runtime.
+- **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-MERGE-NEVER-AUTOMATIC`, `INT-CONTAINER-JOB-INPUTS`,
+  `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `DES-PANEL-SEPARATE-FROM-RECEIVER`
+
 ## DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS
 
 - **Decision**: `@playwright/cli` with Chromium bundled in the job image, with
@@ -176,9 +346,22 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   requires has a different `$HOME` and **cannot see it**. Setting the variable at both stages makes
   install and lookup agree. Note pi-playwright itself has no browser-resolution logic — it delegates
   entirely to standard Playwright resolution — so this is ours to get right.
+  **`@playwright/cli` does not install browsers.** Verified from the published tarball: it is a 115-line
+  wrapper with `bin: {"playwright-cli": …}` and no browser-fetch code; its own `install` subcommand
+  installs *agent skill files*, not binaries. Browsers come from the standard installer —
+  `npx playwright install --with-deps chromium`. Note it depends on `playwright@1.62.0-alpha-1783623505000`
+  — **an alpha, pinned exactly by the package itself**; treat that as another upstream pin to watch.
+  **Chromium must run `--no-sandbox`** — see `INT-CONTAINER-RUNTIME-CONTRACT`. The alternative is
+  re-granting `CAP_SYS_ADMIN` or widening seccomp, which trades the container boundary for Chromium's
+  internal one against adversarial input. The container is the sandbox.
 - **Evidence (upstream)**: `guwidoe/pi-playwright @ 7d3eeeda` — `PLAYWRIGHT_BROWSERS_PATH` appears
-  nowhere in the repo; `scripts/pw.js` is a passthrough to `@playwright/cli`
-- **Reference** (no authority): Playwright docs — default Linux browser path `~/.cache/ms-playwright`.
+  nowhere in the repo; `scripts/pw.js` is a passthrough to `@playwright/cli` ·
+  `npm @playwright/cli@0.1.17` — `bin: {"playwright-cli": "playwright-cli.js"}`, deps pin
+  `playwright@1.62.0-alpha-1783623505000`; no installer code in the tarball
+- **Reference** (no authority): Playwright docs — default Linux browser path `~/.cache/ms-playwright`;
+  Chromium sandbox needs custom seccomp (`clone`/`setns`/`unshare`) or `SYS_ADMIN` when non-root;
+  Chromium download ~281 MB, with `--only-shell` documented as a smaller headless-only variant (a real
+  trade with feature gaps, not a free win — evaluate against `REQ-FRONTEND-VISUAL-VERIFY` before taking).
 - **Rejected**: *pi-chrome-dev-tools* — drives the **system Chrome with a persistent profile**. There is
   no system Chrome in the container, and a persistent profile contradicts
   `CONST-ISOLATION-CONTAINER-PER-JOB` directly. It is a desktop tool.
@@ -218,12 +401,13 @@ Considered and declined. Recorded so they are not re-proposed.
 ```
 pi-dispatch/
   specs/          ← this directory: the source of truth
-  receiver/       # Express webhook ingress + Bull Board
+  receiver/       # Express webhook ingress. Public edge. No dashboard.
+  panel/          # Admin UI + Bull Board. Localhost-bound. See DES-PANEL-SEPARATE-FROM-RECEIVER
   worker/         # BullMQ worker, docker orchestration, GitHub token minting
   image/          # Dockerfile + entrypoint + /runner (SDK job runner)
-  flows/          # frontend-fix.md, bug-fix.md, triage.md
-  persona/        # persona prompt file(s)
-  deploy/         # systemd units: redis/valkey, receiver, worker
+  flows/          # frontend-fix.md, bug-fix.md, triage.md — DEFAULTS, seeded into the data volume
+  persona/        # hard rules; baked into the image. Not runtime-editable
+  deploy/         # docker-compose (Valkey + receiver + worker + panel); systemd units as examples
   docs/
 ```
 
@@ -233,8 +417,16 @@ installable packages (`pi install npm:…`), a package's *registered* skill (pi-
 removes the ambiguity at its root — the alternative is a glossary that explains a collision we could
 simply not have.
 
-**Build order**: image + runner (headless pi proven in isolation) → worker → receiver → flows →
-hardening.
+**Build order**: image + runner + persona (headless pi proven in isolation) → worker → receiver → flows
+→ panel → deploy + hardening. The first step is deliberately the one that needs no queue and no GitHub:
+it is where the SDK traps in `INT-SDK-SESSION-OPTIONS` live, and they are cheapest to find with nothing
+else in the frame.
+
+**Platform**: Windows, macOS and Linux, wherever Docker runs. `docker-compose` is the supported
+deployment; systemd units ship as untested examples. Two consequences are not incidental and are tracked
+where they bite: a containerised worker talking to the Docker socket resolves bind-mount paths in the
+*daemon's* namespace, not its own; and a home machine behind NAT cannot receive GitHub webhooks without
+a tunnel.
 
 ---
 
@@ -243,3 +435,4 @@ hardening.
 | Date | Change |
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted) §2, §3, §4, §5, §9, §11. That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — **verified against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points. `DES-PERSONA-VIA-APPEND-SYSTEM-MD` is materially rewritten: the source doc's decisions #1 and #2 were mutually exclusive as written. `DES-NAME-KEEP-PI-DISPATCH` is new. `pi-harness` and `pi-sentry` were absent from the source doc's alternatives and are added. §5.7's "caches roll at midnight" caveat is **dropped** — 0.80.7 removed the date from the default system prompt. |
+| 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |

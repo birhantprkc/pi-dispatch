@@ -1,6 +1,7 @@
 # pi-dispatch
 
-**A GitHub-triggered, containerized job harness for the [pi](https://github.com/earendil-works/pi) coding agent.**
+**A containerized job harness for the [pi](https://github.com/earendil-works/pi) coding agent — triggered
+by GitHub, by a schedule, or by you.**
 
 Label an issue `pi:fix`. A container spins up, pi works the issue on a fresh clone, opens a PR, and
 comments back. Fifty labels at once become fifty queued jobs, drained at a fixed concurrency, with
@@ -10,6 +11,11 @@ pi is an excellent agent. It has no trigger layer, no job queue, no concurrency 
 own README — no permission system. pi-dispatch is that missing layer, and nothing else. Everything
 below the container is pi; everything above it is a few hundred lines of TypeScript.
 
+**Your project tells the agent what to do**, using pi's own layout — `.pi/APPEND_SYSTEM.md` for the
+persona, `.pi/skills/<name>/SKILL.md` for the flows. Not a format we invented; pi's native skills, read
+from your default branch at a pinned commit. pi-dispatch ships no persona of its own — only a small,
+immutable safety floor baked into the image that your instructions add to and cannot remove.
+
 ---
 
 ## Why this exists
@@ -18,9 +24,10 @@ pi runs where you put it. To use it as an unattended worker you need four things
 
 | Need | pi's answer | pi-dispatch's answer |
 |---|---|---|
-| **Trigger** | Extension events observe a *running session*; there are no webhook/cron event types, and a listener inside a session dies with it | An always-on receiver outside pi |
-| **Queue** | The only queueing is intra-session message delivery. Nothing coordinates across sessions | Redis + BullMQ. 50 triggers → 50 durable jobs |
+| **Trigger** | Extension events observe a *running session*; there are no webhook/cron event types, and a listener inside a session dies with it | An always-on receiver outside pi, plus schedules and manual runs |
+| **Queue** | The only queueing is intra-session message delivery. Nothing coordinates across sessions | Valkey + BullMQ. 50 triggers → 50 durable jobs |
 | **Concurrency** | None | Fixed worker concurrency, rate limiter, daily budget cap |
+| **Spend control** | **None whatsoever** — the agent loop is a bare `while (true)` bounded only by an abort signal; there is no max-turns, step limit or iteration cap anywhere in pi | A turn budget in the runner that aborts at N |
 | **Isolation** | *"Pi does not include a built-in permission system… If you need stronger boundaries, containerize or sandbox Pi."* | One ephemeral container per job |
 
 That last row is not a nice-to-have. GitHub issue text is untrusted, adversarial input, and it drives
@@ -42,14 +49,39 @@ your automation metered by hosted-runner minutes. If that is not you, the action
 ## How it works
 
 ```
-GitHub  ──webhook──▶  receiver  ──▶  Redis + BullMQ  ──▶  worker  ──▶  pi-job container
-                      HMAC-verify      the wait-list       mints a         pi + Playwright
-                      label allowlist  concurrency N       1h scoped       edit → screenshot
-                      author gate      budget cap          token           → PR → comment
+ TRIGGER                             TARGET
+ ───────                             ──────
+ webhook   label / @pi comment  ┐
+ panel     you, manually        ├──▶  a GitHub repo   → clone → branch → PR → comment
+ cron      a schedule           ┘     a local folder  → edited in place
+
+        │
+        ▼
+ receiver ──▶ Valkey + BullMQ ──▶ worker ──▶ pi-job container
+ HMAC-verify   the wait-list       branch-protection check    pi + Playwright + gh
+ label gate    concurrency N       budget cap (before spend)  guardrails + your .pi/
+ author gate   dedup + schedules   1h single-repo token       edit → screenshot → PR
 ```
 
-A job never merges its own PR. Human review is the backstop, and that is deliberate: the tests live in
-the same repo the agent can edit.
+Run it with `npm start` plus Docker for Valkey and the job containers. The worker drives the `docker`
+CLI directly — which is what lets a local folder on Windows, macOS or Linux be mounted into a job
+without any path guesswork.
+
+**pi-dispatch never merges a pull request.** Note the honest version of that promise: no code here calls
+a merge API, but the agent's own token *can* — GitHub gates push and merge behind the same `contents:
+write` scope, with no finer split. **Branch protection on your default branch is the real control**, so
+the worker refuses to run without it. Read [`SECURITY.md`](SECURITY.md) before you decide that is fine.
+
+## The panel
+
+A small local UI on `127.0.0.1`, separate from the webhook receiver — deliberately, since the receiver
+has to face the internet and the panel must not. It turns the queue on and off, shows what is waiting
+and what failed, sets the model, concurrency, turn budget, daily cap and schedules, and runs a flow
+against a folder on demand.
+
+It does **not** edit your persona or your skills. Those live in your project's `.pi/`, in git, reviewed —
+because a UI that rewrites what a paid agent is told, with no history and no review, is a worse version
+of a commit.
 
 ## Burst behaviour
 
