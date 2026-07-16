@@ -31,6 +31,11 @@
  * The event is the bare AgentEvent `{ type: "turn_start" }` -- it carries NO turnIndex.
  * The indexed TurnStartEvent exists only on the extension bus, which subscribe() is not.
  * So we count ourselves.
+ *
+ * This counts EVERY turn_start, including those pi emits for internal auto-retry and
+ * auto-compaction continuations (each `agent.continue()` re-emits one). Deliberate and
+ * conservative: the budget bounds total PAID turns, which is what protects spend -- a retry
+ * storm eats the same budget, which is exactly the runaway we want capped.
  */
 export function attachTurnBudget(session, maxTurns, { onAbort } = {}) {
 	if (!Number.isInteger(maxTurns) || maxTurns < 1) {

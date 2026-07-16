@@ -95,14 +95,17 @@ RUN useradd --create-home --shell /bin/bash --uid 1001 pi
 # WRITE. Everything else it merely reads or executes, and code the agent can rewrite is not a
 # boundary -- see the guardrails/runner COPYs below.
 #
-# ~/.pi/agent: pi lazily creates it (0700) and writes auth.json (0600) on the FIRST credential
-# operation (ensureParentDir/ensureFileExists inside withLock). Root-owned means the job dies
-# EACCES at runtime, on a path nothing here hints at. `COPY --chown` would not fix this anyway:
-# it does not apply to parent dirs COPY auto-creates, so /home/pi/.pi would still be root:root.
-# /ms-playwright: the runtime user must be able to read the root-installed browser binaries.
-RUN mkdir -p /home/pi/.pi/agent \
-    && chown -R pi:pi /home/pi/.pi \
-    && chown -R pi:pi /ms-playwright
+# ~/.pi/agent is the ONLY thing chowned to pi here: pi lazily creates it (0700) and writes
+# auth.json (0600) on the FIRST credential operation (ensureParentDir/ensureFileExists inside
+# withLock). Root-owned means the job dies EACCES at runtime, on a path nothing here hints at.
+# `COPY --chown` would not fix this anyway: it does not apply to parent dirs COPY auto-creates,
+# so /home/pi/.pi would still be root:root.
+#
+# /ms-playwright is deliberately NOT chowned. The browsers install root-owned and 0755
+# (world-readable/executable), which is all the non-root runtime user needs -- and root ownership
+# means the agent cannot tamper with its own browser binary. Chowning ~1GB of browser in a
+# separate layer also cost 687MB of overlay2 copy-up for a metadata-only change.
+RUN mkdir -p /home/pi/.pi/agent && chown -R pi:pi /home/pi/.pi
 
 # The safety floor and the runner are ROOT-OWNED and NOT writable by pi. The agent runs AS pi;
 # if it could overwrite /opt/pi-dispatch/HARD_RULES.md it would own its own constraints, and if

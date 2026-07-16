@@ -30,8 +30,8 @@ Evidence convention as in `constitution.md`.
   const authStorage   = AuthStorage.create(`${agentDir}/auth.json`);
   const modelRegistry = ModelRegistry.create(authStorage, `${agentDir}/models.json`);
   const model = modelRegistry.find(process.env.PI_PROVIDER, process.env.PI_MODEL);  // NOT getModel
-  if (!model) throw new InfraError(`unknown model`);   // exit 2 — config, not retryable
-  if (!modelRegistry.hasConfiguredAuth(model)) throw new InfraError(`no auth`);      // exit 2
+  if (!model) throw configError(`unknown model`);   // configError tags exit 2 — see below
+  if (!modelRegistry.hasConfiguredAuth(model)) throw configError(`no configured auth`);
 
   // Guardrails read EXPLICITLY from a path we own — never via discovery. See (e).
   const guardrails    = readFileSync("/opt/pi-dispatch/HARD_RULES.md", "utf8");
@@ -204,6 +204,7 @@ Evidence convention as in `constitution.md`.
 
   | Failure | Surfaces as | Exit |
   |---|---|---|
+  | **Our own precondition fails** — missing/malformed `PI_*` env, missing `/job/prompt.md`, unknown model | **throws a tagged `configError`** | `2` — deterministic; the worker passes the same bad value on every retry |
   | No API key for the provider | **throws** (preflight) | `2` — config error; retrying cannot fix it |
   | No model selected / unknown model | **throws** (preflight) | `2` — same |
   | Streaming without `streamingBehavior` | **throws** (preflight) | `1` — our bug |
@@ -251,7 +252,16 @@ Evidence convention as in `constitution.md`.
 
   The split is the point: **preflight throws; the loop swallows.** Neither mechanism alone is sufficient,
   and there is no typed error class — classify caught errors by inspection, and loop outcomes by
-  `stopReason`.
+  `stopReason`. For errors the runner raises *itself* (bad env, missing input), do not lean on inspecting
+  pi's error vocabulary: **tag them** with the exit code at the throw site (a `configError` helper), so the
+  classifier honours the tag instead of pattern-matching a string it controls. A regex tuned for "no
+  model / no API key" will not match "invalid PI_MAX_TURNS", and that miss silently makes a config typo
+  *retryable*.
+
+  **`session.dispose()` in the `finally`.** Every official SDK example disposes; it is the only caller of
+  the provider cleanup callbacks. Skip it and a provider transport can keep the event loop alive, hanging
+  the container until the 30-minute timeout turns a completed job into a timeout failure — silent, and
+  exactly the class this file exists to prevent.
   **The listener must be synchronous.** `_emit` is `for (const l of this._eventListeners) { l(event); }`
   — no `await`. An `async` listener is fire-and-forget, so a budget check that awaits anything is not
   guaranteed to run before the next turn. `session.abort()` returns a promise but flips the `AbortSignal`
@@ -366,6 +376,13 @@ Evidence convention as in `constitution.md`.
     Bake the guardrails in as root and forget to `chown`, and the job dies EACCES at runtime, inside the
     container, on a path nothing in the Dockerfile hints at. `models.json` is the exception: read-only,
     never created, safe if absent.
+    **Inversely, the guardrails, the runner, `node_modules`, and the browser cache are root-owned and NOT
+    writable by the runtime user.** The agent runs *as* that user; if it could rewrite
+    `/opt/pi-dispatch/HARD_RULES.md` it would own its own safety floor, and `/job:ro` — which exists
+    precisely so the agent cannot rewrite its instructions — would be pointless next to a writable `/opt`.
+    Only `~/.pi/agent` is agent-writable, because pi must write `auth.json` there. Everything the agent
+    merely reads or executes stays root-owned; the browser binaries are `0755` root-owned, which is all a
+    non-root user needs to launch Chromium.
     **`COPY --chown` alone does NOT fix this** — it does not apply to parent directories that `COPY`
     auto-creates, so `/home/pi/.pi` and `/home/pi/.pi/agent` are still born `root:root`. The trap
     survives the obvious fix. Create and chown the directory explicitly:
@@ -383,11 +400,13 @@ Evidence convention as in `constitution.md`.
     is. **Never "fix" a Chromium launch error by adding `SYS_ADMIN` or widening seccomp**: that trades
     the outer boundary for an inner one against adversarial input, inverting the security model. Written
     here because the vendor's own documentation recommends the thing we must not do.
-  - **`playwright-cli` is stateful and its file access is restricted by default.** `open <url>` starts a
-    session; `screenshot --filename <path>` acts on the current page. There is no one-shot
-    `screenshot <url> <path>` form. Navigation to `file://` is **blocked outside cwd** unless
-    `PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS` is set — a good default that this project does not
-    weaken: the agent's pages are served from `/workspace`, which is cwd.
+  - **`playwright-cli` is stateful.** `open <url>` starts a session; `screenshot --filename <path>` acts
+    on the current page; `snapshot` returns the DOM. There is no one-shot `screenshot <url> <path>` form.
+    **Navigation to `file://` is blocked outright** by default (not merely restricted to cwd — an
+    earlier version of this spec claimed the latter, and it was wrong). A frontend job navigates its dev
+    server over **http**, which is not blocked; that is the real usage and the only one worth testing.
+    Do **not** set `PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS` to work around the block — the block
+    is a good default.
   - **Fonts are required, and their absence is silent.** `bookworm-slim` ships none, so Chromium renders
     tofu boxes and screenshots look plausible while containing no legible text — which would quietly
     gut `REQ-FRONTEND-VISUAL-VERIFY`, the capability the whole image exists for. Install `fontconfig` +

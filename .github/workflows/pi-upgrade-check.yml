@@ -147,24 +147,41 @@ jobs:
       # CONST-ISOLATION-CONTAINER-PER-JOB requires. --shm-size, NOT --ipc=host: Playwright recommends
       # the latter, but it shares the HOST IPC namespace with a container running adversarial-input
       # agent code. The crash it prevents is caused by a 64MB /dev/shm, so fix that instead.
-      # playwright-cli is STATEFUL: `open` starts a session, `screenshot` acts on the current page.
-      # It is not a one-shot that takes a URL. The sandbox is controlled by PLAYWRIGHT_MCP_SANDBOX,
-      # not by a --no-sandbox argument. And file:// navigation is blocked by default outside cwd --
-      # a good default we do NOT weaken here: the page is served from /workspace, which is cwd.
-      - name: Chromium screenshots a page as non-root
+      #
+      # This asserts REAL rendering, not merely "a PNG exists". An earlier version opened a file://
+      # URL -- which playwright-cli BLOCKS by default -- so it screenshotted about:blank and passed
+      # on a blank page: green and vacuous. Two corrections: (1) navigate over http, which is what a
+      # frontend job actually does (a dev server), and which is not blocked; (2) diff the screenshot
+      # against a blank baseline, so a blank or all-tofu page FAILS. A non-empty PNG proves nothing;
+      # a PNG that differs from about:blank proves the browser painted the page.
+      # Two assertions that a NON-VACUOUS test needs, both learned the hard way:
+      #  - The page is served over HTTP (a dev server, what a frontend job hits), not file:// --
+      #    playwright-cli BLOCKS file:// by default, so the old test screenshotted about:blank and
+      #    passed green on a blank page.
+      #  - Correctness is proven by finding a MARKER in the page snapshot, not by diffing the
+      #    screenshot against blank. When the server is down, `open` renders Chrome's own
+      #    connection-refused error page, which ALSO differs from blank -- so a pixel diff passes on
+      #    an error page. The DOM snapshot containing our marker proves the real page loaded.
+      #  - The page is passed via env, not a bind mount: mounts are the one thing that behaves
+      #    differently across host OSes, and this must not depend on that.
+      # Both directions verified locally: a dead server makes the marker absent and the step fails.
+      - name: Chromium renders a real page as non-root
         run: |
-          mkdir -p ws && echo '<html><body><h1>pi-dispatch</h1></body></html>' > ws/page.html
-          # No -e for browser/sandbox: both are baked into the image, because they are facts about
-          # the image rather than choices a job makes. Asserting without them proves that.
           docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
-            -v "$PWD/ws:/workspace" --entrypoint sh pi-job:ci \
-            -c 'playwright-cli open file:///workspace/page.html && playwright-cli screenshot --filename /workspace/shot.png && test -s /workspace/shot.png' \
-            || { echo "::error::Chromium unusable as non-root — check PLAYWRIGHT_BROWSERS_PATH at build AND run, and PLAYWRIGHT_MCP_SANDBOX at run"; exit 1; }
+            -e PAGE='<html><body style="background:#f00"><h1 style="color:#fff">RENDER-CHECK-MARKER</h1></body></html>' \
+            --entrypoint sh pi-job:ci -c \
+            'node -e "require(\"http\").createServer((_,r)=>{r.writeHead(200,{\"content-type\":\"text/html\"});r.end(process.env.PAGE)}).listen(8099)" & sleep 1;
+             playwright-cli open http://localhost:8099 >/dev/null 2>&1;
+             playwright-cli snapshot 2>&1 | grep -q RENDER-CHECK-MARKER || { echo "page did not load — chromium could not navigate/render"; exit 1; };
+             playwright-cli screenshot --filename /tmp/s.png >/dev/null 2>&1;
+             test -s /tmp/s.png || { echo "no screenshot produced"; exit 1; }' \
+            || { echo "::error::Chromium did not render a real page. Check PLAYWRIGHT_BROWSERS_PATH (build+run), PLAYWRIGHT_MCP_BROWSER, PLAYWRIGHT_MCP_SANDBOX, fonts."; exit 1; }
 
-      # Fonts absent => tofu boxes => screenshots that look fine and contain no legible text. That
-      # silently guts the requirement full Chromium is in this image for.
-      - name: Fonts are installed (or screenshots are tofu)
+      # Fonts: a weaker, independent check. The render diff above already catches a totally blank
+      # page; this catches "fonts package silently dropped" specifically. Neither proves LEGIBILITY
+      # (that needs OCR, which is not worth it here) -- honest about what it does and does not show.
+      - name: Fonts are installed
         run: |
           n=$(docker run --rm --entrypoint sh pi-job:ci -c 'fc-list | wc -l')
-          [ "$n" -gt 0 ] || { echo "::error::No fonts. Chromium will render boxes and REQ-FRONTEND-VISUAL-VERIFY is a lie."; exit 1; }
+          [ "$n" -gt 0 ] || { echo "::error::No fonts. Chromium renders tofu; REQ-FRONTEND-VISUAL-VERIFY degraded."; exit 1; }
           echo "OK: $n fonts"
