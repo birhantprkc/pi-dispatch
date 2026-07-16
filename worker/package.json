@@ -6,15 +6,20 @@
   "description": "BullMQ worker: drains the queue, mints scoped tokens, runs one container per job.",
   "license": "MIT",
   "main": "src/index.mjs",
+  "bin": {
+    "pi-dispatch": "src/cli.mjs"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test \"test/*.test.mjs\"",
+    "start": "node src/cli.mjs worker"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.80.7",
     "@octokit/auth-app": "8.2.0",
-    "bullmq": "5.80.4"
+    "bullmq": "5.80.4",
+    "ioredis": "5.11.1"
   }
 }
