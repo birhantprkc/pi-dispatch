@@ -26,8 +26,10 @@ export const STOP_REASONS = ["stop", "length", "toolUse", "error", "aborted"];
 export function classifyThrow(error) {
 	const message = error instanceof Error ? error.message : String(error);
 
-	// Config errors. Retrying cannot fix these, so do not let the queue try.
-	if (/no model|model not|no api key|no.*credential|not authenticated/i.test(message)) {
+	// Config errors. Retrying cannot fix these, so do not let the queue try. A missing required
+	// env var is deterministic misconfiguration -- the worker will pass the same (absent) value
+	// on every retry, so exit 2 (not retried), not 1 (retryable).
+	if (/no model|model not|no api key|no.*credential|not authenticated|missing required env/i.test(message)) {
 		return { code: EXIT_POLICY, reason: "config", message };
 	}
 

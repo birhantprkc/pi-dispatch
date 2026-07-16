@@ -91,28 +91,35 @@ ENV PLAYWRIGHT_MCP_BROWSER=chromium \
 # Non-root. CONST-ISOLATION-CONTAINER-PER-JOB.
 RUN useradd --create-home --shell /bin/bash --uid 1001 pi
 
-# pi lazily creates ~/.pi/agent (0700) and writes auth.json (0600) on the FIRST credential
-# operation -- ensureParentDir/ensureFileExists run inside withLock. Root-owned means the
-# job dies EACCES at runtime, inside the container, on a path nothing here hints at.
+# ONLY these two are chowned to pi, because they are the only things the runtime user must
+# WRITE. Everything else it merely reads or executes, and code the agent can rewrite is not a
+# boundary -- see the guardrails/runner COPYs below.
 #
-# `COPY --chown` alone does NOT fix this: it does not apply to parent directories COPY
-# auto-creates, so /home/pi/.pi would still be born root:root. The trap survives the
-# obvious fix. Create and chown explicitly.
+# ~/.pi/agent: pi lazily creates it (0700) and writes auth.json (0600) on the FIRST credential
+# operation (ensureParentDir/ensureFileExists inside withLock). Root-owned means the job dies
+# EACCES at runtime, on a path nothing here hints at. `COPY --chown` would not fix this anyway:
+# it does not apply to parent dirs COPY auto-creates, so /home/pi/.pi would still be root:root.
+# /ms-playwright: the runtime user must be able to read the root-installed browser binaries.
 RUN mkdir -p /home/pi/.pi/agent \
     && chown -R pi:pi /home/pi/.pi \
-    && chown -R pi:pi /ms-playwright \
-    && chown -R pi:pi /app
+    && chown -R pi:pi /ms-playwright
 
-# The safety floor. Deliberately NOT at ~/.pi/agent/APPEND_SYSTEM.md: a trusted project's
-# .pi/APPEND_SYSTEM.md shadows that path via an early return in discoverAppendSystemPromptFile,
-# which would delete these rules from the prompt with no error and a job that succeeds. The
-# runner reads this path explicitly instead, so discovery cannot shadow it.
-COPY --chown=pi:pi guardrails/HARD_RULES.md /opt/pi-dispatch/HARD_RULES.md
+# The safety floor and the runner are ROOT-OWNED and NOT writable by pi. The agent runs AS pi;
+# if it could overwrite /opt/pi-dispatch/HARD_RULES.md it would own its own constraints, and if
+# it could overwrite /app it would own the runner and pi itself. `/job:ro` exists precisely so
+# the agent cannot rewrite its instructions -- leaving its code agent-writable is the identical
+# hole through a different door. Root owns it; pi reads it (npm's 0644/0755 defaults suffice).
+#
+# The guardrails path is deliberately NOT ~/.pi/agent/APPEND_SYSTEM.md: a trusted project's
+# .pi/APPEND_SYSTEM.md shadows that via an early return in discoverAppendSystemPromptFile, which
+# would delete the floor from the prompt with no error. The runner reads this path explicitly.
+COPY guardrails/HARD_RULES.md /opt/pi-dispatch/HARD_RULES.md
 
 # Source last: everything above is cacheable and this layer changes on every commit.
-COPY --chown=pi:pi image/runner /app/image/runner
-COPY --chown=pi:pi image/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY image/runner /app/image/runner
+COPY image/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && chmod -R a-w /opt/pi-dispatch /app/image/runner /app/node_modules
 
 USER pi
 WORKDIR /workspace
