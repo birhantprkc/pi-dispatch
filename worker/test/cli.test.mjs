@@ -6,9 +6,16 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { main } from "../src/cli.mjs";
 
-// cli.mjs dynamic-imports bullmq (in the `run` enqueue and `worker` paths), so the VALIDATION
-// paths -- which return before any enqueue -- run everywhere. That is exactly the safety surface
-// worth testing: nothing should reach the queue if the inputs are bad.
+// cli.mjs dynamic-imports bullmq/ioredis (in the `run` enqueue and `worker` paths), so the
+// VALIDATION paths -- which return before any enqueue -- run everywhere. That is exactly the safety
+// surface worth testing: nothing should reach the queue if the inputs are bad. Tests that DO reach
+// the enqueue need the queue deps; they skip below the node floor and run in CI.
+let depsOk = false;
+try {
+	await import("../src/connection.mjs");
+	depsOk = true;
+} catch {}
+const needsDeps = depsOk ? false : `queue deps not installed (node ${process.version} < 22.19.0); CI runs these`;
 
 const env = { VALKEY_URL: "redis://127.0.0.1:6399" };
 
@@ -59,7 +66,7 @@ test("run enqueues against a real Valkey (VALKEY_TEST_URL) and prints the job id
 	assert.equal(code, 0, "a clean enqueue against a real Valkey returns 0");
 });
 
-test("run fails FAST (does not hang) when Valkey is unreachable", async () => {
+test("run fails FAST (does not hang) when Valkey is unreachable", { skip: needsDeps }, async () => {
 	// The whole point of failFast: a one-shot enqueue against a down Valkey must error in seconds,
 	// not hang forever on ioredis's null retry policy. Port 1 is closed.
 	const dir = gitRepo({ dirty: false });
