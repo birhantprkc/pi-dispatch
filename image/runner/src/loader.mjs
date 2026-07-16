@@ -27,8 +27,8 @@ function readIfExists(path) {
  *   CONST-NO-CONTEXT-FILES-MANDATORY fails open by omission; this is the omission.
  *
  * - `noSkills`/`noExtensions` suppress cwd/package discovery, which would read the
- *   CHECKED-OUT branch -- a fork's branch on a PR-triggered job. The additional*Paths
- *   are merged in both the no*/else branches and are never trust-checked, so they load
+ *   CHECKED-OUT branch -- a fork's branch on a PR-triggered job. The additional paths are
+ *   merged whether or not those flags are set, and are never trust-checked, so they load
  *   exactly what the worker handed over and nothing from the tree. Project trust is
  *   therefore never granted: reload() is called without resolveProjectTrust.
  *

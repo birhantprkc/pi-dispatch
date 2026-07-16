@@ -40,23 +40,36 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# The workspace .npmrc's engine-strict does NOT reach a global install: `npm i -g` reads
-# only $HOME/.npmrc and $PREFIX/etc/npmrc, never a project file. Set it explicitly or the
-# node-floor guard silently does not cover the one install that matters most.
+# engine-strict is set explicitly because npm reads it from $HOME/.npmrc and
+# $PREFIX/etc/npmrc but NEVER from a project .npmrc for installs outside a project root.
+# Without this the node-floor guard silently does not cover the install that matters most.
 ENV NPM_CONFIG_ENGINE_STRICT=true
 
-# Exact versions, no ranges. pi breaks between MINORS -- a past regression silently dropped
-# sendUserMessage after newSession, and the package was renamed mid-flight.
-RUN npm install -g --no-fund --no-audit \
-      @earendil-works/pi-coding-agent@0.80.7 \
-      @playwright/cli@0.1.17
+# A LOCAL install from the lockfile -- deliberately not `npm i -g`.
+#
+# A global install puts binaries on PATH but does NOT make a package importable by a bare
+# specifier: node's ESM resolver walks node_modules upward from the importing file and
+# ignores the global prefix entirely. NODE_PATH does not help either -- it is CommonJS-only
+# and the resolver ignores it for ESM. `import "@earendil-works/pi-coding-agent"` from
+# /app/image/runner therefore only resolves against a real node_modules above it.
+#
+# Deps are copied before source so a source edit does not invalidate this layer.
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY image/runner/package.json ./image/runner/
+RUN npm ci --omit=dev --no-audit --no-fund
+
+# The pi and playwright-cli binaries come from that same install: one pin, one copy on disk,
+# no chance of the CLI and the imported library drifting to different versions.
+ENV PATH="/app/node_modules/.bin:${PATH}"
 
 # Set BEFORE the browser install so root-time install and non-root-time lookup agree.
 # Root installs would otherwise land in /root/.cache/ms-playwright, which the non-root
 # runtime user cannot see -- a direct collision between two of our own constraints.
-# @playwright/cli does NOT install browsers; it is a thin wrapper. The standard installer does.
+# @playwright/cli does NOT install browsers; it is a thin wrapper. The standard installer,
+# pinned transitively by @playwright/cli and resolved from the lockfile, does.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN npx --yes playwright@1.62.0-alpha-1783623505000 install --with-deps chromium \
+RUN playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root. CONST-ISOLATION-CONTAINER-PER-JOB.
@@ -71,7 +84,8 @@ RUN useradd --create-home --shell /bin/bash --uid 1001 pi
 # obvious fix. Create and chown explicitly.
 RUN mkdir -p /home/pi/.pi/agent \
     && chown -R pi:pi /home/pi/.pi \
-    && chown -R pi:pi /ms-playwright
+    && chown -R pi:pi /ms-playwright \
+    && chown -R pi:pi /app
 
 # The safety floor. Deliberately NOT at ~/.pi/agent/APPEND_SYSTEM.md: a trusted project's
 # .pi/APPEND_SYSTEM.md shadows that path via an early return in discoverAppendSystemPromptFile,
@@ -79,7 +93,8 @@ RUN mkdir -p /home/pi/.pi/agent \
 # runner reads this path explicitly instead, so discovery cannot shadow it.
 COPY --chown=pi:pi guardrails/HARD_RULES.md /opt/pi-dispatch/HARD_RULES.md
 
-COPY --chown=pi:pi image/runner /runner
+# Source last: everything above is cacheable and this layer changes on every commit.
+COPY --chown=pi:pi image/runner /app/image/runner
 COPY --chown=pi:pi image/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

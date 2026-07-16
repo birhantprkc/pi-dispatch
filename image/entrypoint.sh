@@ -15,4 +15,4 @@
 # "bad interpreter" inside the container: a confusing error with a boring cause.
 set -eu
 
-exec node /runner/run-job.mjs
+exec node /app/image/runner/run-job.mjs
