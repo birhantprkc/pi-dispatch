@@ -8,8 +8,14 @@ import { Redis } from "ioredis";
  * budget client, so it is set consistently.
  */
 
-/** BullMQ connection options parsed from a redis:// URL. */
-export function parseConnection(url) {
+/**
+ * BullMQ connection options parsed from a redis:// URL.
+ *
+ * `failFast` is for the CLI producer (a one-shot enqueue): if Valkey is unreachable it should
+ * error in a couple of seconds with a clear message, not hang forever. The long-running WORKER
+ * uses the default (persistent) options -- it should ride out a Valkey restart, not give up.
+ */
+export function parseConnection(url, { failFast = false } = {}) {
 	const u = new URL(url);
 	return {
 		host: u.hostname || "127.0.0.1",
@@ -17,7 +23,14 @@ export function parseConnection(url) {
 		...(u.password ? { password: u.password } : {}),
 		...(u.username ? { username: u.username } : {}),
 		...(u.pathname && u.pathname !== "/" ? { db: Number(u.pathname.slice(1)) } : {}),
-		maxRetriesPerRequest: null,
+		maxRetriesPerRequest: null, // required for BullMQ blocking connections
+		...(failFast
+			? {
+					connectTimeout: 2000,
+					enableOfflineQueue: false, // don't buffer commands while disconnected -- error now
+					retryStrategy: (attempts) => (attempts > 2 ? null : 200), // give up after ~2 tries
+				}
+			: {}),
 	};
 }
 

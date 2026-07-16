@@ -53,16 +53,18 @@ test("run refuses a dirty git working tree (edits are in place, no undo)", async
 	assert.equal(await main(["run", dir, "--task", "x"], env), 1);
 });
 
-test("--force overrides the dirty-tree refusal (reaches the enqueue, which needs Valkey)", async () => {
-	// Without Valkey the enqueue will throw; we only assert the guard did NOT stop it (it got past
-	// validation). If a Valkey is present it returns 0. Either way it must not return 1-from-guard.
-	const dir = gitRepo({ dirty: true });
-	let reachedEnqueue = false;
-	try {
-		const code = await main(["run", dir, "--task", "x", "--force"], env);
-		reachedEnqueue = code === 0; // Valkey present
-	} catch {
-		reachedEnqueue = true; // tried to connect => passed the guard
-	}
-	assert.ok(reachedEnqueue, "--force must let a dirty tree through to the enqueue");
+test("run enqueues against a real Valkey (VALKEY_TEST_URL) and prints the job id", { skip: process.env.VALKEY_TEST_URL ? false : "needs VALKEY_TEST_URL" }, async () => {
+	const dir = gitRepo({ dirty: false });
+	const code = await main(["run", dir, "--task", "tidy the imports", "--force"], { VALKEY_URL: process.env.VALKEY_TEST_URL });
+	assert.equal(code, 0, "a clean enqueue against a real Valkey returns 0");
+});
+
+test("run fails FAST (does not hang) when Valkey is unreachable", async () => {
+	// The whole point of failFast: a one-shot enqueue against a down Valkey must error in seconds,
+	// not hang forever on ioredis's null retry policy. Port 1 is closed.
+	const dir = gitRepo({ dirty: false });
+	const start = Date.now();
+	const code = await main(["run", dir, "--task", "x"], { VALKEY_URL: "redis://127.0.0.1:1" });
+	assert.equal(code, 1, "an unreachable Valkey is a clean error, not a hang");
+	assert.ok(Date.now() - start < 15000, "must fail fast, well under any CI timeout");
 });

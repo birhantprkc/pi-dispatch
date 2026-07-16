@@ -51,7 +51,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		const config = loadConfig(env);
 		const { parseConnection } = await import("./connection.mjs");
 		const { makeQueue, enqueueLocalJob } = await import("./queue.mjs");
-		const queue = makeQueue(parseConnection(config.valkeyUrl));
+		// failFast: a one-shot enqueue must not hang forever if Valkey is down -- error clearly.
+		const queue = makeQueue(parseConnection(config.valkeyUrl, { failFast: true }));
 		try {
 			const jobId = await enqueueLocalJob(queue, {
 				folder,
@@ -62,8 +63,10 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 				maxTurns: values["max-turns"] ? Number(values["max-turns"]) : config.maxTurns,
 			});
 			process.stdout.write(`queued ${jobId} — folder ${folder}\nrun \`pi-dispatch worker\` to process it.\n`);
+		} catch (error) {
+			return fail(`could not reach Valkey at ${config.valkeyUrl} — is it running? (docker compose up)\n  ${error.message}`);
 		} finally {
-			await queue.close();
+			await queue.close().catch(() => {});
 		}
 		return 0;
 	}
