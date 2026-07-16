@@ -337,8 +337,18 @@ Evidence convention as in `constitution.md`.
     a common reason for zombie processes."* Our entrypoint `exec`s the runner, so **node is PID 1** and
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
-  - Env: `ANTHROPIC_API_KEY`, `GITHUB_TOKEN` (scoped, 1h), `PI_JOB_ID`,
-    `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
+  - Env: **the configured provider's key variable(s), derived — not hardcoded** (see below);
+    `GITHUB_TOKEN` (scoped, 1h — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`; `PI_MODEL`;
+    `PI_MAX_TURNS`; `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`; `PLAYWRIGHT_MCP_SANDBOX=false`;
+    `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
+  - **The provider key variable is derived from pi's own table via `findEnvKeys(provider)`**
+    (`import { findEnvKeys } from "@earendil-works/pi-ai/compat"`), never hardcoded and never
+    pass-through. pi supports ~30 providers, each with its own variable, so "support any model" must not
+    become "forward everything" — `no-broad-env-into-container` is a BLOCKER. Deriving the allowlist
+    from pi's table rather than copying it means it **cannot drift** when pi adds a provider, and a
+    hand-maintained copy is exactly the reinvention `no-reimplementing-pi` forbids. For `anthropic` the
+    call returns `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` — **the array order *is* the
+    precedence**, which is precisely the trap this rule exists for.
   - Mounts: `/job:ro`, `/workspace:rw` — delivered by named volume + `volume-subpath`, never a host bind
     mount (`DES-JOB-FILES-VIA-VOLUME-SUBPATH`)
   - No TTY (`-it` absent)
@@ -355,15 +365,21 @@ Evidence convention as in `constitution.md`.
     RUN mkdir -p /home/pi/.pi/agent && chown -R pi:pi /home/pi/.pi
     COPY --chown=pi:pi guardrails/HARD_RULES.md /home/pi/.pi/agent/APPEND_SYSTEM.md
     ```
-  - **Chromium must launch with `--no-sandbox`** — and this is a **deliberate divergence from
-    Playwright's docs**, which do not mention the flag at all. Their supported path for non-root Chromium
-    is a custom seccomp profile granting `clone`/`setns`/`unshare`, or `--cap-add=SYS_ADMIN`. We give it
-    neither: `--cap-drop=ALL` *is* `CONST-ISOLATION-CONTAINER-PER-JOB`'s enforcement surface.
-    `--no-sandbox` does not acquire the privilege — it skips the code path needing it, leaving the
-    container as the only boundary, which is exactly what this project already decided the boundary is.
-    **Never "fix" a Chromium launch error by adding `SYS_ADMIN` or widening seccomp**: that trades the
-    outer boundary for an inner one against adversarial input, inverting the security model. Written
+  - **Chromium's own sandbox is disabled via `PLAYWRIGHT_MCP_SANDBOX=false`** — an env var, **not** a
+    `--no-sandbox` argument, and not a `playwright-cli` flag. This is a **deliberate divergence from
+    Playwright's docs**, which never mention disabling it: their supported path for non-root Chromium is
+    a custom seccomp profile granting `clone`/`setns`/`unshare`, or `--cap-add=SYS_ADMIN`. We give it
+    neither, because `--cap-drop=ALL` *is* `CONST-ISOLATION-CONTAINER-PER-JOB`'s enforcement surface.
+    Disabling the inner sandbox does not acquire the privilege — it skips the code path that needs it,
+    leaving the container as the only boundary, which is what this project already decided the boundary
+    is. **Never "fix" a Chromium launch error by adding `SYS_ADMIN` or widening seccomp**: that trades
+    the outer boundary for an inner one against adversarial input, inverting the security model. Written
     here because the vendor's own documentation recommends the thing we must not do.
+  - **`playwright-cli` is stateful and its file access is restricted by default.** `open <url>` starts a
+    session; `screenshot --filename <path>` acts on the current page. There is no one-shot
+    `screenshot <url> <path>` form. Navigation to `file://` is **blocked outside cwd** unless
+    `PLAYWRIGHT_MCP_ALLOW_UNRESTRICTED_FILE_ACCESS` is set — a good default that this project does not
+    weaken: the agent's pages are served from `/workspace`, which is cwd.
   - **Fonts are required, and their absence is silent.** `bookworm-slim` ships none, so Chromium renders
     tofu boxes and screenshots look plausible while containing no legible text — which would quietly
     gut `REQ-FRONTEND-VISUAL-VERIFY`, the capability the whole image exists for. Install `fontconfig` +

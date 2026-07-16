@@ -147,13 +147,18 @@ jobs:
       # CONST-ISOLATION-CONTAINER-PER-JOB requires. --shm-size, NOT --ipc=host: Playwright recommends
       # the latter, but it shares the HOST IPC namespace with a container running adversarial-input
       # agent code. The crash it prevents is caused by a 64MB /dev/shm, so fix that instead.
-      - name: Chromium screenshots a local page as non-root
+      # playwright-cli is STATEFUL: `open` starts a session, `screenshot` acts on the current page.
+      # It is not a one-shot that takes a URL. The sandbox is controlled by PLAYWRIGHT_MCP_SANDBOX,
+      # not by a --no-sandbox argument. And file:// navigation is blocked by default outside cwd --
+      # a good default we do NOT weaken here: the page is served from /workspace, which is cwd.
+      - name: Chromium screenshots a page as non-root
         run: |
-          echo '<html><body><h1>pi-dispatch</h1></body></html>' > fixture/page.html
+          mkdir -p ws && echo '<html><body><h1>pi-dispatch</h1></body></html>' > ws/page.html
           docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
-            -v "$PWD/fixture:/fixture:ro" --entrypoint sh pi-job:ci \
-            -c 'playwright-cli screenshot --browser-arg=--no-sandbox file:///fixture/page.html /tmp/x.png && test -s /tmp/x.png' \
-            || { echo "::error::Chromium unusable as non-root — check PLAYWRIGHT_BROWSERS_PATH at build AND run"; exit 1; }
+            -e PLAYWRIGHT_MCP_SANDBOX=false \
+            -v "$PWD/ws:/workspace" --entrypoint sh pi-job:ci \
+            -c 'playwright-cli open file:///workspace/page.html && playwright-cli screenshot --filename /workspace/shot.png && test -s /workspace/shot.png' \
+            || { echo "::error::Chromium unusable as non-root — check PLAYWRIGHT_BROWSERS_PATH at build AND run, and PLAYWRIGHT_MCP_SANDBOX at run"; exit 1; }
 
       # Fonts absent => tofu boxes => screenshots that look fine and contain no legible text. That
       # silently guts the requirement full Chromium is in this image for.
