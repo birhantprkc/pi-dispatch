@@ -1,0 +1,20 @@
+{
+  "name": "pi-dispatch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A containerized job harness for the pi coding agent",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "image/runner",
+    "worker",
+    "receiver",
+    "panel"
+  ],
+  "scripts": {
+    "test": "node --test \"image/runner/test/*.test.mjs\""
+  }
+}
