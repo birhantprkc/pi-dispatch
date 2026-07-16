@@ -154,8 +154,9 @@ jobs:
       - name: Chromium screenshots a page as non-root
         run: |
           mkdir -p ws && echo '<html><body><h1>pi-dispatch</h1></body></html>' > ws/page.html
+          # No -e for browser/sandbox: both are baked into the image, because they are facts about
+          # the image rather than choices a job makes. Asserting without them proves that.
           docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
-            -e PLAYWRIGHT_MCP_SANDBOX=false \
             -v "$PWD/ws:/workspace" --entrypoint sh pi-job:ci \
             -c 'playwright-cli open file:///workspace/page.html && playwright-cli screenshot --filename /workspace/shot.png && test -s /workspace/shot.png' \
             || { echo "::error::Chromium unusable as non-root — check PLAYWRIGHT_BROWSERS_PATH at build AND run, and PLAYWRIGHT_MCP_SANDBOX at run"; exit 1; }

@@ -72,6 +72,22 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
+# Baked because they are facts about THIS IMAGE, not choices a job makes. Leaving them to the
+# worker means every caller has to remember them and a frontend job fails when one forgets.
+#
+# PLAYWRIGHT_MCP_BROWSER: playwright-cli defaults to the branded `chrome` CHANNEL and looks for
+# /opt/google/chrome/chrome, which does not exist here and must not -- a system Chrome with a
+# persistent profile is precisely what DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS rejected. Without
+# this, every frontend job dies with "Chromium distribution 'chrome' is not found" and
+# REQ-FRONTEND-VISUAL-VERIFY is dead on arrival.
+#
+# PLAYWRIGHT_MCP_SANDBOX: Chromium's own sandbox needs user-namespace syscalls or CAP_SYS_ADMIN.
+# --cap-drop=ALL denies both, deliberately -- the container IS the boundary
+# (CONST-ISOLATION-CONTAINER-PER-JOB). Disabling the inner sandbox skips the code path that needs
+# the privilege rather than granting it. Never "fix" a launch error by re-adding SYS_ADMIN.
+ENV PLAYWRIGHT_MCP_BROWSER=chromium \
+    PLAYWRIGHT_MCP_SANDBOX=false
+
 # Non-root. CONST-ISOLATION-CONTAINER-PER-JOB.
 RUN useradd --create-home --shell /bin/bash --uid 1001 pi
 

@@ -337,10 +337,18 @@ Evidence convention as in `constitution.md`.
     a common reason for zombie processes."* Our entrypoint `exec`s the runner, so **node is PID 1** and
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
-  - Env: **the configured provider's key variable(s), derived — not hardcoded** (see below);
-    `GITHUB_TOKEN` (scoped, 1h — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`; `PI_MODEL`;
-    `PI_MAX_TURNS`; `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`; `PLAYWRIGHT_MCP_SANDBOX=false`;
-    `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
+  - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
+    (see below); `GITHUB_TOKEN` (scoped, 1h — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
+    `PI_MODEL`; `PI_MAX_TURNS`; `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
+  - Env **baked into the image**, because they are facts about the image and not choices a job makes:
+    `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,
+    `PLAYWRIGHT_MCP_SANDBOX=false`. **`PLAYWRIGHT_MCP_BROWSER` is load-bearing**: `playwright-cli`
+    defaults to the branded **`chrome` channel** and looks for `/opt/google/chrome/chrome`, which this
+    image does not have and must not — a system Chrome with a persistent profile is exactly what
+    `DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS` rejected. Omit it and every frontend job dies with
+    *"Chromium distribution 'chrome' is not found"*, making `REQ-FRONTEND-VISUAL-VERIFY` dead on
+    arrival. Leaving these to the worker means every caller must remember them; baking them means the
+    image cannot be held wrong.
   - **The provider key variable is derived from pi's own table via `findEnvKeys(provider)`**
     (`import { findEnvKeys } from "@earendil-works/pi-ai/compat"`), never hardcoded and never
     pass-through. pi supports ~30 providers, each with its own variable, so "support any model" must not
