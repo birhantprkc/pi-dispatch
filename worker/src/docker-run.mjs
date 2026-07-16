@@ -24,7 +24,7 @@ export const ISOLATION_FLAGS = [
  *
  * @param image      pinned job image tag/digest
  * @param env        the closed env map from buildContainerEnv -- passed as explicit -e NAME=VALUE
- * @param jobPiDir   host path to the materialised .pi/ (mounted /job/pi:ro)
+ * @param jobDir     host path to the /job inputs dir (contains prompt.md and pi/); mounted /job:ro
  * @param workspace  host path to the fresh clone / local folder (mounted /workspace:rw)
  * @param name       container name (for `docker stop` at the timeout)
  * @param memory     e.g. "4g"; cpus e.g. "2"
@@ -33,7 +33,7 @@ export const ISOLATION_FLAGS = [
 export function buildDockerRunArgs({
 	image,
 	env,
-	jobPiDir,
+	jobDir,
 	workspace,
 	name,
 	memory = "4g",
@@ -54,9 +54,9 @@ export function buildDockerRunArgs({
 		args.push("-e", `${k}=${v}`);
 	}
 
-	// /job is read-only (INT-CONTAINER-JOB-INPUTS): the agent cannot rewrite its own instructions.
-	// /workspace is the only writable mount.
-	if (jobPiDir) args.push("-v", `${jobPiDir}:/job/pi:ro`);
+	// The WHOLE /job dir is read-only (INT-CONTAINER-JOB-INPUTS): it holds prompt.md and pi/, and
+	// the agent cannot rewrite any of it. /workspace is the only writable mount.
+	if (jobDir) args.push("-v", `${jobDir}:/job:ro`);
 	args.push("-v", `${workspace}:/workspace`);
 
 	args.push(image);

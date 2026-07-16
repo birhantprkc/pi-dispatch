@@ -5,7 +5,7 @@ import { buildDockerRunArgs, ISOLATION_FLAGS } from "../src/docker-run.mjs";
 const base = {
 	image: "pi-job:pinned",
 	env: { PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-real" },
-	jobPiDir: "/srv/jobs/abc/pi",
+	jobDir: "/srv/jobs/abc/job",
 	workspace: "/srv/jobs/abc/workspace",
 	name: "pi-job-abc",
 };
@@ -23,7 +23,7 @@ test("carries every isolation flag -- these ARE the boundary", () => {
 
 test("/job is read-only, /workspace is writable", () => {
 	const args = buildDockerRunArgs(base);
-	assert.ok(args.includes("/srv/jobs/abc/pi:/job/pi:ro"), "/job/pi must be :ro");
+	assert.ok(args.includes("/srv/jobs/abc/job:/job:ro"), "the whole /job must be :ro");
 	assert.ok(args.includes("/srv/jobs/abc/workspace:/workspace"), "/workspace must be writable");
 	assert.ok(!args.some((a) => a.includes("/workspace:ro")), "/workspace must not be read-only");
 });
