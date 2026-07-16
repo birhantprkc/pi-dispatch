@@ -19,6 +19,29 @@ was verified against pi's docs across two adversarial passes, recorded 48/50 cla
 wrong on roughly seven points within twenty-four hours — every one of them found by reading source. For
 a dependency that moves this fast, docs are a hint.
 
+**Verify against the PINNED ARTIFACT, not against HEAD. A sha is not a version.** This rule is written
+in blood: every upstream claim in this repository was originally verified by reading source at
+`earendil-works/pi @ 5e336cf`, while the image pins **npm `0.80.7`**. Those are different artifacts.
+`ModelRuntime` is a value export at that sha and **does not exist in 0.80.7 at all** — pi's changelog
+files it under `[Unreleased]`, which was exactly correct, and a spec entry here "corrected" the
+changelog for being out of date. The changelog was right; the methodology was wrong. The runner imported
+it, the image built cleanly, and every job would have died on a missing export.
+
+Reading a moving branch to verify a fixed version is not verification — it is verification of something
+else. So:
+
+- A sha citation establishes *where the behaviour lives and why*, and nothing about whether the pinned
+  release contains it. It is necessary and **not sufficient**.
+- Any claim the code depends on must additionally hold in the **published artifact**: `npm pack` it and
+  read `dist/`, or assert it in a test that imports what the lockfile resolves.
+- Prefer the release tag over `main`. Where a sha is cited, state its relationship to the pin.
+- `REQ-UPSTREAM-CONTRACT-TESTS` is the enforcement: `image/runner/test/pinned-api.test.mjs` asserts the
+  runner's imports exist in the resolved package, so the next pin/HEAD divergence fails a test rather
+  than a container.
+
+The failure this guards is the familiar one: it is **silent**. HEAD and the pin agree often enough that
+the habit forms, and the day they disagree the build still passes.
+
 **Two evidence classes, deliberately.** `Evidence (upstream)` and `Code evidence` have different drift
 semantics and must not share a field: upstream facts are pinned to *pi's* sha and must never be
 drift-checked against *our* HEAD. `detect_drift.py` keys only on the literal `- **Code evidence**:`, so

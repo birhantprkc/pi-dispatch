@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import {
+	AuthStorage,
 	createAgentSession,
 	getAgentDir,
-	ModelRuntime,
+	ModelRegistry,
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -29,19 +30,31 @@ async function main() {
 	const maxTurns = Number.parseInt(requireEnv("PI_MAX_TURNS"), 10);
 
 	const agentDir = getAgentDir();
-	const modelRuntime = await ModelRuntime.create({
-		authPath: `${agentDir}/auth.json`,
-		modelsPath: `${agentDir}/models.json`,
-	});
 
-	// Pin the model explicitly. With `model` omitted, findInitialModel picks from settings
-	// and provider defaults -- nondeterministic across images, and it silently changes cost
-	// per job. A missing model yields modelFallbackMessage on the RESULT rather than a
-	// throw, so validate here and fail loudly instead of discovering it in a bill.
-	const model = modelRuntime.getModel(provider, modelId);
+	// AuthStorage + ModelRegistry, NOT ModelRuntime.
+	//
+	// pi's [Unreleased] changelog says these two are replaced by an async `modelRuntime`.
+	// That is true of its main branch and NOT of 0.80.7, which is what we pin -- the source
+	// at HEAD and the artifact on npm are different things, and conflating them cost a build.
+	// When the migration ships, REQ-UPSTREAM-CONTRACT-TESTS fires on the pin bump and this
+	// is the code that changes. See OQ-005.
+	const authStorage = AuthStorage.create(`${agentDir}/auth.json`);
+	const modelRegistry = ModelRegistry.create(authStorage, `${agentDir}/models.json`);
+
+	// Pin the model explicitly. With `model` omitted, pi picks from settings and provider
+	// defaults -- nondeterministic across images, and it silently changes cost per job. A
+	// missing model surfaces as a fallback message on the RESULT rather than a throw, so
+	// validate here and fail loudly instead of discovering it on a bill.
+	const model = modelRegistry.find(provider, modelId);
 	if (!model) {
 		log("model_unknown", { provider, modelId });
 		return EXIT_POLICY; // config error: retrying cannot fix it
+	}
+	if (!modelRegistry.hasConfiguredAuth(model)) {
+		// Catch this before the container spends anything. Preflight would throw on it
+		// anyway, but a clear signal beats parsing a message out of an exception.
+		log("model_no_auth", { provider, modelId });
+		return EXIT_POLICY;
 	}
 
 	// Pin pi's own retry settings rather than inherit `maxRetries ?? 3`. An upstream default
@@ -62,7 +75,8 @@ async function main() {
 	const { session } = await createAgentSession({
 		cwd: WORKSPACE,
 		agentDir,
-		modelRuntime,
+		authStorage,
+		modelRegistry,
 		model,
 		settingsManager,
 		sessionManager: SessionManager.inMemory(WORKSPACE),

@@ -21,10 +21,17 @@ Evidence convention as in `constitution.md`.
 *invisibly*.
 
 - **Contract**:
+  **Verified against the published `0.80.7` tarball, not against HEAD** — see the evidence convention
+  in `constitution.md`. At this pin the model/auth wiring is `AuthStorage` + `ModelRegistry`. There is
+  **no `ModelRuntime`**: that is HEAD-only, `[Unreleased]`, and importing it makes every job die on a
+  missing export while the image builds cleanly.
+
   ```typescript
-  const modelRuntime = await ModelRuntime.create({ authPath, modelsPath });
-  const model = modelRuntime.getModel(process.env.PI_PROVIDER, process.env.PI_MODEL);
+  const authStorage   = AuthStorage.create(`${agentDir}/auth.json`);
+  const modelRegistry = ModelRegistry.create(authStorage, `${agentDir}/models.json`);
+  const model = modelRegistry.find(process.env.PI_PROVIDER, process.env.PI_MODEL);  // NOT getModel
   if (!model) throw new InfraError(`unknown model`);   // exit 2 — config, not retryable
+  if (!modelRegistry.hasConfiguredAuth(model)) throw new InfraError(`no auth`);      // exit 2
 
   // Guardrails read EXPLICITLY from a path we own — never via discovery. See (e).
   const guardrails    = readFileSync("/opt/pi-dispatch/HARD_RULES.md", "utf8");
@@ -46,7 +53,8 @@ Evidence convention as in `constitution.md`.
   const { session } = await createAgentSession({
     cwd: "/workspace",
     agentDir: getAgentDir(),
-    modelRuntime,
+    authStorage,
+    modelRegistry,
     model,
     sessionManager: SessionManager.inMemory("/workspace"),
     settingsManager: SettingsManager.inMemory({ retry: { maxRetries, baseDelayMs } }),
@@ -108,10 +116,10 @@ Evidence convention as in `constitution.md`.
   `noSkills: true` + `additionalSkillPaths` loads *exactly* what we hand it and nothing from the tree.
   Explicit beats gated: the same principle as `noContextFiles` + an explicit read.
 
-  `modelRuntime.getModel(provider, modelId)` is a **method**, not a free function; there is no exported
-  `getModel`. Pin the model explicitly: with `model` omitted, `findInitialModel` picks from settings and
-  provider defaults, which is nondeterministic across images and silently changes cost per job. A missing
-  model yields a `modelFallbackMessage` on the *result*, not a throw — validate and fail loudly.
+  `modelRegistry.find(provider, modelId)` is a **method**, not a free function; there is no exported
+  `getModel`. Pin the model explicitly: with `model` omitted, pi picks from settings and provider
+  defaults, which is nondeterministic across images and silently changes cost per job. A missing model
+  yields a fallback message on the *result*, not a throw — validate and fail loudly.
   `SessionManager.inMemory()` because the container is ephemeral: session storage would write to a
   filesystem that is about to cease existing.
   `SettingsManager.inMemory()` is load-bearing beyond the retry pin: it writes our settings to the
@@ -119,13 +127,23 @@ Evidence convention as in `constitution.md`.
   never read and **cannot override our spend controls**. `SettingsManager.create(cwd, agentDir)` would
   read it and `deepMergeSettings(global, project)` lets project win. Use `inMemory`. Deliberately.
 
-  The complete option set is `cwd`, `agentDir`, `modelRuntime`, `model`, `thinkingLevel`, `scopedModels`,
-  `noTools`, `tools`, `excludeTools`, `customTools`, `resourceLoader`, `sessionManager`,
-  `settingsManager`, `sessionStartEvent`. Note `modelRuntime` is **already present at the pin** — part of
-  `OQ-005`'s migration has landed.
-- **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/sdk.ts:33-80`
+  The complete option set **at 0.80.7** is `cwd`, `agentDir`, `authStorage`, `modelRegistry`, `model`,
+  `thinkingLevel`, `scopedModels`, `noTools`, `tools`, `excludeTools`, `customTools`, `resourceLoader`,
+  `sessionManager`, `settingsManager`, `sessionStartEvent`. `OQ-005`'s migration replaces the first two
+  with an async `modelRuntime` and **has not shipped** — it exists only on `main`.
+- **Evidence (pinned artifact — authoritative)**: `npm @earendil-works/pi-coding-agent@0.80.7 →
+  dist/core/sdk.d.ts → CreateAgentSessionOptions` — `authStorage?: AuthStorage` ("Default:
+  AuthStorage.create(agentDir/auth.json)"), `modelRegistry?: ModelRegistry` ("Default:
+  ModelRegistry.create(authStorage, agentDir/models.json)"); **no `modelRuntime` field, and no
+  `model-runtime` module in `dist/` at all** · `→ dist/core/model-registry.d.ts → find(provider, modelId)`,
+  `hasConfiguredAuth(model)`, `getAvailable()`, `getAll()`, `static create(authStorage, modelsJsonPath?)`
+  · `→ dist/index.js` — `AuthStorage` and `ModelRegistry` are value exports; `ModelRuntime` is absent ·
+  `→ dist/core/resource-loader.d.ts` — `noContextFiles`, `noSkills`, `noExtensions`,
+  `additionalSkillPaths`, `additionalExtensionPaths`, `appendSystemPromptOverride` all present at the pin
+- **Evidence (HEAD — explains behaviour, does NOT establish the pin contains it)**:
+  `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/sdk.ts:33-80`
   (option set; no append fields, `resourceLoader?: ResourceLoader`) · `→ sdk.ts:164` (`createAgentSession`
-  is async) · `→ sdk.ts:171` (`ModelRuntime.create`, async) · `→ sdk.ts:176-180` (default loader is built
+  is async) · `→ sdk.ts:176-180` (default loader is built
   **and `reload()`ed** only when none is passed) · `→ sdk.ts:187-217` (`findInitialModel` fallback;
   `modelFallbackMessage` returned, not thrown) · `→ resource-loader.ts:122-157`
   (`DefaultResourceLoaderOptions`; `cwd`/`agentDir` **required**) · `→ resource-loader.ts:156`

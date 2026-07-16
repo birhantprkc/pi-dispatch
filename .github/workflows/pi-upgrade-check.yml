@@ -96,22 +96,24 @@ jobs:
       # `pi --mode print` does not exist: --mode accepts text|json|rpc, and --print/-p is a separate
       # boolean. --help rather than a real prompt, because a real prompt needs a paid API key and a
       # contract test that costs money is a contract test that gets disabled.
+      # --entrypoint is required: ENTRYPOINT is the runner and ignores CMD, so `docker run img pi ...`
+      # would silently run the runner instead of pi and the assertion would test nothing.
       - name: pi -p is still a flag
-        run: docker run --rm pi-job:ci pi -p --help >/dev/null
+        run: docker run --rm --entrypoint pi pi-job:ci -p --help >/dev/null
 
       # --- CONST-ISOLATION-CONTAINER-PER-JOB ---
       # --cap-drop=ALL is the enforcement surface. Read the effective capability set directly rather
       # than install libcap just to ask.
       - name: No capabilities under --cap-drop=ALL
         run: |
-          caps=$(docker run --rm --cap-drop=ALL --security-opt no-new-privileges pi-job:ci \
-                   sh -c 'grep ^CapEff /proc/self/status' | awk '{print $2}')
+          caps=$(docker run --rm --cap-drop=ALL --security-opt no-new-privileges \
+                   --entrypoint sh pi-job:ci -c 'grep ^CapEff /proc/self/status' | awk '{print $2}')
           [ "$caps" = "0000000000000000" ] || { echo "::error::Container retains capabilities: $caps"; exit 1; }
           echo "OK: CapEff=$caps"
 
       - name: Runs as a non-root user
         run: |
-          uid=$(docker run --rm pi-job:ci id -u)
+          uid=$(docker run --rm --entrypoint id pi-job:ci -u)
           [ "$uid" != "0" ] || { echo "::error::Job container runs as root."; exit 1; }
 
       # --- INT-CONTAINER-JOB-INPUTS ---
@@ -121,8 +123,8 @@ jobs:
         run: |
           mkdir -p fixture/pi
           echo "x" > fixture/pi/APPEND_SYSTEM.md
-          if docker run --rm --cap-drop=ALL -v "$PWD/fixture:/job:ro" pi-job:ci \
-               sh -c 'echo pwned > /job/pi/APPEND_SYSTEM.md' 2>/dev/null; then
+          if docker run --rm --cap-drop=ALL -v "$PWD/fixture:/job:ro" --entrypoint sh pi-job:ci \
+               -c 'echo pwned > /job/pi/APPEND_SYSTEM.md' 2>/dev/null; then
             echo "::error::/job is writable. The agent can rewrite its own instructions."
             exit 1
           fi
@@ -133,11 +135,11 @@ jobs:
       # dir is root-owned the job dies EACCES at runtime, on a path nothing in the Dockerfile hints
       # at. COPY --chown does not fix it (it skips auto-created parents), so assert the real thing.
       - name: The agent dir is writable by the runtime user
-        run: docker run --rm pi-job:ci sh -c 'touch "$HOME/.pi/agent/auth.json" && rm "$HOME/.pi/agent/auth.json"'
+        run: docker run --rm --entrypoint sh pi-job:ci -c 'touch "$HOME/.pi/agent/auth.json" && rm "$HOME/.pi/agent/auth.json"'
 
       - name: The guardrails are baked where the runner reads them
         run: |
-          docker run --rm pi-job:ci grep -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
+          docker run --rm --entrypoint grep pi-job:ci -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
             || { echo "::error::Guardrails sentinel missing from /opt/pi-dispatch/HARD_RULES.md"; exit 1; }
 
       # --- DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS / REQ-FRONTEND-VISUAL-VERIFY ---
@@ -149,14 +151,14 @@ jobs:
         run: |
           echo '<html><body><h1>pi-dispatch</h1></body></html>' > fixture/page.html
           docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
-            -v "$PWD/fixture:/fixture:ro" pi-job:ci \
-            sh -c 'playwright-cli screenshot --browser-arg=--no-sandbox file:///fixture/page.html /tmp/x.png && test -s /tmp/x.png' \
+            -v "$PWD/fixture:/fixture:ro" --entrypoint sh pi-job:ci \
+            -c 'playwright-cli screenshot --browser-arg=--no-sandbox file:///fixture/page.html /tmp/x.png && test -s /tmp/x.png' \
             || { echo "::error::Chromium unusable as non-root — check PLAYWRIGHT_BROWSERS_PATH at build AND run"; exit 1; }
 
       # Fonts absent => tofu boxes => screenshots that look fine and contain no legible text. That
       # silently guts the requirement full Chromium is in this image for.
       - name: Fonts are installed (or screenshots are tofu)
         run: |
-          n=$(docker run --rm pi-job:ci sh -c 'fc-list | wc -l')
+          n=$(docker run --rm --entrypoint sh pi-job:ci -c 'fc-list | wc -l')
           [ "$n" -gt 0 ] || { echo "::error::No fonts. Chromium will render boxes and REQ-FRONTEND-VISUAL-VERIFY is a lie."; exit 1; }
           echo "OK: $n fonts"
