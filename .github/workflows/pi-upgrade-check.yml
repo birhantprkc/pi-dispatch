@@ -64,6 +64,15 @@ jobs:
   contract-tests:
     name: pinned assumptions still hold (offline, no API key)
     runs-on: ubuntu-latest
+    services:
+      # A real Valkey backs the queue integration test (enqueue + dedup). AOF is not needed for a
+      # test run; the point is a genuine Redis-protocol server, not the fake.
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 10s --health-timeout 3s --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -77,13 +86,14 @@ jobs:
       # boundary (pure) or at before_agent_start (which fires strictly before any provider HTTP
       # call). No API key, no tokens, no flake, no excuse not to run them on every build.
       #
-      # PI_DISPATCH_REQUIRE_LOADER_TESTS=1 turns a skip into a hard failure. A skipped assertion is
-      # an UNVERIFIED assertion, and "skipped = pass" is precisely the reasoning that lets a
-      # guardrail-less agent ship green.
-      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist (all required)
+      # PI_DISPATCH_REQUIRE_*_TESTS=1 turns a skip into a hard failure. A skipped assertion is an
+      # UNVERIFIED assertion, and "skipped = pass" is precisely the reasoning that lets a
+      # guardrail-less agent ship green. VALKEY_TEST_URL activates the queue integration test.
+      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist, queue (all required)
         env:
           PI_DISPATCH_REQUIRE_LOADER_TESTS: "1"
           PI_DISPATCH_REQUIRE_WORKER_TESTS: "1"
+          VALKEY_TEST_URL: "redis://127.0.0.1:6379"
         run: npm test
 
   image:

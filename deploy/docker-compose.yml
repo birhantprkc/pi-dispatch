@@ -1,0 +1,27 @@
+# pi-dispatch's worker runs on the HOST, not in a container: it drives the `docker` CLI to launch
+# job containers, and the CLI is what translates bind-mount paths cross-platform (Windows/macOS/
+# Linux) -- see DES-WORKER-ON-HOST. So Compose runs only Valkey, the durable wait-list. You run the
+# worker with `pi-dispatch worker` (or `npm --workspace worker start`).
+#
+#   docker compose -f deploy/docker-compose.yml up -d      # start Valkey
+#   pi-dispatch worker                                     # drain the queue (host)
+
+services:
+  valkey:
+    image: valkey/valkey:8
+    # AOF on: the wait-list must survive a reboot (REQ-QUEUE-BURST-NO-DROP).
+    command: valkey-server --appendonly yes
+    # Bound to localhost only -- the queue is not a public surface.
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - valkey-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  valkey-data:
