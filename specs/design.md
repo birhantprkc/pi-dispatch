@@ -214,6 +214,15 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     one under load, so the panel should surface `next` drift rather than let it look healthy.
   - **Deterministic `jobId`** — `repeat:<schedulerId>:<nextMillis>` — so scheduler jobs get
     `REQ-DEDUP-BY-DELIVERY-GUID`-equivalent dedup for free, with no GUID to supply.
+  - **Local-only this slice.** A `kind:"github"` schedule is rejected at load. A scheduled GitHub job has
+    no webhook delivery, issue number, title, or body to supply, and post-integration the github path would
+    perform a real host clone and per-job token mint before failing every tick — spend and side effects for
+    a trigger that cannot complete. GitHub scheduling is deferred to a later slice.
+  - **Two distinct enqueue paths, not duplication.** The interactive `enqueueLocalJob` sets `attempts: 2`
+    with backoff; the scheduled path (`upsertJobScheduler`) passes retention-only opts with a single
+    attempt. For an unattended recurring trigger the **cadence is the retry**, so a failing tick must not
+    multiply spend within one tick — two distinct triggers with different retry semantics, not two
+    implementations of one thing.
   **Legacy `repeat:` is deprecated and slated for removal in v6** — starting on it would be adopting a
   known-dead API.
 - **Evidence (upstream)**: `taskforcesh/bullmq @ v5.80.4 → src/classes/queue.ts:468-495 → upsertJobScheduler`

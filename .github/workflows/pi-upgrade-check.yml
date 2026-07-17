@@ -107,7 +107,13 @@ jobs:
       # PI_DISPATCH_REQUIRE_*_TESTS=1 turns a skip into a hard failure. A skipped assertion is an
       # UNVERIFIED assertion, and "skipped = pass" is precisely the reasoning that lets a
       # guardrail-less agent ship green. VALKEY_TEST_URL activates the queue integration test.
-      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist, queue, receiver enqueue (all required)
+      #
+      # Cron/scheduler assumptions this run pins (BullMQ 5.80.4), each SILENT if it drifts:
+      #   - no-backfill / no-overlap / deterministic repeat: jobId  -> specs/design.md:206-216
+      #   - must-handle -10/-11 (schedule edit else silent no-op)   -> specs/design.md:231
+      #   - scheduler jobs bypass maxStalledCount (stall carve-out)  -> specs/constitution.md:203-216
+      # Exercised by worker/test/cron.integration.test.mjs (VALKEY_TEST_URL + PI_DISPATCH_REQUIRE_WORKER_TESTS gate it live).
+      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist, queue, receiver enqueue, cron (all required)
         env:
           PI_DISPATCH_REQUIRE_LOADER_TESTS: "1"
           PI_DISPATCH_REQUIRE_WORKER_TESTS: "1"

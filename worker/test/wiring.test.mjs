@@ -88,3 +88,34 @@ test("an abort stops the container", { skip }, async () => {
 	assert.equal(stopped, "pi-job-j2");
 	await running;
 });
+
+test("shutdown closes each extraCloser after the worker drains", { skip }, async () => {
+	// A cron scheduler (or any auxiliary resource) is handed to createWorker as an extraCloser so it
+	// is torn down on SIGTERM/SIGINT alongside the worker. This proves close() runs during shutdown.
+	const origExit = process.exit;
+	const beforeTerm = new Set(process.listeners("SIGTERM"));
+	const beforeInt = new Set(process.listeners("SIGINT"));
+	let closed = false;
+	let worker;
+	try {
+		process.exit = () => {}; // shutdown ends in process.exit(0); neutralise it for the test
+		worker = mod.createWorker({
+			connection: { host: "127.0.0.1", port: 1 },
+			concurrency: 1,
+			cap: 10,
+			redis: {},
+			deps: {},
+			extraClosers: [{ close: async () => { closed = true; } }],
+		});
+		worker.on("error", () => {}); // swallow the connection-refused error against the dead port
+		const shutdown = process.listeners("SIGTERM").find((l) => !beforeTerm.has(l));
+		assert.ok(shutdown, "createWorker must register a SIGTERM shutdown handler");
+		await shutdown();
+		assert.equal(closed, true, "extraCloser.close() must run during shutdown");
+	} finally {
+		process.exit = origExit;
+		for (const l of process.listeners("SIGTERM")) if (!beforeTerm.has(l)) process.removeListener("SIGTERM", l);
+		for (const l of process.listeners("SIGINT")) if (!beforeInt.has(l)) process.removeListener("SIGINT", l);
+		await Promise.resolve(worker?.close()).catch(() => {});
+	}
+});

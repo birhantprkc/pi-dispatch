@@ -42,6 +42,8 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		maxTurns: positiveInt(env, "PI_MAX_TURNS", 30), // pi has no turn limit; we impose one
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
+		schedulesFile: env.PI_SCHEDULES_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: schedule list is a host file; null = cron disabled
+		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
 		github: loadGitHubAuth(env, fileExists),
 	};
 }

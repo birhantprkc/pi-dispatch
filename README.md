@@ -72,6 +72,32 @@ flowchart LR
 
 Read [`SECURITY.md`](SECURITY.md) before you rely on it — it states plainly what is and is not defended.
 
+## Scheduling recurring jobs
+
+A cron schedule is a trigger, not a new job kind: each entry runs a local folder through a flow on a cron
+pattern. Cron is **off by default** — the worker reads schedules only when `PI_SCHEDULES_FILE` points at a
+file.
+
+```bash
+# 1. Copy the template and edit it
+cp schedules.example.json schedules.json   # then edit "folder" to a REAL absolute path
+
+# 2. Point the worker at it (absolute path), and restart the worker
+#    In .env:  PI_SCHEDULES_FILE=/absolute/path/to/schedules.json
+npx pi-dispatch worker
+```
+
+Each entry sets `id`, `cron` (5 or 6 fields), `folder`, `flow`, and `task`; `provider`, `model`, and
+`maxTurns` are optional and fall back to the worker's defaults. A schedule's `folder` is a **host path** —
+the worker runs on the host ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job
+container, so it must be readable by the worker's user.
+
+- **Local schedules only this slice.** `kind` must be `"local"`; the loader rejects `kind:"github"` at
+  startup — a schedule has no webhook delivery, issue number, or body to work.
+- **Editing `folder` is mandatory.** Copying `schedules.example.json` verbatim makes the worker **refuse
+  to start** with `configError: folder does not exist` until `folder` names a real path. This is
+  fail-loud on purpose: a broken schedule never silently fails to fire.
+
 ## Advanced: GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
@@ -132,9 +158,9 @@ minutes.
 
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`) and the GitHub webhook path
-(receiver → queue → clone → PR) are built and work. The admin panel and scheduled (cron) triggers are in
-progress. The design is specified in
+The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitHub webhook path
+(receiver → queue → clone → PR), and scheduled (cron) triggers for local folders are built and work. The
+admin panel is in progress. The design is specified in
 [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
 and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 
