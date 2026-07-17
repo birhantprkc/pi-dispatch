@@ -20,7 +20,7 @@ A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
 
 Everything below the trigger is identical: budget check → `/job:ro` inputs → one container → the runner
 → an exit code. What differs is authz (a label/collaborator gate for webhooks vs panel/CLI access for
-local), the credential (a 1h scoped token for GitHub jobs vs none for local), and the completion signal
+local), the credential (a short-lived scoped token for GitHub jobs vs none for local), and the completion signal
 (an issue comment vs the console/panel — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`).
 
 **Out of scope**: being a hosted service; multi-tenancy; merging anything.
@@ -191,6 +191,23 @@ local), the credential (a 1h scoped token for GitHub jobs vs none for local), an
 - **Acceptance**: Given any GitHub job reaching a terminal state, exactly one completion or failure
   comment exists on the issue.
 
+## REQ-BRANCH-PROTECTION-PRECONDITION
+
+- **Statement**: The worker shall refuse a GitHub-backed job whose default branch is unprotected,
+  before reserving budget or starting a container.
+- **Scope**: GitHub jobs only. A local-folder job has no remote branch to protect.
+- **Why**: The per-job credential carries `contents:write`, which covers push **and** merge, so branch
+  protection is the only technical barrier to a self-merge — the precondition is the operational
+  backstop for `CONST-MERGE-NEVER-AUTOMATIC`. The check is consulted before any spend so a repo that
+  cannot satisfy it costs nothing: a determinate "no protection object" (a `404` from the protection
+  API) is a policy refusal, while any other error is retryable and must never be read as a silent
+  "unprotected" that would bypass the backstop.
+- **Traces to**: `CONST-MERGE-NEVER-AUTOMATIC`, `CONST-TOKEN-SCOPED-PER-JOB`, `CONST-BUDGET-BEFORE-TOKENS`
+- **Acceptance**: Given a GitHub job whose default branch has no protection, the worker returns a policy
+  refusal before `reserveBudget` and before any container starts — no budget slot is consumed, no
+  provider spend occurs, and a refusal comment is posted to the issue. A transient protection-API error
+  (non-`404`) is retried, not treated as unprotected.
+
 ## REQ-LOCAL-JOB-VISIBILITY
 
 - **Statement**: A local-folder job shall surface its outcome where the operator is already looking — the
@@ -230,4 +247,5 @@ wait-list working as designed, not a failure — see `README.md`.
 | Date | Change |
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
+| 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |

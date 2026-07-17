@@ -4,7 +4,8 @@
  * yielding the same `{ mintToken, selfId, source }` shape so the processor never branches on source.
  *
  * CONST-TOKEN-SCOPED-PER-JOB: the App path mints one installation token per job, scoped to the one
- * repo, expiring in an hour. That expiry IS the blast-radius bound for an exfiltrated environment.
+ * repo, expiring in an hour. That short-lived, repo-scoped expiry IS the blast-radius bound for an
+ * exfiltrated environment (App: 1h; a single-owner fine-grained PAT: operator-set, still short).
  *
  * Money-hole invariant: `mintToken` NEVER returns "" / null. `env-allowlist.mjs` forwards the token
  * as `GITHUB_TOKEN` only when truthy (`if (githubToken)`), so an empty token becomes an ABSENT

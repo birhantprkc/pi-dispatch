@@ -73,17 +73,19 @@ pi-dispatch run ── enqueue ──▶ Valkey + BullMQ ──▶ worker (on yo
 
 Read [`SECURITY.md`](SECURITY.md) before you rely on it — it states plainly what is and is not defended.
 
-## Advanced: GitHub automation *(in progress)*
+## Advanced: GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
-opens a PR, and comments back. This path needs a **GitHub App** and is **not yet built** in this
-repository; the local-folder path above is complete. When it lands:
+opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECRET`), and the worker
+authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
+**PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
+for multi-tenant.
 
 - Only a collaborator's label or `@pi` comment starts a job (the label *is* the approval step).
-- The agent gets a **1-hour, single-repo token** — and, honestly: that token *can* merge, because GitHub
-  gates push and merge behind the same `contents: write` scope. **Branch protection on your default
-  branch is the real control**, so the worker will refuse an unprotected repo. `SECURITY.md` has the
-  detail.
+- The agent gets a **repo-scoped, short-lived token** — and, honestly: that token *can* merge, because
+  GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
+  default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
+  the detail.
 - A separate **admin panel** on `127.0.0.1` (never on the internet-facing receiver) will turn the queue
   on/off, show jobs, and set the model/budgets. It will not edit your persona or skills — those live in
   your project's `.pi/`, in git, reviewed.
@@ -99,8 +101,9 @@ minutes.
 
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`) is built and works. The GitHub
-webhook path, the admin panel, and scheduled (cron) triggers are in progress. The design is specified in
+The local-folder path (image, worker, `pi-dispatch run` / `worker`) and the GitHub webhook path
+(receiver → queue → clone → PR) are built and work. The admin panel and scheduled (cron) triggers are in
+progress. The design is specified in
 [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
 and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 

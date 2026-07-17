@@ -16,7 +16,7 @@
  *
  * CONST-TOKEN-SCOPED-PER-JOB: the token is minted per job and passed to every method. Each method
  * constructs a FRESH Octokit through the injected `octokitFor(token)`; no client is cached or reused
- * across calls, so one job's one-hour credential never bleeds into another job's request.
+ * across calls, so one job's short-lived credential never bleeds into another job's request.
  *
  * `octokitFor` is injected -- defaulting to the real `@octokit/rest` -- so the module is testable
  * offline against a fake `request(route, params)`, matching the identity.mjs / get-token.mjs

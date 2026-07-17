@@ -356,7 +356,7 @@ Evidence convention as in `constitution.md`.
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
   - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
-    (see below); `GITHUB_TOKEN` (scoped, 1h — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
+    (see below); `GITHUB_TOKEN` (scoped, short-lived — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
   - Env **baked into the image**, because they are facts about the image and not choices a job makes:
     `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,
