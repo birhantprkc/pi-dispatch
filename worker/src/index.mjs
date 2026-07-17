@@ -53,7 +53,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, cap, deps, time
 	};
 }
 
-export function createWorker({ connection, concurrency, cap, redis, deps, limiter }) {
+export function createWorker({ connection, concurrency, cap, redis, deps, limiter, extraClosers = [] }) {
 	let worker; // referenced by cancelJob before assignment; only called later, so the TDZ is fine
 	const processor = makeProcessor({
 		cancelJob: (id, reason) => worker.cancelJob(id, reason),
@@ -76,6 +76,10 @@ export function createWorker({ connection, concurrency, cap, redis, deps, limite
 		// worker.close() would wait up to 30 minutes for the container.
 		await Promise.resolve(worker.cancelAllJobs?.("shutdown")).catch(() => {});
 		await worker.close();
+		// Close auxiliary resources (e.g. a cron scheduler) after the worker drains. Per-item catch
+		// so one failing or absent closer never strands the others or blocks exit -- matches the
+		// swallow posture on cancelAllJobs above.
+		await Promise.all(extraClosers.map((c) => Promise.resolve(c.close?.()).catch(() => {})));
 		process.exit(0);
 	};
 	process.once("SIGTERM", shutdown);
