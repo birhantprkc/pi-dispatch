@@ -1,0 +1,15 @@
+{
+  "schedules": [
+    {
+      "id": "nightly-tidy",
+      "kind": "local",
+      "cron": "0 3 * * *",
+      "folder": "/absolute/path/to/your/project",
+      "flow": "tidy",
+      "task": "dedupe imports and run the formatter",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5-20250929",
+      "maxTurns": 30
+    }
+  ]
+}

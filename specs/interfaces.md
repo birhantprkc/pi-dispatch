@@ -468,12 +468,41 @@ Evidence convention as in `constitution.md`.
 - **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `REQ-TRIGGER-AUTHOR-GATE`, `REQ-DEDUP-BY-DELIVERY-GUID`
 - **Acceptance**: Given a payload with unknown extra fields, behaviour is unchanged.
 
+## INT-SCHEDULES-FILE-CONTRACT
+
+**operator → worker.**
+
+- **Contract**:
+  ```
+  schedules.json  (path via PI_SCHEDULES_FILE; absolute; unset = cron disabled)
+  { "schedules": [
+    { "id": "<[A-Za-z0-9._-]+, no ':' , unique>",
+      "kind": "local",                     // only "local"; "github" rejected at load
+      "cron": "<5 or 6 space-separated fields>",
+      "folder": "<absolute HOST path, must exist>",
+      "flow": "<flow name>",
+      "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
+      "provider": "<optional>", "model": "<optional>", "maxTurns": <optional> } ] }
+  ```
+- **Why**: The operator's schedule set is a host file — diffable, reviewable, and git-trackable — rather
+  than API state, so a schedule change is a reviewed edit. `id` must be `:`-free because the stall guard
+  parses BullMQ's deterministic `repeat:<id>:<millis>` job id by splitting on `:`; a colon in the id would
+  corrupt that parse. `task` is operator-authored natural language and is therefore **DATA**
+  (`CONST-ISSUE-TEXT-IS-DATA`): it lands in `/job/prompt.md` as the user prompt, never in a system prompt
+  or persona.
+- **Traces to**: `DES-CRON-VIA-BULLMQ-SCHEDULER`, `CONST-ISSUE-TEXT-IS-DATA`
+- **Acceptance**: Given an entry that is malformed, has `kind:"github"`, a duplicate `id`, a `:` in its
+  `id`, or a `folder` that does not exist, when the config loads, then load throws a
+  `piDispatchConfig`-tagged error. Given a valid `local` entry, when it fires, then the emitted job's
+  `data` byte-matches the shape produced by the interactive local (`enqueueLocalJob`) path.
+
 ---
 
 ## Revision History
 
 | Date | Change |
 |---|---|
+| 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §5.1, §5.3, §5.4, §5.5. `INT-SDK-SESSION-OPTIONS` is **new** — the source doc left the SDK option set unverified (its §10) and was wrong about the print-mode flag shape and the mode union. `PLAYWRIGHT_BROWSERS_PATH` added to the runtime contract: the source doc's Dockerfile was broken as written for non-root execution. The source doc's code sketches are deliberately **not** carried over — the real Dockerfile and handler are the truth, and a spec that mirrors them drifts on the first commit. |
 | 2026-07-16 | **Correction — "pi never throws" was FALSE**, and it was in this file for a day as the justification for forbidding `try`/`catch` outright. Adversarial re-verification refuted it: `agent-session.ts:1242-1244` is `catch (error) { preflightResult?.(false); throw error; }`, and pi's **own JSDoc** (`:1099-1100`) documents throws on no-model, no-API-key, and missing `streamingBehavior`; `agent.ts:470-471` throws `"Agent is already processing."` outside the lifecycle try entirely. The rule as written would have produced a runner that dies of an unhandled rejection on a missing API key, exiting Node's default `1` = *retryable*, so the queue pays to retry a job that can never succeed. **Both mechanisms are required and cover disjoint sets: preflight throws, the loop swallows.** Also corrected: `StopReason` has **five** values (`packages/ai/src/types.ts:380`) — the entry handled three, and a default branch silently maps `"length"` (truncated output) to success. `reload()` has **no early return** — a second call fully re-runs everything; the earlier "the `loaded` guard makes a double call safe" framing was wrong. The lesson is the file's own: this entry was written from source and still asserted an absolute from a partial read. `INT-CONTAINER-RUNTIME-CONTRACT` gained `--init`, `--shm-size` (explicitly **not** `--ipc=host`, which Playwright recommends but which would share the host IPC namespace with an adversarial container), fonts (absent ⇒ tofu-box screenshots that silently gut `REQ-FRONTEND-VISUAL-VERIFY`), and the fact that **`COPY --chown` does not fix the EACCES trap** because it skips auto-created parent dirs. |
 | 2026-07-15 | `INT-RUNNER-EXIT-CODE-PROTOCOL` gained its **mechanism**, which was the missing half. The codes were right; nothing said how to produce them, and **the obvious implementation produces them wrong**. ~~`pi never throws`~~ (**refuted the next day — see above**): `agent.ts:485-491` catches and `handleRunFailure` does not rethrow, so abort / 429 / 5xx / dead network all resolve `await session.prompt()` normally — and `prompt()` returns `Promise<void>`, so there is no return value either. A `try`/`catch` runner exits `0` on every infrastructure failure: queue records success, never retries, job did nothing — verbatim the worst failure class this project names. The exit code must be derived from `stopReason` on the terminal message, captured via `subscribe()`. Also recorded: the `subscribe()` listener is **sync and unawaited**, so a budget check that awaits will overshoot. `INT-CONTAINER-RUNTIME-CONTRACT` gained two runtime facts that fail *inside the container* where no Dockerfile hints at them: the agent dir must be **writable** by the non-root user (pi lazily writes `auth.json` on first credential touch), and Chromium needs **`--no-sandbox`** because `--cap-drop=ALL` denies it the seccomp/`SYS_ADMIN` its own sandbox requires — the container is the sandbox, and re-granting caps to Chromium would invert the security model. Two cited paths were **dead** (`packages/ai/src/api/env-api-keys.ts`, `packages/coding-agent/src/core/config.ts`); claims and line numbers were correct, only the addresses were wrong — the sneakiest defect class, since it reads as verified and cannot be followed. All cited paths now resolve. Good news recorded too: `before_agent_start` fires strictly before any provider HTTP call, so the assembled-prompt assertion costs **zero tokens**. |
