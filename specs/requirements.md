@@ -219,9 +219,11 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   nothing. Streaming the container output is not a debug nicety — on the operator's own machine, watching
   the agent work on their own folder is the primary feedback surface, and a missing completion line is
   what tells them a run did nothing.
-- **Note on logs**: this is the operator's own terminal for their own folder, not a persistent multi-user
-  log; `no-pii-in-logs` still applies to any *stored* worker logs (log the stable job id and outcome,
-  not task bodies).
+- **Note on logs**: in a terminal this is the operator's own console for their own folder, not a
+  persistent multi-user log. **Under a service manager it becomes one**: the console is the manager's
+  captured, persistent log (systemd's journald, launchd's `StandardOutPath`, nssm's `AppStdout`), so
+  `no-pii-in-logs` applies to it directly — not only to hypothetical *stored* logs. Log the stable job id
+  and outcome, not task bodies.
 - **Traces to**: `CONST-PI-VERSION-PINNED`, `DES-CLI-TRIGGER-FOR-LOCAL`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
 - **Acceptance**: Given a local job reaching a terminal state, the worker console shows exactly one
   completion or failure line carrying the job id and outcome; during the run, the container's output is

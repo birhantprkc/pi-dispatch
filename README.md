@@ -72,6 +72,86 @@ flowchart LR
 
 Read [`SECURITY.md`](SECURITY.md) before you rely on it — it states plainly what is and is not defended.
 
+## Run as a service
+
+`pi-dispatch worker` is a long-running process — run it in a terminal, or hand it to your OS's service
+manager so it starts on boot and restarts on a crash. The units in [`deploy/`](deploy/) are **per-host
+templates, not turnkey**: each carries `<PLACEHOLDER>` paths you fill in for your machine. The systemd
+unit's *structure* is checked by `systemd-analyze`; the launchd and nssm units are worked examples. All
+three run the worker on the **host** — it drives the `docker` CLI and is not itself containerised — so
+they need the AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running
+alongside, which is what makes the queue **and the pause state** survive a reboot.
+
+**Steer the running worker** without stopping it — these commands talk to Valkey, so they work whether the
+worker runs in a terminal or under a service manager:
+
+- `pi-dispatch pause` — stop taking new jobs. **Durable**: the pause lives in the queue and survives a
+  worker restart, so a paused worker comes back paused after a reboot. Jobs still enqueue; they just wait.
+- `pi-dispatch resume` — start taking jobs again.
+- `pi-dispatch status` — prints `{ pausedState, waiting, active, paused, delayed, failed }`. `pausedState`
+  is the switch; `paused` is the backlog **count** of jobs that piled up while paused (they land in the
+  `paused` list, not `waiting`).
+
+### Linux (systemd)
+
+Edit [`deploy/worker.service`](deploy/worker.service): set `WorkingDirectory`, `EnvironmentFile`, `User`,
+and the `node` path to your clone. Then install and start it:
+
+```bash
+sudo cp deploy/worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now worker
+```
+
+`systemctl stop worker` sends **SIGTERM** — the worker stops accepting jobs and lets the in-flight
+container drain before it exits.
+
+### macOS (launchd)
+
+Edit [`deploy/com.pi-dispatch.worker.plist`](deploy/com.pi-dispatch.worker.plist) and its wrapper
+[`deploy/worker-env-wrapper.sh`](deploy/worker-env-wrapper.sh): set the repo-root and log paths (launchd
+has no `EnvironmentFile`, so the wrapper loads `.env` at runtime). Then bootstrap it:
+
+```bash
+launchctl bootstrap gui/$(id -u) deploy/com.pi-dispatch.worker.plist
+```
+
+`launchctl bootout gui/$(id -u)/com.pi-dispatch.worker` sends **SIGTERM** for the same graceful drain.
+
+### Windows (nssm)
+
+Put `nssm.exe` on PATH ([nssm.cc](https://nssm.cc)), set `SERVICE` / `REPO` / `LOGDIR` in
+[`deploy/nssm-install.cmd`](deploy/nssm-install.cmd), then run it and start the service:
+
+```
+deploy\nssm-install.cmd
+nssm start pi-dispatch-worker
+```
+
+The wrapper [`deploy/worker-env-wrapper.cmd`](deploy/worker-env-wrapper.cmd) loads `.env` at runtime. A
+console-stop (`nssm stop pi-dispatch-worker`) sends the worker a signal it handles, so it drains
+gracefully.
+
+### Drain before a planned restart
+
+A planned restart should abort no in-flight job. Pause, wait for the queue to go idle, restart, then
+resume:
+
+```bash
+pi-dispatch pause                     # stop taking new jobs (durable)
+pi-dispatch status                    # repeat until "active": 0 — nothing in flight
+sudo systemctl restart worker         # (or the launchctl / nssm equivalent)
+pi-dispatch resume                    # take jobs again
+```
+
+Because the pause is durable, the worker comes back paused even if the restart outruns your `resume`, so
+nothing slips through in the gap.
+
+**Windows caveat**: stop the service with nssm's **console-stop** (`nssm stop`), which delivers a signal
+the worker handles and drains gracefully. Task Scheduler is a weaker fallback — it stops a task with a
+hard kill, giving the worker no chance to drain; a job killed mid-flight leaves a stray container that the
+worker's **boot reaper** clears on the next start, rather than draining cleanly.
+
 ## Advanced: GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
@@ -133,7 +213,8 @@ minutes.
 ## Status
 
 The local-folder path (image, worker, `pi-dispatch run` / `worker`) and the GitHub webhook path
-(receiver → queue → clone → PR) are built and work. The admin panel and scheduled (cron) triggers are in
+(receiver → queue → clone → PR) are built and work; the worker runs in a terminal or as an OS service on
+Linux, macOS or Windows (see **Run as a service**). The admin panel and scheduled (cron) triggers are in
 progress. The design is specified in
 [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
 and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.

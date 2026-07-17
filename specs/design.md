@@ -192,6 +192,12 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   throttles concurrent streams and tokens-per-minute long before Docker runs out of memory. A **config
   knob rather than a constant** because one of the two inputs is an unmeasured guess (`OQ-002`), so
   re-tuning after measurement should be a deploy, not a code change.
+- **Boot-reaper invariant — single worker per docker daemon**: The knob is parallelism *within* one worker
+  process; the design assumes exactly one worker per docker daemon. The boot reaper clears every stray
+  `pi-job-*` container on start (a leaked container keeps spending, so it must go before any new job
+  launches) — a co-located second worker sharing the daemon would read the first's in-flight container as
+  its own to remove and kill a live job. Per-host is the common case, but the docker daemon, not the host,
+  is the true boundary.
 - **Traces to**: `OQ-002`, `REQ-QUEUE-BURST-NO-DROP`
 
 ## DES-CRON-VIA-BULLMQ-SCHEDULER
@@ -481,7 +487,8 @@ pi-dispatch/
   flows/          # frontend-fix.md, bug-fix.md, triage.md — DEFAULTS, seeded into the data volume
   persona/        # hard rules; baked into the image. Not runtime-editable
   deploy/         # docker-compose runs Valkey only; worker/receiver/panel are host Node processes
-                  #   (DES-WORKER-ON-HOST). systemd units ship as untested examples.
+                  #   (DES-WORKER-ON-HOST). The systemd unit is a verified-structure per-host template;
+                  #   launchd (.plist) and Windows (nssm) units are added as untested examples.
   .env.example    # provider key, spend/concurrency knobs, VALKEY_URL, PI_JOB_IMAGE
   docs/
 ```
@@ -498,8 +505,11 @@ it is where the SDK traps in `INT-SDK-SESSION-OPTIONS` live, and they are cheape
 else in the frame.
 
 **Platform**: Windows, macOS and Linux, wherever Docker runs. `docker-compose` is the supported
-deployment; systemd units ship as untested examples. Two consequences are not incidental and are tracked
-where they bite: a containerised worker talking to the Docker socket resolves bind-mount paths in the
+deployment; the systemd unit is a verified-structure per-host template — its structure statically checked
+by `systemd-analyze`, its placeholders unresolved, so it is neither turnkey nor end-to-end tested — and
+the launchd (`.plist`) and Windows (nssm) units are added as untested examples. Two consequences are not
+incidental and are tracked where they bite: a containerised worker talking to the Docker socket resolves
+bind-mount paths in the
 *daemon's* namespace, not its own; and a home machine behind NAT cannot receive GitHub webhooks without
 a tunnel.
 
