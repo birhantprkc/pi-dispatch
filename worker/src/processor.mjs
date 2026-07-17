@@ -69,6 +69,13 @@ export async function runJob(job, deps) {
 
 		prepared = await prepareWorkspace(job, token); // resolves SHA, clones, materialises .pi/, writes prompt
 
+		// A determinate prepare refusal (e.g. sha-gone: the default branch advanced past the resolved
+		// tip) is POLICY -- return before reserveBudget so it burns no cap slot and is never retried.
+		// Mirrors the branch-protection policy return above.
+		if (prepared?.outcome === "policy") {
+			return prepared;
+		}
+
 		// Budget last-but-before-container. A refusal here spends nothing (no container starts).
 		const budget = await reserveBudget(redis, { cap, now });
 		reserved = true;

@@ -1,0 +1,209 @@
+/*
+ * prepare-github.mjs — build the read-only /job inputs for a GitHub-triggered job by cloning the
+ * serviced repo AT A PINNED SHA onto the host, then materialising its .pi/ and writing the prompt.
+ *
+ * This is the highest-risk host operation in the worker: it places attacker-influenced repository
+ * bytes on the host filesystem before any container exists. Two properties make it safe, and both
+ * are structural, not content filters:
+ *
+ *   1. THE CLONE RUNS NO REPO-SUPPLIED CODE. Every git invocation carries
+ *      `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.ext.allow=never
+ *      -c credential.helper=` and `--no-pager`, and the fetch is `--no-recurse-submodules`. Hooks,
+ *      the fsmonitor daemon, ext-protocol transports, credential helpers, and submodules are the
+ *      paths by which a repo runs code during clone/checkout; all are disabled. `.pi/` is then read
+ *      by object id via materializePiDir (`git cat-file`), never through the working tree, so no
+ *      symlink/filter/hook runs there either. Per CONST-ISOLATION-CONTAINER-PER-JOB the agent runs
+ *      in the container; the host only assembles the box's inputs and must not itself execute repo
+ *      code.
+ *
+ *   2. THE TOKEN NEVER LANDS ANYWHERE THE AGENT OR THE REPO CAN READ IT. The per-job credential
+ *      reaches git ONLY through a GIT_ASKPASS helper's env var (GIT_ASKPASS_TOKEN), never in argv, a
+ *      remote URL, or the persisted `.git/config` (the remote is the tokenless
+ *      `https://github.com/<owner>/<name>.git`, with no `x-access-token@` and no `url.*.insteadOf`).
+ *      The askpass script itself holds no token — it prints the env var — and lives in a host temp
+ *      dir OUTSIDE jobDir and workspace/, removed in a `finally`. jobDir is mounted `/job` :ro and IS
+ *      agent-readable, so nothing token-bearing is written under it. See CONST-TOKEN-SCOPED-PER-JOB
+ *      and no-token-in-agent-reachable-file.
+ *
+ * The /job inputs written here are exactly INT-CONTAINER-JOB-INPUTS: `prompt.md` (the user prompt,
+ * issue text as DATA), `event.json` (the INT-WEBHOOK-PAYLOAD-SUBSET body fields only — never a
+ * header, never the `X-Hub-Signature-256` signature, never the token), and `pi/` (materialised
+ * persona/skills). Neither the token nor any issue text is logged.
+ *
+ * A determinate gone-SHA (the default branch advanced past the resolved tip before the fetch) is a
+ * POLICY outcome, returned as `{ outcome: "policy", reason: "sha-gone" }` — NOT thrown, so the
+ * processor does not retry a job that can never fetch that commit. Every other fetch failure
+ * (DNS/connection/timeout/5xx/auth) throws InfraRetry and is retried. The discipline mirrors
+ * github-host.mjs's 404-vs-other split: only the determinate class becomes policy.
+ */
+
+import { execFile } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { buildGithubPrompt } from "./github-prompt.mjs";
+import { materializePiDir } from "./materialize.mjs";
+import { InfraRetry } from "./processor.mjs";
+
+const exec = promisify(execFile);
+
+// The -c flags that make a clone/checkout run no repo-supplied code, applied to EVERY git invocation
+// through `hardened()` below so they cannot be omitted at a call site. Matches materialize.mjs's bar
+// (hooksPath, fsmonitor, --no-pager) plus the clone-specific transport/credential locks.
+const HARDEN_FLAGS = [
+	"-c",
+	"core.hooksPath=/dev/null",
+	"-c",
+	"core.fsmonitor=false",
+	"-c",
+	"protocol.ext.allow=never",
+	"-c",
+	"credential.helper=",
+	"--no-pager",
+];
+
+/** Prepend the hardening flags to a bare git subcommand's args. */
+function hardened(args) {
+	return [...HARDEN_FLAGS, ...args];
+}
+
+// stderr fragments that mean the resolved SHA is provably gone from the remote: the default branch
+// advanced and git can no longer fetch/realise that commit. These are DETERMINATE, so they map to a
+// policy refusal, never a retry. Any other failure stays retryable (see fetch catch below).
+const SHA_GONE_MARKERS = [
+	"couldn't find remote ref",
+	"not our ref",
+	"unadvertised object",
+	"did not send all necessary objects",
+	"reference is not a tree",
+];
+
+/** True only when a git error's output names one of the determinate gone-SHA conditions. */
+function isShaGone(error) {
+	const text = `${error?.stderr ?? ""}\n${error?.message ?? ""}`.toLowerCase();
+	return SHA_GONE_MARKERS.some((marker) => text.includes(marker));
+}
+
+/**
+ * Prepare a GITHUB job's read-only /job inputs. Clones `job.repo` at the caller-resolved default-
+ * branch SHA into `jobDir/workspace`, materialises `.pi/` into `jobDir/pi`, and writes `prompt.md`
+ * and `event.json`. Mirrors prepare-local's jobDir-in shape and return object.
+ *
+ * Collaborators are injected so tests run offline against fakes and never touch a real network/git:
+ *   - `git(cwd, args, { env })`      transport for a single git invocation; default runs the real
+ *                                     binary via execFile (no shell). Args arrive already hardened.
+ *   - `resolveDefaultBranchSha(repo, token) => { sha }`  fresh default-branch tip (github-host).
+ *   - `materialize({ gitDir, sha, destDir }) => string[]`  the .pi/ materialiser (git cat-file).
+ *   - `writeFile` / `mkdir`          fs writes for the job inputs (default sync fs).
+ *
+ * On a determinate gone-SHA returns `{ outcome: "policy", reason: "sha-gone" }`. On success returns
+ * `{ workspace, jobDir, sha, materialised }`.
+ */
+export async function prepareGithubWorkspace(
+	job,
+	token,
+	{
+		jobDir,
+		git = defaultGit,
+		resolveDefaultBranchSha,
+		materialize = materializePiDir,
+		writeFile = writeFileSync,
+		mkdir = mkdirSync,
+	} = {},
+) {
+	// Fresh API resolve of the commit to clone at — never a webhook field, never the triggering branch.
+	const { sha } = await resolveDefaultBranchSha(job.repo, token);
+
+	const workspace = join(jobDir, "workspace");
+	mkdir(workspace, { recursive: true });
+
+	// Split once. The remote URL is TOKENLESS; the credential comes from the askpass helper's env.
+	const [owner, name] = String(job.repo).split("/");
+	const remoteUrl = `https://github.com/${owner}/${name}.git`;
+
+	const askpass = createAskpassHelper();
+	try {
+		await git(workspace, hardened(["init"]));
+		await git(workspace, hardened(["remote", "add", "origin", remoteUrl]));
+
+		// The token reaches git ONLY here, via GIT_ASKPASS_TOKEN read by the helper — never argv/URL.
+		const netEnv = {
+			...process.env,
+			GIT_TERMINAL_PROMPT: "0",
+			GIT_ASKPASS: askpass.path,
+			GIT_ASKPASS_TOKEN: token,
+		};
+
+		try {
+			await git(
+				workspace,
+				hardened(["fetch", "--depth=1", "--no-tags", "--no-recurse-submodules", "origin", sha]),
+				{ env: netEnv },
+			);
+			await git(workspace, hardened(["checkout", "--detach", "FETCH_HEAD"]));
+		} catch (error) {
+			// Determinate gone-SHA => policy, no retry. Anything else (DNS/connection/timeout/5xx/auth)
+			// => retryable infra. The cause carries git's output for debugging; it is token-free by
+			// construction (tokenless remote URL + askpass), and BullMQ persists only message+stack.
+			if (isShaGone(error)) {
+				return { outcome: "policy", reason: "sha-gone" };
+			}
+			throw new InfraRetry(`prepare-github: fetch failed for ${owner}/${name}`, { cause: error });
+		}
+
+		// .pi/ is read by object id from the pinned SHA — symlink/submodule/exec safe, no working tree.
+		const materialised = await materialize({ gitDir: workspace, sha, destDir: jobDir });
+
+		// Issue text is DATA: it enters the USER prompt (buildGithubPrompt), never a system prompt.
+		writeFile(
+			join(jobDir, "prompt.md"),
+			buildGithubPrompt({ flow: job.flow, title: job.title, body: job.body, issueNumber: job.issueNumber }),
+			{ mode: 0o444 },
+		);
+
+		// The INT-WEBHOOK-PAYLOAD-SUBSET body fields ONLY — no header, no signature, no token.
+		const subset = {
+			event: job.trigger?.event,
+			action: job.trigger?.action,
+			delivery: job.trigger?.deliveryId,
+			repository: { full_name: job.repo },
+			issue: { number: job.issueNumber, title: job.title, body: job.body },
+			sender: { id: job.trigger?.sender?.id, login: job.trigger?.sender?.login },
+		};
+		writeFile(join(jobDir, "event.json"), JSON.stringify(subset, null, 2), { mode: 0o444 });
+
+		return { workspace, jobDir, sha, materialised };
+	} finally {
+		// The askpass machinery must not outlive the prepare, and must never be agent-reachable.
+		rmSync(askpass.dir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Write the GIT_ASKPASS helper to a fresh host temp dir OUTSIDE jobDir/workspace. The script holds no
+ * token: it prints GIT_ASKPASS_TOKEN, which git sets in the child's env only for the network fetch.
+ * Returns `{ dir, path }`; the caller removes `dir` in a finally.
+ */
+function createAskpassHelper() {
+	const dir = mkdtempSync(join(tmpdir(), "pi-askpass-"));
+	const path = join(dir, "askpass.sh");
+	writeFileSync(path, "#!/bin/sh\nprintf '%s' \"$GIT_ASKPASS_TOKEN\"\n", { mode: 0o700 });
+	chmodSync(path, 0o700);
+	return { dir, path };
+}
+
+/**
+ * Transport for one git invocation. `args` arrive already hardened by `hardened()`. Runs the real
+ * binary via execFile (array args, NO shell); `cwd` is the workspace and `env` is passed only for the
+ * network fetch (the askpass env), so local calls inherit the ambient environment.
+ */
+async function defaultGit(cwd, args, { env } = {}) {
+	const { stdout } = await exec("git", args, {
+		cwd,
+		encoding: "utf8",
+		maxBuffer: 16 * 1024 * 1024,
+		env,
+	});
+	return stdout;
+}

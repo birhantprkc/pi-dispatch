@@ -57,6 +57,19 @@ test("over budget refuses AFTER prepare but BEFORE the container -- no provider 
 	assert.ok(!calls.includes("run-container"), "over budget => NO container, no money spent");
 });
 
+test("a prepare policy outcome (sha-gone) RETURNS before reserveBudget -- no cap slot burned", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({
+		redis,
+		prepareWorkspace: async () => ({ outcome: "policy", reason: "sha-gone" }),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "sha-gone");
+	assert.equal(redis.incrCalls, 0, "reserveBudget never reached on a determinate prepare policy outcome");
+	assert.ok(!calls.includes("run-container"), "a sha-gone prepare must never spend on a container");
+});
+
 test("container exit 0 => success, no retry", async () => {
 	const { deps: d } = deps({ runContainer: async () => ({ code: 0, aborted: false }) });
 	assert.equal((await runJob(ghJob, d)).outcome, "completed");
