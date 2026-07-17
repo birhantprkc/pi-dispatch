@@ -1,4 +1,5 @@
-import { reserveBudget } from "./budget.mjs";
+import { releaseBudget, reserveBudget } from "./budget.mjs";
+import { configError } from "./config.mjs";
 import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
 
 /**
@@ -26,12 +27,12 @@ export async function runJob(job, deps) {
 	const {
 		redis,
 		cap,
-		mintToken, // (repo) => scoped 1h token  | null for local-folder jobs
+		mintToken, // (repo) => scoped short-lived token | null for local-folder jobs
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
-		// runContainer({ job, token, prepared, name, signal }) => exitCode. It MUST honour `signal`:
-		// stop the container on abort, and reject/exit promptly if `signal.aborted` is already true
-		// at entry (the timeout can fire during a slow prepare). The wiring injects name + signal.
+		// runContainer({ job, token, prepared, name, signal }) => { code, aborted }. It MUST honour
+		// `signal`: stop the container on abort, and reject/exit promptly if `signal.aborted` is already
+		// true at entry (the timeout can fire during a slow prepare). The wiring injects name + signal.
 		runContainer,
 		cleanup, // (dirs) => void
 		comment, // (job, text) => void   (issue status; no-op for local jobs)
@@ -47,6 +48,14 @@ export async function runJob(job, deps) {
 	try {
 		if (isGitHub) {
 			token = await mintToken(job.repo);
+
+			// Defense-in-depth at the DI seam: mintToken is injected, so we cannot assume it routed
+			// through get-token's own empty-token guard. An empty credential here would reach
+			// env-allowlist's `if (githubToken)` as a falsy value -> GITHUB_TOKEN omitted -> an
+			// anonymous paid run. Refuse before reserveBudget so a bad token burns no cap slot.
+			if (isGitHub && (typeof token !== "string" || token.trim() === "")) {
+				throw configError("mintToken returned an empty credential");
+			}
 
 			// REQ-BRANCH-PROTECTION-PRECONDITION. The agent's token can merge (contents:write covers
 			// push AND merge), so branch protection is the only technical barrier to a self-merge.
@@ -69,19 +78,36 @@ export async function runJob(job, deps) {
 			return { outcome: "policy", reason: "over-budget" }; // return => not retried
 		}
 
-		const exitCode = await runContainer({ job, token, prepared });
-		log("container_exit", { exitCode });
+		const { code, aborted } = await runContainer({ job, token, prepared });
+		log("container_exit", { exitCode: code, aborted });
 
-		switch (exitCode) {
+		// A WORKER-initiated stop (30-min timeout via cancelJob, or graceful-shutdown docker stop) kills
+		// the container -> exit 143/137. That is our decision, not an infra fault: it is POLICY and must
+		// NOT retry, or a wedged job re-runs into a second PR / double spend. Keyed on the abort FLAG,
+		// not the code -- an unbidden 137 (kernel OOM) carries `aborted: false`, falls to the switch, and
+		// stays infra-retryable.
+		if (aborted) return { outcome: "policy", reason: "worker-abort" };
+
+		switch (code) {
 			case EXIT_COMPLETED:
 				return { outcome: "completed" };
 			case EXIT_POLICY:
 				return { outcome: "policy", reason: "runner-policy" };
 			case EXIT_INFRA:
-				throw new InfraRetry(`infra failure, container exit ${exitCode}`);
+				throw new InfraRetry(`infra failure, container exit ${code}`);
 			default:
-				throw new InfraRetry(`unknown container exit ${exitCode}`);
+				throw new InfraRetry(`unknown container exit ${code}`);
 		}
+	} catch (e) {
+		// A spawn fault (docker daemon down / binary missing) reserved a slot but never started a
+		// container, so nothing was spent -- give the slot back before the retry. Every other throw
+		// here (exit-1 infra, unknown exit) means the container ran and legitimately spent its slot,
+		// so `reason` gates the release to the never-started case only. Guarded on `reserved` and run
+		// once per invocation; a BullMQ retry reserves afresh, so this cannot double-release.
+		if (reserved && e instanceof InfraRetry && e.reason === "container-never-started") {
+			await releaseBudget(redis, { now });
+		}
+		throw e;
 	} finally {
 		if (prepared) await cleanup(prepared).catch(() => {});
 	}
@@ -89,10 +115,11 @@ export async function runJob(job, deps) {
 
 /** Thrown for the retryable (infra) class only. The BullMQ processor lets this propagate to retry. */
 export class InfraRetry extends Error {
-	constructor(message) {
-		super(message);
+	constructor(message, { cause, reason } = {}) {
+		super(message, cause ? { cause } : undefined);
 		this.name = "InfraRetry";
 		this.piDispatchRetry = true;
+		this.reason = reason ?? message;
 	}
 }
 

@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { InfraRetry, runJob } from "../src/processor.mjs";
 
-/** A fake redis whose counter we can preset, to force over/under budget. */
+/** A fake redis whose counter we can preset, to force over/under budget. `decrCalls` spies
+ *  releaseBudget, so tests assert the slot is (or is not) given back and never double-released. */
 function fakeRedis(start = 0) {
 	let n = start;
-	return { async incr() { return ++n; }, async decr() { return --n; }, async expire() {} };
+	const redis = { decrCalls: 0, incrCalls: 0 };
+	redis.incr = async () => (redis.incrCalls++, ++n);
+	redis.decr = async () => (redis.decrCalls++, --n);
+	redis.expire = async () => {};
+	return redis;
 }
 
 /** Deps with call-order tracking, so tests can assert the money-safety ORDER, not just outcomes. */
@@ -17,7 +22,7 @@ function deps(overrides = {}) {
 		mintToken: async (repo) => (calls.push(`mint:${repo}`), "tok"),
 		isDefaultBranchProtected: async () => (calls.push("branch-check"), true),
 		prepareWorkspace: async () => (calls.push("prepare"), { workspaceDir: "/w", jobDir: "/j" }),
-		runContainer: async () => (calls.push("run-container"), 0),
+		runContainer: async () => (calls.push("run-container"), { code: 0, aborted: false }),
 		cleanup: async () => (calls.push("cleanup"), undefined),
 		comment: async (_j, t) => calls.push(`comment:${t.slice(0, 12)}`),
 		now: new Date("2026-07-16T10:00:00Z"),
@@ -53,27 +58,41 @@ test("over budget refuses AFTER prepare but BEFORE the container -- no provider 
 });
 
 test("container exit 0 => success, no retry", async () => {
-	const { deps: d } = deps({ runContainer: async () => 0 });
+	const { deps: d } = deps({ runContainer: async () => ({ code: 0, aborted: false }) });
 	assert.equal((await runJob(ghJob, d)).outcome, "completed");
 });
 
 test("container exit 2 => policy, RETURNS (not retried)", async () => {
-	const { deps: d } = deps({ runContainer: async () => 2 });
+	const { deps: d } = deps({ runContainer: async () => ({ code: 2, aborted: false }) });
 	assert.equal((await runJob(ghJob, d)).outcome, "policy");
 });
 
 test("container exit 1 => THROWS InfraRetry (BullMQ will retry)", async () => {
-	const { deps: d } = deps({ runContainer: async () => 1 });
+	const { deps: d } = deps({ runContainer: async () => ({ code: 1, aborted: false }) });
 	await assert.rejects(() => runJob(ghJob, d), (e) => e instanceof InfraRetry && e.piDispatchRetry === true);
 });
 
-test("an unknown exit code throws (retry-then-visible), never silent success", async () => {
-	const { deps: d } = deps({ runContainer: async () => 137 });
+test("a worker-initiated abort (137, aborted) => policy RETURNS worker-abort, never retried", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 137, aborted: true }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "worker-abort", "our own docker stop must not re-run into a second PR");
+});
+
+test("a graceful-shutdown SIGTERM (143, aborted) => policy worker-abort, not retried", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 143, aborted: true }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "worker-abort");
+});
+
+test("an unbidden 137 (aborted:false, kernel OOM) throws InfraRetry -- infra stays retryable", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 137, aborted: false }) });
 	await assert.rejects(() => runJob(ghJob, d), InfraRetry);
 });
 
 test("cleanup runs even when the container throws", async () => {
-	const { deps: d, calls } = deps({ runContainer: async () => 1 });
+	const { deps: d, calls } = deps({ runContainer: async () => ({ code: 1, aborted: false }) });
 	await runJob(ghJob, d).catch(() => {});
 	assert.ok(calls.includes("cleanup"), "the job dir must be cleaned up on the infra path too");
 });
@@ -85,4 +104,56 @@ test("a local-folder job skips minting and branch-check entirely", async () => {
 	assert.equal(r.outcome, "completed");
 	assert.ok(!calls.some((c) => c.startsWith("mint")), "no token for a local job");
 	assert.ok(!calls.includes("branch-check"), "no branch check for a non-git folder");
+});
+
+test("an empty minted token refuses as configError BEFORE reserveBudget -- no cap slot burned", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({ redis, mintToken: async () => "" });
+	await assert.rejects(() => runJob(ghJob, d), (e) => e.piDispatchConfig === true);
+	assert.equal(redis.incrCalls, 0, "reserveBudget never reached -- no slot burned on a bad token");
+	assert.ok(!calls.includes("run-container"), "an empty credential must never spend");
+});
+
+test("a whitespace-only minted token is also refused as configError", async () => {
+	const redis = fakeRedis();
+	const { deps: d } = deps({ redis, mintToken: async () => "   " });
+	await assert.rejects(() => runJob(ghJob, d), (e) => e.piDispatchConfig === true);
+	assert.equal(redis.incrCalls, 0, "whitespace is empty -- no slot burned");
+});
+
+test("a local job does not hit the empty-credential guard (guard is isGitHub-gated)", async () => {
+	const redis = fakeRedis();
+	const { deps: d } = deps({ redis, mintToken: async () => "" });
+	const localJob = { kind: "local", folder: "/home/rob/proj", provider: "anthropic", model: "m", maxTurns: 5 };
+	const r = await runJob(localJob, d);
+	assert.equal(r.outcome, "completed", "a local job never mints, so the empty-token guard cannot fire");
+});
+
+test("container-never-started (spawn fault) after reserving RELEASES the slot, still throws InfraRetry", async () => {
+	const redis = fakeRedis();
+	const { deps: d } = deps({
+		redis,
+		runContainer: async () => {
+			throw new InfraRetry("container-never-started", { reason: "container-never-started" });
+		},
+	});
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) => e instanceof InfraRetry && e.reason === "container-never-started",
+	);
+	assert.equal(redis.decrCalls, 1, "releaseBudget gives the slot back exactly once -- no double-release");
+});
+
+test("exit-1 infra retry KEEPS the slot -- the container ran and spent, so no release", async () => {
+	const redis = fakeRedis();
+	const { deps: d } = deps({ redis, runContainer: async () => ({ code: 1, aborted: false }) });
+	await assert.rejects(() => runJob(ghJob, d), InfraRetry);
+	assert.equal(redis.decrCalls, 0, "a container that ran must not get its slot back");
+});
+
+test("InfraRetry back-compat: message-only ctor keeps piDispatchRetry and defaults reason to the message", () => {
+	const e = new InfraRetry("x");
+	assert.equal(e.piDispatchRetry, true);
+	assert.equal(e.reason, "x");
+	assert.equal(e.message, "x");
 });
