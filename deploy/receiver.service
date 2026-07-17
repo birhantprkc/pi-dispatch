@@ -1,8 +1,10 @@
-# UNTESTED EXAMPLE (design.md:483-484) -- a starting point, not a shipped, verified unit. Adapt it.
+# UNTESTED EXAMPLE (DES-WORKER-ON-HOST) -- a starting point, not a shipped, verified unit. Adapt it.
 #
 # The receiver runs on the HOST as the public edge: it verifies GitHub deliveries and enqueues jobs.
 # Requires node >=22.19.0 on PATH for User=pi -- or pin an absolute `ExecStart=/usr/bin/node ...`.
-# This is a Linux/systemd unit; a launchd (macOS) / nssm (Windows) equivalent is left to the operator.
+# This is a Linux/systemd unit. The worker ships cross-platform daemon artifacts under deploy/
+# (com.pi-dispatch.worker.plist for launchd, nssm-install.cmd for Windows); receiver daemonization is
+# out of scope, but a launchd/nssm receiver would follow the same .env-wrapper pattern those use.
 #
 # NAT / tunnel: the receiver binds `RECEIVER_BIND` (default 0.0.0.0) and must be reachable by GitHub's
 # webhook delivery. On a home machine behind NAT, put it behind a tunnel (cloudflared / ngrok /

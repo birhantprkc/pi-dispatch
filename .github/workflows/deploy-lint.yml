@@ -1,0 +1,64 @@
+# Syntax lint for the deploy/ daemon artifacts.
+#
+# These files are hand-written examples an operator adapts; nothing exercises them in the normal test
+# suite (deploy/** is not in any other workflow's path filter), so a typo'd directive or a malformed
+# plist ships silently and only fails on the operator's box. This workflow is the cheap gate: it checks
+# STRUCTURE, not runtime behaviour.
+#
+#   - worker.service / receiver.service : `systemd-analyze verify` parses the units. The PLACEHOLDER
+#     paths (/opt/pi-dispatch, /usr/bin/node) do not exist on the runner, so path-existence warnings are
+#     EXPECTED and ignored; only genuine syntax errors (unknown directives, parse failures) fail.
+#   - com.pi-dispatch.worker.plist : `xmllint --noout` proves the plist is well-formed XML. plutil is
+#     macOS-only, so xmllint (libxml2-utils) is the Linux stand-in for well-formedness.
+#   - worker-env-wrapper.sh : `sh -n` is a POSIX shell parse check (no execution).
+#
+# The `.cmd` wrappers (worker-env-wrapper.cmd, nssm-install.cmd) have no practical Linux linter and are
+# not checked here -- deliberately, rather than with a flaky approximation.
+
+name: deploy lint
+
+on:
+  push:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy-lint.yml"
+  pull_request:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy-lint.yml"
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: deploy/ artifacts are syntactically valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install linters
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+
+      - name: systemd units parse (syntax only; PLACEHOLDER path warnings ignored)
+        run: |
+          # verify exits non-zero for the missing PLACEHOLDER exec paths, which is expected -- so gate on
+          # the CONTENT of the diagnostics, not the exit code. A real defect is an unknown directive or a
+          # parse failure; a missing /opt/pi-dispatch or /usr/bin/node is not.
+          systemd-analyze verify --no-pager deploy/worker.service deploy/receiver.service > verify.log 2>&1 || true
+          cat verify.log
+          if grep -Eiq 'Unknown (key name|lvalue|section)|Failed to parse|Invalid setting|not a valid|expected ' verify.log; then
+            echo "::error::systemd-analyze found a syntax error in a unit file. See the log above."
+            exit 1
+          fi
+          echo "OK: unit files are syntactically valid (path-existence warnings ignored)"
+
+      - name: plist is well-formed XML
+        run: |
+          xmllint --noout deploy/com.pi-dispatch.worker.plist \
+            || { echo "::error::deploy/com.pi-dispatch.worker.plist is not well-formed XML."; exit 1; }
+          echo "OK: plist well-formed"
+
+      - name: POSIX wrapper parses
+        run: |
+          sh -n deploy/worker-env-wrapper.sh \
+            || { echo "::error::deploy/worker-env-wrapper.sh has a shell syntax error."; exit 1; }
+          echo "OK: worker-env-wrapper.sh parses"
