@@ -15,6 +15,6 @@
     "panel"
   ],
   "scripts": {
-    "test": "node --test \"image/runner/test/*.test.mjs\" \"worker/test/*.test.mjs\""
+    "test": "node --test \"image/runner/test/*.test.mjs\" \"worker/test/*.test.mjs\" \"receiver/test/*.test.mjs\""
   }
 }

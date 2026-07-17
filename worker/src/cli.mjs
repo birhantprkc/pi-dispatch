@@ -18,7 +18,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 
 	if (cmd === "worker") {
 		const { startWorker } = await import("./start.mjs");
-		startWorker(env);
+		await startWorker(env);
 		return 0; // the worker keeps the process alive until SIGTERM
 	}
 

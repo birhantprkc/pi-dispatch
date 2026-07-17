@@ -1,0 +1,36 @@
+# UNTESTED EXAMPLE (design.md:483-484) -- a starting point, not a shipped, verified unit. Adapt it.
+#
+# The worker runs on the HOST, not in a container (DES-WORKER-ON-HOST): it drives the `docker` CLI to
+# launch one job container per job, and the CLI is what translates bind-mount paths cross-platform.
+# Compose runs only Valkey; this unit runs the worker beside it.
+#
+# Requires node >=22.19.0 (worker/package.json engines) on PATH for User=pi -- or pin an absolute
+# `ExecStart=/usr/bin/node ...` if PATH is not reliable under systemd. This is a Linux/systemd unit;
+# a launchd (macOS) / nssm (Windows) equivalent is left to the operator.
+#
+# Env vars come from your `.env` (see `.env.example`) via EnvironmentFile -- never commit real secrets.
+# WorkingDirectory / EnvironmentFile / User / node path below are PLACEHOLDERS: set them to wherever
+# you cloned the repo and whoever owns it.
+
+[Unit]
+Description=pi-dispatch worker (drains the job queue on the host; launches job containers via docker)
+After=network-online.target docker.service
+Wants=network-online.target
+# Valkey must be reachable (docker compose -f deploy/docker-compose.yml up -d), but it is a separate
+# unit/container -- not ordered here since it may be remote.
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/pi-dispatch
+EnvironmentFile=/opt/pi-dispatch/.env
+ExecStart=/usr/bin/node worker/src/cli.mjs worker
+Restart=on-failure
+RestartSec=5
+# The worker handles SIGTERM: it stops accepting new jobs and lets the in-flight container finish or
+# abort cleanly. Give it room before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

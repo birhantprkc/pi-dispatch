@@ -33,21 +33,36 @@ function fakeSpawn(recorder, exitCode = 0) {
 	};
 }
 
-test("an already-aborted signal returns 137 and NEVER spawns docker", { skip }, async () => {
+/** A fake `docker` child modelling a WORKER-initiated stop: the container has already started (so the
+ *  entry guard passed), then the worker's onAbort fires `docker stop`, aborting the signal, and the
+ *  container exits with `exitCode`. The close handler must see `signal.aborted === true`. */
+function fakeSpawnAbortedThenClose(ac, exitCode) {
+	return () => {
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		ac.abort();
+		queueMicrotask(() => child.emit("close", exitCode));
+		return child;
+	};
+}
+
+test("an already-aborted signal returns {code:137, aborted:true} and NEVER spawns docker", { skip }, async () => {
 	const rec = {};
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn(rec) });
 	const ac = new AbortController();
 	ac.abort();
-	const code = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: ac.signal });
-	assert.equal(code, 137);
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: ac.signal });
+	assert.deepEqual(result, { code: 137, aborted: true });
 	assert.equal(rec.cmd, undefined, "no container may start once the timeout has fired");
 });
 
 test("launches docker with the isolation argv and returns the container's exit code", { skip }, async () => {
 	const rec = {};
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn(rec, 2) });
-	const code = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
-	assert.equal(code, 2, "exit 2 (policy) is a normal outcome, not an error to reject on");
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.equal(result.code, 2, "exit 2 (policy) is a normal outcome, not an error to reject on");
+	assert.equal(result.aborted, false, "no worker abort -> the code stands on its own");
 	assert.equal(rec.cmd, "docker");
 	assert.ok(rec.args.includes("--cap-drop=ALL"), "isolation flags present");
 	assert.ok(rec.args.includes("/host/jobs/j1:/job:ro"), "whole /job mounted read-only");
@@ -57,8 +72,21 @@ test("launches docker with the isolation argv and returns the container's exit c
 
 test("exit 1 (infra) is returned, not thrown -- it is retryable, not a spawn error", { skip }, async () => {
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn({}, 1) });
-	const code = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
-	assert.equal(code, 1);
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.deepEqual(result, { code: 1, aborted: false });
+});
+
+test("close 137 while the worker aborted => {code:137, aborted:true} (our docker stop is POLICY)", { skip }, async () => {
+	const ac = new AbortController();
+	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawnAbortedThenClose(ac, 137) });
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: ac.signal });
+	assert.deepEqual(result, { code: 137, aborted: true });
+});
+
+test("close 137 with a signal that never aborted => {code:137, aborted:false} (kernel OOM stays infra)", { skip }, async () => {
+	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn({}, 137) });
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.deepEqual(result, { code: 137, aborted: false });
 });
 
 test("refuses before spawning if the provider is unconfigured (pre-spend guard)", { skip }, async () => {

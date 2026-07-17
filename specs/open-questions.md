@@ -53,7 +53,7 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
 
 - **Status**: **ACCEPTED RISK** — *wants explicit ratification*
 - **Position**: v1 ships without an allowlist proxy. A job container can reach the internet. The bound
-  on exfiltration is `CONST-TOKEN-SCOPED-PER-JOB`'s one-hour expiry, not network policy.
+  on exfiltration is `CONST-TOKEN-SCOPED-PER-JOB`'s short-lived, minimally-permissioned credential, not network policy.
 - **Why it is a risk row and not a constraint**: the source design doc listed egress allowlisting as
   security "layer 4" while also saying v1 ships without it. **A constraint that ships unenforced is worse
   than an honest open risk** — it teaches readers that the constitution is aspirational, which corrodes
@@ -97,6 +97,25 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   `earendil-works/pi @ 5e336cf → CHANGELOG.md:5-10` (`[Unreleased]`) · `→ sdk.ts:33-80`
   (`modelRuntime?: ModelRuntime` present **on main only**) · `→ sdk.ts:171` (async `ModelRuntime.create`)
 
+## OQ-006 — Which GitHub auth mechanism is the default, and when is an App required?
+
+- **Status**: **CLOSED — default `gh` / fine-grained PAT for single-owner; App for multi-tenant**
+- **Answer**: The default `GITHUB_AUTH_SOURCE` is `gh` (or a repo-scoped, short-expiry fine-grained PAT)
+  for a single-owner deployment. The GitHub App path is optional, strictly stronger on the token axis
+  (true per-repo scoping, shorter expiry), and **mandatory for multi-tenant** deployments — a
+  fine-grained PAT is per-account and cannot isolate mutually-distrusting owners. A broad or long-lived
+  classic PAT is non-conformant either way. This is the property set `CONST-TOKEN-SCOPED-PER-JOB`
+  enumerates; the App is no longer a hard prerequisite for running GitHub jobs.
+- **Why it was an open question**: the original design assumed a GitHub App was mandatory. Research
+  found no GitHub requirement forcing an App for a single-owner tool, and `@octokit/auth-app` shipped
+  declared-but-unused — so the mechanism was undecided in practice while the docs implied App-only.
+- **What closed it**: this plan (the pluggable `makeGitHubAuth(pat|gh|app)` resolver) plus the E1
+  amendment of `CONST-TOKEN-SCOPED-PER-JOB` from App-mandatory/one-hour to mechanism-neutral required
+  properties. Recorded here so the decision is durable and greppable rather than buried in a closed PR.
+- **Related risk**: `OQ-004` (unrestricted egress) is the reason the credential mechanism matters — the
+  token's short expiry, not network policy, is the exfiltration bound, so the mechanism must keep that
+  expiry short and the scope narrow. `OQ-004` remains **ACCEPTED RISK** (unchanged by this entry).
+
 ---
 
 ## Retired from the source design document
@@ -135,3 +154,4 @@ adversarial passes did.
 | 2026-07-15 | Initial. Replaces `DESIGN.md` v0.1 §10. Collapsed from ~10 checklist items to 5 rows: source-verification at `earendil-works/pi @ 5e336cf` answered most of them. The register's value inverted in the process — from "holds ten unknowns" to "holds one known-incoming breaking change" (`OQ-005`). |
 | 2026-07-16 | `OQ-005` **retracted and re-corrected** to `WATCH — NOT IN THE PIN`. The 2026-07-15 "correction" below was itself wrong: it read `sdk.ts` at `5e336cf` (**HEAD**) to describe npm `0.80.7` (**the pin**), concluded `modelRuntime` had already landed, and declared the changelog unreliable. `ModelRuntime` does not exist in `0.80.7` — no `model-runtime` in its `dist/`, not exported from `dist/index.js`. The changelog said `[Unreleased]` and was exactly right. The runner was written against the phantom API, the image built cleanly, and every job would have died on a missing export; CI caught it on the first real container run. `constitution.md`'s evidence convention now requires verification against the **published artifact**, and `pinned-api.test.mjs` asserts `ModelRuntime` is absent so the real migration fails a test instead of a job. |
 | 2026-07-15 | ~~`OQ-005` corrected to **WATCH — PARTIALLY LANDED**~~ — **this entry was wrong; see above.** It claimed `modelRuntime` was already in `CreateAgentSessionOptions` at the pinned sha and that the changelog was not a reliable signal. Both false: the sha was HEAD, not the pin. Kept rather than deleted, because a spec that hides having been wrong teaches the next reader to trust it more than it deserves. |
+| 2026-07-17 | Added OQ-006 recording the GitHub-auth-mechanism decision (default gh/fine-grained PAT single-owner; App mandatory multi-tenant), closed by this plan + the E1 CONST-TOKEN-SCOPED-PER-JOB amendment. |

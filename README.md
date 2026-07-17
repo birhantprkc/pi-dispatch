@@ -51,15 +51,14 @@ folders you can restore, and commit first.
 
 ## What runs, and what protects you
 
-```
-pi-dispatch run ── enqueue ──▶ Valkey + BullMQ ──▶ worker (on your host)
-                               the wait-list          budget check (before any spend)
-                                                      docker run: one ephemeral container
-                                                          │  --cap-drop=ALL, non-root, no new privileges
-                                                          │  /job read-only, /workspace = your folder
-                                                          ▼
-                                                      pi + Playwright + git + gh
-                                                      guardrails + your .pi/  →  edits your folder
+```mermaid
+flowchart LR
+  CLI["pi-dispatch run ./folder --task ..."] -->|enqueue| Q[("Valkey + BullMQ<br/>the wait-list, AOF")]
+  Q --> B{"under the daily cap<br/>and turn budget?"}
+  B -->|no| STOP["refused before any spend"]
+  B -->|yes| C["docker run --rm: one ephemeral container<br/>--cap-drop=ALL, non-root, no-new-privileges<br/>/job read-only, /workspace = your folder"]
+  C --> PI["pi + Playwright + git + gh<br/>guardrails + your .pi/"]
+  PI -->|"edits in place"| F[("your folder")]
 ```
 
 - **The container is the security boundary.** pi has no permission system, so every job runs
@@ -73,20 +72,54 @@ pi-dispatch run ── enqueue ──▶ Valkey + BullMQ ──▶ worker (on yo
 
 Read [`SECURITY.md`](SECURITY.md) before you rely on it — it states plainly what is and is not defended.
 
-## Advanced: GitHub automation *(in progress)*
+## Advanced: GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
-opens a PR, and comments back. This path needs a **GitHub App** and is **not yet built** in this
-repository; the local-folder path above is complete. When it lands:
+opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECRET`), and the worker
+authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
+**PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
+for multi-tenant.
+
+```mermaid
+flowchart LR
+  GH["GitHub repo<br/>issue labeled, or @pi comment"] -->|"webhook, HMAC-signed"| R
+  subgraph EDGE["receiver/ — public edge, binds 0.0.0.0"]
+    R["verify raw-body HMAC (401 on mismatch)<br/>filter: label allowlist, author gate, bot-loop"]
+  end
+  R -->|"enqueueGitHubJob (jobId = gh-&lt;delivery&gt;)"| Q[("Valkey + BullMQ<br/>pi-jobs, AOF, 31d+ retention")]
+  subgraph HOST["worker/ — host process"]
+    W["mint scoped token, refuse an unprotected branch,<br/>hardened clone at the default-branch SHA, run container"]
+  end
+  Q --> W
+  W -->|"docker run --rm"| C["job container: the agent commits,<br/>pushes --force-with-lease, gh pr create, comments"]
+  C -->|"GITHUB_TOKEN via env only, never merges"| GH
+```
 
 - Only a collaborator's label or `@pi` comment starts a job (the label *is* the approval step).
-- The agent gets a **1-hour, single-repo token** — and, honestly: that token *can* merge, because GitHub
-  gates push and merge behind the same `contents: write` scope. **Branch protection on your default
-  branch is the real control**, so the worker will refuse an unprotected repo. `SECURITY.md` has the
-  detail.
+- The agent gets a **repo-scoped, short-lived token** — and, honestly: that token *can* merge, because
+  GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
+  default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
+  the detail.
 - A separate **admin panel** on `127.0.0.1` (never on the internet-facing receiver) will turn the queue
   on/off, show jobs, and set the model/budgets. It will not edit your persona or skills — those live in
   your project's `.pi/`, in git, reviewed.
+
+Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
+*before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the
+receiver's own comments can never re-trigger a job):
+
+```mermaid
+flowchart TD
+  D["POST delivery"] --> V{"HMAC over the<br/>raw body valid?"}
+  V -->|no| E401["401 — reject, enqueue nothing"]
+  V -->|yes| S{"sender.id ==<br/>our own id?"}
+  S -->|"yes"| D204a["204 — drop (bot-loop guard)"]
+  S -->|no| A{"allowlisted label,<br/>or collaborator @pi?"}
+  A -->|no| D204b["204 — drop"]
+  A -->|yes| EN{"enqueue to Valkey"}
+  EN -->|ok| A202["202 — queued<br/>(duplicate delivery = no-op, deduped by GUID)"]
+  EN -->|"Valkey down"| E503["503 — GitHub redelivers,<br/>deduped by GUID"]
+```
 
 ## Should you use this instead of the Claude Code GitHub Action?
 
@@ -99,8 +132,9 @@ minutes.
 
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`) is built and works. The GitHub
-webhook path, the admin panel, and scheduled (cron) triggers are in progress. The design is specified in
+The local-folder path (image, worker, `pi-dispatch run` / `worker`) and the GitHub webhook path
+(receiver → queue → clone → PR) are built and work. The admin panel and scheduled (cron) triggers are in
+progress. The design is specified in
 [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
 and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 

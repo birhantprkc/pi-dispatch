@@ -256,16 +256,28 @@ that always fires is one nobody reads.
 
 ## CONST-TOKEN-SCOPED-PER-JOB
 
-- **Statement**: Each job shall receive a freshly minted GitHub App installation token, scoped to one
-  repository, expiring in one hour. No long-lived PAT shall enter a container.
-- **Why**: The one-hour expiry **is** the blast-radius bound for the case where an injected agent
-  exfiltrates its environment — which is a *when*, not an *if*. A PAT makes one successful injection
-  permanent and multi-repo. The provider API key is the acknowledged exception: it cannot be scoped
-  because the agent cannot function without it, so it is bounded by a provider-side spend limit instead
-  of by scope. That asymmetry is deliberate and documented rather than pretended away.
+- **Statement**: The container git credential shall be **repo-scoped** (reaching only the serviced
+  repository), **minimally-permissioned** (contents + pull-requests only), **short-lived**,
+  **host-held** and **env-injected** (never written to an agent-reachable file), and **not
+  merge-capable in practice** (branch protection is the barrier — see `CONST-MERGE-NEVER-AUTOMATIC`).
+  A freshly-minted GitHub App installation token satisfies these properties. A tightly-scoped,
+  short-expiry **fine-grained** PAT satisfies them for a **single-owner** deployment. A **broad or
+  long-lived classic PAT does not** and shall not enter a container. The App path remains strictly
+  stronger on the token axis and is **mandatory for multi-tenant** deployments — a fine-grained PAT is
+  per-account and cannot isolate mutually-distrusting owners.
+- **Why**: The credential's short **expiry** — not its capabilities — is the blast-radius bound for the
+  case where an injected agent exfiltrates its environment, which is a *when*, not an *if*. A broad,
+  long-lived classic PAT makes one successful injection permanent and multi-repo, which is why it is
+  excluded. The provider API key is the acknowledged exception: it cannot be scoped because the agent
+  cannot function without it, so it is bounded by a provider-side spend limit instead of by scope. That
+  asymmetry is deliberate and documented rather than pretended away.
 - **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `INT-CONTAINER-RUNTIME-CONTRACT`
-- **Acceptance**: No container environment contains a credential valid beyond one hour or beyond one
-  repository, except the provider key.
+- **Acceptance**: (a) **Code-checkable** — no container environment holds a credential that is
+  broad-scope or long-lived; the App path scopes the token to exactly one repository; the token is
+  env-injected and never written to `/workspace`, `.git/config`, argv, or logs; no acceptance clause
+  mandates a specific expiry duration. (b) **Operator obligation** — a single-owner deployment must
+  supply a repo-scoped, minimally-permissioned, short-expiry fine-grained PAT (or use the App); a broad
+  or long-lived classic PAT is non-conformant. Multi-tenant deployments must use the App.
 
 ## CONST-PI-VERSION-PINNED
 
@@ -291,3 +303,4 @@ that always fires is one nobody reads.
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted). That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — but verified **against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points, two of them architecture-breaking. Hence the evidence convention above: source is authoritative, docs are a hint. |
 | 2026-07-15 | `CONST-NO-CONTEXT-FILES-MANDATORY` amended: it named only the CLI flag (`-nc`), but the runner uses the **SDK**, where the mechanism is `noContextFiles: true` on a caller-constructed `DefaultResourceLoader` — and it is **off by default**. The constraint therefore fails **open by omission**: there is no flag to forget, there is an entire object to forget to build. Statement and Evidence corrected; Acceptance unchanged (it was right; the named mechanism was wrong). This is the distinction the evidence convention exists to catch — the *requirement* was verified, the *mechanism* was assumed. |
+| 2026-07-17 | `CONST-TOKEN-SCOPED-PER-JOB` amended: Statement, Why, and Acceptance rewritten from a single-mechanism mandate (App installation token with one fixed expiry duration) to mechanism-neutral **required properties** — repo-scoped, minimally-permissioned, short-lived, host-held, env-injected, not merge-capable in practice. The App path satisfies them and stays **mandatory for multi-tenant**; a tightly-scoped short-expiry **fine-grained** PAT satisfies them for **single-owner**; a broad or long-lived classic PAT is excluded. The bound is the token's **expiry**, not a fixed duration — no acceptance clause mandates one. Provider-key exception preserved unchanged. |

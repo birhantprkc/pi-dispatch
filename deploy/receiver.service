@@ -1,0 +1,34 @@
+# UNTESTED EXAMPLE (design.md:483-484) -- a starting point, not a shipped, verified unit. Adapt it.
+#
+# The receiver runs on the HOST as the public edge: it verifies GitHub deliveries and enqueues jobs.
+# Requires node >=22.19.0 on PATH for User=pi -- or pin an absolute `ExecStart=/usr/bin/node ...`.
+# This is a Linux/systemd unit; a launchd (macOS) / nssm (Windows) equivalent is left to the operator.
+#
+# NAT / tunnel: the receiver binds `RECEIVER_BIND` (default 0.0.0.0) and must be reachable by GitHub's
+# webhook delivery. On a home machine behind NAT, put it behind a tunnel (cloudflared / ngrok /
+# tailscale funnel) or a reverse proxy with TLS -- do not port-forward it raw without one.
+# `WEBHOOK_SECRET` is what authenticates deliveries; without a public URL GitHub cannot deliver.
+#
+# Env vars come from your `.env` (see `.env.example`) via EnvironmentFile -- never commit real secrets.
+# WorkingDirectory / EnvironmentFile / User / node path below are PLACEHOLDERS: set them to wherever
+# you cloned the repo and whoever owns it.
+
+[Unit]
+Description=pi-dispatch webhook receiver (public edge: verifies GitHub deliveries and enqueues jobs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/pi-dispatch
+EnvironmentFile=/opt/pi-dispatch/.env
+ExecStart=/usr/bin/node receiver/src/start.mjs
+Restart=on-failure
+RestartSec=5
+# The receiver handles SIGTERM: it closes the HTTP server and the queue connection, then exits.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

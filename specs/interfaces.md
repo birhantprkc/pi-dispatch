@@ -198,6 +198,14 @@ Evidence convention as in `constitution.md`.
   | `1` | Infrastructure failure (container died, network, provider 5xx/429) | Retryable |
   | `2` | Budget or policy refusal (cap exhausted, turn budget hit) | Not retried |
 
+  **A worker-initiated termination overrides the numeric code.** When the worker itself stops the
+  container — `docker stop` on the 30-minute timeout (`cancelJob`) or on graceful shutdown, delivering
+  SIGTERM (`143`) then SIGKILL (`137`) — the outcome is classified **POLICY, not retried**, keyed on the
+  worker's own abort signal rather than the exit code, because a worker SIGKILL and a kernel OOM both
+  surface as `137`. Retrying a worker-aborted job re-runs a wedged run into a second PR. This is distinct
+  from the runner's clean in-process abort (turn budget / timeout observed inside the container, exit
+  `2`) and from an **unbidden** OOM-`137` with no worker abort, which stays infra-retryable (`1` class).
+
   **The runner needs BOTH a `try`/`catch` AND `stopReason` handling — they cover disjoint failure sets.**
   `session.prompt()` is `Promise<void>`, so there is no return value to inspect; the terminal message is
   captured via `subscribe()` (`turn_end` / `agent_end`).
@@ -348,7 +356,7 @@ Evidence convention as in `constitution.md`.
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
   - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
-    (see below); `GITHUB_TOKEN` (scoped, 1h — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
+    (see below); `GITHUB_TOKEN` (scoped, short-lived — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
   - Env **baked into the image**, because they are facts about the image and not choices a job makes:
     `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,

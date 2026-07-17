@@ -1,5 +1,7 @@
-import { loadConfig } from "./config.mjs";
+import { configError, loadConfig } from "./config.mjs";
 import { makeRedisClient, parseConnection } from "./connection.mjs";
+import { makeGitHubAuth } from "./get-token.mjs";
+import { makeGitHubHost } from "./github-host.mjs";
 import { createWorker } from "./index.mjs";
 import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { makeRunContainer } from "./run-container.mjs";
@@ -9,30 +11,61 @@ import { makeRunContainer } from "./run-container.mjs";
  * needs, and starts draining the queue. `createWorker` already installs the timeout, the
  * abort->docker-stop, and the SIGTERM/SIGINT graceful shutdown.
  *
- * GitHub deps (mintToken, isDefaultBranchProtected) are wired to throw: a github job reaching this
- * worker in this slice is a clear error, not a silent no-op.
+ * GitHub auth is initialised best-effort: a local-only deployment must still boot when no working
+ * GITHUB_AUTH_SOURCE is present, so an auth failure is logged and the github deps fail closed per
+ * job (mintToken throws configError) rather than blocking startup. Collaborators are injectable
+ * (defaulting to the real ones) so the wiring is testable offline with no Redis and no GitHub.
  */
-export function startWorker(env = process.env) {
+export async function startWorker(
+	env = process.env,
+	{ makeAuth = makeGitHubAuth, makeHost = makeGitHubHost, createWorkerFn = createWorker } = {},
+) {
 	const config = loadConfig(env);
 	const log = (event, fields = {}) => process.stdout.write(`${JSON.stringify({ event, ...fields })}\n`);
 
-	const worker = createWorker({
+	let gh = null;
+	try {
+		gh = await makeAuth(config.github);
+		log("self_identity", { id: gh.selfId, source: gh.source });
+	} catch (err) {
+		log("github_auth_unavailable", { reason: err?.message });
+	}
+	const host = makeHost();
+
+	const worker = createWorkerFn({
 		connection: parseConnection(config.valkeyUrl),
 		concurrency: config.concurrency,
 		cap: config.dailyCap,
 		redis: makeRedisClient(config.valkeyUrl),
 		deps: {
 			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env }),
-			prepareWorkspace: makePrepareWorkspace({ jobsDir: config.jobsDir }),
+			prepareWorkspace: makePrepareWorkspace({
+				jobsDir: config.jobsDir,
+				resolveDefaultBranchSha: host.resolveDefaultBranchSha,
+			}),
 			cleanup,
-			comment: (job, text) => log("comment", { jobId: job?.id, text }),
+			comment: async (job, text) => {
+				// Best-effort: the processor awaits comment() inside its try, so a rejection here would
+				// corrupt the job outcome and could drive a wrong retry / second PR (CONST-RETRY-INFRA-ONLY).
+				// This adapter NEVER throws.
+				if (job?.kind === "github" && gh) {
+					try {
+						const token = await gh.mintToken(job.repo);
+						await host.postStatusComment(job.repo, job.issueNumber, text, token);
+					} catch (err) {
+						log("comment_failed", { jobId: job?.id, reason: err?.message });
+					}
+					return;
+				}
+				log("comment", { jobId: job?.id, text });
+			},
 			log,
-			mintToken: async () => {
-				throw new Error("github jobs are not implemented in this slice");
-			},
-			isDefaultBranchProtected: async () => {
-				throw new Error("github jobs are not implemented in this slice");
-			},
+			mintToken:
+				gh?.mintToken ??
+				(async () => {
+					throw configError("github jobs require a working GITHUB_AUTH_SOURCE (gh/pat/app)");
+				}),
+			isDefaultBranchProtected: host.isDefaultBranchProtected,
 		},
 	});
 

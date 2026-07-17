@@ -47,7 +47,8 @@ export async function reserveBudget(redis, { cap, now = new Date(), keyPrefix = 
  * Give a reservation back. Used ONLY when the container never started because of an INFRA fault
  * AFTER reserving (e.g. the docker daemon was unreachable) -- an infra failure that spent nothing
  * should not permanently consume a cap slot. NOT used for a completed run (0/2), which really did
- * consume its slot, nor for a refusal (which never incremented past the cap deliberately).
+ * consume its slot, nor for an exit-1 infra retry (the container ran and spent), nor for a refusal
+ * (which never incremented past the cap deliberately).
  */
 export async function releaseBudget(redis, { now = new Date(), keyPrefix = "budget" } = {}) {
 	await redis.decr(dayKey(now, keyPrefix));

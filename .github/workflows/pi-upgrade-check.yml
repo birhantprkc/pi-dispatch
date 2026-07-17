@@ -19,6 +19,7 @@ on:
     paths:
       - "image/**"
       - "worker/**"
+      - "receiver/**"
       - "guardrails/**"
       - "package.json"
       - ".github/workflows/pi-upgrade-check.yml"
@@ -26,6 +27,7 @@ on:
     paths:
       - "image/**"
       - "worker/**"
+      - "receiver/**"
       - "guardrails/**"
       - "package.json"
       - ".github/workflows/pi-upgrade-check.yml"
@@ -61,6 +63,22 @@ jobs:
           fi
           echo "OK: base pinned by digest"
 
+  no-automatic-merge:
+    name: no automatic merge (CONST-MERGE-NEVER-AUTOMATIC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No merge API call anywhere
+        run: |
+          # CONST-MERGE-NEVER-AUTOMATIC: "grep is the test". A match is a merge symbol reaching
+          # the code — the human review step is the last line and is not negotiable.
+          if grep -rnE 'pulls\.merge|gh pr merge|mergePullRequest|merge_pull_request|[Aa]utoMerge|/pulls/.*/merge' worker/src image/runner receiver/src; then
+            echo "::error::Merge symbol found. CONST-MERGE-NEVER-AUTOMATIC forbids any merge call."
+            exit 1
+          fi
+          echo "OK: no merge symbols"
+
   contract-tests:
     name: pinned assumptions still hold (offline, no API key)
     runs-on: ubuntu-latest
@@ -89,10 +107,11 @@ jobs:
       # PI_DISPATCH_REQUIRE_*_TESTS=1 turns a skip into a hard failure. A skipped assertion is an
       # UNVERIFIED assertion, and "skipped = pass" is precisely the reasoning that lets a
       # guardrail-less agent ship green. VALKEY_TEST_URL activates the queue integration test.
-      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist, queue (all required)
+      - name: Contract tests -- guardrails, -nc, exit codes, env allowlist, queue, receiver enqueue (all required)
         env:
           PI_DISPATCH_REQUIRE_LOADER_TESTS: "1"
           PI_DISPATCH_REQUIRE_WORKER_TESTS: "1"
+          PI_DISPATCH_REQUIRE_RECEIVER_TESTS: "1"
           VALKEY_TEST_URL: "redis://127.0.0.1:6379"
         run: npm test
 

@@ -45,3 +45,88 @@ test("cap 0 is rejected -- it would fail closed, and is more likely a typo than 
 test("configError is tagged for clean CLI reporting", () => {
 	assert.equal(configError("x").piDispatchConfig, true);
 });
+
+test("github auth defaults to gh source with no extra required vars", () => {
+	const c = loadConfig({});
+	assert.equal(c.github.source, "gh");
+	assert.equal(c.github.patVar, "GITHUB_PAT");
+});
+
+test("source=pat with empty or absent PAT is a config error", () => {
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "pat" }),
+		(e) => e.piDispatchConfig === true,
+	);
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT: "   " }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("source=pat with a non-empty PAT parses and echoes patVar", () => {
+	const c = loadConfig({ GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT: "ghp_x" });
+	assert.equal(c.github.source, "pat");
+	assert.equal(c.github.patVar, "GITHUB_PAT");
+});
+
+test("unknown GITHUB_AUTH_SOURCE is a config error", () => {
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "oauth" }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("source=app missing installationId or privateKeyPath is a config error", () => {
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "app", GITHUB_APP_ID: "1", GITHUB_APP_PRIVATE_KEY_PATH: "/k.pem" }),
+		(e) => e.piDispatchConfig === true,
+	);
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "app", GITHUB_APP_ID: "1", GITHUB_APP_INSTALLATION_ID: "2" }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("source=app with all vars present but a missing key file is a config error", () => {
+	assert.throws(
+		() =>
+			loadConfig(
+				{
+					GITHUB_AUTH_SOURCE: "app",
+					GITHUB_APP_ID: "1",
+					GITHUB_APP_INSTALLATION_ID: "2",
+					GITHUB_APP_PRIVATE_KEY_PATH: "/nope.pem",
+				},
+				{ fileExists: () => false },
+			),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("source=app with all vars present and key file present parses the exact block shape", () => {
+	const c = loadConfig(
+		{
+			GITHUB_AUTH_SOURCE: "app",
+			GITHUB_APP_ID: "1",
+			GITHUB_APP_INSTALLATION_ID: "2",
+			GITHUB_APP_PRIVATE_KEY_PATH: "/k.pem",
+		},
+		{ fileExists: () => true },
+	);
+	assert.deepEqual(c.github, {
+		source: "app",
+		patVar: "GITHUB_PAT",
+		appId: "1",
+		installationId: "2",
+		privateKeyPath: "/k.pem",
+	});
+});
+
+test("custom GITHUB_PAT_VAR reads the named env var for the PAT", () => {
+	const c = loadConfig({ GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT_VAR: "MY_PAT", MY_PAT: "ghp_y" });
+	assert.equal(c.github.patVar, "MY_PAT");
+	assert.throws(
+		() => loadConfig({ GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT_VAR: "MY_PAT" }),
+		(e) => e.piDispatchConfig === true,
+	);
+});

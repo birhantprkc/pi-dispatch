@@ -64,12 +64,13 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.
-- **Credential scope.** A GitHub App installation token minted per job: one repository, one hour. The
-  expiry and the single-repo scope bound **where** an injected agent can act — not **how much**, within
-  that repo. See *What is NOT defended*.
-- **CI integrity.** The token is minted **without** the `workflows` permission, which is a separate scope
-  from `contents`. An injected agent therefore cannot rewrite `.github/workflows/` even though it can
-  write code. This one holds.
+- **Credential scope.** A repo-scoped, short-lived token minted per job — a GitHub App installation
+  token, or a single-owner fine-grained PAT. Its narrow scope and short expiry bound **where** and for
+  **how long** an injected agent can act within that repo. See *What is NOT defended*.
+- **CI integrity.** The token is minimally-permissioned — `contents` and `pull-requests`, **not**
+  `workflows`, which is a separate scope. For a fine-grained PAT this is an operator-set property. An
+  injected agent therefore cannot rewrite `.github/workflows/` even though it can write code. This one
+  holds.
 - **Branch protection is required.** The worker refuses to run against a repository whose default branch
   is unprotected, checked before any money is spent. This is the control that makes human review real
   rather than customary — without it, nothing technical stops a merge.
@@ -82,9 +83,9 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   a pull request cannot change them. Baked guardrails are read from a path the project cannot influence.
 - **We never merge.** No code path in this project calls a merge API; grep is the test. Note carefully
   what that does and does not mean — see below.
-- **Spend.** A daily cap checked *before* tokens are spent, plus a per-job turn budget enforced by our
-  runner (pi has no turn limit of its own). An agent that concluded "I can't fix this" is a success and
-  is never blind-retried.
+- **Spend.** A daily cap checked *before* tokens are spent, a per-job turn budget enforced by our runner
+  (pi has no turn limit of its own), and a 30-minute container wall-clock timeout. An agent that concluded
+  "I can't fix this" is a success and is never blind-retried.
 
 ## What is NOT defended (v1)
 
@@ -112,7 +113,7 @@ Stated openly rather than discovered later:
   removing the human who would have noticed.
 - **Network egress from the job container is unrestricted.** There is no allowlist proxy in v1. A job
   can reach the internet. If an agent is successfully induced to exfiltrate its environment, egress
-  filtering will not stop it — the scoped token's one-hour expiry is what bounds the damage. Run this on
+  filtering will not stop it — the token's short expiry and narrow scope are what bound the damage. Run this on
   hardware where that is acceptable, or put an egress policy on the Docker network yourself.
 - **The provider API key is broad.** Unlike the GitHub token it cannot be meaningfully scoped per job —
   the agent needs it to function. It is the one broad secret inside the container. **Set a spend limit
