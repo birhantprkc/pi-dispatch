@@ -1,0 +1,16 @@
+{
+  "name": "@pi-dispatch/receiver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/start.mjs",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@octokit/webhooks": "14.2.0",
+    "@pi-dispatch/worker": "*",
+    "bullmq": "5.80.4",
+    "ioredis": "5.11.1"
+  }
+}

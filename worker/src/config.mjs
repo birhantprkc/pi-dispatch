@@ -13,7 +13,7 @@ export function configError(message) {
 	return error;
 }
 
-function positiveInt(env, name, fallback) {
+export function positiveInt(env, name, fallback) {
 	const raw = env[name];
 	if (raw === undefined || raw === "") {
 		if (fallback !== undefined) return fallback;
@@ -51,7 +51,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
  * get-token.mjs. Shape is fixed: `{ source, patVar, appId, installationId, privateKeyPath }`.
  * Fails loud at load time so a misconfigured worker refuses to boot rather than failing per-job.
  */
-function loadGitHubAuth(env, fileExists) {
+export function loadGitHubAuth(env, fileExists) {
 	const source = env.GITHUB_AUTH_SOURCE ?? "gh";
 	if (source !== "pat" && source !== "gh" && source !== "app") {
 		throw configError(`invalid GITHUB_AUTH_SOURCE: ${source} (expected pat|gh|app)`);
