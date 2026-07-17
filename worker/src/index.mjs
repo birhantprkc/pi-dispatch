@@ -80,6 +80,10 @@ export function createWorker({ connection, concurrency, cap, redis, deps, limite
 	};
 	process.once("SIGTERM", shutdown);
 	process.once("SIGINT", shutdown);
+	// Windows never delivers an external SIGTERM. nssm's console-stop delivers Ctrl-C => SIGINT
+	// (handled above); SIGBREAK covers console-close. Route it to the same shutdown so a stopped
+	// worker still aborts in-flight jobs and docker-stops their containers rather than orphaning them.
+	if (process.platform === "win32") process.once("SIGBREAK", shutdown);
 
 	return worker;
 }
