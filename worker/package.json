@@ -9,6 +9,13 @@
   "bin": {
     "pi-dispatch": "src/cli.mjs"
   },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./queue": "./src/queue.mjs",
+    "./job-id": "./src/job-id.mjs",
+    "./identity": "./src/identity.mjs",
+    "./get-token": "./src/get-token.mjs"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -19,6 +26,7 @@
   "dependencies": {
     "@earendil-works/pi-ai": "0.80.7",
     "@octokit/auth-app": "8.2.0",
+    "@octokit/rest": "22.0.1",
     "bullmq": "5.80.4",
     "ioredis": "5.11.1"
   }

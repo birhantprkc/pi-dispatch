@@ -1,0 +1,240 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { makeGitHubAuth } from "../src/get-token.mjs";
+
+/**
+ * All collaborators are injected. Fakes are hand-rolled (no mocking library), matching the
+ * budget/identity test convention.
+ */
+
+/** Fake @octokit/rest: `new Octokit(opts)` ignores auth; `request(route)` returns canned `{ data }`. */
+function FakeOctokit(routes) {
+	return class {
+		constructor(options) {
+			this.options = options;
+		}
+		async request(route) {
+			if (!(route in routes)) throw new Error(`unexpected route: ${route}`);
+			const canned = routes[route];
+			if (canned instanceof Error) throw canned;
+			return { data: canned };
+		}
+	};
+}
+
+/**
+ * Fake @octokit/auth-app. `createAppAuth(auth)` returns an async `appAuth(params)` that records its
+ * params in `calls` and either yields `result` (e.g. `{ token }`) or throws `error`.
+ */
+function fakeCreateAppAuth({ result, error, calls }) {
+	return () => async (params) => {
+		calls.push(params);
+		if (error) throw error;
+		return result;
+	};
+}
+
+/** Callback-style execFile so `promisify` resolves `{ stdout, stderr }` (or rejects with `error`). */
+function fakeExecFile({ stdout = "", stderr = "", error = null } = {}) {
+	return (_file, _args, cb) => {
+		if (error) return cb(error);
+		cb(null, { stdout, stderr });
+	};
+}
+
+/** An Error tagged like an octokit RequestError. */
+function httpError(status, extra = {}) {
+	const e = new Error(`HTTP ${status}`);
+	e.status = status;
+	return Object.assign(e, extra);
+}
+
+const USER_ROUTES = { "GET /user": { id: 4242, login: "octo" } };
+const APP_ROUTES = {
+	"GET /app": { slug: "pi-dispatch", id: 9001 },
+	"GET /users/{username}": { id: 555123, login: "pi-dispatch[bot]" },
+};
+
+// -- pat -----------------------------------------------------------------------------------------
+
+test("pat happy: mintToken returns the non-empty token, selfId is the /user integer id", async () => {
+	const auth = await makeGitHubAuth(
+		{ source: "pat" },
+		{ Octokit: FakeOctokit(USER_ROUTES), env: { GITHUB_PAT: "ghp_realtoken" } },
+	);
+	assert.equal(auth.source, "pat");
+	assert.equal(auth.selfId, 4242);
+	assert.ok(Number.isInteger(auth.selfId));
+	const token = await auth.mintToken("owner/repo");
+	assert.equal(token, "ghp_realtoken");
+	assert.ok(token.length > 0);
+});
+
+test("pat honours a custom patVar", async () => {
+	const auth = await makeGitHubAuth(
+		{ source: "pat", patVar: "MY_PAT" },
+		{ Octokit: FakeOctokit(USER_ROUTES), env: { MY_PAT: "ghp_custom" } },
+	);
+	assert.equal(await auth.mintToken("o/r"), "ghp_custom");
+});
+
+test("pat empty env var is a config error (money hole: absent GITHUB_TOKEN runs anonymously)", async () => {
+	await assert.rejects(
+		() => makeGitHubAuth({ source: "pat" }, { Octokit: FakeOctokit(USER_ROUTES), env: { GITHUB_PAT: "" } }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("pat whitespace-only env var is a config error", async () => {
+	await assert.rejects(
+		() => makeGitHubAuth({ source: "pat" }, { Octokit: FakeOctokit(USER_ROUTES), env: { GITHUB_PAT: "   \t\n" } }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+// -- gh ------------------------------------------------------------------------------------------
+
+test("gh happy: mintToken returns the trimmed `gh auth token` stdout, selfId resolves", async () => {
+	const auth = await makeGitHubAuth(
+		{ source: "gh" },
+		{ Octokit: FakeOctokit(USER_ROUTES), execFile: fakeExecFile({ stdout: "ghs_ghtoken\n" }) },
+	);
+	assert.equal(auth.source, "gh");
+	assert.equal(auth.selfId, 4242);
+	assert.equal(await auth.mintToken("owner/repo"), "ghs_ghtoken");
+});
+
+test("gh logged-out (exit 0, empty stdout) is a config error", async () => {
+	await assert.rejects(
+		() => makeGitHubAuth({ source: "gh" }, { Octokit: FakeOctokit(USER_ROUTES), execFile: fakeExecFile({ stdout: "" }) }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("gh ENOENT (binary absent) is a config error", async () => {
+	const enoent = Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" });
+	await assert.rejects(
+		() => makeGitHubAuth({ source: "gh" }, { Octokit: FakeOctokit(USER_ROUTES), execFile: fakeExecFile({ error: enoent }) }),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+// -- app -----------------------------------------------------------------------------------------
+
+test("app happy: installation token minted, selfId is the bot-user id via the two-step", async () => {
+	const calls = [];
+	const auth = await makeGitHubAuth(
+		{ source: "app", appId: "123", installationId: "456", privateKeyPath: "/keys/app.pem" },
+		{
+			Octokit: FakeOctokit(APP_ROUTES),
+			createAppAuth: fakeCreateAppAuth({ result: { token: "ghs_installtoken" }, calls }),
+			readFile: async () => "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n",
+		},
+	);
+	assert.equal(auth.source, "app");
+	assert.equal(auth.selfId, 555123); // bot USER id, not the App id
+	assert.ok(Number.isInteger(auth.selfId));
+	assert.equal(await auth.mintToken("some-owner/some-repo"), "ghs_installtoken");
+});
+
+test("app mint strips the owner: repositoryNames gets the bare repo name", async () => {
+	const calls = [];
+	const auth = await makeGitHubAuth(
+		{ source: "app", appId: "123", installationId: "456", privateKeyPath: "/keys/app.pem" },
+		{
+			Octokit: FakeOctokit(APP_ROUTES),
+			createAppAuth: fakeCreateAppAuth({ result: { token: "ghs_x" }, calls }),
+			readFile: async () => "PEM",
+		},
+	);
+	await auth.mintToken("acme-corp/widgets");
+	assert.deepEqual(calls[0].repositoryNames, ["widgets"]);
+	assert.equal(calls[0].type, "installation");
+});
+
+test("app missing config (no installationId) is a config error before any network call", async () => {
+	await assert.rejects(
+		() =>
+			makeGitHubAuth(
+				{ source: "app", appId: "123", privateKeyPath: "/keys/app.pem" },
+				{ Octokit: FakeOctokit(APP_ROUTES), createAppAuth: fakeCreateAppAuth({ result: {}, calls: [] }), readFile: async () => "PEM" },
+			),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("app unreadable PEM is a config error", async () => {
+	const enoent = Object.assign(new Error("no such file"), { code: "ENOENT" });
+	await assert.rejects(
+		() =>
+			makeGitHubAuth(
+				{ source: "app", appId: "123", installationId: "456", privateKeyPath: "/nope.pem" },
+				{
+					Octokit: FakeOctokit(APP_ROUTES),
+					createAppAuth: fakeCreateAppAuth({ result: {}, calls: [] }),
+					readFile: async () => {
+						throw enoent;
+					},
+				},
+			),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("app mint 503 is a retryable InfraRetry", async () => {
+	const auth = await appAuthThrowing(httpError(503));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+});
+
+test("app mint 429 is a retryable InfraRetry", async () => {
+	const auth = await appAuthThrowing(httpError(429));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+});
+
+test("app mint 403 + retry-after (secondary rate limit) is a retryable InfraRetry", async () => {
+	const auth = await appAuthThrowing(httpError(403, { response: { headers: { "retry-after": "60" } } }));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+});
+
+test("app mint network fault (ENOTFOUND, no status) is a retryable InfraRetry", async () => {
+	const auth = await appAuthThrowing(Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+});
+
+test("app mint 401 (bad credentials) is a deterministic config error", async () => {
+	const auth = await appAuthThrowing(httpError(401));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchConfig === true);
+});
+
+test("app mint 404 (unknown installation) is a deterministic config error", async () => {
+	const auth = await appAuthThrowing(httpError(404));
+	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchConfig === true);
+});
+
+/** Build an app auth whose mint call throws `error` (construction still succeeds via canned routes). */
+async function appAuthThrowing(error) {
+	return makeGitHubAuth(
+		{ source: "app", appId: "123", installationId: "456", privateKeyPath: "/keys/app.pem" },
+		{
+			Octokit: FakeOctokit(APP_ROUTES),
+			createAppAuth: fakeCreateAppAuth({ error, calls: [] }),
+			readFile: async () => "PEM",
+		},
+	);
+}
+
+// -- source validation ---------------------------------------------------------------------------
+
+test("unknown source is a config error", async () => {
+	await assert.rejects(
+		() => makeGitHubAuth({ source: "oauth" }, {}),
+		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("missing source is a config error", async () => {
+	await assert.rejects(
+		() => makeGitHubAuth({}, {}),
+		(e) => e.piDispatchConfig === true,
+	);
+});

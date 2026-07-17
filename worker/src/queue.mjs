@@ -1,8 +1,8 @@
 import { Queue } from "bullmq";
-import { localJobId } from "./job-id.mjs";
+import { localJobId, deliveryJobId } from "./job-id.mjs";
 
 export const QUEUE = "pi-jobs";
-export { localJobId };
+export { localJobId, deliveryJobId };
 
 export function makeQueue(connection) {
 	return new Queue(QUEUE, { connection });
@@ -25,6 +25,36 @@ export async function enqueueLocalJob(queue, { folder, flow, task, provider, mod
 		backoff: { type: "exponential", delay: 60_000 },
 		removeOnComplete: { age: 24 * 3600 },
 		removeOnFail: { age: 7 * 24 * 3600 },
+	});
+	return jobId;
+}
+
+// Coalesces rapid re-label spam; the GUID jobId + 31d retention handle exact redelivery, so this
+// window only needs to absorb burst re-labels, not the full redelivery window.
+const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Enqueue a GitHub-triggered job. Returns the jobId. The data shape is what prepare/runJob consumes
+ * for the github kind. No `sha` field: the commit is resolved fresh in prepare (C1), so baking a
+ * possibly-stale sha here would only race the branch head.
+ *
+ * Two dedup layers, ADDITIVE and independent:
+ *   - `jobId` (the delivery GUID) is exact-per-delivery: a redelivered webhook resolves to the same
+ *     id and BullMQ's `EXISTS jobId` rejects it -- REQ-DEDUP-BY-DELIVERY-GUID.
+ *   - `deduplication` keys on `repo#issue:flow` for SEMANTIC_WINDOW_MS: distinct GUIDs from rapid
+ *     re-labels of the same issue coalesce to one active job. It coexists with jobId; it does not
+ *     replace it.
+ */
+export async function enqueueGitHubJob(queue, { repo, issueNumber, flow, title, body, trigger, provider, model, maxTurns }) {
+	const jobId = deliveryJobId(trigger.deliveryId);
+	const data = { kind: "github", repo, issueNumber, flow, title, body, trigger, provider, model, maxTurns };
+	await queue.add("github", data, {
+		jobId,
+		deduplication: { id: `${repo}#${issueNumber}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
+		attempts: 2,
+		backoff: { type: "exponential", delay: 60_000 },
+		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above
+		removeOnFail: { age: 31 * 24 * 3600 },
 	});
 	return jobId;
 }

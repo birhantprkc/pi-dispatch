@@ -1,0 +1,176 @@
+/**
+ * GitHub authentication for the worker: mint a per-job scoped token and resolve the harness's own
+ * identity ONCE at construction. Three sources -- a user PAT, the `gh` CLI, or a GitHub App -- each
+ * yielding the same `{ mintToken, selfId, source }` shape so the processor never branches on source.
+ *
+ * CONST-TOKEN-SCOPED-PER-JOB: the App path mints one installation token per job, scoped to the one
+ * repo, expiring in an hour. That expiry IS the blast-radius bound for an exfiltrated environment.
+ *
+ * Money-hole invariant: `mintToken` NEVER returns "" / null. `env-allowlist.mjs` forwards the token
+ * as `GITHUB_TOKEN` only when truthy (`if (githubToken)`), so an empty token becomes an ABSENT
+ * variable -- a silent anonymous run that still spends provider money. Every mint path routes through
+ * `requireToken`, which throws `configError` on an empty/whitespace token instead of handing it out.
+ *
+ * All side-effecting collaborators are INJECTED (Octokit, createAppAuth, execFile, readFile, env),
+ * each defaulting to the real import -- the budget.mjs / identity.mjs DI convention -- so the whole
+ * module is testable offline with no GitHub, no `gh` binary, and no filesystem.
+ */
+
+import { execFile as realExecFile } from "node:child_process";
+import { readFile as realReadFile } from "node:fs/promises";
+import { promisify } from "node:util";
+import { createAppAuth as realCreateAppAuth } from "@octokit/auth-app";
+import { Octokit as RealOctokit } from "@octokit/rest";
+import { configError } from "./config.mjs";
+import { resolveSelfId } from "./identity.mjs";
+import { InfraRetry } from "./processor.mjs";
+
+/**
+ * Build the auth surface for `cfg = { source, patVar?, appId?, installationId?, privateKeyPath? }`.
+ *
+ * Returns `{ mintToken, selfId, source }`:
+ *   - `mintToken(repo)` -> a non-empty token string (rejects, never returns empty).
+ *   - `selfId` -> the acting identity's integer user id (resolved once here, for the bot-loop guard).
+ *   - `source` -> the configured source, echoed back.
+ *
+ * Fails CLOSED at construction: an empty PAT, an unreadable PEM, a logged-out `gh`, or an
+ * unresolvable identity throws before returning, so a misconfigured worker refuses to boot.
+ */
+export async function makeGitHubAuth(cfg, deps = {}) {
+	const {
+		Octokit = RealOctokit,
+		createAppAuth = realCreateAppAuth,
+		execFile = realExecFile,
+		readFile = realReadFile,
+		env = process.env,
+	} = deps;
+
+	const source = cfg?.source;
+
+	if (source === "pat") {
+		const patVar = cfg.patVar ?? "GITHUB_PAT";
+		const token = requireToken(env[patVar], patVar);
+		const octokit = new Octokit({ auth: token });
+		const selfId = await resolveSelfId({ source: "pat", octokit });
+		const mintToken = async () => requireToken(token, patVar);
+		return { mintToken, selfId, source };
+	}
+
+	if (source === "gh") {
+		const execFileAsync = promisify(execFile);
+		const ghToken = () => runGhAuthToken(execFileAsync);
+		// Resolve identity from a token minted once here; each job mints its own below.
+		const octokit = new Octokit({ auth: await ghToken() });
+		const selfId = await resolveSelfId({ source: "gh", octokit });
+		const mintToken = async () => ghToken();
+		return { mintToken, selfId, source };
+	}
+
+	if (source === "app") {
+		if (!cfg.appId || !cfg.installationId || !cfg.privateKeyPath) {
+			throw configError(
+				"app auth requires appId, installationId, and privateKeyPath (see .env.example)",
+			);
+		}
+		const privateKey = await readPem(readFile, cfg.privateKeyPath);
+		const auth = { appId: cfg.appId, privateKey, installationId: cfg.installationId };
+
+		// App-JWT client: resolveSelfId's app path reads GET /app then GET /users/{slug}[bot].
+		const octokit = new Octokit({ authStrategy: createAppAuth, auth });
+		const selfId = await resolveSelfId({ source: "app", octokit });
+
+		const mintToken = async (repo) => {
+			const repositoryNames = [repoNameOf(repo)]; // scope to the ONE repo; owner stripped
+			let minted;
+			try {
+				const appAuth = createAppAuth(auth);
+				minted = await appAuth({ type: "installation", repositoryNames });
+			} catch (error) {
+				throw classifyAppMintError(error);
+			}
+			return requireToken(minted?.token, "app installation token");
+		};
+		return { mintToken, selfId, source };
+	}
+
+	throw configError(`makeGitHubAuth: unknown or missing source: ${JSON.stringify(source)}`);
+}
+
+/**
+ * Enforce the money-hole invariant: return a trimmed non-empty token, or throw `configError`.
+ * Handing back "" would let `env-allowlist.mjs` drop `GITHUB_TOKEN` entirely and run anonymously.
+ */
+function requireToken(raw, what) {
+	const token = (raw ?? "").trim();
+	if (!token) {
+		throw configError(
+			`${what}: empty token -- refusing to run (an absent GITHUB_TOKEN runs anonymously on paid infra)`,
+		);
+	}
+	return token;
+}
+
+/** Run `gh auth token` (array args, no shell) and return the trimmed token, or throw configError. */
+async function runGhAuthToken(execFileAsync) {
+	let stdout;
+	try {
+		({ stdout } = await execFileAsync("gh", ["auth", "token"]));
+	} catch (error) {
+		// ENOENT (binary absent) or a non-zero exit (logged out / broken) -- both deterministic.
+		const detail = error?.code ?? error?.message ?? "unknown";
+		throw configError(`\`gh auth token\` failed (${detail}); is the gh CLI installed and logged in?`);
+	}
+	// Logged-out gh can exit 0 with empty stdout; an empty token is the money hole, so refuse it.
+	return requireToken(stdout, "gh auth token");
+}
+
+/** Read a PEM file as UTF-8, throwing configError on an unreadable or empty file. */
+async function readPem(readFile, path) {
+	let pem;
+	try {
+		pem = await readFile(path, "utf8");
+	} catch (error) {
+		throw configError(`could not read private key at ${path}: ${error?.code ?? error?.message ?? "unknown"}`);
+	}
+	if (!pem || !pem.trim()) {
+		throw configError(`private key at ${path} is empty`);
+	}
+	return pem;
+}
+
+/** `"owner/name"` -> `"name"`. The installation token is scoped by repo NAME, not `owner/name`. */
+function repoNameOf(repo) {
+	const name = String(repo ?? "").split("/").pop()?.trim() ?? "";
+	if (!name) {
+		throw configError(`app token mint: invalid repo, expected "owner/name", got ${JSON.stringify(repo)}`);
+	}
+	return name;
+}
+
+/**
+ * Map an octokit/auth-app rejection to the retry-vs-config distinction the queue depends on.
+ * Retryable (InfraRetry): 429, 403 + Retry-After (secondary rate limit), 5xx, and status-less
+ * network faults (ENOTFOUND/ECONNRESET/ETIMEDOUT). Deterministic (configError): 401 bad
+ * credentials, 404 unknown installation, and any other 4xx. Collapsing all 4xx to config would
+ * turn a transient rate-limit into a permanent failure, so the classes are kept disjoint.
+ */
+function classifyAppMintError(error) {
+	const status = typeof error?.status === "number" ? error.status : undefined;
+	const retryAfter = error?.response?.headers?.["retry-after"];
+
+	if (status === 401) return configError("app token mint refused: bad app credentials (401)");
+	if (status === 404) return configError("app token mint refused: unknown installation (404)");
+	if (status === 429) return new InfraRetry("app token mint: rate limited (429)");
+	if (status === 403 && retryAfter !== undefined) {
+		return new InfraRetry("app token mint: secondary rate limit (403 + retry-after)");
+	}
+	if (status !== undefined && status >= 500) {
+		return new InfraRetry(`app token mint: upstream error (${status})`);
+	}
+	if (status !== undefined) {
+		return configError(`app token mint failed (${status}): ${error?.message ?? "unknown"}`);
+	}
+	// No HTTP status -> network-level fault. Retry per INT-RUNNER-EXIT-CODE-PROTOCOL.
+	const detail = error?.code ? `${error.code}: ` : "";
+	return new InfraRetry(`app token mint: network fault: ${detail}${error?.message ?? "unknown"}`);
+}
