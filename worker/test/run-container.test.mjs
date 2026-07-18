@@ -47,13 +47,66 @@ function fakeSpawnAbortedThenClose(ac, exitCode) {
 	};
 }
 
+/** A `docker` child that streams stdout `data` chunks BEFORE the `close`, so a test can exercise the
+ *  tee (onOutput + sink.write) and then observe the resolved result. Chunks arrive in array order. */
+function fakeSpawnWithData(recorder, { chunks = [], exitCode = 0 } = {}) {
+	return (cmd, args) => {
+		recorder.cmd = cmd;
+		recorder.args = args;
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		queueMicrotask(() => {
+			for (const chunk of chunks) child.stdout.emit("data", chunk);
+			child.emit("close", exitCode);
+		});
+		return child;
+	};
+}
+
+/** A `docker` child that fails to launch: it emits `error` and NEVER `close`, modelling docker-not-found
+ *  / daemon-down. Drives the `container-never-started` InfraRetry path and its best-effort sink teardown. */
+function fakeSpawnError(recorder, err = new Error("spawn docker ENOENT")) {
+	return (cmd, args) => {
+		recorder.cmd = cmd;
+		recorder.args = args;
+		const child = new EventEmitter();
+		child.stdout = new EventEmitter();
+		child.stderr = new EventEmitter();
+		queueMicrotask(() => child.emit("error", err));
+		return child;
+	};
+}
+
+/** A recording fake for `openJobLog`: captures every `write` chunk and counts `close` calls, and its
+ *  `close` resolves `{ turns }`. `closeDelay` defers the resolve past a `setImmediate`, so a test can
+ *  prove `resolve` awaits `close` -- a non-awaited close would leave `turns` at its null default. */
+function makeRecordingSink({ turns = null, closeDelay = false } = {}) {
+	const writes = [];
+	let closeCalls = 0;
+	return {
+		writes,
+		get closeCalls() {
+			return closeCalls;
+		},
+		write(chunk) {
+			writes.push(chunk);
+		},
+		close: async () => {
+			closeCalls += 1;
+			if (closeDelay) await new Promise((resolve) => setImmediate(resolve));
+			return { turns };
+		},
+	};
+}
+
 test("an already-aborted signal returns {code:137, aborted:true} and NEVER spawns docker", { skip }, async () => {
 	const rec = {};
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn(rec) });
 	const ac = new AbortController();
 	ac.abort();
 	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: ac.signal });
-	assert.deepEqual(result, { code: 137, aborted: true });
+	assert.deepEqual(result, { code: 137, aborted: true, turns: null });
 	assert.equal(rec.cmd, undefined, "no container may start once the timeout has fired");
 });
 
@@ -73,20 +126,20 @@ test("launches docker with the isolation argv and returns the container's exit c
 test("exit 1 (infra) is returned, not thrown -- it is retryable, not a spawn error", { skip }, async () => {
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn({}, 1) });
 	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
-	assert.deepEqual(result, { code: 1, aborted: false });
+	assert.deepEqual(result, { code: 1, aborted: false, turns: null });
 });
 
 test("close 137 while the worker aborted => {code:137, aborted:true} (our docker stop is POLICY)", { skip }, async () => {
 	const ac = new AbortController();
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawnAbortedThenClose(ac, 137) });
 	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: ac.signal });
-	assert.deepEqual(result, { code: 137, aborted: true });
+	assert.deepEqual(result, { code: 137, aborted: true, turns: null });
 });
 
 test("close 137 with a signal that never aborted => {code:137, aborted:false} (kernel OOM stays infra)", { skip }, async () => {
 	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, spawnFn: fakeSpawn({}, 137) });
 	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
-	assert.deepEqual(result, { code: 137, aborted: false });
+	assert.deepEqual(result, { code: 137, aborted: false, turns: null });
 });
 
 test("refuses before spawning if the provider is unconfigured (pre-spend guard)", { skip }, async () => {
@@ -97,4 +150,70 @@ test("refuses before spawning if the provider is unconfigured (pre-spend guard)"
 		(e) => e.piDispatchConfig === true,
 	);
 	assert.equal(rec.cmd, undefined, "no container for an unconfigured provider");
+});
+
+test("tee: every chunk reaches BOTH onOutput and the sink, in order", { skip }, async () => {
+	const outputs = [];
+	const sink = makeRecordingSink();
+	const runContainer = mod.makeRunContainer({
+		image: "pi-job:x",
+		hostEnv: HOST,
+		onOutput: (c) => outputs.push(c),
+		openJobLog: () => sink,
+		spawnFn: fakeSpawnWithData({}, { chunks: ["one", "two"], exitCode: 0 }),
+	});
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.deepEqual(outputs, ["one", "two"], "onOutput sees both chunks in order");
+	assert.deepEqual(sink.writes, ["one", "two"], "the sink tee sees both chunks in order");
+	assert.equal(result.code, 0);
+});
+
+test("flush-before-resolve: resolve awaits a delayed sink.close and carries its turns", { skip }, async () => {
+	const sink = makeRecordingSink({ turns: 7, closeDelay: true });
+	const runContainer = mod.makeRunContainer({
+		image: "pi-job:x",
+		hostEnv: HOST,
+		onOutput: () => {},
+		openJobLog: () => sink,
+		spawnFn: fakeSpawn({}, 0),
+	});
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.equal(result.turns, 7, "turns from a close that resolves only after setImmediate proves resolve awaited it");
+	assert.equal(result.code, 0);
+	assert.equal(sink.closeCalls, 1, "close is invoked exactly once");
+});
+
+test("hostile sink: a throwing write and a rejecting close neither hang nor crash the run", { skip, timeout: 5000 }, async () => {
+	const runContainer = mod.makeRunContainer({
+		image: "pi-job:x",
+		hostEnv: HOST,
+		onOutput: () => {},
+		openJobLog: () => ({
+			write: () => {
+				throw new Error("boom");
+			},
+			close: async () => {
+				throw new Error("boom2");
+			},
+		}),
+		spawnFn: fakeSpawnWithData({}, { chunks: ["x"], exitCode: 0 }),
+	});
+	const result = await runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	assert.deepEqual(result, { code: 0, aborted: false, turns: null }, "the swallowed sink faults leave code/aborted intact and turns null");
+});
+
+test("never-started: the sink is still closed (best-effort teardown) and the reject reason is unchanged", { skip }, async () => {
+	const sink = makeRecordingSink();
+	const runContainer = mod.makeRunContainer({
+		image: "pi-job:x",
+		hostEnv: HOST,
+		onOutput: () => {},
+		openJobLog: () => sink,
+		spawnFn: fakeSpawnError({}),
+	});
+	await assert.rejects(
+		() => runContainer({ job: JOB, prepared: PREPARED, name: "j1", signal: new AbortController().signal }),
+		(e) => e.reason === "container-never-started",
+	);
+	assert.equal(sink.closeCalls, 1, "the never-started path still closes the sink");
 });
