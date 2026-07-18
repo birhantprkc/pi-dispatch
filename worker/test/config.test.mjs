@@ -14,6 +14,47 @@ test("loads conservative defaults with an empty-ish env", () => {
 	assert.ok(c.jobsDir.length > 0);
 	assert.equal(c.schedulesFile, null);
 	assert.equal(c.schedulerStallMax, 2);
+	assert.ok(c.logsDir.endsWith("/pi-dispatch/logs"), c.logsDir);
+	assert.equal(c.captureJobLogs, false);
+	assert.equal(c.logRetentionDays, 30);
+});
+
+test("run-history env overrides logsDir, captureJobLogs, and logRetentionDays", () => {
+	const c = loadConfig({ PI_LOGS_DIR: "/x", PI_CAPTURE_JOB_LOGS: "1", PI_LOG_RETENTION_DAYS: "7" });
+	assert.equal(c.logsDir, "/x");
+	assert.equal(c.captureJobLogs, true);
+	assert.equal(c.logRetentionDays, 7);
+});
+
+test("logsDir uses || so an empty PI_LOGS_DIR falls back to the default", () => {
+	const c = loadConfig({ PI_LOGS_DIR: "" });
+	assert.ok(c.logsDir.endsWith("/pi-dispatch/logs"), c.logsDir);
+});
+
+test("captureJobLogs is strict: only \"1\" enables it, everything else stays off", () => {
+	for (const off of ["0", "true", "yes", "", undefined]) {
+		const c = loadConfig(off === undefined ? {} : { PI_CAPTURE_JOB_LOGS: off });
+		assert.equal(c.captureJobLogs, false, `PI_CAPTURE_JOB_LOGS=${JSON.stringify(off)}`);
+	}
+});
+
+test("logRetentionDays accepts 0 (keep forever)", () => {
+	const c = loadConfig({ PI_LOG_RETENTION_DAYS: "0" });
+	assert.equal(c.logRetentionDays, 0);
+});
+
+test("logRetentionDays rejects negative and non-integer values as config errors", () => {
+	for (const bad of ["-1", "abc", "1.5"]) {
+		assert.throws(
+			() => loadConfig({ PI_LOG_RETENTION_DAYS: bad }),
+			(e) => e.piDispatchConfig === true,
+			`PI_LOG_RETENTION_DAYS=${bad}`,
+		);
+	}
+});
+
+test("positiveInt is unchanged: a spend var of 0 still throws", () => {
+	assert.throws(() => loadConfig({ PI_DAILY_CAP: "0" }), (e) => e.piDispatchConfig === true);
 });
 
 test("env overrides every field", () => {
