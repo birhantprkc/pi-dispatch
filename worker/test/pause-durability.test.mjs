@@ -7,6 +7,11 @@ import { parseConnection } from "../src/connection.mjs";
 // throwaway queue name so a run never disturbs a live "pi-jobs" queue -- the durability SEMANTICS
 // are what we exercise here; the real CLI's fixed "pi-jobs" name is covered by cli-control.test.mjs.
 const url = process.env.VALKEY_TEST_URL;
+// A skipped assertion is an UNVERIFIED assertion. In CI, PI_DISPATCH_REQUIRE_WORKER_TESTS=1 turns a
+// missing VALKEY_TEST_URL into a hard failure so the durability guarantee can never silently no-op.
+if (!url && process.env.PI_DISPATCH_REQUIRE_WORKER_TESTS === "1") {
+	throw new Error("pause-durability REQUIRES VALKEY_TEST_URL when PI_DISPATCH_REQUIRE_WORKER_TESTS=1");
+}
 const skip = url ? false : "needs VALKEY_TEST_URL";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
