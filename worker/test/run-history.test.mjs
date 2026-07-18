@@ -1,0 +1,560 @@
+import assert from "node:assert/strict";
+import { basename, join } from "node:path";
+import { test } from "node:test";
+import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
+
+/**
+ * A fake writable that records chunks and lets a test drive `finish`/`error` timing.
+ * `emitOn` controls what `end()` emits: "finish" (normal flush), "error" (broken flush), or "none"
+ * (never settles -- exercises the bounded close timeout). `writeThrows` makes `write` throw
+ * synchronously; `emitError` makes `write` also schedule an async 'error' event.
+ */
+function makeFakeStream({ emitOn = "finish", writeThrows = false, emitError = false } = {}) {
+	const listeners = new Map();
+	const chunks = [];
+	const stream = {
+		chunks,
+		writeCalls: 0,
+		on(event, cb) {
+			if (!listeners.has(event)) listeners.set(event, []);
+			listeners.get(event).push(cb);
+			return stream;
+		},
+		once(event, cb) {
+			return stream.on(event, cb);
+		},
+		emit(event, ...args) {
+			for (const cb of [...(listeners.get(event) ?? [])]) cb(...args);
+		},
+		write(chunk) {
+			stream.writeCalls++;
+			chunks.push(chunk);
+			if (emitError) queueMicrotask(() => stream.emit("error", new Error("write error")));
+			if (writeThrows) throw new Error("write threw");
+		},
+		end() {
+			if (emitOn === "finish") queueMicrotask(() => stream.emit("finish"));
+			else if (emitOn === "error") queueMicrotask(() => stream.emit("error", new Error("end error")));
+			// emitOn === "none": never settles -- close must fall back to its timeout.
+		},
+	};
+	return stream;
+}
+
+/**
+ * A fake fs exposing only what the sink, the record writer, and the log reaper touch, with call
+ * counters for the assertions. `writes` records every `writeFileSync({path, data})`; `writeThrows`
+ * makes it throw so the writer's never-throw posture can be exercised.
+ *
+ * Reaper surface: `readdirNames` is the directory listing `readdirSync` returns; `readdirThrows` makes
+ * it throw (first-boot ENOENT). `stats` maps a filename to `{ isFile, mtimeMs }` -- `statSync` looks the
+ * entry up by `basename(path)` and returns a real `{ isFile: () => bool, mtimeMs }`. `statThrowsFor` and
+ * `unlinkThrowsFor` are name lists that make `statSync`/`unlinkSync` throw for those specific entries.
+ * `calls.readdir` counts listings and `unlinked` records every unlinked path.
+ */
+function makeFakeFs({
+	stream,
+	mkdirThrows = false,
+	writeThrows = false,
+	readdirNames = [],
+	readdirThrows = false,
+	stats = {},
+	statThrowsFor = [],
+	unlinkThrowsFor = [],
+} = {}) {
+	const calls = { mkdir: 0, createWriteStream: 0, paths: [], readdir: 0, stat: [] };
+	const writes = [];
+	const unlinked = [];
+	return {
+		calls,
+		writes,
+		unlinked,
+		mkdirSync() {
+			calls.mkdir++;
+			if (mkdirThrows) throw new Error("mkdir failed");
+		},
+		createWriteStream(path) {
+			calls.createWriteStream++;
+			calls.paths.push(path);
+			return stream;
+		},
+		writeFileSync(path, data) {
+			if (writeThrows) throw new Error("writeFileSync failed");
+			writes.push({ path, data });
+		},
+		readdirSync() {
+			calls.readdir++;
+			if (readdirThrows) throw new Error("ENOENT: no such file or directory");
+			return readdirNames;
+		},
+		statSync(path) {
+			calls.stat.push(path);
+			const name = basename(path);
+			if (statThrowsFor.includes(name)) throw new Error(`stat failed: ${name}`);
+			const entry = stats[name] ?? { isFile: true, mtimeMs: 0 };
+			return { isFile: () => entry.isFile, mtimeMs: entry.mtimeMs };
+		},
+		unlinkSync(path) {
+			const name = basename(path);
+			if (unlinkThrowsFor.includes(name)) throw new Error(`unlink failed: ${name}`);
+			unlinked.push(path);
+		},
+	};
+}
+
+test("sanitizeJobId strips colons from BullMQ scheduled ids", () => {
+	assert.equal(sanitizeJobId("repeat:a:1"), "repeat_a_1");
+});
+
+test("sanitizeJobId leaves an already-legal id unchanged", () => {
+	assert.equal(sanitizeJobId("gh-abc-123"), "gh-abc-123");
+});
+
+test("sanitizeJobId maps empty/nullish to a fixed sentinel", () => {
+	assert.equal(sanitizeJobId(""), "unknown-job");
+	assert.equal(sanitizeJobId(undefined), "unknown-job");
+	assert.equal(sanitizeJobId(null), "unknown-job");
+});
+
+test("sanitizeJobId collapses path separators to underscore", () => {
+	assert.equal(sanitizeJobId("a/b"), "a_b");
+	assert.equal(sanitizeJobId("a\\b"), "a_b");
+});
+
+test("parseExitTurns reads turns off the success exit line", () => {
+	assert.equal(parseExitTurns('{"event":"exit","code":0,"turns":7}\n'), 7);
+});
+
+test("parseExitTurns ignores pi_auto_retry noise before the exit line", () => {
+	const text = [
+		'{"event":"pi_auto_retry","attempt":1,"maxAttempts":3}',
+		'{"event":"pi_auto_retry","attempt":2,"maxAttempts":3}',
+		'{"event":"exit","code":0,"turns":12}',
+	].join("\n");
+	assert.equal(parseExitTurns(text), 12);
+});
+
+test("parseExitTurns returns null for the catch-path exit line that omits turns", () => {
+	assert.equal(parseExitTurns('{"event":"exit","code":2,"reason":"config"}'), null);
+});
+
+test("parseExitTurns skips non-JSON noise and finds the exit line", () => {
+	assert.equal(parseExitTurns('garbage not json\n{"event":"exit","turns":3}'), 3);
+});
+
+test("parseExitTurns returns null on a partial/truncated final line", () => {
+	assert.equal(parseExitTurns('{"event":"exi'), null);
+});
+
+test("parseExitTurns returns the LAST exit line's turns when two are present", () => {
+	assert.equal(parseExitTurns('{"event":"exit","turns":2}\n{"event":"exit","turns":9}'), 9);
+});
+
+test("parseExitTurns returns null for empty input", () => {
+	assert.equal(parseExitTurns(""), null);
+});
+
+test("parseExitTurns never throws across the full corpus", () => {
+	const inputs = [
+		'{"event":"exit","code":0,"turns":7}\n',
+		'{"event":"exit","code":2,"reason":"config"}',
+		'garbage not json\n{"event":"exit","turns":3}',
+		'{"event":"exi',
+		'{"event":"exit","turns":2}\n{"event":"exit","turns":9}',
+		"",
+		undefined,
+		null,
+		42,
+		"null",
+		"123",
+	];
+	for (const input of inputs) {
+		assert.doesNotThrow(() => parseExitTurns(input), `input=${JSON.stringify(input)}`);
+	}
+});
+
+test("buildRecord for a github job keeps id-only fields and admits no PII", () => {
+	const job = {
+		id: "gh-x",
+		attemptsMade: 0,
+		name: "github",
+		data: { kind: "github", repo: "o/r", issueNumber: 5, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+	};
+	const record = buildRecord({
+		job,
+		result: { outcome: "completed" },
+		startedAt: "2026-07-18T00:00:00.000Z",
+		endedAt: "2026-07-18T00:01:00.000Z",
+	});
+	assert.equal(record.target, "o/r#5");
+	assert.equal(record.outcome, "completed");
+	assert.equal(record.attempt, 0);
+	assert.equal(record.kind, "github");
+	assert.equal(record.flow, "fix");
+	assert.equal(record.turns, null);
+	assert.equal(record.exitCode, null);
+	assert.equal(record.budgetReserved, null);
+	assert.equal(record.reason, null);
+
+	const json = JSON.stringify(record);
+	assert.ok(!json.includes("SECRET_T"), "title must not leak");
+	assert.ok(!json.includes("SECRET_B"), "body must not leak");
+});
+
+test("buildRecord for a local job keeps only the folder basename and no task text", () => {
+	const job = {
+		id: "local-abc",
+		name: "local",
+		data: { kind: "local", folder: "C:/Users/rob/proj", flow: "x", task: "SECRET_TASK" },
+	};
+	const record = buildRecord({
+		job,
+		result: { outcome: "completed" },
+		startedAt: "2026-07-18T00:00:00.000Z",
+		endedAt: "2026-07-18T00:01:00.000Z",
+	});
+	assert.equal(record.target, "local:proj");
+	assert.equal(record.attempt, 0); // attemptsMade absent -> 0
+
+	const json = JSON.stringify(record);
+	assert.ok(!json.includes("SECRET_TASK"), "task must not leak");
+	assert.ok(!json.includes("C:/Users/rob/proj"), "full folder path must not leak");
+	assert.ok(!json.includes("/Users/rob/"), "OS account path must not leak");
+});
+
+test("buildRecord throw-path maps a present error and no result to a failed outcome", () => {
+	const job = { id: "gh-y", attemptsMade: 1, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 9 } };
+	const record = buildRecord({
+		job,
+		error: { reason: "error" },
+		startedAt: "2026-07-18T00:00:00.000Z",
+		endedAt: "2026-07-18T00:00:30.000Z",
+	});
+	assert.equal(record.outcome, "failed");
+	assert.equal(record.reason, "error");
+	assert.equal(record.attempt, 1);
+	assert.equal(record.turns, null);
+});
+
+test("buildRecord throw-path admits no PII for either job kind", () => {
+	const startedAt = "2026-07-18T00:00:00.000Z";
+	const endedAt = "2026-07-18T00:00:30.000Z";
+
+	const githubRecord = buildRecord({
+		job: {
+			id: "gh-err",
+			attemptsMade: 1,
+			name: "github",
+			data: { kind: "github", repo: "o/r", issueNumber: 9, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+		},
+		error: { reason: "error" },
+		startedAt,
+		endedAt,
+	});
+	assert.equal(githubRecord.outcome, "failed");
+	const githubJson = JSON.stringify(githubRecord);
+	assert.ok(!githubJson.includes("SECRET_T"), "github title must not leak on the error branch");
+	assert.ok(!githubJson.includes("SECRET_B"), "github body must not leak on the error branch");
+
+	const localRecord = buildRecord({
+		job: {
+			id: "local-err",
+			attemptsMade: 1,
+			name: "local",
+			data: { kind: "local", folder: "C:/Users/rob/proj", flow: "x", task: "SECRET_TASK" },
+		},
+		error: { reason: "error" },
+		startedAt,
+		endedAt,
+	});
+	assert.equal(localRecord.outcome, "failed");
+	const localJson = JSON.stringify(localRecord);
+	assert.ok(!localJson.includes("SECRET_TASK"), "local task must not leak on the error branch");
+	assert.ok(!localJson.includes("C:/Users/rob/proj"), "full folder path must not leak on the error branch");
+	assert.ok(!localJson.includes("/Users/rob/"), "OS account path must not leak on the error branch");
+});
+
+test("makeLogSink enabled appends chunks in order and returns turns from the exit line", async () => {
+	const stream = makeFakeStream({ emitOn: "finish" });
+	const fs = makeFakeFs({ stream });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: true, fs });
+	const jobLog = openJobLog("gh-1");
+
+	const c1 = Buffer.from('{"event":"start"}\n');
+	const c2 = Buffer.from('{"event":"exit","turns":5}\n');
+	jobLog.write(c1);
+	jobLog.write(c2);
+	const { turns } = await jobLog.close();
+
+	assert.equal(turns, 5);
+	assert.equal(stream.chunks.length, 2);
+	assert.equal(stream.chunks[0].toString(), c1.toString());
+	assert.equal(stream.chunks[1].toString(), c2.toString());
+	assert.equal(fs.calls.createWriteStream, 1); // opened lazily, once per job
+	assert.equal(fs.calls.paths[0], join("/logs", "gh-1.log"));
+});
+
+test("makeLogSink disabled never opens a stream but still returns turns", async () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: false, fs });
+	const jobLog = openJobLog("gh-2");
+
+	jobLog.write(Buffer.from('{"event":"exit","turns":8}\n'));
+	const { turns } = await jobLog.close();
+
+	assert.equal(turns, 8);
+	assert.equal(fs.calls.createWriteStream, 0); // the raw .log is opt-in; nothing opened
+});
+
+test("makeLogSink swallows a stream that throws on write and emits error, still returning turns", async () => {
+	const stream = makeFakeStream({ emitOn: "finish", writeThrows: true, emitError: true });
+	const logs = [];
+	const fs = makeFakeFs({ stream });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: true, fs, log: (event, fields) => logs.push({ event, fields }) });
+	const jobLog = openJobLog("gh-3");
+
+	assert.doesNotThrow(() => jobLog.write(Buffer.from('{"event":"exit","turns":4}\n')));
+	const res = await jobLog.close();
+
+	assert.equal(res.turns, 4);
+	assert.ok(logs.some((l) => l.event === "log_sink_error"), "a swallowed error is reported, not thrown");
+});
+
+test("makeLogSink close resolves within the timeout when finish never fires", async () => {
+	const stream = makeFakeStream({ emitOn: "none" });
+	const fs = makeFakeFs({ stream });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: true, fs });
+	const jobLog = openJobLog("gh-4");
+
+	jobLog.write(Buffer.from('{"event":"exit","turns":2}\n'));
+	const start = Date.now();
+	const { turns } = await jobLog.close({ timeoutMs: 50 });
+	const elapsed = Date.now() - start;
+
+	assert.equal(turns, 2);
+	assert.ok(elapsed < 2000, `close must not hang, resolved in ${elapsed}ms`);
+});
+
+test("makeLogSink bounds the tail: an exit line older than the cap is evicted", async () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: false, fs });
+	const jobLog = openJobLog("gh-5");
+
+	jobLog.write(Buffer.from('{"event":"exit","turns":9}\n')); // early -- must fall out of the tail window
+	const noise = `${"x".repeat(1000)}\n`;
+	for (let i = 0; i < 20; i++) jobLog.write(Buffer.from(noise)); // ~20KB > 8KB cap
+	const { turns } = await jobLog.close();
+
+	assert.equal(turns, null); // the old exit line was dropped -> buffer is bounded
+});
+
+test("makeLogSink bounded tail retains the most recent exit line", async () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: false, fs });
+	const jobLog = openJobLog("gh-6");
+
+	const noise = `${"x".repeat(1000)}\n`;
+	for (let i = 0; i < 20; i++) jobLog.write(Buffer.from(noise));
+	jobLog.write(Buffer.from('{"event":"exit","turns":11}\n')); // last -- stays in the window
+	const { turns } = await jobLog.close();
+
+	assert.equal(turns, 11);
+});
+
+test("makeLogSink never throws from the factory when mkdirSync fails", () => {
+	const logs = [];
+	const fs = makeFakeFs({ stream: makeFakeStream(), mkdirThrows: true });
+	assert.doesNotThrow(() => makeLogSink({ logsDir: "/logs", enabled: true, fs, log: (event, fields) => logs.push({ event, fields }) }));
+	assert.ok(logs.some((l) => l.event === "logs_dir_error"), "a logs-dir failure is reported, not thrown");
+});
+
+test("makeRecordWriter writes one truncating JSON sidecar whose content round-trips the record", () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs });
+	const record = { jobId: "gh-x", target: "o/r#5", outcome: "completed" };
+
+	writeRecord(record);
+
+	assert.equal(fs.writes.length, 1);
+	assert.equal(fs.writes[0].path, join("/logs", "gh-x.json"));
+	assert.deepEqual(JSON.parse(fs.writes[0].data), record);
+});
+
+test("makeRecordWriter sanitizes the job id at the filename boundary only", () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs });
+
+	writeRecord({ jobId: "repeat:a:1", target: "o/r#5", outcome: "completed" });
+
+	assert.equal(basename(fs.writes[0].path), "repeat_a_1.json");
+	// The record body keeps the raw id; only the filename is sanitized.
+	assert.equal(JSON.parse(fs.writes[0].data).jobId, "repeat:a:1");
+});
+
+test("makeRecordWriter swallows an fs failure and logs jobId + reason with no record content", () => {
+	const logs = [];
+	const fs = makeFakeFs({ stream: makeFakeStream(), writeThrows: true });
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs, log: (event, fields) => logs.push({ event, fields }) });
+
+	assert.doesNotThrow(() => writeRecord({ jobId: "gh-x", target: "o/r#5", outcome: "completed" }));
+
+	const failed = logs.find((l) => l.event === "run_record_failed");
+	assert.ok(failed, "an fs failure is reported, not thrown");
+	assert.equal(failed.fields.jobId, "gh-x");
+	assert.equal(typeof failed.fields.reason, "string");
+	const loggedKeys = Object.keys(failed.fields).sort();
+	assert.deepEqual(loggedKeys, ["jobId", "reason"]);
+	const loggedJson = JSON.stringify(failed.fields);
+	assert.ok(!loggedJson.includes("o/r#5"), "target must not leak into the failure log");
+	assert.ok(!loggedJson.includes("completed"), "outcome must not leak into the failure log");
+});
+
+test("makeRecordWriter swallows a JSON.stringify failure and never touches the fs", () => {
+	const logs = [];
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs, log: (event, fields) => logs.push({ event, fields }) });
+	const circular = { jobId: "gh-circ", target: "o/r#5" };
+	circular.self = circular; // JSON.stringify throws on a circular reference
+
+	assert.doesNotThrow(() => writeRecord(circular));
+
+	assert.ok(logs.some((l) => l.event === "run_record_failed"), "a serialize failure is reported, not thrown");
+	assert.equal(fs.writes.length, 0, "no partial write reaches the fs when serialization fails");
+});
+
+test("makeRecordWriter overwrites on a re-run: two same-id writes are truncating writeFileSync, not append", () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs });
+
+	writeRecord({ jobId: "gh-x", target: "o/r#5", outcome: "failed", attempt: 0 });
+	writeRecord({ jobId: "gh-x", target: "o/r#5", outcome: "completed", attempt: 1 });
+
+	assert.equal(fs.writes.length, 2);
+	assert.equal(fs.writes[0].path, fs.writes[1].path); // same job id -> same sidecar, last write wins
+	assert.equal(fs.calls.createWriteStream, 0); // truncating writeFileSync, never an append stream
+	assert.equal(JSON.parse(fs.writes[1].data).outcome, "completed");
+});
+
+// A fixed clock so the reaper's cutoff is deterministic: day 1000, in ms.
+const NOW = 1000 * 86400000;
+
+test("makeLogReaper unlinks files older than the window and keeps newer ones, logging one reaped_log per unlink", () => {
+	const logs = [];
+	const fs = makeFakeFs({
+		stream: makeFakeStream(),
+		readdirNames: ["old.log", "old.json", "new.log", "new.json"],
+		stats: {
+			"old.log": { isFile: true, mtimeMs: 990 * 86400000 }, // < cutoff (993d) -> reaped
+			"old.json": { isFile: true, mtimeMs: 990 * 86400000 },
+			"new.log": { isFile: true, mtimeMs: 999 * 86400000 }, // > cutoff -> kept
+			"new.json": { isFile: true, mtimeMs: 999 * 86400000 },
+		},
+	});
+	const reapLogs = makeLogReaper({
+		logsDir: "/logs",
+		retentionDays: 7,
+		fs,
+		now: () => NOW,
+		log: (event, fields) => logs.push({ event, fields }),
+	});
+
+	assert.doesNotThrow(reapLogs);
+
+	assert.deepEqual(fs.unlinked.sort(), [join("/logs", "old.json"), join("/logs", "old.log")]);
+	const reaped = logs.filter((l) => l.event === "reaped_log").map((l) => l.fields.file).sort();
+	assert.deepEqual(reaped, ["old.json", "old.log"]);
+});
+
+test("makeLogReaper with retentionDays 0 keeps forever: nothing is read or unlinked", () => {
+	const fs = makeFakeFs({
+		stream: makeFakeStream(),
+		readdirNames: ["old.log"],
+		stats: { "old.log": { isFile: true, mtimeMs: 0 } },
+	});
+	const reapLogs = makeLogReaper({ logsDir: "/logs", retentionDays: 0, fs, now: () => NOW });
+
+	reapLogs();
+
+	assert.equal(fs.calls.readdir, 0); // keep-forever sentinel: the directory is never listed
+	assert.equal(fs.unlinked.length, 0);
+});
+
+test("makeLogReaper isolates a per-file failure: one statSync throw does not abort the sweep", () => {
+	const logs = [];
+	const fs = makeFakeFs({
+		stream: makeFakeStream(),
+		readdirNames: ["bad.log", "good.log"],
+		stats: {
+			"good.log": { isFile: true, mtimeMs: 990 * 86400000 },
+		},
+		statThrowsFor: ["bad.log"],
+	});
+	const reapLogs = makeLogReaper({
+		logsDir: "/logs",
+		retentionDays: 7,
+		fs,
+		now: () => NOW,
+		log: (event, fields) => logs.push({ event, fields }),
+	});
+
+	assert.doesNotThrow(reapLogs);
+
+	assert.deepEqual(fs.unlinked, [join("/logs", "good.log")]); // the sweep continued past the bad entry
+	const skipped = logs.find((l) => l.event === "log_reaper_skipped");
+	assert.equal(skipped.fields.file, "bad.log");
+});
+
+test("makeLogReaper does not throw and logs log_reaper_skipped when the logs dir is missing", () => {
+	const logs = [];
+	const fs = makeFakeFs({ stream: makeFakeStream(), readdirThrows: true });
+	const reapLogs = makeLogReaper({
+		logsDir: "/logs",
+		retentionDays: 7,
+		fs,
+		now: () => NOW,
+		log: (event, fields) => logs.push({ event, fields }),
+	});
+
+	assert.doesNotThrow(reapLogs);
+
+	assert.equal(fs.unlinked.length, 0);
+	assert.ok(logs.some((l) => l.event === "log_reaper_skipped"), "a missing dir is reported, not thrown");
+});
+
+test("makeLogReaper considers only .log/.json: other extensions are never statted or unlinked", () => {
+	const fs = makeFakeFs({
+		stream: makeFakeStream(),
+		readdirNames: ["notes.txt", "worker.out", "keep.log"],
+		stats: { "keep.log": { isFile: true, mtimeMs: 990 * 86400000 } },
+	});
+	const reapLogs = makeLogReaper({ logsDir: "/logs", retentionDays: 7, fs, now: () => NOW });
+
+	reapLogs();
+
+	const statted = fs.calls.stat.map((p) => basename(p));
+	assert.ok(!statted.includes("notes.txt"), "a non-matching extension is never statted");
+	assert.ok(!statted.includes("worker.out"), "a non-matching extension is never statted");
+	assert.deepEqual(fs.unlinked, [join("/logs", "keep.log")]); // only the .log was swept
+});
+
+test("makeLogReaper skips a directory entry: an aged name whose isFile() is false is not unlinked", () => {
+	const logs = [];
+	const fs = makeFakeFs({
+		stream: makeFakeStream(),
+		readdirNames: ["dir.log"],
+		stats: { "dir.log": { isFile: false, mtimeMs: 990 * 86400000 } }, // aged, but a directory
+	});
+	const reapLogs = makeLogReaper({
+		logsDir: "/logs",
+		retentionDays: 7,
+		fs,
+		now: () => NOW,
+		log: (event, fields) => logs.push({ event, fields }),
+	});
+
+	reapLogs();
+
+	assert.equal(fs.calls.stat.length, 1); // it was statted...
+	assert.equal(fs.unlinked.length, 0); // ...but the isFile() guard skipped the unlink
+	assert.ok(!logs.some((l) => l.event === "reaped_log"), "a directory is never reaped");
+});
