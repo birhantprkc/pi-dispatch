@@ -229,6 +229,40 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   completion or failure line carrying the job id and outcome; during the run, the container's output is
   visible there.
 
+## REQ-CRON-SCHEDULED-JOBS
+
+- **Statement**: Scheduled jobs shall be driven by BullMQ **Job Schedulers** (`upsertJobScheduler`), one
+  per configured schedule. A schedule is a **trigger, not a job kind**: on each tick it emits an ordinary
+  `kind:"local"` job that flows through the **same** processor as an interactively-triggered local job.
+- **Why**: An unattended recurring trigger spends real money against a paid provider with nobody watching,
+  so every failure mode of the scheduler is a money-or-silence failure. Job Schedulers are a Redis-resident
+  object (survives worker and Redis-under-AOF restart) and give no-backfill and structural no-overlap for
+  free — reimplementing those is the four-mechanism drowning `DES-CRON-VIA-BULLMQ-SCHEDULER` refused. The
+  scheduler is also the one path that **bypasses `maxStalledCount`** (`CONST-RETRY-INFRA-ONLY`), so the
+  stall backstop must be rebuilt explicitly; and because it fires while nobody watches, a `-10`/`-11`
+  silent no-op or an in-tick retry storm would be invisible without the loud-surfacing and no-retry rules
+  below.
+- **Traces to**: `DES-CRON-VIA-BULLMQ-SCHEDULER`, `CONST-RETRY-INFRA-ONLY`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `REQ-RUNNER-TURN-BUDGET`
+- **Acceptance**:
+  - Given a config with N schedules, when the worker loads them, then it calls `upsertJobScheduler` once
+    per schedule; a `-10` (`SchedulerJobIdCollision`) or `-11` (`SchedulerJobSlotsBusy`) result — whether
+    thrown or returned — is surfaced loudly (logged and the load fails), never swallowed into a silent
+    no-op.
+  - Given a scheduler whose per-scheduler stall counter exceeds `PI_SCHEDULER_STALL_MAX`, when the next
+    stall is observed, then the scheduler is torn down via `removeJobScheduler` — the explicit backstop for
+    the `maxStalledCount` carve-out.
+  - Given a worker that was down across one or more due ticks, when it restarts, then exactly one job is
+    emitted (no backfill) and no second job for a schedule is created while that schedule's prior job is
+    still processing (no overlap).
+  - Given a scheduler resident in Redis but absent from the current config, when the worker performs its
+    startup reconcile, then the orphaned scheduler is removed.
+  - Given a schedule entry with `kind:"github"`, when the config loads, then the entry is rejected — a
+    scheduled trigger supplies no webhook delivery, issue number, title, or body, so only `kind:"local"`
+    is admissible.
+  - Given a scheduled occurrence that fails (including an infra fault), when the tick concludes, then the
+    occurrence is **not** retried within the tick — the schedule's own cadence is the retry.
+
 ---
 
 ## Notes (not requirements)
@@ -250,4 +284,5 @@ wait-list working as designed, not a failure — see `README.md`.
 |---|---|
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
 | 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
+| 2026-07-17 | Added REQ-CRON-SCHEDULED-JOBS, formalizing the implemented BullMQ Job Scheduler cron path: `local`-only triggers, loud `-10`/`-11` handling, per-scheduler stall teardown, startup orphan reconcile, and no in-tick retry. |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |

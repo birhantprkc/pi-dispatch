@@ -12,6 +12,8 @@ test("loads conservative defaults with an empty-ish env", () => {
 	assert.equal(c.valkeyUrl, "redis://127.0.0.1:6379");
 	assert.equal(c.jobImage, "pi-job:latest");
 	assert.ok(c.jobsDir.length > 0);
+	assert.equal(c.schedulesFile, null);
+	assert.equal(c.schedulerStallMax, 2);
 });
 
 test("env overrides every field", () => {
@@ -40,6 +42,19 @@ test("a malformed integer is a config error, not a silent NaN", () => {
 
 test("cap 0 is rejected -- it would fail closed, and is more likely a typo than intent", () => {
 	assert.throws(() => loadConfig({ PI_DAILY_CAP: "0" }), (e) => e.piDispatchConfig === true);
+});
+
+test("scheduler stall max 0 is rejected -- a 0 threshold would fail closed", () => {
+	assert.throws(() => loadConfig({ PI_SCHEDULER_STALL_MAX: "0" }), (e) => e.piDispatchConfig === true);
+});
+
+test("scheduler stall max non-integer is a config error, not a silent NaN", () => {
+	assert.throws(() => loadConfig({ PI_SCHEDULER_STALL_MAX: "abc" }), (e) => e.piDispatchConfig === true);
+});
+
+test("schedules file is honored verbatim -- no default path, null means cron disabled", () => {
+	const c = loadConfig({ PI_SCHEDULES_FILE: "/abs/x.json" });
+	assert.equal(c.schedulesFile, "/abs/x.json");
 });
 
 test("configError is tagged for clean CLI reporting", () => {

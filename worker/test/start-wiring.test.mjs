@@ -30,15 +30,15 @@ function fakeHost(overrides = {}) {
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
 async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}) {
 	const calls = [];
-	const handlers = {};
+	const registered = {};
 	const createWorkerFn = (arg) => {
 		if (order) order.push("createWorker");
 		calls.push(arg);
-		// startWorker calls worker.on("completed"/"failed", ...); capture the handlers so a test can
-		// drive them and inspect the emitted log line.
+		// Record every worker.on(...) registration so tests can drive the completed/failed handlers
+		// (inspecting the emitted log line) and assert the scheduler stall guard's "stalled" listener.
 		return {
-			on(event, handler) {
-				handlers[event] = handler;
+			on(evt, fn) {
+				registered[evt] = fn;
 			},
 		};
 	};
@@ -61,6 +61,8 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}
 
 	const captured = calls[0];
 	captured?.redis?.disconnect?.(); // release the background reconnect handle
+	// The persistent schedulerQueue opens its own ioredis connection; close it so the suite leaks no handle.
+	await captured?.extraClosers?.[0]?.close?.().catch(() => {});
 
 	const logs = lines.map((l) => {
 		try {
@@ -69,7 +71,9 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}
 			return { raw: l };
 		}
 	});
-	return { captured, deps: captured?.deps, logs, handlers };
+	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
+	// `registered` for the scheduler stall-guard test. Same object, one capture path.
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered };
 }
 
 // Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
@@ -185,4 +189,36 @@ test("job_completed carries reason when the result has one and omits it otherwis
 	const nr = noReason.find((l) => l.event === "job_completed");
 	assert.equal(nr?.outcome, "success");
 	assert.ok(!("reason" in nr), "reason must be omitted from a clean success line");
+});
+
+// Cron wiring. DEFAULT env => no PI_SCHEDULES_FILE => schedules=[] => reconcile is skipped, so these
+// assert the wiring that runs even with cron disabled: no live Valkey required.
+test("cron wiring: a stalled listener is registered and schedules_installed precedes worker_started", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 9, source: "gh" });
+	const { captured, logs, registered } = await runStart({ makeAuth, makeHost: () => fakeHost() });
+
+	// (a) the money backstop is keyed on "stalled" -- the guard's onStalled is registered there.
+	assert.equal(typeof registered.stalled, "function", "a stalled listener (the scheduler stall guard) must be registered");
+
+	// (c) the persistent schedulerQueue is handed to createWorker as an extraCloser so shutdown drains it.
+	assert.equal(
+		typeof captured.extraClosers?.[0]?.close,
+		"function",
+		"the schedulerQueue must be registered as extraClosers[0] with a close()",
+	);
+
+	// (d) empty schedule set still emits schedules_installed {0,0} so the operator sees cron is off.
+	const installed = logs.find((l) => l.event === "schedules_installed");
+	assert.ok(installed, "a schedules_installed log must be emitted even when cron is disabled");
+	assert.deepEqual(
+		{ installed: installed.installed, removed: installed.removed },
+		{ installed: 0, removed: 0 },
+		"an empty schedule set must log schedules_installed {installed:0, removed:0}",
+	);
+
+	// (b) schedules must be reconciled and logged before the worker announces itself.
+	const installedIdx = logs.findIndex((l) => l.event === "schedules_installed");
+	const startedIdx = logs.findIndex((l) => l.event === "worker_started");
+	assert.ok(startedIdx !== -1, "a worker_started log must be emitted");
+	assert.ok(installedIdx < startedIdx, "schedules_installed must be logged before worker_started");
 });
