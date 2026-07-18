@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 // index.mjs imports bullmq, so this skips below the node floor / without deps and runs in CI,
@@ -14,6 +15,23 @@ if (!mod && process.env.PI_DISPATCH_REQUIRE_WORKER_TESTS === "1") {
 	throw new Error(`worker wiring tests are REQUIRED here but bullmq could not import.\n${importError}`);
 }
 const skip = mod ? false : `bullmq not installed (node ${process.version} < 22.19.0); CI runs these`;
+
+test("createWorker registers a win32-guarded SIGBREAK shutdown alongside SIGTERM/SIGINT", () => {
+	// The signal registration lives inside createWorker, AFTER `new Worker(...)`. Constructing a real
+	// Worker to observe process.once at runtime leaves a dangling ioredis reconnect handle that keeps
+	// `node --test` from exiting (verified), so this asserts the contract against the source instead:
+	// SIGTERM/SIGINT register unconditionally, SIGBREAK only on win32, and all three route to the same
+	// `shutdown` closure (Windows never delivers an external SIGTERM; SIGBREAK covers console-close).
+	// No bullmq import here, so this runs even below the node floor where the other tests skip.
+	const src = readFileSync(new URL("../src/index.mjs", import.meta.url), "utf8");
+	assert.match(src, /process\.once\("SIGTERM", shutdown\)/, "SIGTERM must route to shutdown");
+	assert.match(src, /process\.once\("SIGINT", shutdown\)/, "SIGINT must route to shutdown");
+	assert.match(
+		src,
+		/process\.platform === "win32"\)\s*\{?\s*process\.once\("SIGBREAK", shutdown\)/,
+		"SIGBREAK must be win32-guarded and route to the same shutdown closure",
+	);
+});
 
 test("the processor declares arity 3 -- the silent trap that would disable the timeout", { skip }, () => {
 	// BullMQ only allocates an AbortController when processor.length >= 3. If a refactor drops the

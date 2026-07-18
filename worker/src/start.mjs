@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { configError, loadConfig } from "./config.mjs";
 import { makeRedisClient, parseConnection } from "./connection.mjs";
 import { reconcile } from "./cron.mjs";
@@ -9,6 +11,42 @@ import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
 import { loadSchedules } from "./schedules.mjs";
 import { makeStallGuard } from "./scheduler-stall-guard.mjs";
+
+const exec = promisify(execFile);
+
+/**
+ * Boot-time reaper: clear stray `pi-job-*` containers a previous worker crash left behind, before
+ * the new worker starts draining. A leaked container keeps spending, so it must go before any new
+ * job launches.
+ *
+ * It runs `docker ps` / `docker rm -f` ONLY. It never inspects a container's exit code, never touches
+ * the queue, and never re-enqueues -- queue and retry state belong to Redis, not to docker
+ * (INT-RUNNER-EXIT-CODE-PROTOCOL / CONST-RETRY-INFRA-ONLY). It logs container names only (no PII).
+ *
+ * It assumes ONE worker per docker daemon: a co-located second worker's boot would remove the first's
+ * in-flight `pi-job-*` container. That is the accepted v1 shape (DES-CONCURRENCY-3, single worker per
+ * host).
+ *
+ * `reap()` NEVER throws: a missing docker binary or a down daemon is caught, logged as
+ * `reaper_skipped`, and boot continues to the worker.
+ */
+export function makeReaper({ log }) {
+	return async function reap() {
+		try {
+			const { stdout } = await exec("docker", ["ps", "--filter", "name=pi-job-", "--format", "{{.Names}}"]);
+			const names = stdout
+				.split("\n")
+				.map((n) => n.trim())
+				.filter(Boolean);
+			for (const name of names) {
+				await exec("docker", ["rm", "-f", name]);
+				log("reaped_container", { name });
+			}
+		} catch (err) {
+			log("reaper_skipped", { reason: err?.message });
+		}
+	};
+}
 
 /**
  * The runnable worker. Reads config, connects to Valkey, wires every REAL dependency the processor
@@ -22,7 +60,7 @@ import { makeStallGuard } from "./scheduler-stall-guard.mjs";
  */
 export async function startWorker(
 	env = process.env,
-	{ makeAuth = makeGitHubAuth, makeHost = makeGitHubHost, createWorkerFn = createWorker } = {},
+	{ makeAuth = makeGitHubAuth, makeHost = makeGitHubHost, createWorkerFn = createWorker, makeReaper: makeReaperFn = makeReaper } = {},
 ) {
 	const config = loadConfig(env);
 	const log = (event, fields = {}) => process.stdout.write(`${JSON.stringify({ event, ...fields })}\n`);
@@ -40,6 +78,14 @@ export async function startWorker(
 		log("github_auth_unavailable", { reason: err?.message });
 	}
 	const host = makeHost();
+
+	// Clear strays left by a previous crash before the worker starts draining. Best-effort: the reaper
+	// swallows its own docker errors; this guard keeps any reaper failure from blocking boot.
+	try {
+		await makeReaperFn({ log })();
+	} catch (err) {
+		log("reaper_skipped", { reason: err?.message });
+	}
 
 	// One raw Redis client, shared by the budget (via the worker) and the scheduler stall guard, so it is
 	// hoisted out of the createWorkerFn arg object.
@@ -91,7 +137,12 @@ export async function startWorker(
 	// comment and the signal for CONST-PI-VERSION-PINNED's silent-no-op mode -- a missing line is
 	// what tells a human a run did nothing. The container's own output already streams via
 	// runContainer's onOutput during the run.
-	worker.on("completed", (job, result) => log("job_completed", { jobId: job?.id, outcome: result?.outcome }));
+	// `reason` is a fixed enum (worker-abort | over-budget | unprotected-branch | runner-policy), never
+	// user content. Included only when present so success lines stay clean; a shutdown-aborted job logs
+	// { outcome: "policy", reason: "worker-abort" }, making a restart-dropped job visible.
+	worker.on("completed", (job, result) =>
+		log("job_completed", { jobId: job?.id, outcome: result?.outcome, ...(result?.reason ? { reason: result.reason } : {}) }),
+	);
 	worker.on("failed", (job, err) =>
 		log("job_failed", { jobId: job?.id, attempt: job?.attemptsMade, reason: String(err?.message ?? err).slice(0, 120) }),
 	);

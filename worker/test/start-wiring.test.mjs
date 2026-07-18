@@ -28,19 +28,24 @@ function fakeHost(overrides = {}) {
 // Drive startWorker with injected fakes and capture the exact object handed to createWorker
 // (deps are nested under `deps`). No real Redis: createWorkerFn is faked. The real ioredis client
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
-async function runStart({ env = {}, makeAuth, makeHost }) {
+async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}) {
 	const calls = [];
 	const registered = {};
 	const createWorkerFn = (arg) => {
+		if (order) order.push("createWorker");
 		calls.push(arg);
-		// Record listener registrations so tests can assert startWorker wired worker.on("stalled", ...)
-		// (the scheduler stall guard) alongside the completed/failed handlers.
+		// Record every worker.on(...) registration so tests can drive the completed/failed handlers
+		// (inspecting the emitted log line) and assert the scheduler stall guard's "stalled" listener.
 		return {
 			on(evt, fn) {
 				registered[evt] = fn;
 			},
 		};
 	};
+
+	// Default to a no-op reaper so the wiring tests never shell out to docker; ordering/throwing tests
+	// inject their own.
+	const reaper = makeReaper ?? (() => async () => {});
 
 	const lines = [];
 	const origWrite = process.stdout.write;
@@ -49,7 +54,7 @@ async function runStart({ env = {}, makeAuth, makeHost }) {
 		return true;
 	};
 	try {
-		await mod.startWorker(env, { makeAuth, makeHost, createWorkerFn });
+		await mod.startWorker(env, { makeAuth, makeHost, createWorkerFn, makeReaper: reaper });
 	} finally {
 		process.stdout.write = origWrite;
 	}
@@ -66,7 +71,31 @@ async function runStart({ env = {}, makeAuth, makeHost }) {
 			return { raw: l };
 		}
 	});
-	return { captured, deps: captured?.deps, logs, registered };
+	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
+	// `registered` for the scheduler stall-guard test. Same object, one capture path.
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered };
+}
+
+// Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
+function captureLogs(fn) {
+	const lines = [];
+	const origWrite = process.stdout.write;
+	process.stdout.write = (chunk) => {
+		lines.push(String(chunk));
+		return true;
+	};
+	try {
+		fn();
+	} finally {
+		process.stdout.write = origWrite;
+	}
+	return lines.map((l) => {
+		try {
+			return JSON.parse(l);
+		} catch {
+			return { raw: l };
+		}
+	});
 }
 
 test("github configured: real mintToken and the host's isDefaultBranchProtected are wired", { skip }, async () => {
@@ -124,6 +153,42 @@ test("resolveDefaultBranchSha is threaded into prepareWorkspace (C2)", { skip },
 	// startWorker completed and a prepareWorkspace function was built from the host's resolver.
 	assert.ok(captured, "startWorker completed");
 	assert.equal(typeof deps.prepareWorkspace, "function", "a prepareWorkspace dep must be wired");
+});
+
+test("the boot reaper runs BEFORE the worker starts draining (strays cleared first)", { skip }, async () => {
+	const order = [];
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const makeReaper = () => async () => {
+		order.push("reap");
+	};
+	await runStart({ makeAuth, makeHost: () => fakeHost(), makeReaper, order });
+	assert.deepEqual(order, ["reap", "createWorker"], "reap must clear strays before the worker is created");
+});
+
+test("a reaper that throws does NOT reject startWorker (boot is best-effort)", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const makeReaper = () => async () => {
+		throw new Error("docker daemon down");
+	};
+	const { captured, logs } = await runStart({ makeAuth, makeHost: () => fakeHost(), makeReaper });
+	assert.ok(captured, "startWorker must still construct the worker when the reaper throws");
+	assert.ok(logs.some((l) => l.event === "reaper_skipped"), "a throwing reaper must be logged as reaper_skipped");
+});
+
+test("job_completed carries reason when the result has one and omits it otherwise", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { handlers } = await runStart({ makeAuth, makeHost: () => fakeHost() });
+	assert.equal(typeof handlers.completed, "function", "startWorker must register a completed handler");
+
+	const withReason = captureLogs(() => handlers.completed({ id: "j1" }, { outcome: "policy", reason: "worker-abort" }));
+	const wr = withReason.find((l) => l.event === "job_completed");
+	assert.equal(wr?.outcome, "policy");
+	assert.equal(wr?.reason, "worker-abort", "reason must be logged when the result carries one");
+
+	const noReason = captureLogs(() => handlers.completed({ id: "j2" }, { outcome: "success" }));
+	const nr = noReason.find((l) => l.event === "job_completed");
+	assert.equal(nr?.outcome, "success");
+	assert.ok(!("reason" in nr), "reason must be omitted from a clean success line");
 });
 
 // Cron wiring. DEFAULT env => no PI_SCHEDULES_FILE => schedules=[] => reconcile is skipped, so these

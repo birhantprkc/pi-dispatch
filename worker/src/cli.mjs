@@ -4,12 +4,16 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.mjs";
+import { EXIT_POLICY } from "./exit-code.mjs";
 
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch run <folder> --task "<what to do>" [--flow <name>]
                            [--provider <p>] [--model <m>] [--max-turns <n>] [--force]
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
+  pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
+  pi-dispatch resume       resume taking jobs
+  pi-dispatch status       show paused state + job counts
 
 Config comes from the environment (see .env.example); flags override it per run.`;
 
@@ -71,6 +75,39 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		return 0;
 	}
 
+	if (cmd === "pause" || cmd === "resume" || cmd === "status") {
+		// The kill switch reads ONLY VALKEY_URL, not the full loadConfig -- it must work even when
+		// GitHub auth is misconfigured, so an operator can always stop the queue.
+		const url = env.VALKEY_URL ?? "redis://127.0.0.1:6379";
+		const { parseConnection } = await import("./connection.mjs");
+		const { makeQueue } = await import("./queue.mjs");
+		// failFast: reach the kill switch in seconds when Valkey is down, not a hang. makeQueue pins
+		// the "pi-jobs" name -- a different name would pause an empty queue (silent no-op).
+		const queue = makeQueue(parseConnection(url, { failFast: true }));
+		try {
+			if (cmd === "pause") {
+				await queue.pause();
+				process.stdout.write("paused — worker will stop taking new jobs (jobs still enqueue)\n");
+			} else if (cmd === "resume") {
+				await queue.resume();
+				process.stdout.write("resumed\n");
+			} else {
+				// "paused" is included in the counts because jobs enqueued while paused land in the
+				// `paused` list, not `wait` -- omitting it would report backlog 0 in the exact state
+				// the pause switch creates. `pausedState` (the boolean) is named apart from the
+				// `paused` count `getJobCounts` returns, so the two do not collide in the output.
+				const pausedState = await queue.isPaused();
+				const counts = await queue.getJobCounts("waiting", "active", "paused", "delayed", "failed");
+				process.stdout.write(`${JSON.stringify({ pausedState, ...counts })}\n`);
+			}
+		} catch (error) {
+			return fail(`could not reach Valkey at ${url} — is it running? (docker compose up)\n  ${error.message}`);
+		} finally {
+			await queue.close().catch(() => {});
+		}
+		return 0;
+	}
+
 	process.stdout.write(`${USAGE}\n`);
 	return cmd ? 1 : 0;
 }
@@ -78,6 +115,15 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 function fail(message) {
 	process.stderr.write(`error: ${message}\n`);
 	return 1;
+}
+
+/**
+ * Exit code for an error that escaped main() as a rejection. A tagged config error (loadConfig's
+ * `piDispatchConfig`) is a determinate refusal -> EXIT_POLICY (2, never retried); anything else is
+ * infra -> 1 (retryable). Mirrors INT-RUNNER-EXIT-CODE-PROTOCOL for the CLI's own exit space.
+ */
+export function entryExitCode(err) {
+	return err?.piDispatchConfig ? EXIT_POLICY : 1;
 }
 
 /** true = dirty, false = clean, null = not a working git repo. */
@@ -92,7 +138,12 @@ function gitDirty(folder) {
 
 // Entry point when run as a bin. Kept out of the exported main so tests can call main() directly.
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("cli.mjs")) {
-	main().then((code) => {
-		if (code) process.exitCode = code;
-	});
+	main()
+		.then((code) => {
+			if (code) process.exitCode = code;
+		})
+		.catch((err) => {
+			process.stderr.write(`error: ${err.message}\n`);
+			process.exitCode = entryExitCode(err);
+		});
 }
