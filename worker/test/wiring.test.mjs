@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
+// processor.mjs pulls in no bullmq, so this import is safe below the node floor where index.mjs skips.
+import { InfraRetry } from "../src/processor.mjs";
+// run-history.mjs pulls in only node:fs/node:path -- safe below the node floor alongside processor.mjs.
+import { buildRecord, makeRecordWriter } from "../src/run-history.mjs";
 
 // index.mjs imports bullmq, so this skips below the node floor / without deps and runs in CI,
 // where PI_DISPATCH_REQUIRE_WORKER_TESTS=1 turns a skip into a hard failure.
@@ -44,6 +49,7 @@ test("the processor declares arity 3 -- the silent trap that would disable the t
 		redis: {},
 		cap: 10,
 		deps: {},
+		recordRun: () => {},
 	});
 	assert.equal(processor.length, 3, "processor must declare (job, token, signal) or the abort dies");
 });
@@ -136,4 +142,248 @@ test("shutdown closes each extraCloser after the worker drains", { skip }, async
 		for (const l of process.listeners("SIGINT")) if (!beforeInt.has(l)) process.removeListener("SIGINT", l);
 		await Promise.resolve(worker?.close()).catch(() => {});
 	}
+});
+
+// The full BullMQ job object the processor hands to recordRun -- id/attemptsMade/name/data are the
+// fields buildRecord (start.mjs) reads, so recordRun must receive `job`, not `job.data`.
+const fakeJob = () => ({ id: "j1", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 1, flow: "fix" } });
+const isoRoundtrips = (s) => typeof s === "string" && new Date(s).toISOString() === s;
+
+test("recordRun fires once on the SUCCESS (return) path with { job, result, startedAt, endedAt }", { skip }, async () => {
+	const calls = [];
+	const job = fakeJob();
+	const processor = mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: { async incr() { return 1; }, async expire() {} },
+		cap: 10,
+		timeoutMs: 100000,
+		recordRun: (rec) => calls.push(rec),
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async () => ({}),
+			runContainer: async () => ({ code: 0, aborted: false, turns: 3 }),
+			cleanup: async () => {},
+			comment: async () => {},
+		},
+	});
+
+	const result = await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(calls.length, 1, "recordRun must fire exactly once");
+	const rec = calls[0];
+	assert.equal(rec.job, job, "recordRun receives the FULL job object, not job.data");
+	assert.equal(rec.result, result, "recordRun.result is the runJob return value");
+	assert.equal(rec.result.outcome, "completed");
+	assert.equal(rec.error, undefined, "no error on the success path");
+	assert.ok(isoRoundtrips(rec.startedAt), "startedAt is an ISO string");
+	assert.ok(isoRoundtrips(rec.endedAt), "endedAt is an ISO string");
+});
+
+test("recordRun fires with { job, error } BEFORE an UnrecoverableError propagates (non-infra throw)", { skip }, async () => {
+	const calls = [];
+	const job = fakeJob();
+	const boom = new Error("container boom");
+	const processor = mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: { async incr() { return 1; }, async expire() {} },
+		cap: 10,
+		timeoutMs: 100000,
+		recordRun: (rec) => calls.push(rec),
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async () => ({}),
+			runContainer: async () => { throw boom; },
+			cleanup: async () => {},
+			comment: async () => {},
+		},
+	});
+
+	await assert.rejects(
+		() => processor(job, "tok", new AbortController().signal),
+		(e) => e.name === "UnrecoverableError",
+		"a non-infra throw must surface as UnrecoverableError (no retry)",
+	);
+	assert.equal(calls.length, 1, "recordRun must fire before the throw propagates");
+	const rec = calls[0];
+	assert.equal(rec.job, job);
+	assert.equal(rec.error, boom, "recordRun.error is the original thrown error, pre-wrap");
+	assert.equal(rec.result, undefined, "no result on the throw path");
+	assert.ok(isoRoundtrips(rec.startedAt) && isoRoundtrips(rec.endedAt), "both timestamps are ISO strings");
+});
+
+test("recordRun fires and the InfraRetry still propagates (retryable, not UnrecoverableError)", { skip }, async () => {
+	const calls = [];
+	const job = fakeJob();
+	const processor = mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: { async incr() { return 1; }, async expire() {}, async decr() {} },
+		cap: 10,
+		timeoutMs: 100000,
+		recordRun: (rec) => calls.push(rec),
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async () => ({}),
+			// exit 1 => runJob throws InfraRetry; the processor must rethrow it unwrapped so BullMQ retries.
+			runContainer: async () => ({ code: 1, aborted: false, turns: 2 }),
+			cleanup: async () => {},
+			comment: async () => {},
+		},
+	});
+
+	await assert.rejects(
+		() => processor(job, "tok", new AbortController().signal),
+		(e) => e instanceof InfraRetry,
+		"an InfraRetry must propagate unwrapped (retryable), never become UnrecoverableError",
+	);
+	assert.equal(calls.length, 1, "recordRun must fire on the infra-retry path too");
+	assert.equal(calls[0].job, job);
+	assert.ok(calls[0].error instanceof InfraRetry, "recordRun.error is the InfraRetry");
+});
+
+// End-to-end money-path acceptance: compose the REAL recordRun = writeRecord(buildRecord(...)) over a
+// fake fs and drive makeProcessor per outcome, asserting the SERIALIZED bytes. This is the only place
+// the whole record path (processor wrapper -> buildRecord -> writeRecord) is exercised end-to-end, so
+// it is where "the record path never breaks the retry contract" is actually proven, not asserted piece
+// by piece. writeThrows models a real ENOSPC/EACCES from writeFileSync so (c)/(c2) exercise the
+// never-throw writer THROUGH makeProcessor, not a stub of it.
+function makeRealRecordRun({ writeThrows = false } = {}) {
+	const writes = [];
+	const fakeFs = {
+		mkdirSync: () => {},
+		writeFileSync: (path, data) => {
+			if (writeThrows) throw new Error("ENOSPC");
+			writes.push({ path, data });
+		},
+	};
+	const writeRecord = makeRecordWriter({ logsDir: "/logs", fs: fakeFs, log: () => {} });
+	const recordRun = (a) => writeRecord(buildRecord(a));
+	return { recordRun, writes };
+}
+
+// The full BullMQ job wrapper carrying user-authored PII (title/body) the record must never serialise.
+const secretJob = (id = "j1") => ({
+	id,
+	attemptsMade: 0,
+	name: "github",
+	data: { kind: "github", repo: "o/r", issueNumber: 1, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+});
+
+// A processor wired to the real recordRun. `runContainer`/`redis` are overridable so the infra-exit
+// paths (b)/(c2) reuse the same construction with a different container exit.
+function realRecordProcessor(recordRun, { runContainer, redis } = {}) {
+	return mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: redis ?? { async incr() { return 1; }, async expire() {}, async decr() {} },
+		cap: 10,
+		timeoutMs: 100000,
+		recordRun,
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async () => ({}),
+			runContainer: runContainer ?? (async () => ({ code: 0, aborted: false, turns: 3 })),
+			cleanup: async () => {},
+			comment: async () => {},
+			log: () => {},
+		},
+	});
+}
+
+test("(a) completed run: real writer serialises a PII-free record to <jobId>.json", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun();
+	const job = secretJob("j1");
+	const processor = realRecordProcessor(recordRun);
+
+	await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(writes.length, 1, "exactly one record is written on the success path");
+	assert.equal(writes[0].path, join("/logs", "j1.json"), "path is the sanitized <jobId>.json under logsDir");
+	const rec = JSON.parse(writes[0].data);
+	assert.equal(rec.outcome, "completed");
+	assert.equal(rec.target, "o/r#1", "GitHub target is repo#issue, never the payload text");
+	assert.equal(rec.exitCode, 0);
+	assert.equal(rec.turns, 3);
+	assert.equal(rec.budgetReserved, true);
+	// buildRecord reads only stable non-PII fields, so the serialized bytes carry neither title nor body.
+	assert.equal(writes[0].data.includes("SECRET_T"), false, "issue title must not leak into the record bytes");
+	assert.equal(writes[0].data.includes("SECRET_B"), false, "issue body must not leak into the record bytes");
+});
+
+test("(b) infra exit 1: a failed record is written on the catch path BEFORE InfraRetry rethrows", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun();
+	const job = secretJob("j1");
+	const processor = realRecordProcessor(recordRun, { runContainer: async () => ({ code: 1, aborted: false, turns: 2 }) });
+
+	await assert.rejects(
+		() => processor(job, "tok", new AbortController().signal),
+		(e) => e.name === "InfraRetry",
+		"exit 1 must surface as the retryable InfraRetry",
+	);
+	assert.equal(writes.length, 1, "the record is written before the rethrow");
+	const rec = JSON.parse(writes[0].data);
+	assert.equal(rec.outcome, "failed", "the error path records outcome=failed");
+	assert.equal(rec.exitCode, 1);
+});
+
+test("(c) try-path writer failure NEVER converts a completed run into a failure/retry", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun({ writeThrows: true });
+	const job = secretJob("j1");
+	const processor = realRecordProcessor(recordRun);
+
+	// A throwing writer on the success path must be swallowed by writeRecord: no throw, no
+	// UnrecoverableError, and the processor resolves to the same completed result a healthy run yields.
+	const result = await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(result.outcome, "completed");
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.turns, 3);
+	assert.equal(result.budgetReserved, true);
+	assert.equal(writes.length, 0, "the throwing writer recorded nothing");
+});
+
+test("(c2) catch-path writer failure still propagates the retryable InfraRetry unswallowed", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun({ writeThrows: true });
+	const job = secretJob("j1");
+	const processor = realRecordProcessor(recordRun, { runContainer: async () => ({ code: 1, aborted: false, turns: 2 }) });
+
+	await assert.rejects(
+		() => processor(job, "tok", new AbortController().signal),
+		(e) => e.name === "InfraRetry",
+		"a writer failure on the catch path must not swallow the retryable error",
+	);
+	assert.equal(writes.length, 0, "the throwing writer recorded nothing");
+});
+
+test("(d) a colon-bearing scheduled id sanitizes in the filename but stays raw in the body", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun();
+	const job = secretJob("repeat:sched:123");
+	const processor = realRecordProcessor(recordRun);
+
+	await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(writes[0].path, join("/logs", "repeat_sched_123.json"), "colon (illegal on NTFS) collapses to _ in the filename");
+	assert.equal(JSON.parse(writes[0].data).jobId, "repeat:sched:123", "the record body keeps the raw id");
+});
+
+test("(e) a burst of distinct ids writes one distinct file each through the same writer", { skip }, async () => {
+	const { recordRun, writes } = makeRealRecordRun();
+	const processor = realRecordProcessor(recordRun);
+
+	for (const id of ["j1", "j2", "j3"]) {
+		await processor(secretJob(id), "tok", new AbortController().signal);
+	}
+
+	assert.equal(writes.length, 3, "one record per job, none dropped or collided");
+	const paths = writes.map((w) => w.path);
+	assert.equal(new Set(paths).size, 3, "the three paths are distinct");
+	assert.ok(paths.includes(join("/logs", "j1.json")));
+	assert.ok(paths.includes(join("/logs", "j2.json")));
+	assert.ok(paths.includes(join("/logs", "j3.json")));
 });

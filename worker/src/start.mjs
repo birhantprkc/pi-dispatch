@@ -9,6 +9,7 @@ import { createWorker } from "./index.mjs";
 import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
+import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter } from "./run-history.mjs";
 import { loadSchedules } from "./schedules.mjs";
 import { makeStallGuard } from "./scheduler-stall-guard.mjs";
 
@@ -60,7 +61,15 @@ export function makeReaper({ log }) {
  */
 export async function startWorker(
 	env = process.env,
-	{ makeAuth = makeGitHubAuth, makeHost = makeGitHubHost, createWorkerFn = createWorker, makeReaper: makeReaperFn = makeReaper } = {},
+	{
+		makeAuth = makeGitHubAuth,
+		makeHost = makeGitHubHost,
+		createWorkerFn = createWorker,
+		makeReaper: makeReaperFn = makeReaper,
+		makeLogSink: makeLogSinkFn = makeLogSink,
+		makeRecordWriter: makeRecordWriterFn = makeRecordWriter,
+		makeLogReaper: makeLogReaperFn = makeLogReaper,
+	} = {},
 ) {
 	const config = loadConfig(env);
 	const log = (event, fields = {}) => process.stdout.write(`${JSON.stringify({ event, ...fields })}\n`);
@@ -87,6 +96,15 @@ export async function startWorker(
 		log("reaper_skipped", { reason: err?.message });
 	}
 
+	// REQ-LOCAL-JOB-VISIBILITY: sweep aged `.log`/`.json` history at boot so the logs directory stays
+	// bounded across restarts. Best-effort with the same double-wrap posture as the container reaper: the
+	// reaper swallows its own fs errors, and this guard keeps any reaper failure from blocking draining.
+	try {
+		await makeLogReaperFn({ logsDir: config.logsDir, retentionDays: config.logRetentionDays, log })();
+	} catch (err) {
+		log("log_reaper_skipped", { reason: err?.message });
+	}
+
 	// One raw Redis client, shared by the budget (via the worker) and the scheduler stall guard, so it is
 	// hoisted out of the createWorkerFn arg object.
 	const redis = makeRedisClient(config.valkeyUrl);
@@ -94,14 +112,25 @@ export async function startWorker(
 	// handle rides out a Valkey blip. Registered as an extraCloser so shutdown drains it after the worker.
 	const schedulerQueue = makeQueue(parseConnection(config.valkeyUrl));
 
+	// REQ-LOCAL-JOB-VISIBILITY durable run history, all host-side. The raw `.log` sink is gated on
+	// captureJobLogs (raw container output is user-authored data, opt-in per no-pii-in-logs); the id-only
+	// `.json` record via recordRun is ALWAYS on, so every run leaves a stable, non-PII trace regardless.
+	// logsDir wires only into these host-side factories and openJobLog into runContainer -- never into the
+	// container env allowlist (no-broad-env-into-container).
+	const openJobLog = makeLogSinkFn({ logsDir: config.logsDir, enabled: config.captureJobLogs, log });
+	const writeRecord = makeRecordWriterFn({ logsDir: config.logsDir, log });
+	const recordRun = ({ job, result, error, startedAt, endedAt }) =>
+		writeRecord(buildRecord({ job, result, error, startedAt, endedAt }));
+
 	const worker = createWorkerFn({
 		connection: parseConnection(config.valkeyUrl),
 		concurrency: config.concurrency,
 		cap: config.dailyCap,
 		redis,
+		recordRun,
 		extraClosers: [schedulerQueue],
 		deps: {
-			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env }),
+			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env, openJobLog }),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				resolveDefaultBranchSha: host.resolveDefaultBranchSha,
@@ -179,6 +208,9 @@ export async function startWorker(
 		dailyCap: config.dailyCap,
 		image: config.jobImage,
 		valkey: config.valkeyUrl,
+		logsDir: config.logsDir,
+		captureJobLogs: config.captureJobLogs,
+		logRetentionDays: config.logRetentionDays,
 	});
 	return worker;
 }

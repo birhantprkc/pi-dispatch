@@ -169,4 +169,54 @@ test("InfraRetry back-compat: message-only ctor keeps piDispatchRetry and defaul
 	assert.equal(e.piDispatchRetry, true);
 	assert.equal(e.reason, "x");
 	assert.equal(e.message, "x");
+	assert.equal(e.exitCode, null, "telemetry fields default null on the message-only ctor");
+	assert.equal(e.turns, null);
+	assert.equal(e.budgetReserved, null);
+});
+
+test("a completed return carries exitCode/turns from the container and budgetReserved true", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 0, aborted: false, turns: 7 }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.turns, 7);
+	assert.equal(r.budgetReserved, true);
+});
+
+test("an over-budget return carries null exit/turns but budgetReserved true (slot kept)", async () => {
+	const { deps: d } = deps({ redis: fakeRedis(10), cap: 10 });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.reason, "over-budget");
+	assert.equal(r.exitCode, null);
+	assert.equal(r.turns, null);
+	assert.equal(r.budgetReserved, true);
+});
+
+test("an unprotected-branch return carries null exit/turns and budgetReserved false (pre-reserve)", async () => {
+	const { deps: d } = deps({ isDefaultBranchProtected: async () => false });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.reason, "unprotected-branch");
+	assert.equal(r.exitCode, null);
+	assert.equal(r.turns, null);
+	assert.equal(r.budgetReserved, false);
+});
+
+test("an exit-1 infra throw stamps exitCode/turns and budgetReserved true (container ran and spent)", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 1, aborted: false, turns: 4 }) });
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) => e instanceof InfraRetry && e.exitCode === 1 && e.turns === 4 && e.budgetReserved === true,
+	);
+});
+
+test("a container-never-started throw stamps budgetReserved false (its slot is refunded)", async () => {
+	const { deps: d } = deps({
+		runContainer: async () => {
+			throw new InfraRetry("container-never-started", { reason: "container-never-started" });
+		},
+	});
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) => e instanceof InfraRetry && e.reason === "container-never-started" && e.budgetReserved === false,
+	);
 });
