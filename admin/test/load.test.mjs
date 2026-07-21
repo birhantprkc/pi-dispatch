@@ -62,19 +62,24 @@ test("(d) capability probe is all-or-nothing", async () => {
   assert.match(errors[0], new RegExp(mod.SUPPORTED_PI_VERSION.replace(/\./g, "\\.")));
   assert.match(errors[0], /registerCommand/);
 
-  // Present every USED_API member: exactly one registration named "dispatch".
+  // Present every USED_API member: exactly one command registration named "dispatch".
   const calls = [];
-  const pi = { sendMessage: () => {}, registerCommand: (name, def) => calls.push([name, def]) };
+  const pi = {
+    sendMessage: () => {},
+    registerCommand: (name, def) => calls.push([name, def]),
+    registerTool: () => {},
+  };
   factory(pi);
-  assert.equal(calls.length, 1, "exactly one registration");
+  assert.equal(calls.length, 1, "exactly one command registration");
   const [name, def] = calls[0];
   assert.equal(name, "dispatch");
   assert.equal(typeof def.handler, "function");
 
-  // A parked subcommand notifies through ctx.ui.notify and resolves without touching the model channel.
+  // A write subcommand notifies through ctx.ui.notify and resolves without touching the model channel.
+  // `set` with no key is a usage error surfaced to notify (never sendMessage).
   const notes = [];
   await def.handler("set", { ui: { notify: (...a) => notes.push(a) } });
   assert.equal(notes.length, 1);
   assert.match(notes[0][0], /set/);
-  assert.match(notes[0][0], /not yet implemented/);
+  assert.equal(notes[0][1], "error");
 });

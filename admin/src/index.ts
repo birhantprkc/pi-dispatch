@@ -20,32 +20,46 @@
  * (they may enter later model context, which is accepted per REQ); raw `.log`
  * bytes go ONLY to the overlay viewer, never to a message.
  *
+ * It also registers four LLM-callable tools -- `dispatch_status`, `dispatch_runs`
+ * (reads), and `dispatch_pause`/`dispatch_resume` (durable-but-reversible controls)
+ * -- with no settings-write tool and no log tool, and a live dashboard overlay on
+ * the bare `/dispatch` command.
+ *
  * Supported pi version: 0.80.7. The factory registers nothing unless every API
  * member it consumes is present; on a miss it names the member and the
  * supported version on stderr and returns.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createRequire } from "node:module";
+import { Type } from "typebox";
 import {
   resolvePaths,
   readQueueState,
   readSchedulers,
   readBudget,
   listRuns,
+  readRun,
   readLogTail,
   readSettingsView,
   readFlows,
   listRunIds,
+  setQueuePaused,
+  writeSettings,
+  KNOWN_KEYS,
 } from "./read-model.mjs";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
+import { makeDashboard } from "./dashboard.ts";
+import { matchesKey } from "./keys.mjs";
 
 // The single source of truth for the ExtensionAPI surface this extension
 // consumes. It grows only when a task actually uses a new member.
-export const USED_API = ["registerCommand", "sendMessage"] as const;
+export const USED_API = ["registerCommand", "registerTool", "sendMessage"] as const;
 
 export const SUPPORTED_PI_VERSION = "0.80.7";
 
 const CHANNEL = "pi-dispatch-admin";
+
+const REBUILT_NOTICE = (reason: string) =>
+  `replaced invalid settings file (${reason}) — other keys were lost`;
 
 const USAGE =
   "usage: /dispatch <status|pause|resume|runs|logs|budget|triggers|settings|set|unset>";
@@ -62,9 +76,6 @@ const KNOWN_SUBCOMMANDS = [
   "set",
   "unset",
 ] as const;
-
-// Commands parked for a later slice (4.1): mutation of queue state and settings.
-const NOT_YET_IMPLEMENTED = new Set(["pause", "resume", "set", "unset"]);
 
 export default function admin(pi: ExtensionAPI): void {
   for (const member of USED_API) {
@@ -83,6 +94,93 @@ export default function admin(pi: ExtensionAPI): void {
     getArgumentCompletions: (prefix) => completeArguments(prefix),
     handler: async (args, ctx) => dispatch(pi, args, ctx),
   });
+
+  registerTools(pi);
+}
+
+/** A one-shot text tool result. Failure is signalled by THROWing from `execute`, never by this shape. */
+function toolText(text: string): { content: { type: "text"; text: string }[]; details: Record<string, never> } {
+  return { content: [{ type: "text", text }], details: {} };
+}
+
+/**
+ * Register the four LLM-callable tools: three reads (`dispatch_status`, `dispatch_runs`) and the two
+ * durable-but-reversible controls (`dispatch_pause`, `dispatch_resume`). There is deliberately NO
+ * settings-write tool and NO log tool -- a write is an operator-typed command only, and raw `.log` bytes
+ * never enter model context (DES-ADMIN-VIA-PI-EXTENSION injection boundary; REQ acceptance). Each read
+ * reuses the self-closing read-model wrappers: a tool call is a one-shot, so a per-call connection is
+ * correct here where a per-tick one on the dashboard would not be. A control that cannot reach the queue
+ * THROWs, which pi reports to the model as an error rather than a false success.
+ */
+function registerTools(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "dispatch_status",
+    label: "pi-dispatch status",
+    description:
+      "Read-only. Reports pi-dispatch queue/worker state: paused flag, job counts, connected workers, today's budget use, schedulers, runtime settings overlay.",
+    parameters: Type.Object({}),
+    async execute() {
+      const paths = resolvePaths(process.env);
+      const [queue, budget, schedulers] = await Promise.all([
+        readQueueState({ url: paths.valkeyUrl }),
+        readBudget({ url: paths.valkeyUrl }),
+        readSchedulers({ url: paths.valkeyUrl }),
+      ]);
+      const settings = readSettingsView({ settingsFile: paths.settingsFile });
+      return toolText(JSON.stringify({ queue, budget, settings, schedulers }));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_runs",
+    label: "pi-dispatch runs",
+    description:
+      "Read-only. Returns structured, PII-free run records from the durable run history. Raw job logs are not available to tools — ask the user to run /dispatch logs.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      jobId: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params) {
+      const paths = resolvePaths(process.env);
+      const data = params.jobId
+        ? readRun({ logsDir: paths.logsDir, jobId: params.jobId })
+        : listRuns({ logsDir: paths.logsDir, limit: params.limit ?? 10 });
+      return toolText(JSON.stringify(data));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_pause",
+    label: "pi-dispatch pause",
+    description:
+      "Durably pauses pi-dispatch job processing: NEW jobs stop starting; running containers finish; jobs still enqueue. Survives worker restart. Reversible via dispatch_resume.",
+    executionMode: "sequential",
+    parameters: Type.Object({}),
+    async execute() {
+      const paths = resolvePaths(process.env);
+      const res = await setQueuePaused({ url: paths.valkeyUrl, paused: true });
+      if (res.unreachable) {
+        throw new Error(`could not reach the queue at ${paths.valkeyUrl}: ${res.unreachable}`);
+      }
+      return toolText("paused");
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_resume",
+    label: "pi-dispatch resume",
+    description: "Re-enables PAID job processing after a pause. Only call when the user explicitly asks to resume.",
+    executionMode: "sequential",
+    parameters: Type.Object({}),
+    async execute() {
+      const paths = resolvePaths(process.env);
+      const res = await setQueuePaused({ url: paths.valkeyUrl, paused: false });
+      if (res.unreachable) {
+        throw new Error(`could not reach the queue at ${paths.valkeyUrl}: ${res.unreachable}`);
+      }
+      return toolText("resumed");
+    },
+  });
 }
 
 async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void> {
@@ -92,7 +190,7 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   const paths = resolvePaths(process.env);
 
   if (sub === "") {
-    notify?.(USAGE, "info");
+    await openDashboard(paths, ctx, notify);
     return;
   }
 
@@ -130,14 +228,119 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
     case "logs":
       await showLogs(paths.logsDir, tokens, ctx);
       return;
-    default:
-      if (NOT_YET_IMPLEMENTED.has(sub)) {
-        notify?.(`dispatch ${sub}: not yet implemented`, "info");
+    case "pause":
+    case "resume": {
+      const paused = sub === "pause";
+      const res = await setQueuePaused({ url: paths.valkeyUrl, paused });
+      if (res.unreachable) {
+        notify?.(`could not reach Valkey at ${paths.valkeyUrl} — is it running? (docker compose up)`, "error");
         return;
       }
+      notify?.(
+        paused
+          ? "paused — worker will stop taking new jobs (jobs still enqueue; durable, survives restart)"
+          : "resumed",
+        "info",
+      );
+      return;
+    }
+    case "set": {
+      applySet(paths.settingsFile, tokens, notify);
+      return;
+    }
+    case "unset": {
+      applyUnset(paths.settingsFile, tokens, notify);
+      return;
+    }
+    default:
       notify?.(`dispatch: unknown subcommand '${sub}'. ${USAGE}`, "warning");
       return;
   }
+}
+
+/**
+ * Open the live dashboard overlay for the bare `/dispatch`. The overlay is the panel's only surface, so a
+ * pi build without `ctx.ui.custom` degrades to a usage note naming the reason rather than a silent no-op;
+ * it never sends into the model channel. The `ctx.ui.custom` factory constructs the panel with the real
+ * `tui`/`done`, so the queue and redis connections open only when the overlay actually shows.
+ */
+async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void> {
+  const custom = ctx?.ui?.custom;
+  if (typeof custom !== "function") {
+    notify?.(`${USAGE} — the dashboard needs a TUI (this pi build has no overlay support)`, "info");
+    return;
+  }
+  await custom.call(
+    ctx.ui,
+    (tui: any, _theme: any, _keybindings: any, done: (value: void) => void) => makeDashboard({ paths, done, tui }),
+    { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } },
+  );
+}
+
+type Notify = ((message: string, type?: string) => void) | undefined;
+
+/**
+ * `set <key> <value>`: the key must be a known settings key (checked BEFORE the write, since
+ * `writeOverlay` silently drops unknown keys and would report ok on a no-op), the value is coerced by the
+ * key's type, and exactly one value token is accepted (model ids carry no spaces). A rejected candidate
+ * surfaces `writeOverlay`'s key-only reason; a rebuild over an invalid file adds a loud replaced-file
+ * notice so a lost prior overlay is never silent.
+ */
+function applySet(settingsFile: string, tokens: string[], notify: Notify): void {
+  const key = tokens[1] ?? "";
+  if (!KNOWN_KEYS.includes(key)) {
+    notify?.(`set: unknown key '${key}'. valid keys: ${KNOWN_KEYS.join(", ")}`, "error");
+    return;
+  }
+  const valueTokens = tokens.slice(2);
+  if (valueTokens.length !== 1) {
+    notify?.(`set: ${key} takes exactly one value`, "error");
+    return;
+  }
+  const value = coerceSettingValue(key, valueTokens[0]);
+  const res = writeSettings({ settingsFile, mutate: (o) => ({ ...o, [key]: value }) });
+  if (res.invalid) {
+    notify?.(`set: ${res.invalid}`, "error");
+    return;
+  }
+  notify?.(`set ${key} = ${value}`, "info");
+  if (res.rebuiltFrom) notify?.(REBUILT_NOTICE(res.rebuiltFrom), "warning");
+}
+
+/**
+ * `unset <key>`: the key must be a known settings key; the mutation deletes it, and an empty result `{}`
+ * is a valid written state (no overrides). The same loud replaced-file notice fires when the write repaired
+ * an invalid file.
+ */
+function applyUnset(settingsFile: string, tokens: string[], notify: Notify): void {
+  const key = tokens[1] ?? "";
+  if (!KNOWN_KEYS.includes(key)) {
+    notify?.(`unset: unknown key '${key}'. valid keys: ${KNOWN_KEYS.join(", ")}`, "error");
+    return;
+  }
+  const res = writeSettings({
+    settingsFile,
+    mutate: (o) => {
+      delete o[key];
+      return o;
+    },
+  });
+  if (res.invalid) {
+    notify?.(`unset: ${res.invalid}`, "error");
+    return;
+  }
+  notify?.(`unset ${key}`, "info");
+  if (res.rebuiltFrom) notify?.(REBUILT_NOTICE(res.rebuiltFrom), "warning");
+}
+
+/**
+ * Coerce a raw token to the settings value its key expects: the three numeric keys parse via `Number` (a
+ * non-numeric token becomes `NaN`, which `writeOverlay` then rejects with a key-only reason); `model` and
+ * `provider` keep the raw string. Bounds and integer-ness stay in `writeOverlay`, the single validator.
+ */
+function coerceSettingValue(key: string, raw: string): number | string {
+  if (key === "maxTurns" || key === "dailyCap" || key === "concurrency") return Number(raw);
+  return raw;
 }
 
 /**
@@ -239,46 +442,13 @@ function completeArguments(prefix: string) {
       .map((id) => ({ value: `logs ${id}`, label: id }));
     return items.length > 0 ? items : null;
   }
+  if ((parts[0] === "set" || parts[0] === "unset") && parts.length === 2) {
+    const partial = parts[1];
+    const items = KNOWN_KEYS.filter((k) => k.startsWith(partial)).map((k) => ({
+      value: `${parts[0]} ${k}`,
+      label: k,
+    }));
+    return items.length > 0 ? items : null;
+  }
   return null;
-}
-
-/**
- * Match a raw terminal input string against a named key. Prefers pi's own `matchesKey` (resolved from
- * pi-tui via the pinned pi package, since pi-tui is nested there, not hoisted) to stay faithful to pi's
- * key decoding; falls back to a small legacy-sequence matcher for the keys the viewer uses if resolution
- * is unavailable. Memoized so resolution runs at most once.
- */
-let cachedMatchesKey: ((data: string, keyId: string) => boolean) | null = null;
-
-function matchesKey(data: string, keyId: string): boolean {
-  if (cachedMatchesKey === null) cachedMatchesKey = resolveMatchesKey();
-  return cachedMatchesKey(data, keyId);
-}
-
-function resolveMatchesKey(): (data: string, keyId: string) => boolean {
-  try {
-    const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-    const tui = piRequire("@earendil-works/pi-tui");
-    if (typeof tui.matchesKey === "function") return tui.matchesKey;
-  } catch {
-    // fall through to the local matcher
-  }
-  return localMatchesKey;
-}
-
-function localMatchesKey(data: string, keyId: string): boolean {
-  switch (keyId) {
-    case "escape":
-      return data === "\x1b";
-    case "up":
-      return data === "\x1b[A" || data === "\x1bOA";
-    case "down":
-      return data === "\x1b[B" || data === "\x1bOB";
-    case "pageUp":
-      return data === "\x1b[5~";
-    case "pageDown":
-      return data === "\x1b[6~";
-    default:
-      return false;
-  }
 }

@@ -7,7 +7,8 @@
     "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
-    "@pi-dispatch/worker": "*"
+    "@pi-dispatch/worker": "*",
+    "typebox": "1.1.38"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.7"

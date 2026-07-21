@@ -17,11 +17,15 @@
 import * as nodeFs from "node:fs";
 import { join } from "node:path";
 import { defaultLogsDir } from "@pi-dispatch/worker/config";
-import { settingsFilePath, readOverlay } from "@pi-dispatch/worker/runtime-settings";
+import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
+
+// Re-exported so the command layer reaches the key contract through the admin's single worker-coupling
+// funnel, never re-deriving the five known keys.
+export { KNOWN_KEYS };
 
 /**
  * Resolve the paths and URLs the admin reads, from `env` alone. Mirrors the worker's own defaulting
@@ -59,6 +63,41 @@ export async function readQueueState({ url, makeQueueFn = makeQueue, parseConnec
   }
 }
 
+/**
+ * Set the queue's durable paused state through one failFast Queue, always closed. `pause()`/`resume()`
+ * mirror the CLI kill switch (cli.mjs:90-95): the state survives a worker restart. Returns
+ * `{ ok: true, paused }` on success, or `{ unreachable }` on a connection error, closing in `finally`.
+ */
+export async function setQueuePaused({ url, paused, makeQueueFn = makeQueue, parseConnectionFn = parseConnection } = {}) {
+  let queue;
+  try {
+    queue = makeQueueFn(parseConnectionFn(url, { failFast: true }));
+    if (paused) await queue.pause();
+    else await queue.resume();
+    return { ok: true, paused };
+  } catch (err) {
+    return { unreachable: err?.message ?? String(err) };
+  } finally {
+    if (queue) await queue.close().catch(() => {});
+  }
+}
+
+/**
+ * Read-modify-write the settings overlay: read the current file, apply `mutate` to a copy of the base
+ * overlay, and write the result through the worker's own atomic `writeOverlay`. When the existing file is
+ * invalid, the base is empty `{}` and `rebuiltFrom` carries the read reason so the caller can surface the
+ * loud repair notice (INT-CONFIG-OVERLAY-CONTRACT write protocol). Validation stays in `writeOverlay`; a
+ * rejected candidate returns `{ invalid }`. Returns `{ ok: true, overlay, rebuiltFrom? }`.
+ */
+export function writeSettings({ settingsFile, mutate, fs = nodeFs }) {
+  const res = readOverlay(settingsFile, { fs });
+  const base = res.overlay ?? {};
+  const next = mutate({ ...base });
+  const w = writeOverlay(settingsFile, next, { fs });
+  if (w.invalid) return { invalid: w.invalid };
+  return res.invalid ? { ok: true, overlay: next, rebuiltFrom: res.invalid } : { ok: true, overlay: next };
+}
+
 async function readWorkerCount(queue) {
   try {
     const list = await queue.getWorkers();
@@ -83,23 +122,31 @@ export async function readSchedulers({
   try {
     queue = makeQueueFn(parseConnectionFn(url, { failFast: true }));
     const list = await queue.getJobSchedulers(0, -1, true);
-    const nowMs = now();
-    return (Array.isArray(list) ? list : []).map((s) => {
-      const next = typeof s?.next === "number" ? s.next : null;
-      return {
-        key: s?.key ?? s?.id ?? s?.name ?? null,
-        name: s?.name ?? null,
-        pattern: s?.pattern ?? null,
-        every: s?.every ?? null,
-        next,
-        overdueMs: next !== null && next < nowMs ? nowMs - next : null,
-      };
-    });
+    return mapSchedulers(list, now());
   } catch (err) {
     return { unreachable: err?.message ?? String(err) };
   } finally {
     if (queue) await queue.close().catch(() => {});
   }
+}
+
+/**
+ * Map raw BullMQ job-scheduler entries to the PII-free display shape, computing per-entry `overdueMs`
+ * against `nowMs`. Pure, so the live dashboard can map the entries it reads off its own held queue
+ * without re-opening a connection per tick. A non-array input maps to an empty list.
+ */
+export function mapSchedulers(list, nowMs) {
+  return (Array.isArray(list) ? list : []).map((s) => {
+    const next = typeof s?.next === "number" ? s.next : null;
+    return {
+      key: s?.key ?? s?.id ?? s?.name ?? null,
+      name: s?.name ?? null,
+      pattern: s?.pattern ?? null,
+      every: s?.every ?? null,
+      next,
+      overdueMs: next !== null && next < nowMs ? nowMs - next : null,
+    };
+  });
 }
 
 /**

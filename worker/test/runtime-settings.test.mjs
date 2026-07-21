@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { dirname } from "node:path";
 import { test } from "node:test";
 import { defaultSettingsFile } from "../src/config.mjs";
-import { effectiveSettings, readOverlay, settingsFilePath, writeOverlay } from "../src/runtime-settings.mjs";
+import { KNOWN_KEYS, effectiveSettings, readOverlay, settingsFilePath, writeOverlay } from "../src/runtime-settings.mjs";
 
 /**
  * A fake fs exposing only what the overlay module touches, with an ordered `ops` log so a test can
@@ -244,6 +244,12 @@ test("writeOverlay never throws when mkdir or write fails", () => {
 		const res = writeOverlay("/s/settings.json", { model: "m" }, { fs: makeFakeFs({ writeThrows: true }) });
 		assert.ok(res.invalid);
 	});
+});
+
+// ---- KNOWN_KEYS ----
+
+test("KNOWN_KEYS is exported and lists exactly the five overlay keys", () => {
+	assert.deepEqual([...KNOWN_KEYS].sort(), ["concurrency", "dailyCap", "maxTurns", "model", "provider"]);
 });
 
 // ---- settingsFilePath ----

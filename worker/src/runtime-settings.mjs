@@ -24,7 +24,7 @@ import { defaultSettingsFile } from "./config.mjs";
  * Custom: overlay validated inline per config.mjs precedent; zod not in deps
  */
 
-const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "concurrency"];
+export const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "concurrency"];
 
 function isNonEmptyString(value) {
 	return typeof value === "string" && value.trim() !== "";

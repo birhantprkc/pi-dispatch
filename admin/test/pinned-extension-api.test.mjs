@@ -39,9 +39,18 @@ function extractInterface(src, name) {
 }
 
 test("(a) the pinned extension types still declare every member the admin depends on", () => {
-  // registerCommand/sendMessage are pi.* members; getArgumentCompletions, custom, notify are the
-  // command/ui surfaces the handler and logs viewer reach through ctx.
-  const needles = ["registerCommand(name", "sendMessage<T", "getArgumentCompletions", "custom<T>(", "notify(message"];
+  // registerCommand/registerTool/sendMessage are pi.* members; getArgumentCompletions, custom, notify are
+  // the command/ui surfaces the handler, logs viewer and dashboard reach through ctx. executionMode is the
+  // ToolDefinition field the pause/resume tools set to "sequential".
+  const needles = [
+    "registerCommand(name",
+    "registerTool<TParams",
+    "sendMessage<T",
+    "getArgumentCompletions",
+    "custom<T>(",
+    "notify(message",
+    "executionMode",
+  ];
   for (const needle of needles) {
     assert.ok(
       typesSrc.includes(needle),

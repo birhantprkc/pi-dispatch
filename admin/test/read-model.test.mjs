@@ -12,6 +12,8 @@ import {
   readSettingsView,
   readFlows,
   listRunIds,
+  setQueuePaused,
+  writeSettings,
 } from "../src/read-model.mjs";
 
 /**
@@ -272,4 +274,117 @@ test("readSettingsView surfaces an invalid overlay without throwing (fail closed
 test("listRunIds returns the sanitized ids from json filenames only", () => {
   const files = { "repeat_x_123.json": "{}", "local-abc.json": "{}", "x.log": "raw", "n.txt": "" };
   assert.deepEqual(listRunIds({ logsDir: "/logs", fs: fakeFs(files) }).sort(), ["local-abc", "repeat_x_123"]);
+});
+
+// ---- setQueuePaused ----
+
+test("setQueuePaused pauses through one queue and closes it in finally", async () => {
+  const calls = [];
+  let closed = false;
+  const makeQueueFn = () => ({
+    async pause() {
+      calls.push("pause");
+    },
+    async resume() {
+      calls.push("resume");
+    },
+    async close() {
+      closed = true;
+    },
+  });
+  const res = await setQueuePaused({ url: "redis://x", paused: true, makeQueueFn, parseConnectionFn: () => ({}) });
+  assert.deepEqual(res, { ok: true, paused: true });
+  assert.deepEqual(calls, ["pause"], "pause, never resume");
+  assert.equal(closed, true, "closed in finally");
+});
+
+test("setQueuePaused resumes when paused is false", async () => {
+  const calls = [];
+  const makeQueueFn = () => ({
+    async pause() {
+      calls.push("pause");
+    },
+    async resume() {
+      calls.push("resume");
+    },
+    async close() {},
+  });
+  const res = await setQueuePaused({ url: "redis://x", paused: false, makeQueueFn, parseConnectionFn: () => ({}) });
+  assert.deepEqual(res, { ok: true, paused: false });
+  assert.deepEqual(calls, ["resume"]);
+});
+
+test("setQueuePaused returns { unreachable } and still closes when the queue is down", async () => {
+  let closed = false;
+  const makeQueueFn = () => ({
+    async pause() {
+      throw new Error("connection down");
+    },
+    async close() {
+      closed = true;
+    },
+  });
+  const res = await setQueuePaused({ url: "redis://x", paused: true, makeQueueFn, parseConnectionFn: () => ({}) });
+  assert.match(res.unreachable, /connection down/);
+  assert.equal(closed, true, "closed in finally even on error");
+});
+
+// ---- writeSettings ----
+
+/** An in-memory fs keyed by full path, supporting the read-modify-write path (read, mkdir, write tmp, rename). */
+function memFs(initial = {}) {
+  const files = new Map(Object.entries(initial));
+  return {
+    files,
+    readFileSync(path) {
+      const p = String(path);
+      if (!files.has(p)) {
+        const e = new Error(`ENOENT: ${p}`);
+        e.code = "ENOENT";
+        throw e;
+      }
+      return files.get(p);
+    },
+    mkdirSync() {},
+    writeFileSync(path, data) {
+      files.set(String(path), data);
+    },
+    renameSync(from, to) {
+      const f = String(from);
+      if (!files.has(f)) {
+        const e = new Error(`ENOENT: ${f}`);
+        e.code = "ENOENT";
+        throw e;
+      }
+      files.set(String(to), files.get(f));
+      files.delete(f);
+    },
+  };
+}
+
+test("writeSettings merges into the existing overlay, preserving prior keys", () => {
+  const path = "/s/settings.json";
+  const fs = memFs({ [path]: JSON.stringify({ model: "m1", dailyCap: 5 }) });
+  const res = writeSettings({ settingsFile: path, mutate: (o) => ({ ...o, maxTurns: 12 }), fs });
+  assert.deepEqual(res, { ok: true, overlay: { model: "m1", dailyCap: 5, maxTurns: 12 } });
+  assert.deepEqual(JSON.parse(fs.files.get(path)), { model: "m1", dailyCap: 5, maxTurns: 12 });
+});
+
+test("writeSettings rebuilds from scratch over an invalid file, keeping only the new key and reporting rebuiltFrom", () => {
+  const path = "/s/settings.json";
+  const fs = memFs({ [path]: "{ not valid json" });
+  const res = writeSettings({ settingsFile: path, mutate: (o) => ({ ...o, dailyCap: 7 }), fs });
+  assert.equal(res.ok, true);
+  assert.ok(res.rebuiltFrom, "carries the read reason so the caller can warn loudly");
+  assert.deepEqual(res.overlay, { dailyCap: 7 }, "base was empty; only the new key persists");
+  assert.deepEqual(JSON.parse(fs.files.get(path)), { dailyCap: 7 });
+});
+
+test("writeSettings passes through writeOverlay's { invalid } and leaves the file untouched", () => {
+  const path = "/s/settings.json";
+  const fs = memFs({ [path]: JSON.stringify({ model: "m1" }) });
+  const res = writeSettings({ settingsFile: path, mutate: (o) => ({ ...o, dailyCap: 0 }), fs });
+  assert.ok(res.invalid);
+  assert.ok(res.invalid.includes("dailyCap"));
+  assert.deepEqual(JSON.parse(fs.files.get(path)), { model: "m1" }, "original overlay untouched (validate-before-write)");
 });

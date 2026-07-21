@@ -73,11 +73,11 @@ function capLabel(settings) {
 }
 
 /**
- * Render triggers display-only (OQ-008): resident schedulers with their next fire time and next-drift,
- * then the committed label->flow allowlist. `overdueMs` surfaces the silent under-firing BullMQ's
- * no-overlap scheduler can hide (design.md:249).
+ * Render just the schedulers block: a header and one line per resident scheduler with its next fire time
+ * and next-drift. `overdueMs` surfaces the silent under-firing BullMQ's no-overlap scheduler can hide
+ * (design.md:249). An unreachable read or an empty set degrades in place rather than throwing.
  */
-export function renderTriggers({ schedulers, flows } = {}) {
+export function renderSchedulers(schedulers) {
   const out = ["Schedulers:"];
   if (schedulers && schedulers.unreachable) {
     out.push(`  unreachable (${schedulers.unreachable})`);
@@ -86,8 +86,14 @@ export function renderTriggers({ schedulers, flows } = {}) {
     if (list.length === 0) out.push("  (none configured)");
     else for (const s of list) out.push(`  ${schedulerLine(s)}`);
   }
+  return out.join("\n");
+}
 
-  out.push("", "Label -> flow:");
+/**
+ * Render triggers display-only (OQ-008): the schedulers block, then the committed label->flow allowlist.
+ */
+export function renderTriggers({ schedulers, flows } = {}) {
+  const out = [renderSchedulers(schedulers), "", "Label -> flow:"];
   if (flows && flows.missing) {
     out.push("  (flows file not found)");
   } else if (flows && flows.invalid) {

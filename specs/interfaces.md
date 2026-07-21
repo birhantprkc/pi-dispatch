@@ -565,7 +565,10 @@ Evidence convention as in `constitution.md`.
   ```
   All keys are optional; a missing file is an empty overlay. **Write protocol** (admin extension): validate
   the candidate object, serialise it, write a same-directory `settings.json.tmp`, then `rename` it over
-  `settings.json` — an atomic replace, with one EPERM retry on Windows. **Read protocol** (worker): read at
+  `settings.json` — an atomic replace, with one EPERM retry on Windows. When the existing file is invalid,
+  a write rebuilds it from scratch with the sanitized candidate and surfaces a loud, key-only notice that
+  it replaced an invalid file — the write path is the documented repair for a broken overlay, so the
+  fail-closed guarantee lives only on the worker's job-start read, which is unchanged. **Read protocol** (worker): read at
   **each job start**; a missing file is an empty overlay and is normal; an unknown key is ignored and
   logged, leaving the file valid; an invalid known key (wrong type or out of bounds) or unparseable JSON
   makes the **whole file** invalid.
@@ -591,6 +594,7 @@ Evidence convention as in `constitution.md`.
 
 | Date | Change |
 |---|---|
+| 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |
 | 2026-07-21 | Added INT-CONFIG-OVERLAY-CONTRACT (admin extension → worker `settings.json` overlay: optional keys with bounds, atomic tmp+rename write, per-job-start read, fail-closed `settings-overlay-invalid` on a present-but-invalid file). Reworded INT-RUN-HISTORY-FILE-CONTRACT's boundary from worker→panel to worker→admin extension (repointing the read-model rationale to `DES-ADMIN-VIA-PI-EXTENSION`) and added `settings-overlay-invalid` to its `reason` enum. Clarified in INT-SCHEDULES-FILE-CONTRACT that `provider`/`model`/`maxTurns` are pure passthrough — absent from an entry means absent from job data, resolved against the overlay/env at job start. De-numeralized the intro (contract count no longer stated). |
 | 2026-07-21 | Added INT-RUN-HISTORY-FILE-CONTRACT (worker→panel run-history read-model files). |
 | 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
