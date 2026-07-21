@@ -19,8 +19,9 @@ export const JOB_TIMEOUT_MS = 30 * 60 * 1000; // REQ-JOB-TIMEOUT-30M
  * Dependencies are injected so this is testable without a live queue: `cancelJob` (fired by the
  * timeout), `stopContainer` (fired by the abort), and the orchestration deps.
  */
-export function makeProcessor({ cancelJob, stopContainer, redis, cap, deps, timeoutMs = JOB_TIMEOUT_MS }) {
+export function makeProcessor({ cancelJob, stopContainer, redis, cap, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS }) {
 	return async function processor(job, token, signal) {
+		const startedAt = new Date().toISOString();
 		const name = `pi-job-${job.id}`;
 		const timer = setTimeout(() => {
 			// BullMQ has no per-job kill timer; this is ours. cancelJob raises the AbortSignal.
@@ -35,13 +36,16 @@ export function makeProcessor({ cancelJob, stopContainer, redis, cap, deps, time
 		signal.addEventListener("abort", onAbort, { once: true });
 
 		try {
-			return await runJob(job.data, {
+			const result = await runJob(job.data, {
 				redis,
 				cap,
 				...deps,
 				runContainer: (ctx) => deps.runContainer({ ...ctx, name, signal }),
 			});
+			recordRun({ job, result, startedAt, endedAt: new Date().toISOString() });
+			return result;
 		} catch (error) {
+			recordRun({ job, error, startedAt, endedAt: new Date().toISOString() });
 			if (error instanceof InfraRetry) throw error; // retryable: BullMQ retries per attempts
 			// A non-retryable, non-infra error (our bug) must not retry forever. UnrecoverableError
 			// records it as failed-and-distinct on the dashboard without a retry.
@@ -53,7 +57,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, cap, deps, time
 	};
 }
 
-export function createWorker({ connection, concurrency, cap, redis, deps, limiter, extraClosers = [] }) {
+export function createWorker({ connection, concurrency, cap, redis, deps, recordRun, limiter, extraClosers = [] }) {
 	let worker; // referenced by cancelJob before assignment; only called later, so the TDZ is fine
 	const processor = makeProcessor({
 		cancelJob: (id, reason) => worker.cancelJob(id, reason),
@@ -61,6 +65,7 @@ export function createWorker({ connection, concurrency, cap, redis, deps, limite
 		redis,
 		cap,
 		deps,
+		recordRun,
 	});
 
 	worker = new Worker(QUEUE, processor, {

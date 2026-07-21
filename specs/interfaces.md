@@ -496,12 +496,62 @@ Evidence convention as in `constitution.md`.
   `piDispatchConfig`-tagged error. Given a valid `local` entry, when it fires, then the emitted job's
   `data` byte-matches the shape produced by the interactive local (`enqueueLocalJob`) path.
 
+## INT-RUN-HISTORY-FILE-CONTRACT
+
+**worker → panel.**
+
+- **Contract**:
+  ```
+  <logsDir>/<sanitizedJobId>.log      append-only container stdout+stderr; untrusted, PII-bearing; written ONLY when PI_CAPTURE_JOB_LOGS=1
+  <logsDir>/<sanitizedJobId>.json     one JSON object, PII-free, overwritten on each terminal state (last-write-wins across retries)
+  (logsDir via PI_LOGS_DIR; empty/unset = <OS temp>/pi-dispatch/logs)
+  { "jobId":   "<raw job id: delivery GUID | local-<hex> | repeat:<sched>:<millis>>",
+    "kind":    "github" | "local" | null,
+    "target":  "<repo>#<issue>"  |  "local:<basename>" | null,
+    "flow":    "<flow name>" | null,
+    "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
+    "outcome":   "completed" | "policy" | "failed",
+    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|...>" | null,
+    "exitCode":  <int> | null,
+    "turns":     <int> | null,
+    "budgetReserved": <bool> | null,
+    "attempt":   <int> }
+  ```
+  Field order is the serialisation order (`JSON.stringify` emits insertion order). The filename uses the
+  **sanitized** id (`:` → `_`, because `repeat:<sched>:<millis>` is NTFS-illegal); the record **body**
+  keeps the raw `jobId`. `reason` is a fixed enum passed through from the terminal outcome — never
+  free-form and never payload text — and `turns` is `null` when the container died before emitting the
+  runner `exit` line.
+- **Why**: The panel is a separate process (`DES-PANEL-SEPARATE-FROM-RECEIVER`) that reads this as a
+  read-model it does not share memory with — the worker writes the files, the panel reads them, and
+  nothing crosses in RAM. The worker writes on both terminal paths: `worker/src/index.mjs` `makeProcessor`
+  calls `recordRun` on the success (`result`) and the failure (`error`) branch alike, and
+  `worker/src/run-history.mjs` `makeRecordWriter` serialises the record with a truncating
+  `fs.writeFileSync`, so a re-run of the same id overwrites — last-write-wins across retries. The `.json`
+  is PII-free **by construction**: `buildRecord` (`worker/src/run-history.mjs`) is an explicit object
+  literal over stable id-only fields and never spreads `job.data`, `result`, or `error`, so a GitHub
+  job's title/body and a local job's `task` or full folder path cannot leak — `target` keeps only
+  `repo#issue` or the folder `basename` (`no-pii-in-logs`, `REQ-LOCAL-JOB-VISIBILITY`). The `.log` is a
+  **separate file** from the `.json` precisely so the untrusted, PII-bearing container stream — teed off
+  each stdout/stderr chunk by the sink in `worker/src/run-container.mjs` — never contaminates the
+  structured record; it is opt-in, host-side (never mounted into the container), and written only under
+  `PI_CAPTURE_JOB_LOGS=1`. This is a **flat per-job file, not a database**: one `.json` (plus the optional
+  `.log`) keyed by the sanitized job id, no schema and no query surface — upholding this file's standing
+  invariant that **there is deliberately no database**.
+- **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
+- **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
+  id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
+  issue or comment body text (`target` is `repo#issue` / `local:<basename>` only); `turns` is `null` when
+  the container died before emitting the runner `exit` line; the `.log` exists only when
+  `PI_CAPTURE_JOB_LOGS` is set.
+
 ---
 
 ## Revision History
 
 | Date | Change |
 |---|---|
+| 2026-07-21 | Added INT-RUN-HISTORY-FILE-CONTRACT (worker→panel run-history read-model files). |
 | 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §5.1, §5.3, §5.4, §5.5. `INT-SDK-SESSION-OPTIONS` is **new** — the source doc left the SDK option set unverified (its §10) and was wrong about the print-mode flag shape and the mode union. `PLAYWRIGHT_BROWSERS_PATH` added to the runtime contract: the source doc's Dockerfile was broken as written for non-root execution. The source doc's code sketches are deliberately **not** carried over — the real Dockerfile and handler are the truth, and a spec that mirrors them drifts on the first commit. |
 | 2026-07-16 | **Correction — "pi never throws" was FALSE**, and it was in this file for a day as the justification for forbidding `try`/`catch` outright. Adversarial re-verification refuted it: `agent-session.ts:1242-1244` is `catch (error) { preflightResult?.(false); throw error; }`, and pi's **own JSDoc** (`:1099-1100`) documents throws on no-model, no-API-key, and missing `streamingBehavior`; `agent.ts:470-471` throws `"Agent is already processing."` outside the lifecycle try entirely. The rule as written would have produced a runner that dies of an unhandled rejection on a missing API key, exiting Node's default `1` = *retryable*, so the queue pays to retry a job that can never succeed. **Both mechanisms are required and cover disjoint sets: preflight throws, the loop swallows.** Also corrected: `StopReason` has **five** values (`packages/ai/src/types.ts:380`) — the entry handled three, and a default branch silently maps `"length"` (truncated output) to success. `reload()` has **no early return** — a second call fully re-runs everything; the earlier "the `loaded` guard makes a double call safe" framing was wrong. The lesson is the file's own: this entry was written from source and still asserted an absolute from a partial read. `INT-CONTAINER-RUNTIME-CONTRACT` gained `--init`, `--shm-size` (explicitly **not** `--ipc=host`, which Playwright recommends but which would share the host IPC namespace with an adversarial container), fonts (absent ⇒ tofu-box screenshots that silently gut `REQ-FRONTEND-VISUAL-VERIFY`), and the fact that **`COPY --chown` does not fix the EACCES trap** because it skips auto-created parent dirs. |

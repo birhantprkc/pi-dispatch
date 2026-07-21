@@ -19,6 +19,10 @@ REM One worker per host (DES-CONCURRENCY-3): parallelism is PI_CONCURRENCY insid
 REM multiple services. Requires the AOF-enabled Valkey from deploy/docker-compose.yml.
 REM
 REM Per-host PLACEHOLDERS: set SERVICE / REPO / LOGDIR below for your host before running.
+REM
+REM PI_LOGS_DIR (run-history records; default OS-temp \pi-dispatch\logs) is created and written by the
+REM worker at boot, so it must be writable by the service account. Set via `.env` (the wrapper), not a
+REM change here; its default avoids colliding with the nssm LOGDIR worker.out log set below.
 
 setlocal
 

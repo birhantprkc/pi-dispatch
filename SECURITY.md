@@ -118,6 +118,13 @@ Stated openly rather than discovered later:
 - **The provider API key is broad.** Unlike the GitHub token it cannot be meaningfully scoped per job —
   the agent needs it to function. It is the one broad secret inside the container. **Set a spend limit
   on it.**
+- **Captured job logs can contain issue and comment text (PII).** By default the worker writes only an
+  id-only status record per job — `logs/<jobId>.json`, keyed on stable ids (the delivery GUID,
+  `repo#issue`) and never on issue or comment bodies. With `PI_CAPTURE_JOB_LOGS=1` (opt-in, **off by
+  default**) it also tees the container's raw stdout/stderr to `logs/<jobId>.log`, and that stream **can**
+  carry issue/comment text. Both live host-side under `PI_LOGS_DIR`, are **never mounted into the job
+  container**, and are **gitignored**; a boot-time sweep prunes them (`PI_LOG_RETENTION_DAYS`, `0` = keep
+  forever). Leave capture off unless you need it, and treat the log directory as personal data while it is on.
 - **Prompt injection is not prevented, only bounded.** Untrusted text is kept out of the trusted region
   of the prompt by *placement*, not by filtering — content-filtering natural language is not a security
   boundary and this project does not pretend otherwise. The bound is the container, the scoped token,

@@ -19,14 +19,22 @@ import { InfraRetry } from "./processor.mjs";
  * container at all.
  *
  * Output is streamed to `onOutput` (default: the worker's stdout) so the operator watches the agent
- * work on their own machine -- the natural local UX. This is the operator's own console for their
- * own folder; it is not a persistent PII log.
+ * work on their own machine -- the natural local UX. When raw capture is enabled
+ * (`PI_CAPTURE_JOB_LOGS`), the same output is tee'd to a host-only, gitignored `logs/<jobId>.log`
+ * that is never mounted into the container and may contain agent-echoed issue text (PII). The
+ * worker's event log and the `.json` status record stay id-only.
  */
-export function makeRunContainer({ image, hostEnv = process.env, onOutput = (c) => process.stdout.write(c), spawnFn = spawn }) {
+export function makeRunContainer({
+	image,
+	hostEnv = process.env,
+	onOutput = (c) => process.stdout.write(c),
+	openJobLog = () => ({ write() {}, close: async () => ({ turns: null }) }),
+	spawnFn = spawn,
+}) {
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
 	return async function runContainer({ job, token, prepared, name, signal }) {
-		if (signal?.aborted) return { code: 137, aborted: true }; // killed before it could start
+		if (signal?.aborted) return { code: 137, aborted: true, turns: null }; // killed before it could start
 
 		// Closed env allowlist: only the provider key + the declared PI_* vars. Throws (config) if
 		// the provider is unconfigured -- the processor turns that into a pre-spend refusal.
@@ -47,19 +55,39 @@ export function makeRunContainer({ image, hostEnv = process.env, onOutput = (c) 
 			name,
 		});
 
+		// Host-side per-job log sink, teed off `onOutput`. `name` is `pi-job-<jobId>`; the sink
+		// sanitizes internally. No container mount, no env var -- the sink lives on this side only.
+		const sink = openJobLog(name);
+
 		return await new Promise((resolve, reject) => {
 			const child = spawnFn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
-			child.stdout?.on("data", onOutput);
-			child.stderr?.on("data", onOutput);
+			// A throwing sink.write is swallowed so a misbehaving sink cannot break the tee or hang the run.
+			const tee = (chunk) => {
+				onOutput(chunk);
+				try {
+					sink.write(chunk);
+				} catch {}
+			};
+			child.stdout?.on("data", tee);
+			child.stderr?.on("data", tee);
 			// docker not found / daemon down -- a transient infra fault, so tag it retryable
 			// (CONST-RETRY-INFRA-ONLY). `reason` also cues the processor to release the budget slot,
 			// since a container that never started spent nothing.
-			child.on("error", (err) =>
-				reject(new InfraRetry("container-never-started", { cause: err, reason: "container-never-started" })),
-			);
-			child.on("close", (code) =>
-				resolve(signal?.aborted ? { code: code ?? 137, aborted: true } : { code: code ?? 1, aborted: false }),
-			);
+			child.on("error", (err) => {
+				sink.close().catch(() => {}); // best-effort teardown; a rejecting close cannot leak an unhandled rejection
+				reject(new InfraRetry("container-never-started", { cause: err, reason: "container-never-started" }));
+			});
+			child.on("close", async (code) => {
+				const aborted = signal?.aborted === true; // capture BEFORE the await
+				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns falls back to null.
+				let turns = null;
+				try {
+					({ turns } = await sink.close());
+				} catch {
+					turns = null;
+				}
+				resolve(aborted ? { code: code ?? 137, aborted: true, turns } : { code: code ?? 1, aborted: false, turns });
+			});
 		});
 	};
 }

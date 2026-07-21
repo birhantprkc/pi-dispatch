@@ -13,17 +13,26 @@ export function configError(message) {
 	return error;
 }
 
-export function positiveInt(env, name, fallback) {
+function boundedInt(env, name, fallback, min, want) {
 	const raw = env[name];
 	if (raw === undefined || raw === "") {
 		if (fallback !== undefined) return fallback;
 		throw configError(`missing required env: ${name}`);
 	}
 	const n = Number.parseInt(raw, 10);
-	if (!Number.isInteger(n) || n < 1 || String(n) !== String(raw).trim()) {
-		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (want a positive integer)`);
+	if (!Number.isInteger(n) || n < min || String(n) !== String(raw).trim()) {
+		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (want ${want})`);
 	}
 	return n;
+}
+
+export function positiveInt(env, name, fallback) {
+	return boundedInt(env, name, fallback, 1, "a positive integer");
+}
+
+// min=0: accepts 0 (a sentinel, e.g. "keep forever" for log retention), still rejects negatives and non-integers.
+function nonNegativeInt(env, name, fallback) {
+	return boundedInt(env, name, fallback, 0, "a non-negative integer");
 }
 
 /**
@@ -44,6 +53,9 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		schedulesFile: env.PI_SCHEDULES_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: schedule list is a host file; null = cron disabled
 		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
+		logsDir: env.PI_LOGS_DIR || defaultLogsDir(), // || (not ??) so an empty string falls back to the default
+		captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1", // no-pii-in-logs: raw job-log capture is opt-in; anything but "1" is off
+		logRetentionDays: nonNegativeInt(env, "PI_LOG_RETENTION_DAYS", 30), // 0 = keep forever
 		github: loadGitHubAuth(env, fileExists),
 	};
 }
@@ -91,4 +103,10 @@ function defaultJobsDir() {
 	// Under the OS temp dir by default. Holds only the read-only /job inputs (prompt + .pi/); the
 	// workspace for a local job is the operator's own folder, not here.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/jobs`.replace(/\\/g, "/");
+}
+
+function defaultLogsDir() {
+	// Under the OS temp dir by default. Holds durable per-run history/log artifacts written host-side;
+	// a worker-owned path that never enters the container env allowlist (no-broad-env-into-container).
+	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/logs`.replace(/\\/g, "/");
 }

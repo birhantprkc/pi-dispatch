@@ -12,6 +12,11 @@
 # Env vars come from your `.env` (see `.env.example`) via EnvironmentFile -- never commit real secrets.
 # WorkingDirectory / EnvironmentFile / User / node path below are PLACEHOLDERS: set them to wherever
 # you cloned the repo and whoever owns it.
+#
+# PI_LOGS_DIR (run-history records; default OS-temp /pi-dispatch/logs) is created and written by the
+# worker at boot, so it must be writable by User= (pi) -- do NOT pre-create it as root, or the non-root
+# worker hits EACCES at boot. Set via `.env` (EnvironmentFile), no unit change needed; the default path
+# avoids colliding with the daemon's own logs/worker.out.log.
 
 [Unit]
 Description=pi-dispatch worker (drains the job queue on the host; launches job containers via docker)

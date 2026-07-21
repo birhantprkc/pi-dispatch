@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { captureTerminal, decideExit, EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "../src/outcome.mjs";
 
@@ -42,4 +43,34 @@ test("decideExit: without an abort, the stopReason decides", () => {
 test("decideExit: no terminal message and no abort is infra, not success", () => {
 	// Absence of evidence that the agent ran is not success.
 	assert.equal(decideExit({ budgetAborted: false, terminal: undefined }).code, EXIT_INFRA);
+});
+
+test("decideExit's non-abort branch carries NO turns of its own -- the premise the source-guard rests on", () => {
+	// WHY the guard below exists: on the success path, `turns` reaches the exit log SOLELY from
+	// run-job.mjs's `log("exit", { ...outcome, turns: budget.state.turns })` spread. decideExit's
+	// non-abort branch returns classifyStopReason, which has no `turns` field (only the budget-abort
+	// branch carries one -- see "a blown budget wins" above). So if that spread ever dropped `turns`,
+	// nothing in outcome.mjs would put it back, and the worker's parseExitTurns (which requires a
+	// numeric `turns` on the exit line) would silently read null on every completed run.
+	const outcome = decideExit({ budgetAborted: false, terminal: { stopReason: "stop" } });
+	assert.equal(outcome.code, EXIT_COMPLETED);
+	assert.equal(outcome.turns, undefined, "the non-abort branch of decideExit carries no turns of its own");
+});
+
+test("run-job.mjs staples `turns` onto the success-path exit line -- worker parseExitTurns depends on it", () => {
+	// A stdout-capture test would EXECUTE the runner (main() self-runs on import and `log` is
+	// unexported), so this guards the worker<->runner contract against the source instead -- the same
+	// tactic worker/test/wiring.test.mjs uses for wiring it cannot exercise at runtime. The regex
+	// matches a `log("exit", { ... turns: ... })` call whose object literal carries a `turns:` key
+	// before its closing brace: specific enough that dropping `turns` from the success spread fails
+	// it, tolerant of whitespace and property reordering.
+	const src = readFileSync(new URL("../run-job.mjs", import.meta.url), "utf8");
+	assert.match(
+		src,
+		/log\("exit",\s*\{[^}]*turns:/,
+		"run-job.mjs exit line must carry turns -- worker parseExitTurns depends on it",
+	);
+	// The catch-path exit line (classifyThrow, a preflight throw) legitimately OMITS turns: no budget
+	// exists when the agent loop never started. The regex above matches the success call and does not
+	// require every exit line to carry turns, so that omission is allowed by design.
 });

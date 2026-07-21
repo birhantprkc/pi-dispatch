@@ -30,7 +30,7 @@ export async function runJob(job, deps) {
 		mintToken, // (repo) => scoped short-lived token | null for local-folder jobs
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
-		// runContainer({ job, token, prepared, name, signal }) => { code, aborted }. It MUST honour
+		// runContainer({ job, token, prepared, name, signal }) => { code, aborted, turns }. It MUST honour
 		// `signal`: stop the container on abort, and reject/exit promptly if `signal.aborted` is already
 		// true at entry (the timeout can fire during a slow prepare). The wiring injects name + signal.
 		runContainer,
@@ -63,7 +63,8 @@ export async function runJob(job, deps) {
 			if (!(await isDefaultBranchProtected(job.repo, token))) {
 				await comment(job, "Refused: the default branch is not protected. See SECURITY.md.");
 				log("refused_unprotected", { repo: job.repo });
-				return { outcome: "policy", reason: "unprotected-branch" }; // return => not retried
+				// exitCode/turns null: refused pre-container, so no container exit or turn count exists.
+				return { outcome: "policy", reason: "unprotected-branch", exitCode: null, turns: null, budgetReserved: false }; // return => not retried
 			}
 		}
 
@@ -82,10 +83,11 @@ export async function runJob(job, deps) {
 		if (!budget.allowed) {
 			await comment(job, `Over the daily budget cap (${budget.cap}). Not run.`);
 			log("over_budget", { reserved: budget.reserved, cap: budget.cap });
-			return { outcome: "policy", reason: "over-budget" }; // return => not retried
+			// budgetReserved true: the slot is reserved above and kept (an over-cap reservation still counts).
+			return { outcome: "policy", reason: "over-budget", exitCode: null, turns: null, budgetReserved: true }; // return => not retried
 		}
 
-		const { code, aborted } = await runContainer({ job, token, prepared });
+		const { code, aborted, turns } = await runContainer({ job, token, prepared });
 		log("container_exit", { exitCode: code, aborted });
 
 		// A WORKER-initiated stop (30-min timeout via cancelJob, or graceful-shutdown docker stop) kills
@@ -93,17 +95,18 @@ export async function runJob(job, deps) {
 		// NOT retry, or a wedged job re-runs into a second PR / double spend. Keyed on the abort FLAG,
 		// not the code -- an unbidden 137 (kernel OOM) carries `aborted: false`, falls to the switch, and
 		// stays infra-retryable.
-		if (aborted) return { outcome: "policy", reason: "worker-abort" };
+		// exitCode/turns carry the container's own exit and turn count; budgetReserved true post-reserve.
+		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, budgetReserved: true };
 
 		switch (code) {
 			case EXIT_COMPLETED:
-				return { outcome: "completed" };
+				return { outcome: "completed", exitCode: code, turns, budgetReserved: true };
 			case EXIT_POLICY:
-				return { outcome: "policy", reason: "runner-policy" };
+				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, budgetReserved: true };
 			case EXIT_INFRA:
-				throw new InfraRetry(`infra failure, container exit ${code}`);
+				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns });
 			default:
-				throw new InfraRetry(`unknown container exit ${code}`);
+				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns });
 		}
 	} catch (e) {
 		// A spawn fault (docker daemon down / binary missing) reserved a slot but never started a
@@ -111,6 +114,9 @@ export async function runJob(job, deps) {
 		// here (exit-1 infra, unknown exit) means the container ran and legitimately spent its slot,
 		// so `reason` gates the release to the never-started case only. Guarded on `reserved` and run
 		// once per invocation; a BullMQ retry reserves afresh, so this cannot double-release.
+		// budgetReserved reflects whether a slot stays spent: false when never-started refunds below,
+		// true for a real container that ran and spent (exit-1 infra / unknown exit).
+		if (e instanceof InfraRetry) e.budgetReserved = reserved && e.reason !== "container-never-started";
 		if (reserved && e instanceof InfraRetry && e.reason === "container-never-started") {
 			await releaseBudget(redis, { now });
 		}
@@ -122,11 +128,14 @@ export async function runJob(job, deps) {
 
 /** Thrown for the retryable (infra) class only. The BullMQ processor lets this propagate to retry. */
 export class InfraRetry extends Error {
-	constructor(message, { cause, reason } = {}) {
+	constructor(message, { cause, reason, exitCode, turns, budgetReserved } = {}) {
 		super(message, cause ? { cause } : undefined);
 		this.name = "InfraRetry";
 		this.piDispatchRetry = true;
 		this.reason = reason ?? message;
+		this.exitCode = exitCode ?? null;
+		this.turns = turns ?? null;
+		this.budgetReserved = budgetReserved ?? null;
 	}
 }
 

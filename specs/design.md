@@ -137,6 +137,33 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Reference** (no authority): `docs.bullmq.io/guide/rate-limiting`, `/guide/workers/pausing-queues`,
   `/guide/redis-tm-compatibility`.
 
+## DES-RUN-HISTORY-FLAT-FILES-NO-DB
+
+- **Decision**: The per-job run history is a flat `node:fs` sidecar keyed by job id — an id-only status
+  record at `logs/<jobId>.json` (written with `fs.writeFileSync`) plus an optional append-only
+  `logs/<jobId>.log` of raw container output (`fs.createWriteStream`). No database, no logging framework.
+  Retention is a boot-time age sweep (`makeLogReaper`, window `PI_LOG_RETENTION_DAYS`), not a rotation
+  library.
+- **Why**: The record must **outlive the queue entry**. BullMQ evicts completed and failed jobs by age
+  (`removeOnComplete` / `removeOnFail`), so the retained job cannot be the durable store — and it never
+  carries `exitCode`, `turns`, or `budgetReserved` in the first place. The sidecar is justified precisely
+  by what BullMQ lacks: a record that survives eviction and holds the run's outcome fields. Those records
+  are immutable, filename-keyed, and never queried across each other, so a store with query power earns
+  nothing. This is `DES-QUEUE-BULLMQ-OVER-CUSTOM`'s library-first ethos one file down, and the design
+  home for the `document-build-decision` rule that the sidecar's inline `Custom:` comment cites.
+- **Rejected**:
+  - *Querying BullMQ's retained job instead of a sidecar* — BullMQ evicts by age, so it is not the
+    *durable* store, and it never carries `exitCode` / `turns` / `budgetReserved`. It cannot be the
+    record.
+  - *An embedded database (lowdb / better-sqlite3) or a structured-logging library (pino / winston)* —
+    the records are immutable, filename-keyed, with no cross-record query in scope, so neither earns its
+    keep. A DB adds a native build (the ARM / musl / glibc pain the job image exists to avoid) and a
+    second retention authority beside the reaper for zero query benefit; a logging library brings its own
+    rotation as that same second authority. Both violate the deliberate "no database" thinness
+    (`interfaces.md` preamble) and the library-first ethos — the same reasoning as
+    `DES-QUEUE-BULLMQ-OVER-CUSTOM`.
+- **Traces to**: `DES-QUEUE-BULLMQ-OVER-CUSTOM`; implemented in `worker/src/run-history.mjs`.
+
 ## DES-PERSONA-VIA-APPEND-SYSTEM-MD
 
 - **Decision**: Bake the persona into the image at `~/.pi/agent/APPEND_SYSTEM.md`, **and** pass per-flow
@@ -531,3 +558,4 @@ a tunnel.
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted) §2, §3, §4, §5, §9, §11. That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — **verified against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points. `DES-PERSONA-VIA-APPEND-SYSTEM-MD` is materially rewritten: the source doc's decisions #1 and #2 were mutually exclusive as written. `DES-NAME-KEEP-PI-DISPATCH` is new. `pi-harness` and `pi-sentry` were absent from the source doc's alternatives and are added. §5.7's "caches roll at midnight" caveat is **dropped** — 0.80.7 removed the date from the default system prompt. |
 | 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |
 | 2026-07-16 | **Resolved a spec/code contradiction.** `DES-WORKER-ON-HOST` added and `DES-JOB-FILES-VIA-VOLUME-SUBPATH` marked SUPERSEDED: the worker runs on the host (the `docker` CLI translates host paths, the daemon does not, and the VM prefix moved between Docker Desktop versions; local-folder jobs also *require* a host bind mount a named volume cannot give). The committed spec had rejected worker-on-host while the code already did it -- caught by a spec-conformance scan. `DES-CLI-TRIGGER-FOR-LOCAL` added: the CLI producer was built (user-directed) but unspecified; recorded with the check that `CONST-BUDGET-BEFORE-TOKENS` still holds because the cap is enforced in the processor, not the trigger. Repo-layout `deploy/` line corrected (compose runs Valkey only). |
+| 2026-07-21 | Added DES-RUN-HISTORY-FLAT-FILES-NO-DB (flat node:fs sidecar over a DB / BullMQ-query for run history). |

@@ -28,7 +28,7 @@ function fakeHost(overrides = {}) {
 // Drive startWorker with injected fakes and capture the exact object handed to createWorker
 // (deps are nested under `deps`). No real Redis: createWorkerFn is faked. The real ioredis client
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
-async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}) {
+async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, order } = {}) {
 	const calls = [];
 	const registered = {};
 	const createWorkerFn = (arg) => {
@@ -47,6 +47,33 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}
 	// inject their own.
 	const reaper = makeReaper ?? (() => async () => {});
 
+	// Default the run-history factories to inert fakes so the wiring tests never touch disk (the real
+	// factories mkdirSync/readdirSync at construction). Each default records the args it was constructed
+	// with so a test can assert config threading without a fs. A `logsDir`-only sentinel is fine here:
+	// runContainer is never invoked, so the returned openJobLog is stored and never called.
+	const openJobLogSentinel = () => ({ write() {}, close: async () => ({ turns: null }) });
+	const logSinkCalls = [];
+	const recordWriterCalls = [];
+	const logReaperCalls = [];
+	const logSink =
+		makeLogSink ??
+		((args) => {
+			logSinkCalls.push(args);
+			return openJobLogSentinel;
+		});
+	const recordWriter =
+		makeRecordWriter ??
+		((args) => {
+			recordWriterCalls.push(args);
+			return () => {};
+		});
+	const logReaper =
+		makeLogReaper ??
+		((args) => {
+			logReaperCalls.push(args);
+			return () => {};
+		});
+
 	const lines = [];
 	const origWrite = process.stdout.write;
 	process.stdout.write = (chunk) => {
@@ -54,7 +81,15 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}
 		return true;
 	};
 	try {
-		await mod.startWorker(env, { makeAuth, makeHost, createWorkerFn, makeReaper: reaper });
+		await mod.startWorker(env, {
+			makeAuth,
+			makeHost,
+			createWorkerFn,
+			makeReaper: reaper,
+			makeLogSink: logSink,
+			makeRecordWriter: recordWriter,
+			makeLogReaper: logReaper,
+		});
 	} finally {
 		process.stdout.write = origWrite;
 	}
@@ -73,7 +108,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, order } = {}
 	});
 	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
 	// `registered` for the scheduler stall-guard test. Same object, one capture path.
-	return { captured, deps: captured?.deps, logs, handlers: registered, registered };
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls };
 }
 
 // Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
@@ -221,4 +256,64 @@ test("cron wiring: a stalled listener is registered and schedules_installed prec
 	const startedIdx = logs.findIndex((l) => l.event === "worker_started");
 	assert.ok(startedIdx !== -1, "a worker_started log must be emitted");
 	assert.ok(installedIdx < startedIdx, "schedules_installed must be logged before worker_started");
+});
+
+// Run-history wiring (REQ-LOCAL-JOB-VISIBILITY). DEFAULT env => no live Valkey / disk required: the
+// harness injects inert run-history factories, so these assert the wiring, not the I/O.
+test("run-history: makeLogSink receives config.logsDir and the captureJobLogs gate (both polarities)", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+
+	const on = await runStart({ env: { PI_LOGS_DIR: "/tmp/pi-logs", PI_CAPTURE_JOB_LOGS: "1" }, makeAuth, makeHost: () => fakeHost() });
+	assert.equal(on.logSinkCalls.length, 1, "makeLogSink must be constructed exactly once");
+	assert.equal(on.logSinkCalls[0].logsDir, "/tmp/pi-logs", "makeLogSink must receive the host-side config.logsDir");
+	assert.equal(on.logSinkCalls[0].enabled, true, "enabled must mirror captureJobLogs when PI_CAPTURE_JOB_LOGS=1");
+
+	// The record writer is always constructed against the same logsDir; the id-only record is not gated.
+	assert.equal(on.recordWriterCalls[0]?.logsDir, "/tmp/pi-logs", "makeRecordWriter must receive config.logsDir");
+
+	const off = await runStart({ env: { PI_LOGS_DIR: "/tmp/pi-logs" }, makeAuth, makeHost: () => fakeHost() });
+	assert.equal(off.logSinkCalls[0].enabled, false, "enabled must be false when PI_CAPTURE_JOB_LOGS is unset");
+});
+
+test("run-history: recordRun is passed to createWorker as a TOP-LEVEL arg, not nested under deps", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { captured } = await runStart({ makeAuth, makeHost: () => fakeHost() });
+	assert.equal(typeof captured.recordRun, "function", "recordRun must be a top-level createWorker arg");
+	assert.equal(captured.deps.recordRun, undefined, "recordRun must NOT be nested under deps");
+});
+
+test("run-history: the log reaper sweeps aged history BEFORE the worker starts draining", { skip }, async () => {
+	const order = [];
+	let reaperArgs;
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const makeLogReaper = (args) => {
+		reaperArgs = args;
+		return () => {
+			order.push("reapLogs");
+		};
+	};
+	await runStart({
+		env: { PI_LOGS_DIR: "/tmp/pi-logs", PI_LOG_RETENTION_DAYS: "7" },
+		makeAuth,
+		makeHost: () => fakeHost(),
+		makeLogReaper,
+		order,
+	});
+	assert.deepEqual(order, ["reapLogs", "createWorker"], "the log reaper must sweep before the worker is created");
+	assert.equal(reaperArgs.logsDir, "/tmp/pi-logs", "the log reaper must receive config.logsDir");
+	assert.equal(reaperArgs.retentionDays, 7, "the log reaper must receive config.logRetentionDays");
+});
+
+test("run-history: worker_started announces logsDir, captureJobLogs and logRetentionDays (a path is not PII)", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { logs } = await runStart({
+		env: { PI_LOGS_DIR: "/tmp/pi-logs", PI_CAPTURE_JOB_LOGS: "1", PI_LOG_RETENTION_DAYS: "7" },
+		makeAuth,
+		makeHost: () => fakeHost(),
+	});
+	const started = logs.find((l) => l.event === "worker_started");
+	assert.ok(started, "a worker_started log must be emitted");
+	assert.equal(started.logsDir, "/tmp/pi-logs", "worker_started must announce where records land");
+	assert.equal(started.captureJobLogs, true, "worker_started must announce the raw-log capture gate");
+	assert.equal(started.logRetentionDays, 7, "worker_started must announce the retention window");
 });

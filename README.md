@@ -152,6 +152,16 @@ the worker handles and drains gracefully. Task Scheduler is a weaker fallback â€
 hard kill, giving the worker no chance to drain; a job killed mid-flight leaves a stray container that the
 worker's **boot reaper** clears on the next start, rather than draining cleanly.
 
+## Run history
+
+The worker keeps a durable, per-job record under `PI_LOGS_DIR` (default: your OS temp dir,
+`.../pi-dispatch/logs`). Every job writes an id-only status record `logs/<jobId>.json` â€” stable ids only
+(the delivery GUID, `repo#issue`), never issue or comment text. Set `PI_CAPTURE_JOB_LOGS=1` to **also**
+capture the container's raw stdout/stderr to `logs/<jobId>.log`; this is **opt-in and off by default**,
+because that raw stream can contain issue and comment text (PII). Both files stay host-side, are never
+mounted into the job container, and are gitignored. A boot-time sweep prunes anything older than
+`PI_LOG_RETENTION_DAYS` (default 30; `0` keeps them forever).
+
 ## Scheduling recurring jobs
 
 A cron schedule is a trigger, not a new job kind: each entry runs a local folder through a flow on a cron
