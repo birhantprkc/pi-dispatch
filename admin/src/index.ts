@@ -104,7 +104,7 @@ function toolText(text: string): { content: { type: "text"; text: string }[]; de
 }
 
 /**
- * Register the four LLM-callable tools: three reads (`dispatch_status`, `dispatch_runs`) and the two
+ * Register the four LLM-callable tools: two reads (`dispatch_status`, `dispatch_runs`) and the two
  * durable-but-reversible controls (`dispatch_pause`, `dispatch_resume`). There is deliberately NO
  * settings-write tool and NO log tool -- a write is an operator-typed command only, and raw `.log` bytes
  * never enter model context (DES-ADMIN-VIA-PI-EXTENSION injection boundary; REQ acceptance). Each read
