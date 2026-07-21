@@ -112,7 +112,7 @@ test("missing or empty task is a config error", () => {
 	assert.throws(() => load([{ ...VALID, task: "   " }]), isConfigError);
 });
 
-test("a valid local entry normalizes to the scheduler shape with config defaults resolved", () => {
+test("a valid local entry normalizes to the scheduler shape; omitted provider/model/maxTurns pass through absent (resolved at job start)", () => {
 	const result = load([VALID]);
 	assert.equal(result.length, 1);
 	const s = result[0];
@@ -121,15 +121,16 @@ test("a valid local entry normalizes to the scheduler shape with config defaults
 	assert.equal(s.name, "local");
 	assert.equal(s.pattern, "0 3 * * *");
 
-	// data deep-equals the queue.mjs:21 shape, defaults pulled from CONFIG.
+	// data deep-equals the queue.mjs:21 shape. VALID omits provider/model/maxTurns, so they carry
+	// through as undefined -- the value resolves at job start against the overlay/env, not frozen here.
 	assert.deepEqual(s.data, {
 		kind: "local",
 		folder: "/proj",
 		flow: "tidy",
 		task: "run the tidy pass",
-		provider: "anthropic",
-		model: "claude-sonnet-4-5-20250929",
-		maxTurns: 30,
+		provider: undefined,
+		model: undefined,
+		maxTurns: undefined,
 	});
 
 	// opts: retention only -- no jobId, attempts, or backoff.
@@ -140,7 +141,7 @@ test("a valid local entry normalizes to the scheduler shape with config defaults
 	assert.equal(s.opts.removeOnFail.age, 7 * 24 * 3600);
 });
 
-test("entry-level provider/model/maxTurns override the config defaults", () => {
+test("entry-level provider/model/maxTurns pass through verbatim into data", () => {
 	const [s] = load([{ ...VALID, provider: "openai", model: "gpt-x", maxTurns: 5 }]);
 	assert.equal(s.data.provider, "openai");
 	assert.equal(s.data.model, "gpt-x");

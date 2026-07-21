@@ -47,7 +47,7 @@ test("the processor declares arity 3 -- the silent trap that would disable the t
 		cancelJob: () => {},
 		stopContainer: () => {},
 		redis: {},
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		deps: {},
 		recordRun: () => {},
 	});
@@ -60,7 +60,7 @@ test("the timeout fires cancelJob after timeoutMs", { skip }, async () => {
 		cancelJob: (id, reason) => (cancelled = { id, reason }),
 		stopContainer: () => {},
 		redis: { async incr() { return 1; }, async expire() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 20,
 		deps: {
 			mintToken: async () => "t",
@@ -90,7 +90,7 @@ test("an abort stops the container", { skip }, async () => {
 		cancelJob: () => {},
 		stopContainer: (name) => (stopped = name),
 		redis: { async incr() { return 1; }, async expire() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 100000,
 		deps: {
 			mintToken: async () => "t",
@@ -126,7 +126,7 @@ test("shutdown closes each extraCloser after the worker drains", { skip }, async
 		worker = mod.createWorker({
 			connection: { host: "127.0.0.1", port: 1 },
 			concurrency: 1,
-			cap: 10,
+			getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 			redis: {},
 			deps: {},
 			extraClosers: [{ close: async () => { closed = true; } }],
@@ -156,7 +156,7 @@ test("recordRun fires once on the SUCCESS (return) path with { job, result, star
 		cancelJob: () => {},
 		stopContainer: () => {},
 		redis: { async incr() { return 1; }, async expire() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 100000,
 		recordRun: (rec) => calls.push(rec),
 		deps: {
@@ -189,7 +189,7 @@ test("recordRun fires with { job, error } BEFORE an UnrecoverableError propagate
 		cancelJob: () => {},
 		stopContainer: () => {},
 		redis: { async incr() { return 1; }, async expire() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 100000,
 		recordRun: (rec) => calls.push(rec),
 		deps: {
@@ -222,7 +222,7 @@ test("recordRun fires and the InfraRetry still propagates (retryable, not Unreco
 		cancelJob: () => {},
 		stopContainer: () => {},
 		redis: { async incr() { return 1; }, async expire() {}, async decr() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 100000,
 		recordRun: (rec) => calls.push(rec),
 		deps: {
@@ -281,7 +281,7 @@ function realRecordProcessor(recordRun, { runContainer, redis } = {}) {
 		cancelJob: () => {},
 		stopContainer: () => {},
 		redis: redis ?? { async incr() { return 1; }, async expire() {}, async decr() {} },
-		cap: 10,
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
 		timeoutMs: 100000,
 		recordRun,
 		deps: {

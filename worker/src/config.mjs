@@ -54,6 +54,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		schedulesFile: env.PI_SCHEDULES_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: schedule list is a host file; null = cron disabled
 		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
 		logsDir: env.PI_LOGS_DIR || defaultLogsDir(), // || (not ??) so an empty string falls back to the default
+		settingsFile: env.PI_SETTINGS_FILE || defaultSettingsFile(), // || (not ??) so an empty string falls back; INT-CONFIG-OVERLAY-CONTRACT
 		captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1", // no-pii-in-logs: raw job-log capture is opt-in; anything but "1" is off
 		logRetentionDays: nonNegativeInt(env, "PI_LOG_RETENTION_DAYS", 30), // 0 = keep forever
 		github: loadGitHubAuth(env, fileExists),
@@ -105,8 +106,16 @@ function defaultJobsDir() {
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/jobs`.replace(/\\/g, "/");
 }
 
-function defaultLogsDir() {
+export function defaultLogsDir() {
 	// Under the OS temp dir by default. Holds durable per-run history/log artifacts written host-side;
 	// a worker-owned path that never enters the container env allowlist (no-broad-env-into-container).
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/logs`.replace(/\\/g, "/");
+}
+
+export function defaultSettingsFile() {
+	// Under the OS temp dir by default. Holds the runtime-tunable settings overlay shared with the admin
+	// extension (INT-CONFIG-OVERLAY-CONTRACT); a worker-owned path that never enters the container env
+	// allowlist (no-broad-env-into-container). Exported so the admin extension resolves the same default
+	// without calling loadConfig, which throws on unrelated env problems.
+	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/settings.json`.replace(/\\/g, "/");
 }

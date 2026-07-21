@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 // start.mjs imports index.mjs (bullmq), connection.mjs (ioredis), and the octokit-backed auth/host
@@ -280,6 +283,46 @@ test("run-history: recordRun is passed to createWorker as a TOP-LEVEL arg, not n
 	const { captured } = await runStart({ makeAuth, makeHost: () => fakeHost() });
 	assert.equal(typeof captured.recordRun, "function", "recordRun must be a top-level createWorker arg");
 	assert.equal(captured.deps.recordRun, undefined, "recordRun must NOT be nested under deps");
+});
+
+// Runtime-settings overlay wiring (INT-CONFIG-OVERLAY-CONTRACT). PI_SETTINGS_FILE points at a path that
+// cannot exist so readOverlay yields the normal empty overlay and getSettings resolves purely from
+// env/default config -- no real settings.json on the host is consulted.
+test("runtime settings: getSettings is a top-level createWorker arg resolving effective settings; the static cap arg is gone", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const settingsFile = "/pi-dispatch-nonexistent/does-not-exist/settings.json";
+	const { captured, logs } = await runStart({ env: { PI_SETTINGS_FILE: settingsFile }, makeAuth, makeHost: () => fakeHost() });
+
+	assert.equal(typeof captured.getSettings, "function", "getSettings must be a top-level createWorker arg");
+	assert.equal(captured.cap, undefined, "no static cap arg survives -- the overlay replaces the frozen daily cap");
+
+	// Calling it with an empty overlay yields the five effective keys from env/default config (env {} here).
+	assert.deepEqual(
+		captured.getSettings(),
+		{ provider: "anthropic", model: "claude-sonnet-4-5-20250929", maxTurns: 30, dailyCap: 25, concurrency: 3 },
+		"getSettings resolves the five effective keys from env/default config when the overlay is empty",
+	);
+
+	const started = logs.find((l) => l.event === "worker_started");
+	assert.ok(started, "a worker_started log must be emitted");
+	assert.equal(started.settingsFile, settingsFile, "worker_started must announce the settings overlay path");
+});
+
+test("runtime settings: a boot overlay sets the constructed concurrency, and worker_started reports that effective value (not the env default)", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	// A real settings.json whose concurrency (7) differs from the env default (3), so the boot-effective
+	// value is distinguishable from config.concurrency in both the constructor arg and the log.
+	const dir = mkdtempSync(join(tmpdir(), "pi-settings-"));
+	const settingsFile = join(dir, "settings.json");
+	writeFileSync(settingsFile, JSON.stringify({ concurrency: 7 }));
+	try {
+		const { captured, logs } = await runStart({ env: { PI_SETTINGS_FILE: settingsFile }, makeAuth, makeHost: () => fakeHost() });
+		assert.equal(captured.concurrency, 7, "the Worker is constructed with the boot-effective concurrency, not the env default 3");
+		const started = logs.find((l) => l.event === "worker_started");
+		assert.equal(started.concurrency, 7, "worker_started must report the concurrency the Worker was actually constructed with");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("run-history: the log reaper sweeps aged history BEFORE the worker starts draining", { skip }, async () => {

@@ -10,6 +10,7 @@ import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
 import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter } from "./run-history.mjs";
+import { effectiveSettings, readOverlay } from "./runtime-settings.mjs";
 import { loadSchedules } from "./schedules.mjs";
 import { makeStallGuard } from "./scheduler-stall-guard.mjs";
 
@@ -122,10 +123,31 @@ export async function startWorker(
 	const recordRun = ({ job, result, error, startedAt, endedAt }) =>
 		writeRecord(buildRecord({ job, result, error, startedAt, endedAt }));
 
+	// INT-CONFIG-OVERLAY-CONTRACT: the worker reads the runtime-settings overlay at EACH job start, so this
+	// closure -- not a value frozen at boot -- is what the processor calls per job. It resolves the five
+	// effective settings from the overlay over env; an invalid overlay returns `{ invalid }` (logged loudly,
+	// key-name-only per no-pii-in-logs) so the processor RETURNS a settings-overlay-invalid refusal instead
+	// of the run.
+	const settingsFile = config.settingsFile;
+	const getSettings = () => {
+		const res = readOverlay(settingsFile, { log });
+		if (res.invalid) {
+			log("settings_overlay_invalid", { reason: res.invalid, settingsFile });
+			return { invalid: res.invalid };
+		}
+		return effectiveSettings(config, res.overlay);
+	};
+
+	// Resolve the Worker constructor's slot count once from the overlay: a present overlay may raise or lower
+	// boot concurrency. An invalid overlay must NOT dead-end the worker -- fall back to the env/default and let
+	// the per-job path enforce the refusal (getSettings already logged the invalid reason).
+	const bootSettings = getSettings();
+	const bootConcurrency = bootSettings.invalid ? config.concurrency : bootSettings.concurrency;
+
 	const worker = createWorkerFn({
 		connection: parseConnection(config.valkeyUrl),
-		concurrency: config.concurrency,
-		cap: config.dailyCap,
+		concurrency: bootConcurrency,
+		getSettings,
 		redis,
 		recordRun,
 		extraClosers: [schedulerQueue],
@@ -204,11 +226,12 @@ export async function startWorker(
 
 	log("worker_started", {
 		queue: "pi-jobs",
-		concurrency: config.concurrency,
+		concurrency: bootConcurrency, // the slot count the Worker is actually constructed with (overlay may raise/lower it)
 		dailyCap: config.dailyCap,
 		image: config.jobImage,
 		valkey: config.valkeyUrl,
 		logsDir: config.logsDir,
+		settingsFile: config.settingsFile,
 		captureJobLogs: config.captureJobLogs,
 		logRetentionDays: config.logRetentionDays,
 	});
