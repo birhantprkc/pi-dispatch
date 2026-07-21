@@ -134,6 +134,20 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   with a hash suffix only if it is ever observed.
 - **Blocks**: nothing from shipping. The boot sweep bounds growth across restarts today.
 
+## OQ-008 — Runtime trigger editing (cron toggle, label→flow) is deferred
+
+- **Status**: **OPEN**
+- **Question**: Should the admin extension edit triggers — toggling a cron schedule, remapping a
+  label→flow — and via what mechanism that survives a worker or receiver restart?
+- **Why it matters**: A Redis-side scheduler toggle is overwritten by the worker's boot reconcile
+  (`REQ-CRON-SCHEDULED-JOBS` acceptance: startup removes schedulers absent from the schedules file), so a
+  runtime edit that silently reverts at the next boot is worse than no edit at all. The label→flow mapping
+  lives in `receiver.flows.json`, loaded fail-loud at receiver boot, so an edit there needs a receiver
+  restart. Two sources of truth — a live toggle and a file the boot reconcile trusts — is the failure mode.
+- **How to answer**: Either make the files the write target (the extension edits `schedules.json` /
+  `receiver.flows.json` and gains a reload story), or ratify trigger editing as display-only.
+- **Blocks**: Nothing this slice — the admin extension ships triggers **display-only**.
+
 ---
 
 ## Retired from the source design document
@@ -174,3 +188,4 @@ adversarial passes did.
 | 2026-07-15 | ~~`OQ-005` corrected to **WATCH — PARTIALLY LANDED**~~ — **this entry was wrong; see above.** It claimed `modelRuntime` was already in `CreateAgentSessionOptions` at the pinned sha and that the changelog was not a reliable signal. Both false: the sha was HEAD, not the pin. Kept rather than deleted, because a spec that hides having been wrong teaches the next reader to trust it more than it deserves. |
 | 2026-07-17 | Added OQ-006 recording the GitHub-auth-mechanism decision (default gh/fine-grained PAT single-owner; App mandatory multi-tenant), closed by this plan + the E1 CONST-TOKEN-SCOPED-PER-JOB amendment. |
 | 2026-07-21 | Added OQ-007 (run-history retention: periodic sweep). |
+| 2026-07-21 | Added OQ-008 (runtime trigger editing — cron toggle, label→flow — deferred; the admin extension ships triggers display-only). |

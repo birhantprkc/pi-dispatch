@@ -15,9 +15,9 @@
  * The receiver resolves identity ONLY. It holds no per-repo tokens: minting a scoped token is the
  * worker's job, per container, per job (CONST-TOKEN-SCOPED-PER-JOB).
  *
- * DES-PANEL-SEPARATE-FROM-RECEIVER: this process exposes exactly one surface, the webhook handler.
- * There is no admin, dashboard, or panel route here -- the panel is a separate service on a separate
- * bind.
+ * DES-ADMIN-VIA-PI-EXTENSION: this process exposes exactly one surface, the webhook handler. There is no
+ * admin, dashboard, or admin-extension route here -- the admin surface is a pi extension in the
+ * operator's session and binds no port.
  */
 
 import http from "node:http";

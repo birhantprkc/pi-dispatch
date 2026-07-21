@@ -1,6 +1,6 @@
 # Interfaces
 
-The five contracts that cross a process or container boundary. These are the seams where a mistake is
+The contracts below cross a process or container boundary. These are the seams where a mistake is
 expensive, because both sides ship separately and nothing type-checks across the gap.
 
 Note what makes this file worth having at a project this size: **these cross a trust boundary, not just
@@ -302,7 +302,7 @@ Evidence convention as in `constitution.md`.
 
 - **Contract**: `/job` mounted **read-only**. `/workspace` is the only writable mount.
   ```
-  /job/prompt.md          task text (issue payload, or the panel-supplied task)
+  /job/prompt.md          task text (issue payload, or the operator-supplied task)
   /job/event.json         raw webhook payload — ABSENT for local-folder jobs
   /job/pi/APPEND_SYSTEM.md      project persona   ─┐ materialised by the worker from the
   /job/pi/skills/<name>/SKILL.md project skills    ├─ project's .pi/ at the DEFAULT-BRANCH SHA,
@@ -482,15 +482,18 @@ Evidence convention as in `constitution.md`.
       "folder": "<absolute HOST path, must exist>",
       "flow": "<flow name>",
       "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
-      "provider": "<optional>", "model": "<optional>", "maxTurns": <optional> } ] }
+      "provider": "<optional passthrough>", "model": "<optional passthrough>", "maxTurns": <optional passthrough> } ] }
   ```
 - **Why**: The operator's schedule set is a host file — diffable, reviewable, and git-trackable — rather
   than API state, so a schedule change is a reviewed edit. `id` must be `:`-free because the stall guard
   parses BullMQ's deterministic `repeat:<id>:<millis>` job id by splitting on `:`; a colon in the id would
   corrupt that parse. `task` is operator-authored natural language and is therefore **DATA**
   (`CONST-ISSUE-TEXT-IS-DATA`): it lands in `/job/prompt.md` as the user prompt, never in a system prompt
-  or persona.
-- **Traces to**: `DES-CRON-VIA-BULLMQ-SCHEDULER`, `CONST-ISSUE-TEXT-IS-DATA`
+  or persona. `provider`, `model`, and `maxTurns` are **pure passthrough**: when an entry omits one it is
+  **absent** from the emitted job data — the loader bakes no config default — so at job start it falls
+  through to the overlay, then env, per `INT-CONFIG-OVERLAY-CONTRACT`, exactly as an interactive local
+  job's omitted field does.
+- **Traces to**: `DES-CRON-VIA-BULLMQ-SCHEDULER`, `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`
 - **Acceptance**: Given an entry that is malformed, has `kind:"github"`, a duplicate `id`, a `:` in its
   `id`, or a `folder` that does not exist, when the config loads, then load throws a
   `piDispatchConfig`-tagged error. Given a valid `local` entry, when it fires, then the emitted job's
@@ -498,7 +501,7 @@ Evidence convention as in `constitution.md`.
 
 ## INT-RUN-HISTORY-FILE-CONTRACT
 
-**worker → panel.**
+**worker → admin extension.**
 
 - **Contract**:
   ```
@@ -511,7 +514,7 @@ Evidence convention as in `constitution.md`.
     "flow":    "<flow name>" | null,
     "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
     "outcome":   "completed" | "policy" | "failed",
-    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|...>" | null,
+    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
     "budgetReserved": <bool> | null,
@@ -522,8 +525,8 @@ Evidence convention as in `constitution.md`.
   keeps the raw `jobId`. `reason` is a fixed enum passed through from the terminal outcome — never
   free-form and never payload text — and `turns` is `null` when the container died before emitting the
   runner `exit` line.
-- **Why**: The panel is a separate process (`DES-PANEL-SEPARATE-FROM-RECEIVER`) that reads this as a
-  read-model it does not share memory with — the worker writes the files, the panel reads them, and
+- **Why**: The admin extension is a separate process (`DES-ADMIN-VIA-PI-EXTENSION`) that reads this as a
+  read-model it does not share memory with — the worker writes the files, the admin extension reads them, and
   nothing crosses in RAM. The worker writes on both terminal paths: `worker/src/index.mjs` `makeProcessor`
   calls `recordRun` on the success (`result`) and the failure (`error`) branch alike, and
   `worker/src/run-history.mjs` `makeRecordWriter` serialises the record with a truncating
@@ -545,12 +548,50 @@ Evidence convention as in `constitution.md`.
   the container died before emitting the runner `exit` line; the `.log` exists only when
   `PI_CAPTURE_JOB_LOGS` is set.
 
+## INT-CONFIG-OVERLAY-CONTRACT
+
+**admin extension → worker.**
+
+- **Contract**:
+  ```
+  settings.json  (PI_SETTINGS_FILE; absolute; unset -> <OS temp>/pi-dispatch/settings.json — same defaulting convention as PI_LOGS_DIR)
+  {
+    "model":       "<optional, non-empty string>",   // provider-native model id
+    "provider":    "<optional, non-empty string>",   // pi provider id
+    "maxTurns":    <optional, int >= 1>,             // runner turn budget
+    "dailyCap":    <optional, int >= 1>,             // jobs admitted per day
+    "concurrency": <optional, int 1-10>              // worker slot count
+  }
+  ```
+  All keys are optional; a missing file is an empty overlay. **Write protocol** (admin extension): validate
+  the candidate object, serialise it, write a same-directory `settings.json.tmp`, then `rename` it over
+  `settings.json` — an atomic replace, with one EPERM retry on Windows. **Read protocol** (worker): read at
+  **each job start**; a missing file is an empty overlay and is normal; an unknown key is ignored and
+  logged, leaving the file valid; an invalid known key (wrong type or out of bounds) or unparseable JSON
+  makes the **whole file** invalid.
+- **Why**: The worker resolves the effective job settings at job start — precedence
+  `job.data > overlay > env > default` — so this file is the shared, durable truth between the admin
+  extension and the worker: a write made while the worker is down is simply read at the next job start.
+  `dailyCap` is resolved at the existing pre-container cap check, so the overlay changes *which value* the
+  cap takes, never *when* it is checked (`CONST-BUDGET-BEFORE-TOKENS`). See `DES-RUNTIME-SETTINGS-FILE-OVERLAY`
+  for why a file, why atomic, and why a present-but-invalid file fails closed.
+- **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `DES-ADMIN-VIA-PI-EXTENSION`,
+  `CONST-BUDGET-BEFORE-TOKENS`, `CONST-RETRY-INFRA-ONLY`
+- **Acceptance**: Given a present-but-invalid file, when a job starts, then the processor returns a policy
+  refusal `settings-overlay-invalid` before `reserveBudget` — no budget slot consumed, no container
+  started, not retried; given a job whose data omits `model`/`provider`/`maxTurns`, when it starts, then
+  the value falls to the overlay, then env, then default — not a value frozen at enqueue; given `dailyCap`
+  lowered below today's reserved count, when the next job starts, then it is refused over-budget before any
+  container; given a concurrent write, when the worker reads, then it never observes a partial file (atomic
+  rename); given an unknown key, when read, then it is ignored and logged, and the file remains valid.
+
 ---
 
 ## Revision History
 
 | Date | Change |
 |---|---|
+| 2026-07-21 | Added INT-CONFIG-OVERLAY-CONTRACT (admin extension → worker `settings.json` overlay: optional keys with bounds, atomic tmp+rename write, per-job-start read, fail-closed `settings-overlay-invalid` on a present-but-invalid file). Reworded INT-RUN-HISTORY-FILE-CONTRACT's boundary from worker→panel to worker→admin extension (repointing the read-model rationale to `DES-ADMIN-VIA-PI-EXTENSION`) and added `settings-overlay-invalid` to its `reason` enum. Clarified in INT-SCHEDULES-FILE-CONTRACT that `provider`/`model`/`maxTurns` are pure passthrough — absent from an entry means absent from job data, resolved against the overlay/env at job start. De-numeralized the intro (contract count no longer stated). |
 | 2026-07-21 | Added INT-RUN-HISTORY-FILE-CONTRACT (worker→panel run-history read-model files). |
 | 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §5.1, §5.3, §5.4, §5.5. `INT-SDK-SESSION-OPTIONS` is **new** — the source doc left the SDK option set unverified (its §10) and was wrong about the print-mode flag shape and the mode union. `PLAYWRIGHT_BROWSERS_PATH` added to the runtime contract: the source doc's Dockerfile was broken as written for non-root execution. The source doc's code sketches are deliberately **not** carried over — the real Dockerfile and handler are the truth, and a spec that mirrors them drifts on the first commit. |

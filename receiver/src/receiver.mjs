@@ -12,8 +12,9 @@
  * no-pii-in-logs: logs carry stable non-PII identifiers only -- the delivery GUID, repo full_name, issue
  * number, flow, and a drop/failure reason. Never an issue title/body, a comment body, or a login.
  *
- * DES-PANEL-SEPARATE-FROM-RECEIVER: the receiver exposes only the webhook handler. There is no admin,
- * dashboard, or BullBoard route here -- the panel is a separate service on a separate bind.
+ * DES-ADMIN-VIA-PI-EXTENSION: the receiver exposes only the webhook handler. There is no admin,
+ * dashboard, or admin-extension route here -- the admin surface is a pi extension in the operator's
+ * session and binds no port.
  */
 
 import { makeVerifiedHandler } from "./verify.mjs";

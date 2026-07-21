@@ -38,7 +38,7 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | Trigger | Who can start a job | Undo |
 |---|---|---|
 | **Webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
-| **Panel** — manual run | Anyone who can reach the panel (localhost by default) | Decline the PR, or **nothing** for a folder |
+| **CLI** — manual run (`pi-dispatch run`) | Whoever has shell on the host / can run the CLI | Decline the PR, or **nothing** for a folder |
 | **Cron** — a schedule | **Nobody, at the time it runs.** It fires unattended. | As above |
 
 ## Trust boundaries
@@ -50,7 +50,7 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | A serviced repo's contents on **any other branch** | **None** | A fork PR can contain anything. Never read for instructions. |
 | A local folder's `.pi/` | **Whatever can write that folder** | No merge gate, no reviewer, no history |
 | The job container | **None** — it is the untrusted side | It runs the agent |
-| Receiver, worker, queue, panel | Trusted | They never execute agent-authored content |
+| Receiver, worker, queue, admin extension | Trusted | They never execute agent-authored content — the admin extension feeds only PII-free, fixed-enum run records to the model; raw container output stays in the overlay viewer |
 
 ## What is defended
 
@@ -153,9 +153,12 @@ Stated openly rather than discovered later:
   a job spends.
 - **Treat `.pi/` on your default branch as production code**, because it is: it goes into the agent's
   system prompt. Review changes to it with the same care as `.github/workflows/`.
-- **Keep the panel off the network.** It sets the model, the budgets, and the schedules. It binds to
-  localhost by default; if you expose it, you have moved the security boundary and this document no
-  longer describes your system.
+- **The admin surface is not a network service.** It is a pi extension in your own terminal session plus
+  a `settings.json` file — it binds no port. Whoever can run pi with the extension loaded, or write
+  `PI_SETTINGS_FILE`, holds operator power: the same trust as shell access on the host. Treat it that way.
+  It is operator-present, processes no adversarial input, and holds no harness credentials — which is why
+  pi running here is scoped out of the container-per-job constraint. Raw job logs are untrusted container
+  output, and the extension never routes them into model context.
 - Review every PR. Automation opens them; it does not land them.
 - Point local-folder jobs only at folders you can restore.
 - Keep the pinned pi version current, and let the upgrade tests gate the bump.
