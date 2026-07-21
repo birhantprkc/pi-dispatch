@@ -263,6 +263,30 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   - Given a scheduled occurrence that fails (including an infra fault), when the tick concludes, then the
     occurrence is **not** retried within the tick — the schedule's own cadence is the retry.
 
+## REQ-DURABLE-RUN-HISTORY
+
+- **Statement**: For each job reaching a terminal state — completed, policy refusal, or infra failure —
+  the worker shall persist a durable, PII-free status record retrievable by job id, and — when raw
+  capture is explicitly enabled (`PI_CAPTURE_JOB_LOGS`) — capture the container's output to
+  `logs/<jobId>.log`. Records shall survive a worker restart and outlive BullMQ's job-hash eviction. No
+  new datastore.
+- **Scope**: Both GitHub and local jobs. This is a **third, durable** surface — it complements, and does
+  not replace, `REQ-LOCAL-JOB-VISIBILITY` (the ephemeral console line plus live stream) and
+  `REQ-JOB-STATUS-COMMENTS` (the GitHub issue comment).
+- **Why**: The panel and post-hoc debugging need a keyed, structured read-model that a scrolling
+  console/journal cannot provide; the durable record is also a second, persistent signal for
+  `CONST-PI-VERSION-PINNED`'s silent-no-op mode. The id-only record honours `no-pii-in-logs` — log the
+  stable ids (the delivery GUID, `repo#issue`), never issue or comment bodies — while the raw
+  `logs/<jobId>.log` is agent output that may echo issue text, so it is opt-in (default off) and
+  gitignored. Assembled in `worker/src/run-history.mjs` and written at the terminal path in
+  `worker/src/index.mjs`.
+- **Traces to**: `REQ-LOCAL-JOB-VISIBILITY`, `REQ-JOB-STATUS-COMMENTS`, `INT-RUNNER-EXIT-CODE-PROTOCOL`,
+  `INT-RUN-HISTORY-FILE-CONTRACT`, `CONST-PI-VERSION-PINNED`
+- **Acceptance**: Given a job reaching a terminal state, a record keyed by its job id exists carrying the
+  correct outcome and is present after a worker restart; the record contains no issue or comment body,
+  title, or username (`target` is `repo#issue` / `local:<basename>` only); the raw `logs/<jobId>.log`
+  exists only when `PI_CAPTURE_JOB_LOGS` is set and is gitignored.
+
 ---
 
 ## Notes (not requirements)
@@ -285,4 +309,5 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
 | 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
 | 2026-07-17 | Added REQ-CRON-SCHEDULED-JOBS, formalizing the implemented BullMQ Job Scheduler cron path: `local`-only triggers, loud `-10`/`-11` handling, per-scheduler stall teardown, startup orphan reconcile, and no in-tick retry. |
+| 2026-07-21 | Added REQ-DURABLE-RUN-HISTORY (durable per-job run record + opt-in raw log; read model for the panel). |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |

@@ -116,6 +116,24 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   token's short expiry, not network policy, is the exfiltration bound, so the mechanism must keep that
   expiry short and the scope narrow. `OQ-004` remains **ACCEPTED RISK** (unchanged by this entry).
 
+## OQ-007 — Run-history log & record retention: periodic (non-boot) sweep
+
+- **Status**: **OPEN**
+- **Question**: Should the durable run-history sidecars (`logs/<jobId>.{json,log}`) be pruned by a
+  periodic, timer-driven sweep, and if so at what cadence?
+- **Why it matters**: sidecar retention is decoupled from BullMQ's queue eviction — the records are meant
+  to outlive the queue entries. Pruning is a **boot-time** age sweep only (`makeLogReaper`, window
+  `PI_LOG_RETENTION_DAYS`, `0` = keep forever). A worker that runs for a long time without restarting
+  therefore never re-sweeps, so `logs/` can grow between restarts. The boot sweep is the shipped partial
+  answer; the periodic sweep is the unresolved half.
+- **How to answer**: decide whether a timer-driven sweep is warranted and pick a cadence, or ratify
+  boot-only pruning as sufficient given the expected restart frequency.
+- **Secondary note**: `sanitizeJobId` collapses filesystem-illegal characters (e.g. the colons in a
+  `repeat:<sched>:<millis>` scheduler id) to `_`, so two distinct job ids could in principle map to one
+  filename. Considered vanishingly unlikely given the `gh-` / `local-` / `repeat:` id grammars; revisit
+  with a hash suffix only if it is ever observed.
+- **Blocks**: nothing from shipping. The boot sweep bounds growth across restarts today.
+
 ---
 
 ## Retired from the source design document
@@ -155,3 +173,4 @@ adversarial passes did.
 | 2026-07-16 | `OQ-005` **retracted and re-corrected** to `WATCH — NOT IN THE PIN`. The 2026-07-15 "correction" below was itself wrong: it read `sdk.ts` at `5e336cf` (**HEAD**) to describe npm `0.80.7` (**the pin**), concluded `modelRuntime` had already landed, and declared the changelog unreliable. `ModelRuntime` does not exist in `0.80.7` — no `model-runtime` in its `dist/`, not exported from `dist/index.js`. The changelog said `[Unreleased]` and was exactly right. The runner was written against the phantom API, the image built cleanly, and every job would have died on a missing export; CI caught it on the first real container run. `constitution.md`'s evidence convention now requires verification against the **published artifact**, and `pinned-api.test.mjs` asserts `ModelRuntime` is absent so the real migration fails a test instead of a job. |
 | 2026-07-15 | ~~`OQ-005` corrected to **WATCH — PARTIALLY LANDED**~~ — **this entry was wrong; see above.** It claimed `modelRuntime` was already in `CreateAgentSessionOptions` at the pinned sha and that the changelog was not a reliable signal. Both false: the sha was HEAD, not the pin. Kept rather than deleted, because a spec that hides having been wrong teaches the next reader to trust it more than it deserves. |
 | 2026-07-17 | Added OQ-006 recording the GitHub-auth-mechanism decision (default gh/fine-grained PAT single-owner; App mandatory multi-tenant), closed by this plan + the E1 CONST-TOKEN-SCOPED-PER-JOB amendment. |
+| 2026-07-21 | Added OQ-007 (run-history retention: periodic sweep). |
