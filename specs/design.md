@@ -442,8 +442,14 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Decision**: The admin surface is a **pi extension** shipped in an `admin/` workspace, loaded into the
   operator's own interactive pi session (via `-e`, `~/.pi/agent/extensions`, or a trust-gated
   `.pi/extensions`). It provides operator-only slash commands
-  (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and a TUI overlay
-  dashboard. The LLM-callable tools are reads, `pause`/`resume`, and the gated `dispatch_run` enqueue;
+  (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and one
+  self-refreshing TUI overlay component with **three in-component views**: **LIST** — a framed
+  monochrome panel carrying a status bar, a SPEND meter, a unified **TRIGGERS** pane that shows
+  schedulers plus `label -> flow` mappings **display-only**, and an interactive runs list with `↑↓`
+  selection; **RUN_DETAIL** — a drill-in dump of the selected run's PII-free `.json` run-record fields;
+  and **LIVE_TAIL** — a view that tails a running job's `.log` **inside the overlay** through an
+  injected `deps.tailLog` seam whose `fs` read lives in `index.ts`. The LLM-callable tools are reads,
+  `pause`/`resume`, and the gated `dispatch_run` enqueue;
   every settings write is an operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
   (`VALKEY_URL`) and reads the run-history sidecar files; it **binds no network port at all**. Bull Board
   is dropped.
@@ -464,9 +470,12 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     for it and disqualifying for a trigger. Reachability, and now lifetime, are per-surface decisions.
   - **The injection boundary holds by placement, not by filtering.** Raw container `.log` output is
     untrusted agent-adjacent text and **never enters LLM context** — only the fixed-enum, PII-free `.json`
-    run records may; the `.log` is overlay-viewer-only. This is the same structural defence as
-    `CONST-ISSUE-TEXT-IS-DATA`, one layer down: the boundary is where the data is placed, not a filter
-    over its content. One residual is named and accepted: a prompt injection in the operator's session
+    run records may; the `.log` is overlay-viewer-only. The LIVE_TAIL view **preserves** exactly this
+    boundary: the injected `deps.tailLog` seam renders `.log` bytes in-overlay only — never a tool result,
+    never model context — and the USED_API surface stays the three pi members, because `tailLog` is an
+    internal overlay dependency injected through the existing `custom` seam, not a pi member. This is the
+    same structural defence as `CONST-ISSUE-TEXT-IS-DATA`, one layer down: the boundary is where the data
+    is placed, not a filter over its content. One residual is named and accepted: a prompt injection in the operator's session
     can invoke `dispatch_pause`/`dispatch_resume`, accepted because the outcome is durable-but-reversible
     and money-safe — neither tool spends tokens nor raises the cap (`CONST-BUDGET-BEFORE-TOKENS`), so the
     worst case is a queue stall the operator observes and undoes.
@@ -802,3 +811,4 @@ a tunnel.
 | 2026-07-22 | **AI-triggered flows.** Two new entries: `DES-AI-TRIGGER-FLOW-GATE` (a flow is AI-triggerable only if its `.pi/skills/<flow>/SKILL.md` frontmatter carries `ai-trigger: allow`, read from the git object store at the pre-agent SHA, default deny — an agent cannot self-authorize by committing its own `SKILL.md`) and `DES-JOB-OUTBOX-CHAINING` (an in-container agent writes `request-<n>.json` to a rw `/outbox` mount outside `/workspace`; the worker is the only enqueuer, collecting completed-only and forcing same-folder local jobs, `VALKEY_URL` never crossing the container boundary; GitHub-parent outboxes dropped). Two amendments: `DES-CLI-TRIGGER-FOR-LOCAL` now names **three** producers of local jobs (CLI, `dispatch_run`, outbox collector), retargets its superseded `DES-PANEL-SEPARATE-FROM-RECEIVER` trace to `DES-ADMIN-VIA-PI-EXTENSION`, and states the dirty-guard's same-folder-chain exception; `DES-ADMIN-VIA-PI-EXTENSION` adds a second named injection residual for the paid, not-money-safe `dispatch_run` tool (bounded by folder allowlist, per-flow opt-in, no-force, no spend-knob params, per-hour rate limit, daily cap), superseding the "reads plus pause/resume only" categorical. Reason: local jobs gain two prompt-injection-reachable producers, which need a WHAT-axis opt-in distinct from `CONST-TRIGGER-AUTHOR-GATE`'s WHO-axis webhook gate. Companion `requirements.md`/`interfaces.md`/`open-questions.md` amendments land in sibling tasks. |
 | 2026-07-22 | `DES-JOB-OUTBOX-CHAINING` records how the agent learns the outbox protocol: a **separate baked persona file** (`guardrails/OUTBOX_PROTOCOL.md`, immutable `chmod a-w`), composed into `appendSystemPromptOverride` **only when `/outbox` is mounted** (a github job is never billed for it) and evaluated once at loader build per `CONST-PERSONA-IN-CACHED-PREFIX`; kept out of `HARD_RULES.md` (the always-billed safety floor) and framed as documentation — the caps and `ai-trigger` gate are host-enforced, the persona controls nothing. |
 | 2026-07-22 | Coherence fix: reworded the `DES-ADMIN-VIA-PI-EXTENSION` `Decision` line — "reads plus `pause`/`resume` only" now reads "reads, `pause`/`resume`, and the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's second injection residual (every settings write stays operator-typed). |
+| 2026-07-22 | `DES-ADMIN-VIA-PI-EXTENSION` dashboard amended to three in-component views — LIST (framed monochrome panel with unified TRIGGERS pane + `↑↓` runs selection), RUN_DETAIL (PII-free `.json` fields), and LIVE_TAIL — in one self-refreshing overlay. LIVE_TAIL renders raw `.log` bytes through an injected `deps.tailLog` seam whose `fs` read lives in `index.ts`, preserving the overlay-only `.log` boundary (never a tool result, never model context); USED_API stays the three pi members, `tailLog` being an internal `custom`-seam dependency, not a pi member. |

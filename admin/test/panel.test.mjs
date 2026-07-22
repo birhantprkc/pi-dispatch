@@ -7,8 +7,8 @@ import { GLYPHS, clip, pad, box, meter } from "../src/panel.mjs";
 test("panel.mjs is pure: no fs, no require, no node:fs import", () => {
   const src = readFileSync(fileURLToPath(new URL("../src/panel.mjs", import.meta.url)), "utf8");
   assert.ok(
-    !/readFileSync|\breadFile\b|require\(|import\s+.*node:fs/.test(src),
-    "panel primitives must have no I/O -- they take values in and return strings",
+    !/readFileSync|\breadFile\b|require\(|import\s+.*node:fs|console\.|process\.env[.[]|@earendil-works/.test(src),
+    "panel primitives must have no I/O, no console, no env, no pi API -- values in, strings out",
   );
 });
 

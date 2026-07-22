@@ -199,3 +199,181 @@ test("dashboard.ts has no path to raw .log content", () => {
     "the dashboard renders records/counts/settings only -- raw .log bytes belong to the logs viewer alone",
   );
 });
+
+test("frames to a sane width and degrades to unframed plain lines at a tiny width", async () => {
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  const framed = comp.render(80);
+  const tiny = comp.render(4).join("\n");
+  await comp.dispose();
+
+  assert.match(framed.join("\n"), /[┌┐└┘│─]/, "a sane width draws a box frame");
+  assert.ok(framed.every((l) => l.length <= 80), "no framed line exceeds the requested width");
+  assert.doesNotMatch(tiny, /[┌┐└┘│─]/, "below MIN_WIDTH the panel drops the frame rather than emitting a ragged box");
+});
+
+test("the spend meter shows a filled bar against a known cap, and (cap unknown) with no bar otherwise", async () => {
+  const known = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  const knownOut = known.render(80).join("\n");
+  await known.dispose();
+
+  const unknown = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    // Overlay carries no dailyCap, so the true cap is unknown to this process: no bar, no denominator.
+    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, settings: { path: "/s", overlay: { model: "m" } } }) }),
+  });
+  await flush();
+  const unknownOut = unknown.render(80).join("\n");
+  await unknown.dispose();
+
+  assert.match(knownOut, /5\/25/, "reserved/cap label against the overlay cap");
+  assert.match(knownOut, /[█]/, "a filled block glyph fills the bar");
+  assert.match(unknownOut, /cap unknown/, "an unknown cap renders as text");
+  assert.doesNotMatch(unknownOut, /[█]/, "no bar is drawn against an unknown denominator");
+});
+
+test("the TRIGGERS section unifies the label allowlist with the schedulers block", async () => {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, flows: { mappings: { bug: "fix" } } }) }),
+  });
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+
+  assert.match(out, /Label -> flow:/, "the committed label allowlist header");
+  assert.match(out, /bug -> fix/, "the label->flow mapping row");
+  assert.match(out, /Schedulers:/, "the schedulers block shares the section");
+});
+
+test("Enter on a run opens its detail dump, and Esc backs out to the list without quitting", async () => {
+  let closed = 0;
+  const comp = makeDashboard({
+    paths: {},
+    done: () => {
+      closed++;
+    },
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps(),
+  });
+  await flush();
+
+  comp.handleInput("\x1b[B");
+  comp.handleInput("\r");
+  await flush();
+  const detail = comp.render(80).join("\n");
+  assert.match(detail, /run j1/, "the detail view titles on the selected run");
+  assert.match(detail, /attempt: -/, "a detail-only field renders, absent as '-'");
+
+  comp.handleInput("\x1b");
+  await flush();
+  const back = comp.render(80).join("\n");
+  await comp.dispose();
+  assert.match(back, /\[p\]ause/, "Esc returns to the interactive list");
+  assert.equal(closed, 0, "Esc from a sub-view never closes the overlay");
+});
+
+test("Enter on the ACTIVE row tails its live log inside the overlay", async () => {
+  const calls = [];
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }),
+      tailLog: (args) => {
+        calls.push(args);
+        return { lines: ["HELLO_TAIL"] };
+      },
+    }),
+  });
+  await flush();
+
+  comp.handleInput("\r");
+  await flush();
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+
+  assert.match(out, /HELLO_TAIL/, "the captured tail line renders in the overlay");
+  assert.match(out, /live jA/, "the tail view titles on the id-only active job");
+  assert.match(out, /\[\d+\/\d+\]/, "a windowed footer counts the tail");
+  assert.equal(calls[0].jobId, "jA", "the tail is keyed by the id-only active job id");
+});
+
+test("the live tail reports a missing captured log by job id", async () => {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }),
+      tailLog: () => ({ missing: true }),
+    }),
+  });
+  await flush();
+
+  comp.handleInput("\r");
+  await flush();
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+
+  assert.match(out, /no captured log \(PI_CAPTURE_JOB_LOGS/, "a missing log degrades to a captured-off notice");
+});
+
+test("the live tail reports unavailable when no tail capability is injected", async () => {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    // No tailLog capability in deps: the view degrades rather than reaching for a .log surface.
+    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }) }),
+  });
+  await flush();
+
+  comp.handleInput("\r");
+  await flush();
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+
+  assert.match(out, /unavailable/, "an absent tail capability renders as unavailable in this build");
+});
+
+test("PageDown scrolls the live tail window past the first viewport", async () => {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }),
+      tailLog: () => ({ lines: Array.from({ length: 50 }, (_, i) => "L" + i) }),
+    }),
+  });
+  await flush();
+
+  comp.handleInput("\r");
+  await flush();
+  await flush();
+  const before = comp.render(80).join("\n");
+  assert.match(before, /\[20\/50\]/, "the first frame windows the first viewport of 50 lines");
+
+  comp.handleInput("\x1b[6~");
+  await flush();
+  const after = comp.render(80).join("\n");
+  await comp.dispose();
+  assert.match(after, /\[40\/50\]/, "PageDown advances the window a full viewport past line 20");
+});

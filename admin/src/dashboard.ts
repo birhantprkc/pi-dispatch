@@ -8,9 +8,15 @@
  * renders the last one, so a slow or unreachable queue degrades the panel rather than freezing it. A
  * fetch already in flight suppresses the next tick's fetch, so a stall cannot stack overlapping reads.
  *
- * PII discipline (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT): the panel shows PII-free run records,
- * counts, budget, schedulers and the settings overlay only. Raw `.log` bytes are never read here -- that
- * surface belongs to the logs overlay viewer in index.ts alone.
+ * Three in-component views share this one overlay: LIST -- a framed monochrome panel of status, spend,
+ * the unified TRIGGERS pane and an interactive runs list; RUN_DETAIL -- a drill-in of one run's PII-free
+ * `.json` fields; and LIVE_TAIL -- a tail of a running job's `.log`.
+ *
+ * PII discipline (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT): LIST and RUN_DETAIL surface only
+ * PII-free run records, counts, budget, schedulers and the settings overlay. LIVE_TAIL renders tail bytes
+ * obtained through the injected `tailLog` seam whose `fs` access lives in index.ts, so this module never
+ * touches the filesystem -- the bytes reach the overlay alone, never `snapshot`, never a shared renderer,
+ * never a message.
  */
 import { dayKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
