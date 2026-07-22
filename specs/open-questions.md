@@ -170,6 +170,44 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   cross-folder chaining as permanently out of scope.
 - **Blocks**: Nothing this slice — same-folder, local-parent-only chaining ships now.
 
+## OQ-010 — Does pinned pi (0.80.7) emit per-turn token usage on the subscribe stream?
+
+- **Status**: **CLOSED — YES: per-turn token usage rides `event.message.usage` on the `subscribe()` bus**
+- **Answer**: Yes. `session.subscribe()` delivers the full `AgentEvent` union, and `turn_end` (plus
+  `message_start`/`message_update`/`message_end` and `agent_end`) carries `message: AgentMessage`. An
+  assistant message's `usage: Usage` field is **required** (non-optional) and holds `input`, `output`,
+  `cacheRead`, `cacheWrite`, `cacheWrite1h?`, `reasoning?`, `totalTokens`, and a `cost` breakdown. Read it
+  as `event.message.usage` when `event.type === "turn_end"` and `event.message.role === "assistant"`. The
+  one caveat: usage is **nested inside the message payload, not a top-level event field** — the bare
+  `turn_start` on this bus still carries nothing (that is why `REQ-RUNNER-TURN-BUDGET` counts turns
+  itself). The cumulative, as-billed session total is separately available via `session.getSessionStats()`.
+- **Why it mattered**: this gated the entire hypothetical token-cap chain (usage capture → per-job token
+  budget → daily token counter → per-job token totals in run history). No usage on the stream = no token
+  cap at all. pi-dispatch bounds **jobs** (`CONST-BUDGET-BEFORE-TOKENS`) and **turns**
+  (`REQ-RUNNER-TURN-BUDGET`) but never tokens; the only $ ceiling today is provider-side
+  (`CONST-TOKEN-SCOPED-PER-JOB`, the broad-key exception). This answer removes the blocker.
+- **Design constraint (recorded)**: a token cap is structurally a **lagging** control — a job's token
+  cost is known only *after* a turn runs, unlike a job *count*, which is knowable *before* and is exactly
+  what makes `CONST-BUDGET-BEFORE-TOKENS` a proactive check. So even with usage data: a **daily** token
+  cap can only stop the *next* job, and a **per-job** token budget can abort mid-run but only once earlier
+  turns' tokens are already spent. `maxTurns` (`REQ-RUNNER-TURN-BUDGET`) therefore remains the one
+  **proactive** per-job token lever; usage-exists does not by itself yield a before-the-spend token cap.
+- **What closed it**: spike #21, verified against the pinned npm artifact (per the evidence convention in
+  `constitution.md` — a sha is not a version; cf. `OQ-005`). Recorded here so the answer is durable and
+  greppable rather than dying with the closed issue.
+- **Unblocks**: the follow-up (#25) for per-job token budget + daily token counter + run-history token
+  fields (deferred deliberately — this was an investigation-only spike). The capture hook already exists:
+  the runner reads `event.message` on `turn_end` today (`captureTerminal`,
+  `image/runner/src/outcome.mjs:68-72`), it simply never touches `.usage`.
+- **Evidence (pinned artifact — authoritative)**: `npm @earendil-works/pi-coding-agent@0.80.7 →
+  dist/core/agent-session.d.ts:255` (`subscribe(listener)`), `:84` (`AgentSessionEventListener`), `:40-82`
+  (`AgentSessionEvent` is the `AgentEvent` union plus session-only events) · `npm
+  @earendil-works/pi-agent-core@0.80.7 → dist/types.d.ts:362-400` (`AgentEvent`; `turn_end` at `:370-372`
+  carries `message: AgentMessage`) · `npm @earendil-works/pi-ai@0.80.7 → dist/types.d.ts:288` (`usage:
+  Usage` required on `AssistantMessage`), `:251-272` (`Usage` shape) · runtime-confirmed `npm
+  @earendil-works/pi-agent-core@0.80.7 → dist/agent-loop.js:108,130` (emits `turn_end` with the finalized
+  message untouched). All three packages resolve to `0.80.7` under the lockfile.
+
 ---
 
 ## Retired from the source design document
@@ -212,3 +250,4 @@ adversarial passes did.
 | 2026-07-21 | Added OQ-007 (run-history retention: periodic sweep). |
 | 2026-07-21 | Added OQ-008 (runtime trigger editing — cron toggle, label→flow — deferred; the admin extension ships triggers display-only). |
 | 2026-07-22 | Added OQ-009 (chaining from a GitHub-job parent, and cross-folder chaining, deferred; this slice ships same-folder, local-parent-only chaining). |
+| 2026-07-22 | Added OQ-010 — spike #21 closed **YES**: pinned pi `0.80.7` emits per-turn token usage on the `subscribe()` stream (nested `event.message.usage`), verified against the npm artifact. Records the lagging-control constraint and unblocks a follow-up for the token-cap chain. |
