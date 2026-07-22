@@ -7,6 +7,7 @@ const base = {
 	env: { PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-real" },
 	jobDir: "/srv/jobs/abc/job",
 	workspace: "/srv/jobs/abc/workspace",
+	outboxDir: "/srv/jobs/abc/outbox",
 	name: "pi-job-abc",
 };
 
@@ -26,6 +27,17 @@ test("/job is read-only, /workspace is writable", () => {
 	assert.ok(args.includes("/srv/jobs/abc/job:/job:ro"), "the whole /job must be :ro");
 	assert.ok(args.includes("/srv/jobs/abc/workspace:/workspace"), "/workspace must be writable");
 	assert.ok(!args.some((a) => a.includes("/workspace:ro")), "/workspace must not be read-only");
+});
+
+test("a local job mounts a writable /outbox host bind (the container's request channel)", () => {
+	const args = buildDockerRunArgs(base);
+	assert.ok(args.includes("/srv/jobs/abc/outbox:/outbox"), "local /outbox must be a host bind mount");
+	assert.ok(!args.some((a) => a.includes("/outbox:ro")), "/outbox must be writable, never :ro");
+});
+
+test("a github job (no outboxDir) emits no /outbox mount -- the request channel does not exist for it", () => {
+	const args = buildDockerRunArgs({ ...base, outboxDir: undefined });
+	assert.ok(!args.some((a) => a.includes(":/outbox")), "a github job must have no /outbox mount");
 });
 
 test("env is an explicit -e NAME=VALUE allowlist, never a pass-through or --env-file", () => {

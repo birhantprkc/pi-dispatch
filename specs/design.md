@@ -283,25 +283,35 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-CLI-TRIGGER-FOR-LOCAL
 
-- **Decision**: Local-folder jobs are triggered by a **CLI** (`pi-dispatch run <folder> --task … [--flow …]`) —
-  the first and, in this slice, the **only** local-enqueue interface. It calls `enqueueLocalJob` directly.
-  The admin surface (`DES-ADMIN-VIA-PI-EXTENSION`) is the interactive operator interface, but it does
-  **not** enqueue in this slice; local enqueue stays CLI-only.
+- **Decision**: Local-folder jobs are triggered through **three producers**, each calling
+  `enqueueLocalJob` directly: the **CLI** (`pi-dispatch run <folder> --task … [--flow …]`), the first and
+  operator-typed interface; the admin **`dispatch_run`** tool/command (`DES-ADMIN-VIA-PI-EXTENSION`); and
+  the **worker's outbox collector** (`DES-JOB-OUTBOX-CHAINING`). The CLI is the terminal entry point a
+  local operator reaches for first; the other two are the AI-triggered paths, gated by
+  `DES-AI-TRIGGER-FLOW-GATE`.
 - **Why**: For a self-hosted tool that mostly runs on people's own machines, the terminal is the natural
   first interface — no web server, no bigger build before anything runs — and it is what makes the local
   path usable early, without the GitHub-webhook receiver a local user does not need.
-- **Consistency check** (this was verified, not assumed): the CLI trigger violates no constraint.
+- **Consistency check** (this was verified, not assumed): no producer violates a constraint.
   `CONST-TRIGGER-AUTHOR-GATE` is webhook/comment-scoped by construction, and local jobs are ungated by
   design (`SECURITY.md`: local CLI access *is* the trust boundary for local). Critically,
   **`CONST-BUDGET-BEFORE-TOKENS` still holds**: the cap is checked and incremented in the *worker's
-  processor*, immediately before the container starts — never in the trigger. A producer that enqueues a
+  processor*, immediately before the container starts — never in a trigger. A producer that enqueues a
   job cannot bypass the budget, because the budget gate lives on the consumer side, after prepare and
-  before `runContainer`. The CLI is only a producer; it spends nothing.
-- **Safety**: a local job edits the folder in place with no undo, so the CLI refuses a **dirty git working
-  tree** unless `--force`. Local enqueue is CLI-only this slice, so this guard has no second producer to
-  mirror it.
-- **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-PANEL-SEPARATE-FROM-RECEIVER`,
-  `REQ-LOCAL-JOB-VISIBILITY`
+  before `runContainer`. All three producers are only producers; they spend nothing. The depth/count/rate
+  caps on the AI-triggered producers (`PI_CHAIN_DEPTH_MAX`, `PI_CHAIN_MAX_PER_JOB`, the `dispatch_run`
+  per-hour rate limit) are **additional producer-side defense-in-depth**, never a substitute for the
+  consumer-side cap that is the actual money bound.
+- **Safety**: a local job edits the folder in place with no undo, so a producer refuses a **dirty git
+  working tree**. The guard is mirrored at each producer: the CLI honours `--force`; the `dispatch_run`
+  tool/command has **no force option**, so an injected call cannot wave the guard away. The **outbox
+  collector** carries a single **same-folder-chain exception**: a chained job continuing on the **parent's
+  own folder** skips the guard, because there the "dirty" tree is the parent agent's deliberate output —
+  the handoff the child builds on — not a human's uncommitted work. A chain targeting a **different**
+  folder is out of this slice and would still enforce the guard; the exception is scoped to same-folder
+  chaining only.
+- **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`, `DES-AI-TRIGGER-FLOW-GATE`,
+  `DES-JOB-OUTBOX-CHAINING`, `REQ-LOCAL-JOB-VISIBILITY`
 
 ## DES-WORKER-ON-HOST
 
@@ -433,8 +443,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   operator's own interactive pi session (via `-e`, `~/.pi/agent/extensions`, or a trust-gated
   `.pi/extensions`). It provides operator-only slash commands
   (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and a TUI overlay
-  dashboard. The LLM-callable tools are **reads plus `pause`/`resume` only**; every settings write is an
-  operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
+  dashboard. The LLM-callable tools are reads, `pause`/`resume`, and the gated `dispatch_run` enqueue;
+  every settings write is an operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
   (`VALKEY_URL`) and reads the run-history sidecar files; it **binds no network port at all**. Bull Board
   is dropped.
 - **Why**:
@@ -460,6 +470,23 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     can invoke `dispatch_pause`/`dispatch_resume`, accepted because the outcome is durable-but-reversible
     and money-safe — neither tool spends tokens nor raises the cap (`CONST-BUDGET-BEFORE-TOKENS`), so the
     worst case is a queue stall the operator observes and undoes.
+    A **second residual is named but is NOT money-safe**, and is bounded by structure rather than by
+    reversibility: a prompt injection in the operator's session can invoke **`dispatch_run`**, which
+    enqueues a **paid** run that edits a folder in place with no undo. This **supersedes the Decision's
+    "reads plus `pause`/`resume` only" categorical** — `dispatch_run` is a **third** model-callable tool,
+    an enqueue, admitted under `DES-AI-TRIGGER-FLOW-GATE` and its companion requirement (the
+    `requirements.md` amendment lands in a sibling task). The surviving half of that categorical still
+    holds: **every settings write is operator-typed, never a model tool**, which is exactly why
+    `dispatch_run` takes no spend knobs. The injected call is bounded by six independent limits, not by
+    undo: (1) the operator-preconfigured **folder allowlist** (`PI_DISPATCH_RUN_ROOTS`, realpath +
+    containment) — the tool can fire only inside folders the operator chose; (2) the **per-flow committed
+    opt-in** (default deny, read at a pre-agent SHA, `DES-AI-TRIGGER-FLOW-GATE`); (3) the final
+    **dirty-tree refusal** — the tool has no force option (`DES-CLI-TRIGGER-FOR-LOCAL`); (4) **no spend-knob
+    params on the tool** — `model`, `maxTurns`, `dailyCap`, and `concurrency` are **not** tool arguments;
+    they resolve from the overlay/env per `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, so an injected call cannot
+    widen per-job spend; (5) a **per-hour rate limit** on `dispatch_run`; and (6) the **daily cap**
+    (`CONST-BUDGET-BEFORE-TOKENS`), the ultimate money bound, resolved consumer-side in the processor. The
+    money-safe framing therefore applies only to `dispatch_pause`/`dispatch_resume`, not to `dispatch_run`.
   - **The operator's pi version is uncontrolled**, so the extension runs a **load-time capability probe**
     of the exact API surface it uses and, on any miss, registers **nothing** — all-or-nothing rather than
     half-loading. The supported version is the pin, `0.80.7` (`CONST-PI-VERSION-PINNED`). Residual risk,
@@ -482,7 +509,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   `node_modules` via jiti). The load-time capability probe exists precisely because these are asserted
   against the pin, not against a moving HEAD.
 - **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-BUDGET-BEFORE-TOKENS`,
-  `CONST-ISSUE-TEXT-IS-DATA`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `REQ-DURABLE-RUN-HISTORY`
+  `CONST-ISSUE-TEXT-IS-DATA`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `DES-AI-TRIGGER-FLOW-GATE`,
+  `DES-JOB-OUTBOX-CHAINING`, `REQ-DURABLE-RUN-HISTORY`
 
 ## DES-RUNTIME-SETTINGS-FILE-OVERLAY
 
@@ -522,6 +550,110 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     `jobImage`, auth); those stay env-only and out of the overlay.
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`,
   `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`, `DES-WORKER-ON-HOST`
+
+## DES-AI-TRIGGER-FLOW-GATE
+
+- **Decision**: A flow is **AI-triggerable only if** its `.pi/skills/<flow>/SKILL.md` YAML frontmatter
+  carries **`ai-trigger: allow`**, read from the **git object store at the SHA the job was prepared from** —
+  the SHA captured **before** the in-container agent runs, and **never** any commit the agent authors
+  during its run. Default deny: absent frontmatter, an absent key, any other value, or a flowless AI
+  trigger is **refused**. This gate governs both AI-triggered producers — the admin `dispatch_run`
+  tool/command (`DES-ADMIN-VIA-PI-EXTENSION`) and the worker's outbox collector
+  (`DES-JOB-OUTBOX-CHAINING`). The operator-typed CLI (`DES-CLI-TRIGGER-FOR-LOCAL`) is not model-callable
+  and is not gated by this opt-in.
+- **Why**:
+  - **The SHA is pre-agent and agent-uninfluenceable — this is the load-bearing property.** The opt-in is
+    read from the object store at the commit the job was prepared from, fixed before the agent starts, so
+    an agent **cannot self-authorize by committing its own `SKILL.md`**: any `ai-trigger: allow` the agent
+    writes lands in a commit later than the pinned SHA and is never consulted for that job. Reading
+    committed, reviewed content at a pinned SHA rather than the working tree is the **same trust doctrine**
+    as `CONST-NO-CONTEXT-FILES-MANDATORY` (a cloned repo's `AGENTS.md` is not trust-gated and must not load)
+    and `DES-PERSONA-VIA-APPEND-SYSTEM-MD` (the persona is baked, not taken from the working tree), applied
+    one layer down to the trigger opt-in. Object-store reads are also **symlink-safe**: reading the blob by
+    object id (`git cat-file blob <oid>`, blobs only, mode `100644`) mirrors the
+    `worker/src/materialize.mjs` blob-only discipline, so an `ai-trigger` frontmatter symlinked at a token
+    file cannot escape the tree.
+  - **Author-controlled and versioned.** The opt-in lives in the project's committed `.pi/`, reviewed like
+    everything else there. Making a flow AI-triggerable is a reviewed commit, not a runtime toggle — the
+    same reviewability that keeps flows as reviewed repo markdown (`DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`).
+  - **Relationship to `CONST-TRIGGER-AUTHOR-GATE`, stated carefully.** That constraint is
+    **webhook/comment-scoped** and governs **WHO** may start a job (only a collaborator can apply the
+    allowlisted label). It is **unaffected** here. The frontmatter opt-in governs **WHICH** flows a
+    model-callable tool may fire — a **different axis, WHAT not WHO**. It is an **additional** local defense,
+    justified because the `dispatch_run` tool and the outbox collector are **prompt-injection-reachable**
+    where the operator-typed CLI is not. It does **not** "satisfy" or "extend" the author-gate — treating a
+    WHAT-gate as a WHO-gate would be a category error; the two are orthogonal axes and both hold.
+  - **Default-deny is fail-closed.** An unreadable, absent, or malformed opt-in refuses the trigger rather
+    than admitting it. A flow becomes AI-triggerable only by an explicit, committed, reviewed `allow`.
+- **Named residuals**:
+  - **The enqueue→run TOCTOU window.** The frontmatter is read at prepare time; a later flip between
+    enqueue and run is not re-checked for the in-flight job. The window is bounded by the daily cap
+    (`CONST-BUDGET-BEFORE-TOKENS`) and by both producers being **host-trusted** — the operator
+    (`dispatch_run`) or the worker (outbox), not the adversarial container.
+  - **A local agent can commit `ai-trigger: allow`.** An agent that can write a folder can commit the
+    opt-in to it, after which a **later** operator or CLI action could run that flow. This is bounded by the
+    local trust model — "whatever can write the folder can trigger it" (`SECURITY.md`) — and is not a
+    self-authorization within the same job, which the pre-agent SHA forecloses.
+- **Rejected**: reading the **working tree** rather than the object store — it reintroduces exactly the two
+  holes the pinned-SHA read closes: an agent self-opening the gate by writing `SKILL.md` mid-run, and a
+  symlink bypass that a blob-only object-store read cannot follow.
+- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-NO-CONTEXT-FILES-MANDATORY`,
+  `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`
+
+## DES-JOB-OUTBOX-CHAINING
+
+- **Decision**: An agent inside a local job requests follow-up flows by writing `request-<n>.json` to a
+  read-write **`/outbox`** mount. The **worker is the only enqueuer**: it collects `/outbox` **only after a
+  completed container exit** and enqueues **ordinary local jobs** (`enqueueLocalJob`, the same producer
+  path as the CLI). The container never enqueues and never learns the queue exists.
+- **Why**:
+  - **Containers stay queue-blind.** No `VALKEY_URL` — or any queue credential — **ever** crosses the
+    container boundary (`CONST-ISOLATION-CONTAINER-PER-JOB` preserved). The `/outbox` file is the
+    container's **only** signal channel back to the host; being agent-authored it is **untrusted** and is
+    validated host-side before anything is enqueued.
+  - **The outbox host dir is NOT under `/workspace`.** It is a **separate per-job mount**, so agent-authored
+    task text is never swept into the operator's folder, committed, or pushed to a PR branch — the same
+    property `no-token-in-agent-reachable-file` protects for credentials, here keeping the operator's tree
+    clear of agent-authored request data.
+  - **Completed-only collection.** `/outbox` is read **only** on a completed container exit. A **policy**
+    parent — the agent concluded "can't", a worker-side abort, or an over-budget refusal — spawns **no**
+    paid follow-ups, and an **infra-thrown** parent is retried (`CONST-RETRY-INFRA-ONLY`); collecting at any
+    other point would **double-chain across attempts**.
+  - **Control-vs-data split.** Structured fields are **allowlist-validated**: the flow name is checked
+    against the skill charset **and** the frontmatter gate (`DES-AI-TRIGGER-FLOW-GATE`), and the child
+    folder is **forced to the parent's own folder** — the outbox `folder` field is **ignored** — so this
+    slice is **same-folder-only**, with no arbitrary host-path mount. The freeform **task text is DATA**: it
+    lands in the child's `prompt.md`, never as instructions to the harness (`CONST-ISSUE-TEXT-IS-DATA`, one
+    layer down — the same payload-subset discipline the receiver applies to issue text).
+  - **GitHub-parent outboxes are dropped.** A GitHub job is driven by adversarial issue text, so **no
+    `/outbox` mount is created for `kind:github`** — an untrusted issue author cannot chain. This is a
+    deliberate **deferral**, recorded inline here; the open-questions register row is a sibling task's job.
+  - **Budget is unchanged.** Chained jobs are ordinary local jobs; they pass `reserveBudget` consumer-side
+    in the processor before `runContainer` (`CONST-BUDGET-BEFORE-TOKENS`). The depth/count caps
+    (`PI_CHAIN_DEPTH_MAX=1`, `PI_CHAIN_MAX_PER_JOB=2`) and the `dispatch_run` per-hour rate limit are
+    **additional producer-side** bounds, never a substitute for the consumer-side cap.
+  - **Retry-idempotent child ids.** A child job id is derived from the **parent id plus a content hash** of
+    the request, so a retried parent re-enqueues **identical** ids and BullMQ dedups them — a retry cannot
+    fan out duplicate follow-ups (the `REQ-DEDUP-BY-DELIVERY-GUID` dedup property, applied to chaining).
+  - **Chain depth is host-computed.** Depth is `parent.chainDepth + 1`, computed on the host, **never read
+    from the outbox**, so the container cannot forge a shallow depth to evade the cap.
+  - **The agent learns the protocol from a baked persona file.** `guardrails/OUTBOX_PROTOCOL.md` is baked
+    into the image immutable (`chmod a-w`, alongside `HARD_RULES.md`) and composed into
+    `appendSystemPromptOverride` **only when `/outbox` exists** — so a `kind:github` job, which has no mount,
+    is never billed for it, and the compose is evaluated **once** at loader build so the prompt is
+    byte-identical across turns (`CONST-PERSONA-IN-CACHED-PREFIX`). It is a **separate file, not folded into
+    `HARD_RULES.md`**, whose charter is the always-billed safety floor. The persona is **documentation**: it
+    describes the request channel, while the caps and the `ai-trigger` gate are host-enforced after the agent
+    exits — the text controls nothing, so it can neither promise a confirmation the host does not give nor
+    widen what the host will honor.
+- **Rejected**:
+  - **`VALKEY_URL` into the container** — an env-allowlist **BLOCKER** (`no-host-env-passthrough`): it hands
+    the adversarial side a producer credential, collapsing every enqueue gate at once.
+  - **A host HTTP broker** — a new network surface, exactly what the port-less admin design
+    (`DES-ADMIN-VIA-PI-EXTENSION`) deliberately removed; the same reasoning applies symmetrically, so the
+    signal channel is a file mount, not a socket.
+- **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `CONST-ISSUE-TEXT-IS-DATA`, `DES-WORKER-ON-HOST`, `DES-CLI-TRIGGER-FOR-LOCAL`, `DES-AI-TRIGGER-FLOW-GATE`
 
 ## DES-FLOWS-ARE-DATA-PERSONA-IS-CODE
 
@@ -667,3 +799,6 @@ a tunnel.
 | 2026-07-21 | Added DES-RUN-HISTORY-FLAT-FILES-NO-DB (flat node:fs sidecar over a DB / BullMQ-query for run history). |
 | 2026-07-21 | `DES-ADMIN-VIA-PI-EXTENSION` injection-boundary bullet records the accepted residual: a prompt injection in the operator's session can invoke `dispatch_pause`/`dispatch_resume`, accepted as durable-but-reversible and money-safe (neither tool spends tokens nor raises the cap), so the worst case is an operator-observable, operator-undoable queue stall. |
 | 2026-07-21 | `DES-PANEL-SEPARATE-FROM-RECEIVER` superseded by `DES-ADMIN-VIA-PI-EXTENSION`: the admin surface becomes a pi extension in the operator's own interactive session (slash commands + TUI overlay), binding no network port; Bull Board dropped. `DES-RUNTIME-SETTINGS-FILE-OVERLAY` added: a flat `settings.json` overlay (`PI_SETTINGS_FILE`), written atomically by the extension and re-read by the worker per job, precedence `job.data > overlay > env > default`, fail-closed on an invalid file before `reserveBudget`. Panel/dashboard wording cascaded across the architecture diagram, `DES-QUEUE-BULLMQ-OVER-CUSTOM` (four queue mechanisms, dashboard dropped), `DES-CRON-VIA-BULLMQ-SCHEDULER`, `DES-CLI-TRIGGER-FOR-LOCAL`, `DES-WORKER-ON-HOST`, `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE` (flow editing deferred out of this slice), and the repo layout / build order. Paired with `CONST-ISOLATION-CONTAINER-PER-JOB` scoped to harness invocations in `constitution.md`. |
+| 2026-07-22 | **AI-triggered flows.** Two new entries: `DES-AI-TRIGGER-FLOW-GATE` (a flow is AI-triggerable only if its `.pi/skills/<flow>/SKILL.md` frontmatter carries `ai-trigger: allow`, read from the git object store at the pre-agent SHA, default deny — an agent cannot self-authorize by committing its own `SKILL.md`) and `DES-JOB-OUTBOX-CHAINING` (an in-container agent writes `request-<n>.json` to a rw `/outbox` mount outside `/workspace`; the worker is the only enqueuer, collecting completed-only and forcing same-folder local jobs, `VALKEY_URL` never crossing the container boundary; GitHub-parent outboxes dropped). Two amendments: `DES-CLI-TRIGGER-FOR-LOCAL` now names **three** producers of local jobs (CLI, `dispatch_run`, outbox collector), retargets its superseded `DES-PANEL-SEPARATE-FROM-RECEIVER` trace to `DES-ADMIN-VIA-PI-EXTENSION`, and states the dirty-guard's same-folder-chain exception; `DES-ADMIN-VIA-PI-EXTENSION` adds a second named injection residual for the paid, not-money-safe `dispatch_run` tool (bounded by folder allowlist, per-flow opt-in, no-force, no spend-knob params, per-hour rate limit, daily cap), superseding the "reads plus pause/resume only" categorical. Reason: local jobs gain two prompt-injection-reachable producers, which need a WHAT-axis opt-in distinct from `CONST-TRIGGER-AUTHOR-GATE`'s WHO-axis webhook gate. Companion `requirements.md`/`interfaces.md`/`open-questions.md` amendments land in sibling tasks. |
+| 2026-07-22 | `DES-JOB-OUTBOX-CHAINING` records how the agent learns the outbox protocol: a **separate baked persona file** (`guardrails/OUTBOX_PROTOCOL.md`, immutable `chmod a-w`), composed into `appendSystemPromptOverride` **only when `/outbox` is mounted** (a github job is never billed for it) and evaluated once at loader build per `CONST-PERSONA-IN-CACHED-PREFIX`; kept out of `HARD_RULES.md` (the always-billed safety floor) and framed as documentation — the caps and `ai-trigger` gate are host-enforced, the persona controls nothing. |
+| 2026-07-22 | Coherence fix: reworded the `DES-ADMIN-VIA-PI-EXTENSION` `Decision` line — "reads plus `pause`/`resume` only" now reads "reads, `pause`/`resume`, and the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's second injection residual (every settings write stays operator-typed). |

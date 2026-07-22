@@ -113,16 +113,16 @@ test("an unknown subcommand notifies and never touches the model channel", async
 });
 
 /**
- * The four LLM-callable tools are the whole model-facing control surface. The structural acceptance
- * (DES-ADMIN-VIA-PI-EXTENSION): reads plus pause/resume ONLY -- no tool writes settings, no tool exposes
- * raw `.log` bytes. These assertions lock that surface so a later edit that adds a `dispatch_set` or a
- * `dispatch_logs` tool fails here.
+ * The five LLM-callable tools are the whole model-facing control surface. The structural acceptance
+ * (DES-ADMIN-VIA-PI-EXTENSION): reads plus pause/resume plus the one gated `dispatch_run` enqueue -- no
+ * tool writes settings, no tool exposes raw `.log` bytes. These assertions lock that surface so a later
+ * edit that adds a `dispatch_set` or a `dispatch_logs` tool fails here.
  */
-test("registers exactly the four dispatch tools, and no write or log tool", async () => {
+test("registers exactly the five dispatch tools, and no write or log tool", async () => {
   const { calls } = await loadRegistered();
   const names = calls.registerTool.map((t) => t.name).sort();
-  assert.equal(calls.registerTool.length, 4, "exactly four tools");
-  assert.deepEqual(names, ["dispatch_pause", "dispatch_resume", "dispatch_runs", "dispatch_status"]);
+  assert.equal(calls.registerTool.length, 5, "exactly five tools");
+  assert.deepEqual(names, ["dispatch_pause", "dispatch_resume", "dispatch_run", "dispatch_runs", "dispatch_status"]);
   for (const name of names) {
     assert.ok(!/set|unset|log/.test(name), `no write/log tool: ${name}`);
   }
@@ -130,6 +130,25 @@ test("registers exactly the four dispatch tools, and no write or log tool", asyn
     assert.equal(typeof tool.execute, "function", `${tool.name}.execute is a function`);
     assert.equal(typeof tool.description, "string");
     assert.ok(tool.parameters && tool.parameters.type === "object", `${tool.name} has an object param schema`);
+  }
+});
+
+/**
+ * `dispatch_run` is the one PAID, model-callable enqueue. Its description must flag the paid, gated,
+ * no-undo nature (an operator or a model reading it should see the risk), and it is sequential so two
+ * enqueues cannot interleave. Its params are the three job inputs ONLY -- no spend knob.
+ */
+test("dispatch_run advertises PAID/ai-trigger/no-force, is sequential, and takes no spend knob", async () => {
+  const { calls } = await loadRegistered();
+  const run = toolByName(calls, "dispatch_run");
+  assert.match(run.description, /PAID/, "flags that the run is paid");
+  assert.match(run.description, /ai-trigger/, "names the committed opt-in gate");
+  assert.match(run.description, /no force/, "states there is no force option for a dirty tree");
+  assert.equal(run.executionMode, "sequential");
+  const props = run.parameters.properties ?? {};
+  assert.deepEqual(Object.keys(props).sort(), ["flow", "folder", "task"], "exactly the three job inputs");
+  for (const knob of ["model", "maxTurns", "dailyCap", "concurrency"]) {
+    assert.ok(!(knob in props), `no spend-knob param: ${knob}`);
   }
 });
 

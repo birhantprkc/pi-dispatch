@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.mjs";
 import { EXIT_POLICY } from "./exit-code.mjs";
+import { gitDirty } from "./git-dirty.mjs";
 
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
@@ -126,16 +126,6 @@ function fail(message) {
  */
 export function entryExitCode(err) {
 	return err?.piDispatchConfig ? EXIT_POLICY : 1;
-}
-
-/** true = dirty, false = clean, null = not a working git repo. */
-function gitDirty(folder) {
-	try {
-		const out = execFileSync("git", ["-C", folder, "status", "--porcelain"], { encoding: "utf8" });
-		return out.trim().length > 0;
-	} catch {
-		return null;
-	}
 }
 
 // Entry point when run as a bin. Kept out of the exported main so tests can call main() directly.

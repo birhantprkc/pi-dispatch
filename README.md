@@ -170,6 +170,7 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 - `pause` / `resume` — the queue on/off switch
 - `runs` / `logs` — recent run records, and one run's raw log
 - `triggers` — the configured triggers (display only)
+- `run <folder> <flow> [task]` — enqueue a flow against a local folder (operator-typed; the dirty-tree guard still applies)
 - `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
 
 ![Transcript of /dispatch status, /dispatch runs and /dispatch triggers output in a pi session](docs/images/dispatch-commands.svg)
@@ -179,12 +180,26 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 and `logs` read the **same** `logs/<jobId>.json` / `.log` files as **Run history** below. The extension
 reads only queue counts, run records, and the settings overlay — none of which carry credentials.
 
-The model-callable tools are **reads plus `pause`/`resume` only** — every settings write is an
-operator-typed command, never a model tool — and a raw `.log` is untrusted container output that renders
-in the overlay viewer only, never into model context. Settings land in the `settings.json` overlay
+The model-callable tools are **reads, `pause`/`resume`, and `dispatch_run`** — every settings write stays
+an operator-typed command, never a model tool. `dispatch_run` is a **third** model-callable tool and,
+unlike the others, it enqueues a **PAID** agent run that edits a folder in place with **no undo** — it is
+**not money-safe**. It is bounded in blast-radius, not prevented, by **six** independent limits: the
+folder allowlist `PI_DISPATCH_RUN_ROOTS` (realpath + containment); the committed per-flow
+`ai-trigger: allow` opt-in read at HEAD (default **deny**); the dirty-tree refusal (no force option); no
+spend-knob parameters on the tool; a per-hour rate limit; and the daily cap. Do not read it as money-safe
+or reversible — it is neither. A raw `.log` is untrusted container output that renders in the overlay
+viewer only, never into model context. Settings land in the `settings.json` overlay
 (`PI_SETTINGS_FILE`; keys `model`, `provider`, `maxTurns`, `dailyCap`, `concurrency`) and take effect per
 job — `concurrency` at the next pickup. The supported pi version is the pinned `0.80.7`; the load-time
 capability probe is all-or-nothing and refuses loudly on any other version.
+
+A flow becomes AI-triggerable only when its `.pi/skills/<flow>/SKILL.md` frontmatter sets
+`ai-trigger: allow` (default **deny**); an AI trigger naming no such opted-in flow is refused.
+
+A completed job can request follow-up flows by writing to a `/outbox` mount. The worker validates each
+request host-side and enqueues **same-folder, local-parent only** (GitHub jobs never chain), gated by the
+same `ai-trigger: allow` opt-in and bounded by `PI_CHAIN_DEPTH_MAX` and `PI_CHAIN_MAX_PER_JOB` — both
+host-enforced, so the in-container agent controls nothing.
 
 ## Run history
 
@@ -253,9 +268,9 @@ flowchart LR
 - The **admin surface** is a pi extension (`admin/`) loaded into your own interactive pi session —
   `/dispatch` commands plus a TUI dashboard. It operates the queue (the same durable `queue.pause()` as
   `pi-dispatch pause`), shows runs, logs, and budget, and edits runtime settings via the `settings.json`
-  overlay. It binds no port at all and triggers no jobs. It never edits your persona (those live in your
-  project's `.pi/`, in git, reviewed) and does not edit flows this slice (deferred). See **Admin (pi
-  extension)**.
+  overlay. It binds no port at all; its one job-triggering tool, `dispatch_run`, is folder-allowlisted,
+  flow-gated, and rate-limited. It never edits your persona (those live in your project's `.pi/`, in git,
+  reviewed) and does not edit flows this slice (deferred). See **Admin (pi extension)**.
 
 Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
 *before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the

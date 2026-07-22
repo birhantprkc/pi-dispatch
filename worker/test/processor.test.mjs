@@ -23,6 +23,7 @@ function deps(overrides = {}) {
 		isDefaultBranchProtected: async () => (calls.push("branch-check"), true),
 		prepareWorkspace: async () => (calls.push("prepare"), { workspaceDir: "/w", jobDir: "/j" }),
 		runContainer: async () => (calls.push("run-container"), { code: 0, aborted: false }),
+		collectChain: async () => (calls.push("collect-chain"), { enqueued: 0, refused: 0 }),
 		cleanup: async () => (calls.push("cleanup"), undefined),
 		comment: async (_j, t) => calls.push(`comment:${t.slice(0, 12)}`),
 		now: new Date("2026-07-16T10:00:00Z"),
@@ -36,7 +37,7 @@ test("happy path: mint -> branch-check -> prepare -> budget -> container, in tha
 	const { deps: d, calls } = deps();
 	const r = await runJob(ghJob, d);
 	assert.equal(r.outcome, "completed");
-	assert.deepEqual(calls, ["mint:org/repo", "branch-check", "prepare", "run-container", "cleanup"]);
+	assert.deepEqual(calls, ["mint:org/repo", "branch-check", "prepare", "run-container", "collect-chain", "cleanup"]);
 });
 
 test("an unprotected branch refuses BEFORE any container -- and never prepares/spends", async () => {
@@ -219,4 +220,73 @@ test("a container-never-started throw stamps budgetReserved false (its slot is r
 		() => runJob(ghJob, d),
 		(e) => e instanceof InfraRetry && e.reason === "container-never-started" && e.budgetReserved === false,
 	);
+});
+
+test("a completed run collects the chain and carries chainEnqueued/chainRefused from collectChain", async () => {
+	const { deps: d } = deps({
+		runContainer: async () => ({ code: 0, aborted: false, turns: 9 }),
+		collectChain: async () => ({ enqueued: 2, refused: 1 }),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.equal(r.chainEnqueued, 2);
+	assert.equal(r.chainRefused, 1);
+});
+
+test("collectChain runs BEFORE cleanup deletes the job dir (the outbox is read before deletion)", async () => {
+	const order = [];
+	const { deps: d } = deps({
+		collectChain: async () => (order.push("collect"), { enqueued: 0, refused: 0 }),
+		cleanup: async () => (order.push("cleanup"), undefined),
+	});
+	await runJob(ghJob, d);
+	assert.deepEqual(order, ["collect", "cleanup"], "the chain must be collected before jobDir is cleaned up");
+});
+
+test("collectChain counts are additive telemetry: they never alter the completed outcome/exit/turns/budget", async () => {
+	const { deps: d } = deps({
+		runContainer: async () => ({ code: 0, aborted: false, turns: 9 }),
+		collectChain: async () => ({ enqueued: 5, refused: 3 }),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed", "a chain result never flips the completed outcome");
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.turns, 9);
+	assert.equal(r.budgetReserved, true);
+	assert.equal(r.chainEnqueued, 5);
+	assert.equal(r.chainRefused, 3);
+});
+
+test("collectChain runs ONLY on the completed branch, never on policy / abort / infra / over-budget", async () => {
+	// EXIT_POLICY (runner-policy, container exit 2)
+	{
+		const { deps: d, calls } = deps({ runContainer: async () => (calls.push("run-container"), { code: 2, aborted: false }) });
+		const r = await runJob(ghJob, d);
+		assert.equal(r.outcome, "policy");
+		assert.ok(!calls.includes("collect-chain"), "runner-policy must not chain");
+	}
+	// worker-abort (137, aborted)
+	{
+		const { deps: d, calls } = deps({ runContainer: async () => (calls.push("run-container"), { code: 137, aborted: true }) });
+		await runJob(ghJob, d);
+		assert.ok(!calls.includes("collect-chain"), "a worker abort must not chain");
+	}
+	// EXIT_INFRA (exit 1 => throws InfraRetry; a retried job would double-chain)
+	{
+		const { deps: d, calls } = deps({ runContainer: async () => (calls.push("run-container"), { code: 1, aborted: false }) });
+		await runJob(ghJob, d).catch(() => {});
+		assert.ok(!calls.includes("collect-chain"), "an infra retry must not chain -- it re-runs");
+	}
+	// over-budget (policy, pre-container)
+	{
+		const { deps: d, calls } = deps({ redis: fakeRedis(10), cap: 10 });
+		await runJob(ghJob, d);
+		assert.ok(!calls.includes("collect-chain"), "over-budget must not chain");
+	}
+	// unprotected-branch (policy, pre-container)
+	{
+		const { deps: d, calls } = deps({ isDefaultBranchProtected: async () => false });
+		await runJob(ghJob, d);
+		assert.ok(!calls.includes("collect-chain"), "an unprotected branch must not chain");
+	}
 });

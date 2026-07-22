@@ -148,6 +148,28 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   `receiver.flows.json` and gains a reload story), or ratify trigger editing as display-only.
 - **Blocks**: Nothing this slice — the admin extension ships triggers **display-only**.
 
+## OQ-009 — Chaining from a GitHub-job parent (and cross-folder chaining) is deferred
+
+- **Status**: **OPEN**
+- **Question**: Should a GitHub-job parent ever chain follow-up flows, and by what mechanism — given its
+  task text is adversarial issue content (`CONST-ISSUE-TEXT-IS-DATA`)? And, as a related future slice,
+  should an outbox request ever target a **different** folder than the parent's (cross-folder chaining),
+  which would need its own guard stack (realpath + a containment allowlist)?
+- **Why it matters**: This slice ships chaining as **same-folder-only, local-parent-only**:
+  `DES-JOB-OUTBOX-CHAINING` creates no `/outbox` mount for a `kind:github` job, and the outbox `folder`
+  field is forced to the parent's own folder. Both are deliberate deferrals already decided there and
+  merely recorded here — this row is the register pointer, not a reconsideration of whether to drop them
+  now. A GitHub parent that could nominate host folders would cross the webhook→local trust boundary — the
+  same boundary the receiver's author-gate and the container hold — so it needs its own threat analysis and
+  author-gate semantics for machine-initiated follow-ups before it can ship. Cross-folder chaining has the
+  same shape: it reopens the arbitrary-host-path mount that forcing the child folder to the parent's own
+  closes, and so wants the realpath + containment-allowlist guard stack in its own right.
+- **How to answer**: Design the threat model and author-gate semantics for a machine-initiated
+  GitHub-parent follow-up (who authorizes it, and how the adversarial task text stays DATA), plus the
+  realpath + containment-allowlist guard for a cross-folder target; or ratify GitHub-parent and
+  cross-folder chaining as permanently out of scope.
+- **Blocks**: Nothing this slice — same-folder, local-parent-only chaining ships now.
+
 ---
 
 ## Retired from the source design document
@@ -189,3 +211,4 @@ adversarial passes did.
 | 2026-07-17 | Added OQ-006 recording the GitHub-auth-mechanism decision (default gh/fine-grained PAT single-owner; App mandatory multi-tenant), closed by this plan + the E1 CONST-TOKEN-SCOPED-PER-JOB amendment. |
 | 2026-07-21 | Added OQ-007 (run-history retention: periodic sweep). |
 | 2026-07-21 | Added OQ-008 (runtime trigger editing — cron toggle, label→flow — deferred; the admin extension ships triggers display-only). |
+| 2026-07-22 | Added OQ-009 (chaining from a GitHub-job parent, and cross-folder chaining, deferred; this slice ships same-folder, local-parent-only chaining). |

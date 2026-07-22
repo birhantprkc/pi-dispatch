@@ -6,6 +6,7 @@ import { reconcile } from "./cron.mjs";
 import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
 import { createWorker } from "./index.mjs";
+import { makeCollectChain } from "./outbox.mjs";
 import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
@@ -109,9 +110,11 @@ export async function startWorker(
 	// One raw Redis client, shared by the budget (via the worker) and the scheduler stall guard, so it is
 	// hoisted out of the createWorkerFn arg object.
 	const redis = makeRedisClient(config.valkeyUrl);
-	// The persistent runtime queue the stall guard tears schedulers down through. Non-failFast: a long-lived
-	// handle rides out a Valkey blip. Registered as an extraCloser so shutdown drains it after the worker.
-	const schedulerQueue = makeQueue(parseConnection(config.valkeyUrl));
+	// The persistent runtime queue: the stall guard tears schedulers down through it, AND the outbox
+	// collector enqueues chained children onto it -- the same pi-jobs queue, so one handle serves both.
+	// Non-failFast: a long-lived handle rides out a Valkey blip. Registered as an extraCloser so shutdown
+	// drains it after the worker.
+	const runtimeQueue = makeQueue(parseConnection(config.valkeyUrl));
 
 	// REQ-LOCAL-JOB-VISIBILITY durable run history, all host-side. The raw `.log` sink is gated on
 	// captureJobLogs (raw container output is user-authored data, opt-in per no-pii-in-logs); the id-only
@@ -144,14 +147,21 @@ export async function startWorker(
 	const bootSettings = getSettings();
 	const bootConcurrency = bootSettings.invalid ? config.concurrency : bootSettings.concurrency;
 
+	// INT-OUTBOX-CONTRACT chain collector: the host-side reader of a completed local parent's /outbox. It
+	// enqueues chained children onto runtimeQueue via enqueueLocalJob -- the same pi-jobs queue the stall
+	// guard tears down through. Never throws, so a chain fault cannot flip a completed parent
+	// (CONST-RETRY-INFRA-ONLY). The processor calls it as the sole COMPLETED-path chain step.
+	const collectChain = makeCollectChain({ queue: runtimeQueue, config, log });
+
 	const worker = createWorkerFn({
 		connection: parseConnection(config.valkeyUrl),
 		concurrency: bootConcurrency,
 		getSettings,
 		redis,
 		recordRun,
-		extraClosers: [schedulerQueue],
+		extraClosers: [runtimeQueue],
 		deps: {
+			collectChain,
 			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env, openJobLog }),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
@@ -204,7 +214,7 @@ export async function startWorker(
 	const guard = makeStallGuard({
 		redis,
 		threshold: config.schedulerStallMax,
-		removeJobScheduler: (id) => schedulerQueue.removeJobScheduler(id),
+		removeJobScheduler: (id) => runtimeQueue.removeJobScheduler(id),
 		log,
 	});
 	worker.on("stalled", (jobId) => void guard.onStalled(jobId));

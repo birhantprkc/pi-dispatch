@@ -246,6 +246,42 @@ test("recordRun fires and the InfraRetry still propagates (retryable, not Unreco
 	assert.ok(calls[0].error instanceof InfraRetry, "recordRun.error is the InfraRetry");
 });
 
+test("collectChain receives the REAL BullMQ job (id + data), not runJob's effectiveJob", { skip }, async () => {
+	// runJob's own `job` is the effectiveJob (a spread of job.data, no `.id`/`.data`). collectChain
+	// (outbox.mjs) needs the parent's real `.id` and `.data.kind`/`.data.chainDepth`, so makeProcessor must
+	// inject the real wrapper -- mirroring the name/signal injection into runContainer. This locks that.
+	let received;
+	const job = { id: "local-parent-1", attemptsMade: 0, name: "local", data: { kind: "local", folder: "/p", chainDepth: 1 } };
+	const processor = mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: { async incr() { return 1; }, async expire() {} },
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
+		timeoutMs: 100000,
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async () => ({ jobDir: "/j", workspace: "/p", outboxDir: "/j/outbox", sha: "s" }),
+			runContainer: async () => ({ code: 0, aborted: false, turns: 1 }),
+			collectChain: async (ctx) => {
+				received = ctx;
+				return { enqueued: 1, refused: 0 };
+			},
+			cleanup: async () => {},
+			comment: async () => {},
+		},
+	});
+
+	const result = await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(result.outcome, "completed");
+	assert.equal(result.chainEnqueued, 1, "the completed result carries collectChain's enqueued count");
+	assert.equal(received.job, job, "collectChain must receive the FULL BullMQ job (with .id/.data), not the effectiveJob");
+	assert.equal(received.job.id, "local-parent-1");
+	assert.equal(received.job.data.kind, "local");
+	assert.equal(received.prepared.outboxDir, "/j/outbox", "prepared threads through to collectChain");
+});
+
 // End-to-end money-path acceptance: compose the REAL recordRun = writeRecord(buildRecord(...)) over a
 // fake fs and drive makeProcessor per outcome, asserting the SERIALIZED bytes. This is the only place
 // the whole record path (processor wrapper -> buildRecord -> writeRecord) is exercised end-to-end, so

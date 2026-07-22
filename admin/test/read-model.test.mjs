@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { dayKey } from "@pi-dispatch/worker/budget";
 import {
   resolvePaths,
@@ -14,6 +17,8 @@ import {
   listRunIds,
   setQueuePaused,
   writeSettings,
+  enqueueDispatchRun,
+  revParseHead,
 } from "../src/read-model.mjs";
 
 /**
@@ -55,6 +60,8 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     PI_SETTINGS_FILE: "/s.json",
     RECEIVER_FLOWS_PATH: "/f.json",
     PI_CAPTURE_JOB_LOGS: "1",
+    PI_DISPATCH_RUN_ROOTS: "/root-a",
+    PI_DISPATCH_RUN_PER_HOUR: "5",
   });
   assert.deepEqual(p, {
     valkeyUrl: "redis://h:1",
@@ -62,6 +69,8 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     settingsFile: "/s.json",
     flowsPath: "/f.json",
     captureJobLogs: true,
+    dispatchRunRoots: ["/root-a"],
+    dispatchRunPerHour: 5,
   });
 });
 
@@ -72,6 +81,14 @@ test("resolvePaths falls back to defaults on empty env (no worker config require
   assert.equal(p.captureJobLogs, false);
   assert.ok(typeof p.logsDir === "string" && p.logsDir.length > 0);
   assert.ok(typeof p.settingsFile === "string" && p.settingsFile.length > 0);
+  assert.deepEqual(p.dispatchRunRoots, [], "default roots [] fails closed");
+  assert.equal(p.dispatchRunPerHour, 3, "default per-hour cap");
+});
+
+test("resolvePaths reimplements the non-negative-int parse: invalid PI_DISPATCH_RUN_PER_HOUR falls back", () => {
+  assert.equal(resolvePaths({ PI_DISPATCH_RUN_PER_HOUR: "0" }).dispatchRunPerHour, 0, "0 is valid (disables the tool)");
+  assert.equal(resolvePaths({ PI_DISPATCH_RUN_PER_HOUR: "abc" }).dispatchRunPerHour, 3, "non-numeric -> default");
+  assert.equal(resolvePaths({ PI_DISPATCH_RUN_PER_HOUR: "-1" }).dispatchRunPerHour, 3, "negative -> default");
 });
 
 test("listRuns parses records, sorts by endedAt desc with nulls last, skips non-json/unparseable", () => {
@@ -387,4 +404,314 @@ test("writeSettings passes through writeOverlay's { invalid } and leaves the fil
   assert.ok(res.invalid);
   assert.ok(res.invalid.includes("dailyCap"));
   assert.deepEqual(JSON.parse(fs.files.get(path)), { model: "m1" }, "original overlay untouched (validate-before-write)");
+});
+
+// ---- revParseHead ----
+
+test("revParseHead trims the HEAD sha and returns null on empty or error", () => {
+  assert.equal(revParseHead("/x", { exec: () => "deadbeefcafe\n" }), "deadbeefcafe");
+  assert.equal(revParseHead("/x", { exec: () => "   \n" }), null, "whitespace-only -> null");
+  assert.equal(
+    revParseHead("/x", {
+      exec: () => {
+        throw new Error("not a git repository");
+      },
+    }),
+    null,
+    "git error -> null (never throws)",
+  );
+});
+
+// ---- enqueueDispatchRun ----
+
+/**
+ * A default set of injected fakes for the happy AI-invoked path, each overridable per test. `makeQueueFn`
+ * returns a fake whose `add` records the enqueue (enqueueLocalJob is the real function calling `queue.add`);
+ * the redis fake models an INCR-then-EXPIRE rolling-hour bucket; the clock is fixed. `env` carries no roots
+ * by default (so the AI allowlist fails closed unless a test supplies one).
+ */
+function dispatchFakes(overrides = {}) {
+  const added = [];
+  const redisCmds = [];
+  const gateCalls = [];
+  const revCalls = [];
+  const fakes = {
+    env: { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_PER_HOUR: "3" },
+    makeQueueFn: () => ({
+      async add(name, data, opts) {
+        added.push({ name, data, opts });
+        return {};
+      },
+      async close() {},
+    }),
+    parseConnectionFn: () => ({}),
+    gitDirtyFn: () => false,
+    revParseHeadFn: (folder) => {
+      revCalls.push(folder);
+      return "deadbeef";
+    },
+    readFlowGateFn: async ({ folder, flow, sha }) => {
+      gateCalls.push({ folder, flow, sha });
+      return { gate: "allow" };
+    },
+    redisFn: () => ({
+      async incr(k) {
+        redisCmds.push(["incr", k]);
+        return 1;
+      },
+      async expire(k, s) {
+        redisCmds.push(["expire", k, s]);
+      },
+      disconnect() {
+        redisCmds.push(["disconnect"]);
+      },
+    }),
+    now: () => Date.UTC(2026, 6, 22, 10, 30, 0),
+    ...overrides,
+  };
+  return { fakes, added, redisCmds, gateCalls, revCalls };
+}
+
+/** A real temp folder nested under a (realpath'd) root, so the allowlist's realpath+containment resolves. */
+function tempRootAndFolder(tag) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), tag)));
+  const folder = join(root, "repo");
+  mkdirSync(folder);
+  return { root, folder };
+}
+
+test("enqueueDispatchRun refuses a flowless trigger (flow required, both paths)", async () => {
+  const { fakes } = dispatchFakes();
+  const res = await enqueueDispatchRun({ folder: "/any", flow: "", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.refused, /no flow/);
+});
+
+test("enqueueDispatchRun (aiInvoked) refuses a folder outside PI_DISPATCH_RUN_ROOTS (default [] fails closed)", async () => {
+  const { fakes, added } = dispatchFakes({ env: { VALKEY_URL: "redis://x" } }); // no roots -> []
+  const res = await enqueueDispatchRun({ folder: "/etc", flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.refused, /PI_DISPATCH_RUN_ROOTS/);
+  assert.equal(added.length, 0);
+});
+
+test("enqueueDispatchRun (aiInvoked) enqueues on the happy path: in-roots, clean, gate allow, under the limit", async () => {
+  const { root, folder } = tempRootAndFolder("dr-happy-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  const { fakes, added, gateCalls, redisCmds } = dispatchFakes({ env });
+  const res = await enqueueDispatchRun({ folder, flow: "fix", task: "do the thing", aiInvoked: true, ...fakes });
+  assert.equal(res.ok, true);
+  assert.ok(typeof res.jobId === "string" && res.jobId.startsWith("local-"), "returns the local job id");
+  assert.equal(added.length, 1, "enqueued exactly one job");
+  assert.equal(added[0].data.folder, folder);
+  assert.equal(added[0].data.flow, "fix");
+  assert.equal(added[0].data.task, "do the thing");
+  assert.equal(added[0].data.chainDepth, undefined, "root run: no chainDepth pinned");
+  assert.equal(added[0].data.parentJobId, undefined, "root run: no parentJobId");
+  assert.equal(gateCalls.length, 1, "flow gate consulted at the resolved sha");
+  assert.equal(gateCalls[0].sha, "deadbeef", "gate uses the pre-agent HEAD sha, not a pinned one");
+  assert.ok(
+    redisCmds.some((c) => c[0] === "incr"),
+    "rate limit ran its INCR",
+  );
+});
+
+test("enqueueDispatchRun refuses a dirty tree and a non-repo (both paths, no force)", async () => {
+  const { root, folder } = tempRootAndFolder("dr-dirty-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  const dirty = await enqueueDispatchRun({
+    folder,
+    flow: "fix",
+    task: "t",
+    aiInvoked: true,
+    ...dispatchFakes({ env, gitDirtyFn: () => true }).fakes,
+  });
+  assert.match(dirty.refused, /uncommitted changes/);
+  const nonRepo = await enqueueDispatchRun({
+    folder,
+    flow: "fix",
+    task: "t",
+    aiInvoked: true,
+    ...dispatchFakes({ env, gitDirtyFn: () => null }).fakes,
+  });
+  assert.match(nonRepo.refused, /not a usable git repository/);
+});
+
+test("enqueueDispatchRun (aiInvoked) refuses when the flow gate denies or has no skill", async () => {
+  const { root, folder } = tempRootAndFolder("dr-gate-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  for (const gate of ["deny", "no-skill"]) {
+    const { fakes } = dispatchFakes({ env, readFlowGateFn: async () => ({ gate }) });
+    const res = await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+    assert.match(res.refused, /not AI-triggerable/);
+    assert.match(res.refused, /ai-trigger: allow/, `${gate} refusal names the required opt-in`);
+  }
+});
+
+test("enqueueDispatchRun (aiInvoked) refuses (gate never consulted) when HEAD cannot be resolved", async () => {
+  const { root, folder } = tempRootAndFolder("dr-nohead-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  let gateCalled = false;
+  const { fakes } = dispatchFakes({
+    env,
+    revParseHeadFn: () => null,
+    readFlowGateFn: async () => {
+      gateCalled = true;
+      return { gate: "allow" };
+    },
+  });
+  const res = await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.refused, /not AI-triggerable/);
+  assert.equal(gateCalled, false, "no sha -> the object-store gate is never read");
+});
+
+test("enqueueDispatchRun (aiInvoked) refuses over the per-hour rate limit; INCR-then-compare, EXPIRE on first", async () => {
+  const { root, folder } = tempRootAndFolder("dr-rate-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "2" };
+  const cmds = [];
+  const redisFn = () => ({
+    async incr(k) {
+      cmds.push(["incr", k]);
+      return 3; // already over the cap of 2
+    },
+    async expire(k, s) {
+      cmds.push(["expire", k, s]);
+    },
+    disconnect() {
+      cmds.push(["disconnect"]);
+    },
+  });
+  const { fakes, added } = dispatchFakes({ env, redisFn });
+  const res = await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.refused, /hourly limit \(2\) reached/);
+  assert.equal(added.length, 0, "over the limit: nothing enqueued");
+  const key = cmds.find((c) => c[0] === "incr")[1];
+  assert.match(key, /^dispatch-run:\d{4}-\d{2}-\d{2}-\d{2}$/, "rolling-hour bucket key shape");
+  assert.ok(cmds.some((c) => c[0] === "disconnect"), "redis client closed in finally");
+});
+
+test("enqueueDispatchRun rate limit sets EXPIRE only when the hour bucket is first created (count===1)", async () => {
+  const { root, folder } = tempRootAndFolder("dr-expire-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "5" };
+  const cmds = [];
+  const redisFn = () => ({
+    async incr(k) {
+      cmds.push(["incr", k]);
+      return 1;
+    },
+    async expire(k, s) {
+      cmds.push(["expire", k, s]);
+    },
+    disconnect() {
+      cmds.push(["disconnect"]);
+    },
+  });
+  const { fakes } = dispatchFakes({ env, redisFn });
+  await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  const key = cmds.find((c) => c[0] === "incr")[1];
+  assert.ok(
+    cmds.some((c) => c[0] === "expire" && c[1] === key),
+    "EXPIRE set on the first INCR",
+  );
+});
+
+test("enqueueDispatchRun (aiInvoked) refuses entirely when the per-hour cap is 0, without touching redis", async () => {
+  const { root, folder } = tempRootAndFolder("dr-zero-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "0" };
+  let redisTouched = false;
+  const { fakes } = dispatchFakes({
+    env,
+    redisFn: () => {
+      redisTouched = true;
+      return { async incr() { return 1; }, async expire() {}, disconnect() {} };
+    },
+  });
+  const res = await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.refused, /hourly limit \(0\) reached/);
+  assert.equal(redisTouched, false, "a disabled tool refuses without opening a redis connection");
+});
+
+test("enqueueDispatchRun returns { unreachable } and closes the queue when the enqueue fails", async () => {
+  const { root, folder } = tempRootAndFolder("dr-unreach-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  let closed = false;
+  const { fakes } = dispatchFakes({
+    env,
+    makeQueueFn: () => ({
+      async add() {
+        throw new Error("connection down");
+      },
+      async close() {
+        closed = true;
+      },
+    }),
+  });
+  const res = await enqueueDispatchRun({ folder, flow: "fix", task: "t", aiInvoked: true, ...fakes });
+  assert.match(res.unreachable, /connection down/);
+  assert.equal(closed, true, "queue closed in finally even on error");
+});
+
+test("enqueueDispatchRun (operator, aiInvoked:false) skips allowlist/gate/rate-limit but STILL refuses a dirty tree", async () => {
+  let gateCalled = false;
+  let redisCalled = false;
+  let revCalled = false;
+  const { fakes } = dispatchFakes({
+    env: { VALKEY_URL: "redis://x" }, // no roots: an AI trigger would refuse, but the operator path skips the allowlist
+    gitDirtyFn: () => true,
+    revParseHeadFn: () => {
+      revCalled = true;
+      return "abc";
+    },
+    readFlowGateFn: async () => {
+      gateCalled = true;
+      return { gate: "allow" };
+    },
+    redisFn: () => {
+      redisCalled = true;
+      return { async incr() { return 1; }, async expire() {}, disconnect() {} };
+    },
+  });
+  const res = await enqueueDispatchRun({ folder: "/anywhere", flow: "fix", task: "t", aiInvoked: false, ...fakes });
+  assert.match(res.refused, /uncommitted changes/, "the dirty guard fires on the operator path too");
+  assert.equal(revCalled, false, "operator path never resolves HEAD for the gate");
+  assert.equal(gateCalled, false, "operator path never reads the flow gate");
+  assert.equal(redisCalled, false, "operator path never touches the rate limiter");
+});
+
+test("enqueueDispatchRun (operator, aiInvoked:false) enqueues a clean tree with no allowlist/gate/rate-limit", async () => {
+  let gateCalled = false;
+  let redisCalled = false;
+  const { fakes, added } = dispatchFakes({
+    env: { VALKEY_URL: "redis://x" }, // no roots at all
+    gitDirtyFn: () => false,
+    readFlowGateFn: async () => {
+      gateCalled = true;
+      return { gate: "allow" };
+    },
+    redisFn: () => {
+      redisCalled = true;
+      return { async incr() { return 1; }, async expire() {}, disconnect() {} };
+    },
+  });
+  const res = await enqueueDispatchRun({ folder: "/anywhere", flow: "fix", task: "t", aiInvoked: false, ...fakes });
+  assert.equal(res.ok, true);
+  assert.equal(added.length, 1, "enqueued one job");
+  assert.equal(added[0].data.task, "t");
+  assert.equal(gateCalled, false);
+  assert.equal(redisCalled, false);
+});
+
+test("enqueueDispatchRun never writes task text to any log line (PII discipline)", async () => {
+  const { root, folder } = tempRootAndFolder("dr-pii-");
+  const env = { VALKEY_URL: "redis://x", PI_DISPATCH_RUN_ROOTS: root, PI_DISPATCH_RUN_PER_HOUR: "3" };
+  const marker = "SUPER_SECRET_TASK_MARKER";
+  const captured = [];
+  const orig = { log: console.log, error: console.error, warn: console.warn, info: console.info };
+  console.log = console.error = console.warn = console.info = (...a) => captured.push(a.map(String).join(" "));
+  try {
+    const { fakes } = dispatchFakes({ env });
+    const res = await enqueueDispatchRun({ folder, flow: "fix", task: marker, aiInvoked: true, ...fakes });
+    assert.equal(res.ok, true);
+  } finally {
+    Object.assign(console, orig);
+  }
+  assert.ok(!captured.some((line) => line.includes(marker)), "task text must never reach a log line");
 });

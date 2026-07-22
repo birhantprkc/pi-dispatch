@@ -117,6 +117,7 @@ RUN mkdir -p /home/pi/.pi/agent && chown -R pi:pi /home/pi/.pi
 # .pi/APPEND_SYSTEM.md shadows that via an early return in discoverAppendSystemPromptFile, which
 # would delete the floor from the prompt with no error. The runner reads this path explicitly.
 COPY guardrails/HARD_RULES.md /opt/pi-dispatch/HARD_RULES.md
+COPY guardrails/OUTBOX_PROTOCOL.md /opt/pi-dispatch/OUTBOX_PROTOCOL.md
 
 # Source last: everything above is cacheable and this layer changes on every commit.
 COPY image/runner /app/image/runner

@@ -34,6 +34,10 @@ export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaul
 	const sha = (await git(folder, ["rev-parse", "HEAD"])).trim();
 
 	mkdirSync(jobDir, { recursive: true });
+	// The outbox is the container's only signal channel back to the worker (INT-OUTBOX-CONTRACT). It is
+	// mounted /outbox:rw for local jobs only; the host reads it after the run to enqueue chained children.
+	const outboxDir = join(jobDir, "outbox");
+	mkdirSync(outboxDir, { recursive: true });
 	// Instructions from HEAD, via the symlink-safe git materialiser, into /job/pi (mounted :ro).
 	const written = await materializePiDir({ gitDir: folder, sha, destDir: jobDir });
 
@@ -41,7 +45,7 @@ export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaul
 	writeFileSync(join(jobDir, "prompt.md"), String(task ?? ""), { mode: 0o444 });
 
 	// The folder itself is /workspace (rw). No clone: local jobs edit in place.
-	return { workspace: folder, jobDir, sha, materialised: written };
+	return { workspace: folder, jobDir, outboxDir, sha, materialised: written };
 }
 
 async function defaultGit(gitDir, args) {

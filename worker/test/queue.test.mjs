@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { deliveryJobId, localJobId } from "../src/job-id.mjs";
+import { chainedJobId, deliveryJobId, localJobId } from "../src/job-id.mjs";
 
 // localJobId is pure -- runs everywhere. It is the dedup key for local jobs (REQ-DEDUP equivalent).
 
@@ -38,6 +38,77 @@ test("deliveryJobId throws on a missing/empty GUID -- no random fallback that wo
 	assert.throws(() => deliveryJobId(""));
 	assert.throws(() => deliveryJobId(undefined));
 	assert.throws(() => deliveryJobId(null));
+});
+
+// chainedJobId is pure -- runs everywhere. It is the retry-idempotent dedup key for chained (outbox)
+// child jobs (INT-OUTBOX-CONTRACT): parent id + content-hash(flow, task), with NO time component.
+
+test("chainedJobId is deterministic and carries no time component -- a retry re-enqueues the same id", () => {
+	const args = { parentJobId: "parent-1", flow: "tidy", task: "dedupe" };
+	const a = chainedJobId(args);
+	const b = chainedJobId(args); // a later collection (retry) of the same parent+request
+	assert.equal(a, b, "same parent+flow+task -> same id regardless of when it is computed");
+	assert.match(a, /^chain-[0-9a-f]{16}$/);
+});
+
+test("chainedJobId binds the parent -- two parents requesting the same flow+task do not collide", () => {
+	const base = { flow: "tidy", task: "dedupe" };
+	assert.notEqual(chainedJobId({ ...base, parentJobId: "parent-1" }), chainedJobId({ ...base, parentJobId: "parent-2" }));
+});
+
+test("chainedJobId changes when flow or task changes -- a genuinely different request is not swallowed", () => {
+	const base = { parentJobId: "parent-1", flow: "tidy", task: "dedupe" };
+	const id = chainedJobId(base);
+	assert.notEqual(id, chainedJobId({ ...base, flow: "bug-fix" }));
+	assert.notEqual(id, chainedJobId({ ...base, task: "other" }));
+});
+
+test("chainedJobId field separation is unambiguous -- concatenation collisions cannot occur", () => {
+	// NUL-delimited so {parentJobId:'a', flow:'bc'} and {parentJobId:'ab', flow:'c'} cannot collide.
+	const x = chainedJobId({ parentJobId: "a", flow: "bc", task: "" });
+	const y = chainedJobId({ parentJobId: "ab", flow: "c", task: "" });
+	assert.notEqual(x, y);
+});
+
+// enqueueLocalJob's chain passthrough, verified without a live Valkey: a fake queue captures the
+// (name, data, opts) it hands to queue.add. A non-chained job must stay byte-identical to the base shape.
+const NON_CHAINED_KEYS = ["kind", "folder", "flow", "task", "provider", "model", "maxTurns"];
+
+test("enqueueLocalJob keeps a non-chained job byte-identical -- no chainDepth/parentJobId keys", async () => {
+	const { enqueueLocalJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+
+	const now = new Date("2026-07-16T12:00:00Z");
+	const jobId = await enqueueLocalJob(fakeQueue, { folder: "/proj", flow: "tidy", task: "t", provider: "anthropic", model: "m", maxTurns: 5, now });
+
+	assert.deepEqual(Object.keys(captured.data), NON_CHAINED_KEYS);
+	assert.equal(jobId, localJobId({ folder: "/proj", flow: "tidy", task: "t", minute: "2026-07-16T12:00" }));
+	assert.equal(captured.opts.jobId, jobId);
+});
+
+test("enqueueLocalJob puts chainDepth/parentJobId on data only when supplied", async () => {
+	const { enqueueLocalJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+
+	await enqueueLocalJob(fakeQueue, { folder: "/proj", flow: "tidy", task: "t", provider: "anthropic", model: "m", maxTurns: 5, chainDepth: 1, parentJobId: "parent-1", now: new Date("2026-07-16T12:00:00Z") });
+
+	assert.equal(captured.data.chainDepth, 1);
+	assert.equal(captured.data.parentJobId, "parent-1");
+});
+
+test("enqueueLocalJob uses an explicit jobId override instead of the computed localJobId", async () => {
+	const { enqueueLocalJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+
+	const override = chainedJobId({ parentJobId: "parent-1", flow: "tidy", task: "t" });
+	const jobId = await enqueueLocalJob(fakeQueue, { folder: "/proj", flow: "tidy", task: "t", provider: "anthropic", model: "m", maxTurns: 5, jobId: override, now: new Date("2026-07-16T12:00:00Z") });
+
+	assert.equal(jobId, override);
+	assert.equal(captured.opts.jobId, override);
+	assert.notEqual(captured.opts.jobId, localJobId({ folder: "/proj", flow: "tidy", task: "t", minute: "2026-07-16T12:00" }));
 });
 
 // The enqueue contract, verified without a live Valkey: a fake queue captures the (name, data, opts)

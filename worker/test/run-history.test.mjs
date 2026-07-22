@@ -274,6 +274,50 @@ test("buildRecord throw-path admits no PII for either job kind", () => {
 	assert.ok(!localJson.includes("/Users/rob/"), "OS account path must not leak on the error branch");
 });
 
+test("buildRecord: the chain fields default null on a non-chain record and chainEnqueued is never stored", () => {
+	const job = { id: "gh-x", name: "github", data: { kind: "github", repo: "o/r", issueNumber: 5 } };
+	const record = buildRecord({
+		job,
+		result: { outcome: "completed" },
+		startedAt: "2026-07-22T00:00:00.000Z",
+		endedAt: "2026-07-22T00:01:00.000Z",
+	});
+	assert.equal(record.parentJobId, null);
+	assert.equal(record.chainDepth, null);
+	assert.equal(record.chainRefused, null);
+	assert.equal("chainEnqueued" in record, false, "chainEnqueued is derivable from children and is never stored on the record");
+});
+
+test("buildRecord: a chained child's parentJobId and chainDepth come from job.data", () => {
+	const job = {
+		id: "chain-abc",
+		name: "local",
+		data: { kind: "local", folder: "C:/Users/rob/proj", flow: "tidy", parentJobId: "local-parent", chainDepth: 2 },
+	};
+	const record = buildRecord({
+		job,
+		result: { outcome: "completed" },
+		startedAt: "2026-07-22T00:00:00.000Z",
+		endedAt: "2026-07-22T00:01:00.000Z",
+	});
+	assert.equal(record.parentJobId, "local-parent");
+	assert.equal(record.chainDepth, 2);
+});
+
+test("buildRecord: chainRefused lands from a completed parent's result", () => {
+	const job = { id: "local-parent", name: "local", data: { kind: "local", folder: "C:/Users/rob/proj" } };
+	const record = buildRecord({
+		job,
+		result: { outcome: "completed", chainRefused: 1 },
+		startedAt: "2026-07-22T00:00:00.000Z",
+		endedAt: "2026-07-22T00:01:00.000Z",
+	});
+	assert.equal(record.chainRefused, 1);
+	// parentJobId/chainDepth are absent from a top-level parent's own data -> null.
+	assert.equal(record.parentJobId, null);
+	assert.equal(record.chainDepth, null);
+});
+
 test("makeLogSink enabled appends chunks in order and returns turns from the exit line", async () => {
 	const stream = makeFakeStream({ emitOn: "finish" });
 	const fs = makeFakeFs({ stream });

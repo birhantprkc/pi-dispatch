@@ -20,10 +20,10 @@
  * (they may enter later model context, which is accepted per REQ); raw `.log`
  * bytes go ONLY to the overlay viewer, never to a message.
  *
- * It also registers four LLM-callable tools -- `dispatch_status`, `dispatch_runs`
- * (reads), and `dispatch_pause`/`dispatch_resume` (durable-but-reversible controls)
- * -- with no settings-write tool and no log tool, and a live dashboard overlay on
- * the bare `/dispatch` command.
+ * It also registers five LLM-callable tools -- `dispatch_status`, `dispatch_runs`
+ * (reads), `dispatch_pause`/`dispatch_resume` (durable-but-reversible controls), and
+ * `dispatch_run` (a gated, PAID enqueue) -- with no settings-write tool and no log
+ * tool, and a live dashboard overlay on the bare `/dispatch` command.
  *
  * Supported pi version: 0.80.7. The factory registers nothing unless every API
  * member it consumes is present; on a miss it names the member and the
@@ -44,6 +44,7 @@ import {
   listRunIds,
   setQueuePaused,
   writeSettings,
+  enqueueDispatchRun,
   KNOWN_KEYS,
 } from "./read-model.mjs";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
@@ -62,12 +63,13 @@ const REBUILT_NOTICE = (reason: string) =>
   `replaced invalid settings file (${reason}) — other keys were lost`;
 
 const USAGE =
-  "usage: /dispatch <status|pause|resume|runs|logs|budget|triggers|settings|set|unset>";
+  "usage: /dispatch <status|pause|resume|run|runs|logs|budget|triggers|settings|set|unset>";
 
 const KNOWN_SUBCOMMANDS = [
   "status",
   "pause",
   "resume",
+  "run",
   "runs",
   "logs",
   "budget",
@@ -90,7 +92,7 @@ export default function admin(pi: ExtensionAPI): void {
 
   pi.registerCommand("dispatch", {
     description:
-      "pi-dispatch admin: status|pause|resume|runs|logs|budget|triggers|settings|set|unset",
+      "pi-dispatch admin: status|pause|resume|run|runs|logs|budget|triggers|settings|set|unset",
     getArgumentCompletions: (prefix) => completeArguments(prefix),
     handler: async (args, ctx) => dispatch(pi, args, ctx),
   });
@@ -104,13 +106,16 @@ function toolText(text: string): { content: { type: "text"; text: string }[]; de
 }
 
 /**
- * Register the four LLM-callable tools: two reads (`dispatch_status`, `dispatch_runs`) and the two
- * durable-but-reversible controls (`dispatch_pause`, `dispatch_resume`). There is deliberately NO
- * settings-write tool and NO log tool -- a write is an operator-typed command only, and raw `.log` bytes
- * never enter model context (DES-ADMIN-VIA-PI-EXTENSION injection boundary; REQ acceptance). Each read
- * reuses the self-closing read-model wrappers: a tool call is a one-shot, so a per-call connection is
- * correct here where a per-tick one on the dashboard would not be. A control that cannot reach the queue
- * THROWs, which pi reports to the model as an error rather than a false success.
+ * Register the five LLM-callable tools: two reads (`dispatch_status`, `dispatch_runs`), the two
+ * durable-but-reversible controls (`dispatch_pause`, `dispatch_resume`), and `dispatch_run` -- the one
+ * gated, PAID enqueue. There is deliberately NO settings-write tool and NO log tool -- a settings write is
+ * an operator-typed command only, and raw `.log` bytes never enter model context (DES-ADMIN-VIA-PI-EXTENSION
+ * injection boundary; REQ acceptance). `dispatch_run` takes no spend-knob params (model/maxTurns/dailyCap/
+ * concurrency resolve worker-side) and is bounded producer-side by the folder allowlist, the committed
+ * per-flow ai-trigger gate read at a pre-agent SHA, and a per-hour rate limit; the daily cap stays the
+ * worker's. Each read reuses the self-closing read-model wrappers: a tool call is a one-shot, so a per-call
+ * connection is correct here where a per-tick one on the dashboard would not be. A control or enqueue that
+ * cannot reach the queue THROWs, which pi reports to the model as an error rather than a false success.
  */
 function registerTools(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -181,6 +186,29 @@ function registerTools(pi: ExtensionAPI): void {
       return toolText("resumed");
     },
   });
+
+  pi.registerTool({
+    name: "dispatch_run",
+    label: "pi-dispatch run",
+    description:
+      "Enqueues a PAID pi-dispatch agent run against a local folder, editing it in place with no undo. " +
+      "Only folders under the operator's PI_DISPATCH_RUN_ROOTS, and only flows whose .pi/skills/<flow>/SKILL.md " +
+      "(at HEAD) sets ai-trigger: allow, can be started. Refuses a dirty git working tree — no force option. " +
+      "Rate-limited per hour.",
+    executionMode: "sequential",
+    parameters: Type.Object({ folder: Type.String(), flow: Type.String(), task: Type.String() }),
+    async execute(_toolCallId, params) {
+      const res = await enqueueDispatchRun({
+        folder: params.folder,
+        flow: params.flow,
+        task: params.task,
+        aiInvoked: true,
+      });
+      if (res.refused) throw new Error(res.refused);
+      if (res.unreachable) throw new Error(`could not reach the queue: ${res.unreachable}`);
+      return toolText(JSON.stringify({ jobId: res.jobId, folder: params.folder, flow: params.flow }));
+    },
+  });
 }
 
 async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void> {
@@ -223,6 +251,28 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
     }
     case "settings": {
       send(pi, renderSettingsView(readSettingsView({ settingsFile: paths.settingsFile })));
+      return;
+    }
+    case "run": {
+      const folder = tokens[1];
+      const flow = tokens[2];
+      const task = tokens.slice(3).join(" ");
+      if (!folder) {
+        notify?.("usage: /dispatch run <folder> <flow> [task...]", "warning");
+        return;
+      }
+      // Operator path (aiInvoked:false): ungated -- typing the command is the approval -- but the dirty
+      // guard still fires inside enqueueDispatchRun. No spend knobs; provider/model/maxTurns resolve worker-side.
+      const res = await enqueueDispatchRun({ folder, flow, task, aiInvoked: false });
+      if (res.refused) {
+        notify?.(res.refused, "error");
+        return;
+      }
+      if (res.unreachable) {
+        notify?.(`could not reach the queue: ${res.unreachable}`, "error");
+        return;
+      }
+      notify?.(`queued ${res.jobId} — ${folder} (${flow})`, "info");
       return;
     }
     case "logs":
