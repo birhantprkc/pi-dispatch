@@ -17,6 +17,10 @@
 # worker at boot, so it must be writable by User= (pi) -- do NOT pre-create it as root, or the non-root
 # worker hits EACCES at boot. Set via `.env` (EnvironmentFile), no unit change needed; the default path
 # avoids colliding with the daemon's own logs/worker.out.log.
+#
+# PI_SETTINGS_FILE is the runtime-tunable settings overlay (default under OS temp, which may be wiped on
+# reboot) -- point it at a durable path in production. Set via `.env` (EnvironmentFile), no unit change
+# needed; it is worker-owned and never belongs in the container env allowlist.
 
 [Unit]
 Description=pi-dispatch worker (drains the job queue on the host; launches job containers via docker)

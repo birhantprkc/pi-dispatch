@@ -138,7 +138,7 @@ test("scheduled job drains through a real Worker; budget INCR precedes the conta
 			cancelJob: () => {},
 			stopContainer: () => {},
 			redis,
-			cap: 100,
+			getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 100, concurrency: 3 }),
 			deps: localDeps({ runContainer, now: fixedNow }),
 		});
 		let drainedJob = null;
@@ -288,7 +288,7 @@ test("a blocking scheduled run never overlaps or stacks", { skip }, async () => 
 			cancelJob: () => {},
 			stopContainer: () => {},
 			redis,
-			cap: 1000,
+			getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 1000, concurrency: 3 }),
 			deps: localDeps({ runContainer, now: fixedNow }),
 		});
 		worker = new Worker(name, processor, { connection: { ...conn, maxRetriesPerRequest: null }, concurrency: 1 });

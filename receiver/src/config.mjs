@@ -11,8 +11,8 @@
  * - `labelFlows` IS the label allowlist: only labels present here map to a flow, and only collaborators
  *   can apply labels, so the map is the human approval gate (CONST-TRIGGER-AUTHOR-GATE).
  * - `bind` defaults to `0.0.0.0` (public): the receiver is the trigger surface that lives outside pi
- *   (DES-TRIGGER-OUTSIDE-PI). It carries no panel/admin/dashboard config -- the panel is a separate
- *   service on a separate bind (DES-PANEL-SEPARATE-FROM-RECEIVER), so there is no admin surface here.
+ *   (DES-TRIGGER-OUTSIDE-PI). It carries no admin/dashboard config -- the admin surface is a pi extension
+ *   in the operator's session and binds no port (DES-ADMIN-VIA-PI-EXTENSION), so there is none here.
  *
  * Errors are tagged `piDispatchConfig` (via the shared `configError`) so the entry can print them
  * cleanly and exit non-zero.

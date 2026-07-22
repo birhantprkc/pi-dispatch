@@ -15,13 +15,13 @@ A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
 - **Targets**: a **local folder** on the operator's machine (edited in place — the primary self-hosted
   use, needs only a provider key), or a **GitHub repo** (cloned, worked, opened as a PR — needs a GitHub
   App).
-- **Triggers**: the **CLI** / **panel** (operator-initiated, `DES-CLI-TRIGGER-FOR-LOCAL`), a **webhook**
-  (GitHub issue activity), or **cron** (a schedule).
+- **Triggers**: the **CLI** (operator-initiated, `DES-CLI-TRIGGER-FOR-LOCAL`; the admin extension operates
+  the queue but triggers no jobs), a **webhook** (GitHub issue activity), or **cron** (a schedule).
 
 Everything below the trigger is identical: budget check → `/job:ro` inputs → one container → the runner
-→ an exit code. What differs is authz (a label/collaborator gate for webhooks vs panel/CLI access for
+→ an exit code. What differs is authz (a label/collaborator gate for webhooks vs CLI access for
 local), the credential (a short-lived scoped token for GitHub jobs vs none for local), and the completion signal
-(an issue comment vs the console/panel — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`).
+(an issue comment vs the console, or the admin extension's runs view — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`).
 
 **Out of scope**: being a hosted service; multi-tenancy; merging anything.
 
@@ -182,9 +182,9 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Scope**: GitHub jobs only. A local-folder job has no issue to comment on; its equivalent is
   `REQ-LOCAL-JOB-VISIBILITY`. Stated explicitly because the original requirement assumed every job is a
   GitHub issue — it is not.
-- **Why**: State must be visible where the human already is. The queue dashboard sits behind basic auth
-  on a home box and nobody opens it; the issue thread is where the requester is already looking, and is
-  the only surface a non-maintainer ever sees. It is also the **only** signal for
+- **Why**: State must be visible where the human already is — the issue thread. An admin surface the
+  operator must deliberately open (now the pi-extension session) does not change that; the issue thread is
+  where the requester is already looking, and is the only surface a non-maintainer ever sees. It is also the **only** signal for
   `CONST-PI-VERSION-PINNED`'s silent-no-op failure mode: if an upstream break makes every job a no-op,
   the queue still reports success — a missing completion comment is what a human would actually notice.
 - **Traces to**: `CONST-MERGE-NEVER-AUTOMATIC`, `CONST-PI-VERSION-PINNED`
@@ -211,8 +211,8 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 ## REQ-LOCAL-JOB-VISIBILITY
 
 - **Statement**: A local-folder job shall surface its outcome where the operator is already looking — the
-  worker's console — at start and on completion or failure, and (once built) in the panel's job view. The
-  container's own output shall stream to that console during the run.
+  worker's console — at start and on completion or failure, and in the admin extension's `runs` view
+  (`REQ-ADMIN-VIA-PI-EXTENSION`). The container's own output shall stream to that console during the run.
 - **Why**: The local counterpart of `REQ-JOB-STATUS-COMMENTS`, and it carries the same load: it is the
   signal for `CONST-PI-VERSION-PINNED`'s silent-no-op failure mode. A local job has no issue thread, so
   without a console signal a broken run would still report success to the queue and a human would notice
@@ -273,7 +273,7 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Scope**: Both GitHub and local jobs. This is a **third, durable** surface — it complements, and does
   not replace, `REQ-LOCAL-JOB-VISIBILITY` (the ephemeral console line plus live stream) and
   `REQ-JOB-STATUS-COMMENTS` (the GitHub issue comment).
-- **Why**: The panel and post-hoc debugging need a keyed, structured read-model that a scrolling
+- **Why**: The admin extension and post-hoc debugging need a keyed, structured read-model that a scrolling
   console/journal cannot provide; the durable record is also a second, persistent signal for
   `CONST-PI-VERSION-PINNED`'s silent-no-op mode. The id-only record honours `no-pii-in-logs` — log the
   stable ids (the delivery GUID, `repo#issue`), never issue or comment bodies — while the raw
@@ -286,6 +286,47 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   correct outcome and is present after a worker restart; the record contains no issue or comment body,
   title, or username (`target` is `repo#issue` / `local:<basename>` only); the raw `logs/<jobId>.log`
   exists only when `PI_CAPTURE_JOB_LOGS` is set and is gitignored.
+
+## REQ-ADMIN-VIA-PI-EXTENSION
+
+- **Statement**: The admin surface shall ship as a pi extension in `admin/`, loaded into the operator's
+  interactive pi session. It provides operator slash commands for observability (`status`, `runs`, `logs`,
+  `budget`, `triggers`), queue on/off (`pause`/`resume`, backed by the same durable `queue.pause()`), and
+  settings editing (`set`/`unset`, writing the `settings.json` overlay). The LLM-callable tools expose
+  **reads and `pause`/`resume` only**; every settings write is an operator-typed command, never a
+  model-invocable tool.
+- **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs and
+  is never materialised into a job's `/job` inputs — `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's
+  own `.pi/` extensions, not this one.
+- **Why**: See `DES-ADMIN-VIA-PI-EXTENSION` — a session-bound, port-less admin surface for a
+  terminal-native operator, narrower than the superseded localhost panel. Reads plus `pause`/`resume` are
+  the only model-callable tools, so a model-invocable surface cannot raise the daily cap
+  (`CONST-BUDGET-BEFORE-TOKENS`); raw `.log` output is overlay-only, so untrusted container text never
+  enters model context (`CONST-ISSUE-TEXT-IS-DATA`, one layer down).
+- **Traces to**: `DES-ADMIN-VIA-PI-EXTENSION`, `CONST-ISSUE-TEXT-IS-DATA`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `REQ-DURABLE-RUN-HISTORY`
+- **Acceptance**: Given the extension is loaded, when the operator runs `/dispatch status`, then queue
+  counts, paused state, and budget render with no model involvement; given a model-invoked tool call, when
+  it is a settings write, then no such tool exists (writes are commands only); given `/dispatch logs`, when
+  the raw `.log` renders, then it renders in the overlay viewer and is never returned as a tool result or
+  sent as a message into model context; given an operator pi whose API surface lacks any required member,
+  when the extension loads, then it registers nothing and reports the unsupported version loudly.
+
+## REQ-RUNTIME-SETTINGS-PICKUP
+
+- **Statement**: The worker shall honour overlay changes without a restart: `model`, `provider`,
+  `maxTurns`, and `dailyCap` resolve per job at job start, and `concurrency` is applied at the worker's
+  next job pickup.
+- **Why**: A settings edit at 11pm must not require a service restart. The worker re-reads the overlay in
+  its processor at each job start — no watcher and no reload signal (see `DES-RUNTIME-SETTINGS-FILE-OVERLAY`).
+- **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `INT-CONFIG-OVERLAY-CONTRACT`,
+  `CONST-BUDGET-BEFORE-TOKENS`
+- **Acceptance**: Given a present-but-invalid overlay, when a job starts, then the processor returns a
+  policy refusal `settings-overlay-invalid` before `reserveBudget` — no budget slot consumed, no container
+  started, not retried; given a job whose data omits `model`/`provider`/`maxTurns`, when it starts, then
+  the value falls to the overlay, then env, then default — not a value frozen at enqueue; given `dailyCap`
+  lowered below today's reserved count, when the next job starts, then it is refused over-budget before any
+  container.
 
 ---
 
@@ -311,3 +352,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-17 | Added REQ-CRON-SCHEDULED-JOBS, formalizing the implemented BullMQ Job Scheduler cron path: `local`-only triggers, loud `-10`/`-11` handling, per-scheduler stall teardown, startup orphan reconcile, and no in-tick retry. |
 | 2026-07-21 | Added REQ-DURABLE-RUN-HISTORY (durable per-job run record + opt-in raw log; read model for the panel). |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |
+| 2026-07-21 | Added REQ-ADMIN-VIA-PI-EXTENSION (admin surface as a pi extension in `admin/`: operator observability/pause-resume/settings commands, reads-plus-pause/resume-only model tools, overlay-only raw logs) and REQ-RUNTIME-SETTINGS-PICKUP (per-job overlay re-read for model/provider/maxTurns/dailyCap; concurrency at next pickup). Rescoped panel references to the admin extension in Scope, `REQ-JOB-STATUS-COMMENTS`, `REQ-LOCAL-JOB-VISIBILITY`, and `REQ-DURABLE-RUN-HISTORY`. |

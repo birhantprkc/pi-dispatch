@@ -58,13 +58,15 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		// failFast: a one-shot enqueue must not hang forever if Valkey is down -- error clearly.
 		const queue = makeQueue(parseConnection(config.valkeyUrl, { failFast: true }));
 		try {
+			// Absent flags stay absent (undefined) so the value resolves at job start against the
+			// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT).
 			const jobId = await enqueueLocalJob(queue, {
 				folder,
 				task: values.task,
 				flow: values.flow,
-				provider: values.provider ?? config.provider,
-				model: values.model ?? config.model,
-				maxTurns: values["max-turns"] ? Number(values["max-turns"]) : config.maxTurns,
+				provider: values.provider,
+				model: values.model,
+				maxTurns: values["max-turns"] ? Number(values["max-turns"]) : undefined,
 			});
 			process.stdout.write(`queued ${jobId} — folder ${folder}\nrun \`pi-dispatch worker\` to process it.\n`);
 		} catch (error) {

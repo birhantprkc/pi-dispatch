@@ -20,17 +20,17 @@ GitHub repo(s)
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
-│ Valkey + BullMQ  "pi-jobs"   │◀──────▶│ panel  (admin)               │
-│ THE WAIT-LIST: 50 triggers   │        │ binds 127.0.0.1 by default   │
-│ = 50 pending jobs, drained   │        │ on/off (pause/resume),       │
-│ at fixed concurrency; dedup  │        │ settings, model, flows,      │
-│ by delivery GUID; retries;   │        │ Bull Board, setup            │
-│ daily budget cap             │        │ ── NEVER on the public edge  │
+│ Valkey + BullMQ  "pi-jobs"   │◀──────▶│ operator terminal (on host)  │
+│ THE WAIT-LIST: 50 triggers   │        │ pi + admin extension         │
+│ = 50 pending jobs, drained   │        │ /dispatch pause|resume,      │
+│ at fixed concurrency; dedup  │        │ status runs logs budget,     │
+│ by delivery GUID; retries;   │        │ settings via TUI overlay     │
+│ daily budget cap             │        │ ── no network bind at all    │
 └──────────────┬───────────────┘        └──────────────┬───────────────┘
                ▼  one job per worker slot              │ reads/writes
 ┌──────────────────────────────┐        ┌──────────────▼───────────────┐
 │ worker (BullMQ Worker proc)  │───────▶│ data volume                  │
-│ fresh clone → docker run     │  reads │ config.json + flows/*.md     │
+│ fresh clone → docker run     │  reads │ settings.json + flows/*.md   │
 └──────────────┬───────────────┘        └──────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────┐
@@ -39,9 +39,9 @@ GitHub repo(s)
 │  • Playwright + headless Chromium           │
 │  • /job:ro  = flow + issue payload          │
 │  • persona BAKED INTO THE IMAGE             │
-│    (hard rules; unreachable from panel      │
-│     or from /job — see INT-CONTAINER-       │
-│     JOB-INPUTS)                             │
+│    (hard rules; unreachable from the        │
+│     admin surface or from /job — see        │
+│     INT-CONTAINER-JOB-INPUTS)               │
 │  edit → screenshot → iterate → commit →     │
 │  push branch → gh pr create → issue comment │
 └─────────────────────────────────────────────┘
@@ -99,11 +99,13 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 ## DES-QUEUE-BULLMQ-OVER-CUSTOM
 
 - **Decision**: Redis + BullMQ.
-- **Why**: BullMQ supplies priorities, a rate limiter, a dedup window, stalled-job recovery, retry
-  policy, and a dashboard — each of which is an independent requirement here, not a bonus. Building five
-  mechanisms to avoid one dependency is precisely how a solo-maintainer project drowns in maintenance.
-  Redis persistence (AOF) is what makes `REQ-QUEUE-BURST-NO-DROP` survive a reboot; an in-memory queue
-  would lose the wait-list on the first restart.
+- **Why**: BullMQ supplies priorities, a rate limiter, a dedup window, and stalled-job recovery with a
+  retry policy — each of which is an independent requirement here, not a bonus. Building four mechanisms
+  to avoid one dependency is precisely how a solo-maintainer project drowns in maintenance. Its Bull
+  Board dashboard was a fifth draw; `DES-ADMIN-VIA-PI-EXTENSION` drops the web surface entirely, so the
+  case now stands on the four queue mechanisms alone. Redis persistence (AOF) is what makes
+  `REQ-QUEUE-BURST-NO-DROP` survive a reboot; an in-memory queue would lose the wait-list on the first
+  restart.
 - **Evidence (upstream)**: BullMQ is MIT (`taskforcesh/bullmq → LICENSE`, © BullForce Labs AB)
 - **Rejected**:
   - *Hand-rolled Redis list* — reimplements the five mechanisms above, badly, forever.
@@ -129,10 +131,11 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     second."* Do **not** multiply `limiter.max` by worker count. `concurrency` is the opposite — it is
     per-Worker-instance. Two adjacent options with opposite scoping is a trap worth writing down.
   - **`queue.pause()` is durable and global**, implemented as a Redis-side rename of the `wait` key to
-    `paused` — so it survives a restart, which is what makes it usable as the panel's on/off switch.
-    New jobs are still accepted while paused (they land in `paused`); in-flight jobs run to completion.
-    That is the correct semantics for `DES-PANEL-SEPARATE-FROM-RECEIVER`'s switch: **off means "stop
-    starting work", not "start dropping work"** — dropping would violate `REQ-QUEUE-BURST-NO-DROP`.
+    `paused` — so it survives a restart, which is what makes it usable as the admin extension's on/off
+    switch (`/dispatch pause` / `/dispatch resume`, still `queue.pause()` / `queue.resume()`, still
+    durable). New jobs are still accepted while paused (they land in `paused`); in-flight jobs run to
+    completion. That is the correct semantics for `DES-ADMIN-VIA-PI-EXTENSION`'s switch: **off means
+    "stop starting work", not "start dropping work"** — dropping would violate `REQ-QUEUE-BURST-NO-DROP`.
   - **Stalled-job recovery re-runs paid jobs by default** — see `CONST-RETRY-INFRA-ONLY`.
 - **Reference** (no authority): `docs.bullmq.io/guide/rate-limiting`, `/guide/workers/pausing-queues`,
   `/guide/redis-tm-compatibility`.
@@ -244,7 +247,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   - **No overlap, structurally.** The next job is only created when the current one *starts processing*,
     so a 30-minute flow on a 10-minute schedule yields one job every 30 minutes rather than three
     concurrent agent runs. The cost is silent under-firing — actual cadence degrades below the configured
-    one under load, so the panel should surface `next` drift rather than let it look healthy.
+    one under load, so the admin extension should surface `next` drift rather than let it look healthy.
   - **Deterministic `jobId`** — `repeat:<schedulerId>:<nextMillis>` — so scheduler jobs get
     `REQ-DEDUP-BY-DELIVERY-GUID`-equivalent dedup for free, with no GUID to supply.
   - **Local-only this slice.** A `kind:"github"` schedule is rejected at load. A scheduled GitHub job has
@@ -280,24 +283,23 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-CLI-TRIGGER-FOR-LOCAL
 
-- **Decision**: Local-folder jobs are triggered by a **CLI** (`pi-dispatch run <folder> --task … [--flow …]`)
-  as the first interface, in addition to the panel that `DES-PANEL-SEPARATE-FROM-RECEIVER` describes. Both
-  are producers that call one `enqueueLocalJob`; the CLI is the leaner, dev-native path and the panel
-  reuses the same enqueue.
+- **Decision**: Local-folder jobs are triggered by a **CLI** (`pi-dispatch run <folder> --task … [--flow …]`) —
+  the first and, in this slice, the **only** local-enqueue interface. It calls `enqueueLocalJob` directly.
+  The admin surface (`DES-ADMIN-VIA-PI-EXTENSION`) is the interactive operator interface, but it does
+  **not** enqueue in this slice; local enqueue stays CLI-only.
 - **Why**: For a self-hosted tool that mostly runs on people's own machines, the terminal is the natural
   first interface — no web server, no bigger build before anything runs — and it is what makes the local
-  path usable ahead of the panel. The spec build order reaches a usable *local* experience only at the
-  panel, which sits after the receiver; a CLI closes that gap without the GitHub-webhook receiver a local
-  user does not need.
+  path usable early, without the GitHub-webhook receiver a local user does not need.
 - **Consistency check** (this was verified, not assumed): the CLI trigger violates no constraint.
   `CONST-TRIGGER-AUTHOR-GATE` is webhook/comment-scoped by construction, and local jobs are ungated by
-  design (`SECURITY.md`: panel/CLI access *is* the trust boundary for local). Critically,
+  design (`SECURITY.md`: local CLI access *is* the trust boundary for local). Critically,
   **`CONST-BUDGET-BEFORE-TOKENS` still holds**: the cap is checked and incremented in the *worker's
   processor*, immediately before the container starts — never in the trigger. A producer that enqueues a
   job cannot bypass the budget, because the budget gate lives on the consumer side, after prepare and
   before `runContainer`. The CLI is only a producer; it spends nothing.
 - **Safety**: a local job edits the folder in place with no undo, so the CLI refuses a **dirty git working
-  tree** unless `--force` — a cheap guard the panel should mirror.
+  tree** unless `--force`. Local enqueue is CLI-only this slice, so this guard has no second producer to
+  mirror it.
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-PANEL-SEPARATE-FROM-RECEIVER`,
   `REQ-LOCAL-JOB-VISIBILITY`
 
@@ -325,7 +327,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   place. There is no volume to hide behind. Since local folders are the primary self-hosted experience,
   the deployment model must support the bind mount, and the host worker does so with zero path math.
   **Isolation is unaffected.** `CONST-ISOLATION-CONTAINER-PER-JOB` is about the **job** container being
-  the boundary — pi still never runs on the host. And a container holding `/var/run/docker.sock` is
+  the boundary — the harness still never runs pi on the host. And a container holding `/var/run/docker.sock` is
   already root-equivalent on the host, so containerising the worker bought *no* isolation; it only bought
   deployment tidiness, which is what this trades away.
 - **What this deletes**: the named-volume + `volume-subpath` machinery, the `≥26.1.0` Engine floor, the
@@ -333,8 +335,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   directly.
 - **Accepted cost, stated plainly**: Node on the host, not only Docker. `docker compose up` alone no
   longer runs everything; the operator also runs `pi-dispatch worker`. That is the honest price of
-  local-folder jobs working on Windows/macOS/Linux without fragile path math. The receiver and panel are
-  Node too, so it is one install story (`npm ci`), with Docker running Valkey and the job containers.
+  local-folder jobs working on Windows/macOS/Linux without fragile path math. The receiver is Node too,
+  so it is one install story (`npm ci`), with Docker running Valkey and the job containers.
 - **Evidence**: verified first-hand this session — `docker context` (`npipe` endpoint, `linux/x86_64`
   daemon) · `moby/for-win#14271` (VM prefix `/run/desktop/mnt/host/…`) and `docker/compose#5563`
   (older `/host_mnt/…`), i.e. the prefix moved · `docker/compose#4240`
@@ -399,6 +401,11 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-PANEL-SEPARATE-FROM-RECEIVER
 
+- **Status**: **SUPERSEDED by `DES-ADMIN-VIA-PI-EXTENSION`.** The port-separation reasoning below was
+  correct for a **networked** admin panel — the panel and the internet-facing receiver have opposite
+  reachability requirements and cannot share a port — but the successor removes the network surface
+  entirely: the admin surface is a pi extension in the operator's own session, binding no port at all.
+  Kept in place because IDs are permanent and inbound `Traces to` references remain valid.
 - **Decision**: The admin panel is a **separate process on a separate port**, binding `127.0.0.1` by
   default. Bull Board mounts on the panel. The receiver carries **no** dashboard and no admin surface.
 - **Why**: The panel sets the model, the budgets, and what the agent is told to do — it is the most
@@ -420,31 +427,130 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     rejection takes down webhook ingress with the admin UI. The wait-list should not depend on the UI.
 - **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-JOB-STATUS-COMMENTS`
 
+## DES-ADMIN-VIA-PI-EXTENSION
+
+- **Decision**: The admin surface is a **pi extension** shipped in an `admin/` workspace, loaded into the
+  operator's own interactive pi session (via `-e`, `~/.pi/agent/extensions`, or a trust-gated
+  `.pi/extensions`). It provides operator-only slash commands
+  (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and a TUI overlay
+  dashboard. The LLM-callable tools are **reads plus `pause`/`resume` only**; every settings write is an
+  operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
+  (`VALKEY_URL`) and reads the run-history sidecar files; it **binds no network port at all**. Bull Board
+  is dropped.
+- **Why**:
+  - **The receiver still carries no admin surface — ever.** The superseded panel narrowed that surface to
+    a `127.0.0.1` bind; a surface with **no port at all** is strictly narrower still. Nothing reachable
+    from the network gained a control here — it lost one.
+  - **Reconciliation with the amended `CONST-ISOLATION-CONTAINER-PER-JOB`.** pi **does** run on the host
+    here, as the operator's own interactive tool — which the amended constraint scopes out: this session
+    is not a harness invocation, processes no adversarial input, is operator-present, and holds no harness
+    credentials. This mirrors `DES-WORKER-ON-HOST`'s "isolation is unaffected" reasoning and clears the
+    higher bar explicitly rather than by omission — the harness still never invokes pi on the host, and
+    `.claude/rules/agent-isolation.md`'s `no-pi-outside-container` targets `receiver`/`worker`/`image`
+    paths, none of which the `admin/` extension is, so that rule is untouched.
+  - **The asymmetry with `DES-TRIGGER-OUTSIDE-PI`.** That entry rejects a pi-extension *trigger* because
+    a session-bound lifetime contradicts an always-on trigger. The admin surface has the opposite lifetime
+    requirement: it is useful only while the operator is present, so a session-bound lifetime is correct
+    for it and disqualifying for a trigger. Reachability, and now lifetime, are per-surface decisions.
+  - **The injection boundary holds by placement, not by filtering.** Raw container `.log` output is
+    untrusted agent-adjacent text and **never enters LLM context** — only the fixed-enum, PII-free `.json`
+    run records may; the `.log` is overlay-viewer-only. This is the same structural defence as
+    `CONST-ISSUE-TEXT-IS-DATA`, one layer down: the boundary is where the data is placed, not a filter
+    over its content. One residual is named and accepted: a prompt injection in the operator's session
+    can invoke `dispatch_pause`/`dispatch_resume`, accepted because the outcome is durable-but-reversible
+    and money-safe — neither tool spends tokens nor raises the cap (`CONST-BUDGET-BEFORE-TOKENS`), so the
+    worst case is a queue stall the operator observes and undoes.
+  - **The operator's pi version is uncontrolled**, so the extension runs a **load-time capability probe**
+    of the exact API surface it uses and, on any miss, registers **nothing** — all-or-nothing rather than
+    half-loading. The supported version is the pin, `0.80.7` (`CONST-PI-VERSION-PINNED`). Residual risk,
+    named: an operator on a divergent pi version gets no admin surface and falls back to direct Valkey and
+    file inspection, rather than a silently degraded one.
+- **Rejected**:
+  - *The web panel + Bull Board* — an entire localhost web app for a solo, terminal-native operator. The
+    superseded `DES-PANEL-SEPARATE-FROM-RECEIVER` holds the full original reasoning; it was correct for a
+    networked panel and is removed because the network surface is removed.
+  - *Mounting admin on the receiver* — unchanged rejection: the receiver must bind `0.0.0.0`, so any admin
+    surface on it is published to the internet.
+  - *The extension spawning pi as a subprocess* — would violate `no-pi-outside-container` and the amended
+    constraint's harness-invocation scope. The extension runs *inside* the operator's session; it does not
+    launch an agent.
+- **Evidence (upstream)**: read from the **published pinned artifact** `@earendil-works/pi-coding-agent@0.80.7`
+  (npm), **not HEAD** — `dist/core/extensions/types.d.ts` (`registerCommand` :876, `registerTool` :874,
+  `ExtensionUIContext.custom` :116-126) · `docs/extensions.md` (extension commands run without model
+  involvement; loading via `-e` / `~/.pi/agent/extensions` / trust-gated `.pi/extensions`) ·
+  `examples/extensions/` (doom-overlay, an interactive TUI overlay; the with-deps example resolves its own
+  `node_modules` via jiti). The load-time capability probe exists precisely because these are asserted
+  against the pin, not against a moving HEAD.
+- **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `CONST-ISSUE-TEXT-IS-DATA`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `REQ-DURABLE-RUN-HISTORY`
+
+## DES-RUNTIME-SETTINGS-FILE-OVERLAY
+
+- **Decision**: Runtime-tunable settings are a flat `settings.json` **overlay** — path `PI_SETTINGS_FILE`,
+  default `<OS temp>/pi-dispatch/settings.json` — written **atomically** (tmp + rename) by the admin
+  extension and **re-read by the worker at each job start**. The keys are exactly `model`, `provider`
+  (non-empty strings), `maxTurns` (int ≥1), `dailyCap` (int ≥1), and `concurrency` (int 1–10). Resolution
+  precedence is **`job.data > overlay > env > default`**; producers stop baking env defaults into job
+  data, so an unset job field falls through to the overlay rather than to a value frozen at enqueue time.
+- **Why**:
+  - **Per-job re-read needs no watcher and no IPC.** The worker already opens each job in its processor;
+    reading one small file there costs a `stat` + parse and removes any need for `fs.watch`, a pub/sub
+    channel, or a reload signal between the extension and the worker.
+  - **`CONST-BUDGET-BEFORE-TOKENS` is untouched.** The cap is resolved at the **existing** check point —
+    in the processor, before the container starts — so the overlay changes *which value* the cap takes,
+    never *when* it is checked. The ordering that is the mechanism stays exactly where it was.
+  - **Fail-closed on a present-but-invalid file.** A settings file that exists but does not parse, or
+    violates the key contract, **refuses the job start** with policy reason `settings-overlay-invalid`,
+    **before `reserveBudget`**, so it burns no budget slot. Fail-open would fall back to env and could
+    silently **restore a higher daily cap** than the operator last set — money fails closed, matching the
+    `config.mjs` posture where a cap of `0` fails closed rather than meaning "unlimited".
+  - **The overlay may never carry persona or hard rules.** It tunes task/config knobs only; the immutable
+    rules stay baked. This is the `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE` boundary applied to settings:
+    mutable = task/config tuning, immutable = hard rules, and the split falls on the risk, not on the
+    filesystem.
+  - **A file, not Redis**, so the live configuration is inspectable, hand-editable with an editor,
+    survives a Valkey flush, and does not become a second opaque state store. The shared-filesystem
+    assumption it relies on is true by construction: `DES-WORKER-ON-HOST` puts the worker and the admin
+    extension on one box.
+- **Rejected**:
+  - *Redis-resident settings* — matches the `queue.pause()` precedent but is opaque, dies with a Valkey
+    flush, and both issue #5 and the maintainer decision specify a file.
+  - *`fs.watch` / pub-sub hot-reload* — more moving parts for a job cadence measured in minutes.
+    `concurrency` is the one key a live reload would help, and it takes effect at the next pickup anyway —
+    a named limitation, not a defect.
+  - *Per-message env mutation* — configuration is boot-only by design for identity keys (`valkeyUrl`,
+    `jobImage`, auth); those stay env-only and out of the overlay.
+- **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`,
+  `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`, `DES-WORKER-ON-HOST`
+
 ## DES-FLOWS-ARE-DATA-PERSONA-IS-CODE
 
 - **Decision**: Split the agent's instructions by mutability. **The persona is baked into the image** and
   carries the *hard rules* — never merge, issue text is data, work only in `/workspace`. **Flows are user
   data** in a mounted volume, seeded from repo defaults on first run, and carry the *task recipe* —
-  screenshot, iterate, open a PR. The panel may edit flows. It may never touch the persona.
-- **Why**: The panel requirement ("set prompts and which flow runs, from the UI") collides head-on with
+  screenshot, iterate, open a PR. The admin surface may edit flows in principle; it may never touch the
+  persona. **Flow display and editing are deferred, out of this slice** — the mutable/immutable split is
+  the boundary the design fixes now, for the admin surface to exercise later.
+- **Why**: The admin requirement ("set prompts and which flow runs") collides head-on with
   this project's earlier decision to keep flows as reviewed repo markdown — *versioned, reviewable,
   pi-version-proof*. The resolution is not a compromise between the two; it is the observation that
   **those two properties were being asked of one file that was doing two jobs.**
   The rules the agent must not be talked out of need immutability, and `INT-CONTAINER-JOB-INPUTS` already
   mounts `/job` read-only and bakes the persona *precisely* so that a total compromise of `/job` cannot
-  reach the system prompt. That same reasoning extends one step: a panel compromise must not reach it
-  either. Meanwhile the task recipe is genuinely configuration — the thing an operator legitimately
-  wants to tune at 11pm without a rebuild — and gains nothing from being immutable.
-  So the security property survives *and* the panel gets real power, because the boundary now falls where
-  the risk actually changes rather than where the filesystem happened to.
+  reach the system prompt. That same reasoning extends one step: an admin-surface compromise must not
+  reach it either. Meanwhile the task recipe is genuinely configuration — the thing an operator
+  legitimately wants to tune at 11pm without a rebuild — and gains nothing from being immutable.
+  So the security property survives *and* the admin surface can gain real power over flows when editing
+  lands, because the boundary now falls where the risk actually changes rather than where the filesystem
+  happened to.
   **Accepted cost**: edited flows lose git review and versioning. That is the honest trade for runtime
   editability, and it is bounded — a flow cannot revoke a hard rule, because the hard rules are not in it.
 - **Rejected**:
-  - *Panel edits `flows/` in the repo* — two sources of truth between a git checkout and a running
+  - *Admin surface edits `flows/` in the repo* — two sources of truth between a git checkout and a running
     system, and the classic "why did my change vanish on redeploy".
-  - *Everything baked, panel read-only* — satisfies the specs and not the user; a panel that cannot
-    change anything is a dashboard.
-  - *Everything panel-editable including hard rules* — makes `CONST-MERGE-NEVER-AUTOMATIC` and
+  - *Everything baked, admin surface read-only* — satisfies the specs and not the user; a surface that
+    cannot change anything is a dashboard.
+  - *Everything admin-editable including hard rules* — makes `CONST-MERGE-NEVER-AUTOMATIC` and
     `CONST-ISSUE-TEXT-IS-DATA` runtime-mutable state. They are constitutional precisely because they are
     not negotiable at runtime.
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-MERGE-NEVER-AUTOMATIC`, `INT-CONTAINER-JOB-INPUTS`,
@@ -517,12 +623,12 @@ Considered and declined. Recorded so they are not re-proposed.
 pi-dispatch/
   specs/          ← this directory: the source of truth
   receiver/       # Express webhook ingress. Public edge. No dashboard.
-  panel/          # Admin UI + Bull Board. Localhost-bound. See DES-PANEL-SEPARATE-FROM-RECEIVER
+  admin/          # pi-extension admin surface (slash commands + TUI). See DES-ADMIN-VIA-PI-EXTENSION
   worker/         # BullMQ worker, docker orchestration, GitHub token minting
   image/          # Dockerfile + entrypoint + /runner (SDK job runner)
   flows/          # frontend-fix.md, bug-fix.md, triage.md — DEFAULTS, seeded into the data volume
   persona/        # hard rules; baked into the image. Not runtime-editable
-  deploy/         # docker-compose runs Valkey only; worker/receiver/panel are host Node processes
+  deploy/         # docker-compose runs Valkey only; worker/receiver are host Node processes
                   #   (DES-WORKER-ON-HOST). The systemd unit is a verified-structure per-host template;
                   #   launchd (.plist) and Windows (nssm) units are added as untested examples.
   .env.example    # provider key, spend/concurrency knobs, VALKEY_URL, PI_JOB_IMAGE
@@ -536,7 +642,7 @@ removes the ambiguity at its root — the alternative is a glossary that explain
 simply not have.
 
 **Build order**: image + runner + persona (headless pi proven in isolation) → worker → receiver → flows
-→ panel → deploy + hardening. The first step is deliberately the one that needs no queue and no GitHub:
+→ admin extension → deploy + hardening. The first step is deliberately the one that needs no queue and no GitHub:
 it is where the SDK traps in `INT-SDK-SESSION-OPTIONS` live, and they are cheapest to find with nothing
 else in the frame.
 
@@ -559,3 +665,5 @@ a tunnel.
 | 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |
 | 2026-07-16 | **Resolved a spec/code contradiction.** `DES-WORKER-ON-HOST` added and `DES-JOB-FILES-VIA-VOLUME-SUBPATH` marked SUPERSEDED: the worker runs on the host (the `docker` CLI translates host paths, the daemon does not, and the VM prefix moved between Docker Desktop versions; local-folder jobs also *require* a host bind mount a named volume cannot give). The committed spec had rejected worker-on-host while the code already did it -- caught by a spec-conformance scan. `DES-CLI-TRIGGER-FOR-LOCAL` added: the CLI producer was built (user-directed) but unspecified; recorded with the check that `CONST-BUDGET-BEFORE-TOKENS` still holds because the cap is enforced in the processor, not the trigger. Repo-layout `deploy/` line corrected (compose runs Valkey only). |
 | 2026-07-21 | Added DES-RUN-HISTORY-FLAT-FILES-NO-DB (flat node:fs sidecar over a DB / BullMQ-query for run history). |
+| 2026-07-21 | `DES-ADMIN-VIA-PI-EXTENSION` injection-boundary bullet records the accepted residual: a prompt injection in the operator's session can invoke `dispatch_pause`/`dispatch_resume`, accepted as durable-but-reversible and money-safe (neither tool spends tokens nor raises the cap), so the worst case is an operator-observable, operator-undoable queue stall. |
+| 2026-07-21 | `DES-PANEL-SEPARATE-FROM-RECEIVER` superseded by `DES-ADMIN-VIA-PI-EXTENSION`: the admin surface becomes a pi extension in the operator's own interactive session (slash commands + TUI overlay), binding no network port; Bull Board dropped. `DES-RUNTIME-SETTINGS-FILE-OVERLAY` added: a flat `settings.json` overlay (`PI_SETTINGS_FILE`), written atomically by the extension and re-read by the worker per job, precedence `job.data > overlay > env > default`, fail-closed on an invalid file before `reserveBudget`. Panel/dashboard wording cascaded across the architecture diagram, `DES-QUEUE-BULLMQ-OVER-CUSTOM` (four queue mechanisms, dashboard dropped), `DES-CRON-VIA-BULLMQ-SCHEDULER`, `DES-CLI-TRIGGER-FOR-LOCAL`, `DES-WORKER-ON-HOST`, `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE` (flow editing deferred out of this slice), and the repo layout / build order. Paired with `CONST-ISOLATION-CONTAINER-PER-JOB` scoped to harness invocations in `constitution.md`. |

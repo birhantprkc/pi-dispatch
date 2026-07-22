@@ -12,9 +12,9 @@
     "image/runner",
     "worker",
     "receiver",
-    "panel"
+    "admin"
   ],
   "scripts": {
-    "test": "node --test \"image/runner/test/*.test.mjs\" \"worker/test/*.test.mjs\" \"receiver/test/*.test.mjs\""
+    "test": "node --test \"image/runner/test/*.test.mjs\" \"worker/test/*.test.mjs\" \"receiver/test/*.test.mjs\" \"admin/test/*.test.mjs\""
   }
 }

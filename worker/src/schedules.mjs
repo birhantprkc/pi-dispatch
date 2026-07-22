@@ -51,10 +51,10 @@ export function loadSchedules(config, { readFileSync = fsReadFileSync, existsSyn
 	}
 
 	const seenIds = new Set();
-	return entries.map((entry, index) => normalizeSchedule(entry, index, config, seenIds, existsSync));
+	return entries.map((entry, index) => normalizeSchedule(entry, index, seenIds, existsSync));
 }
 
-function normalizeSchedule(entry, index, config, seenIds, existsSync) {
+function normalizeSchedule(entry, index, seenIds, existsSync) {
 	const at = `schedule at index ${index}`;
 
 	if (entry === null || typeof entry !== "object") {
@@ -103,12 +103,10 @@ function normalizeSchedule(entry, index, config, seenIds, existsSync) {
 		throw configError(`schedule "${id}": task must be a non-empty string`);
 	}
 
-	const provider = entry.provider ?? config.provider;
-	const model = entry.model ?? config.model;
-	const maxTurns = entry.maxTurns ?? config.maxTurns;
-
+	// Absent entry fields stay absent (undefined) so the value resolves at job start against the
+	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT).
 	// data key order matches queue.mjs:21 -- the shape the processor's runJob consumes.
-	const data = { kind: "local", folder, flow, task, provider, model, maxTurns };
+	const data = { kind: "local", folder, flow, task, provider: entry.provider, model: entry.model, maxTurns: entry.maxTurns };
 	// Retention only; the deterministic repeat:<id>:<millis> jobId supplies dedup, so no jobId here,
 	// and scheduler jobs are not retried (DES-CRON-VIA-BULLMQ-SCHEDULER) so no attempts/backoff.
 	const opts = { removeOnComplete: { age: 24 * 3600 }, removeOnFail: { age: 7 * 24 * 3600 } };

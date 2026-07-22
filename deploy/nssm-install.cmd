@@ -23,6 +23,10 @@ REM
 REM PI_LOGS_DIR (run-history records; default OS-temp \pi-dispatch\logs) is created and written by the
 REM worker at boot, so it must be writable by the service account. Set via `.env` (the wrapper), not a
 REM change here; its default avoids colliding with the nssm LOGDIR worker.out log set below.
+REM
+REM PI_SETTINGS_FILE is the runtime-tunable settings overlay (default under OS temp, which may be wiped
+REM on reboot) -- point it at a durable path in production. Set via `.env` (the wrapper), not a change
+REM here; it is worker-owned and never belongs in the container env allowlist.
 
 setlocal
 

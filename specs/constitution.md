@@ -57,7 +57,11 @@ that always fires is one nobody reads.
 ## CONST-ISOLATION-CONTAINER-PER-JOB
 
 - **Statement**: Every agent invocation shall execute inside a single-use container, destroyed on
-  completion. No pi process shall run on the host.
+  completion. **No harness-invoked pi process shall run on the host** — the harness never invokes pi on
+  the host; every job agent runs inside its ephemeral container. An operator's own interactive pi session
+  (for example one hosting the admin extension) is out of scope: it processes no adversarial input, is
+  operator-present, and holds no harness credentials. The constraint governs harness-invoked agents
+  against untrusted input.
 - **Why**: pi ships no permission system. Untrusted issue text drives an unrestricted agent holding our
   credentials; without the container it runs as the harness user, on the host, with the harness user's
   reach. This is the constraint the entire security model rests on — it is mandatory, not hardening.
@@ -304,3 +308,4 @@ that always fires is one nobody reads.
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted). That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — but verified **against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points, two of them architecture-breaking. Hence the evidence convention above: source is authoritative, docs are a hint. |
 | 2026-07-15 | `CONST-NO-CONTEXT-FILES-MANDATORY` amended: it named only the CLI flag (`-nc`), but the runner uses the **SDK**, where the mechanism is `noContextFiles: true` on a caller-constructed `DefaultResourceLoader` — and it is **off by default**. The constraint therefore fails **open by omission**: there is no flag to forget, there is an entire object to forget to build. Statement and Evidence corrected; Acceptance unchanged (it was right; the named mechanism was wrong). This is the distinction the evidence convention exists to catch — the *requirement* was verified, the *mechanism* was assumed. |
 | 2026-07-17 | `CONST-TOKEN-SCOPED-PER-JOB` amended: Statement, Why, and Acceptance rewritten from a single-mechanism mandate (App installation token with one fixed expiry duration) to mechanism-neutral **required properties** — repo-scoped, minimally-permissioned, short-lived, host-held, env-injected, not merge-capable in practice. The App path satisfies them and stays **mandatory for multi-tenant**; a tightly-scoped short-expiry **fine-grained** PAT satisfies them for **single-owner**; a broad or long-lived classic PAT is excluded. The bound is the token's **expiry**, not a fixed duration — no acceptance clause mandates one. Provider-key exception preserved unchanged. |
+| 2026-07-21 | `CONST-ISOLATION-CONTAINER-PER-JOB` Statement amended: the absolute "No pi process shall run on the host" is scoped to **harness-invoked** agents, which is what it always meant — the harness never runs pi on the host and every job agent runs in its ephemeral container. Admin-via-pi-extension (`DES-ADMIN-VIA-PI-EXTENSION`) made the literal wording ambiguous, because an operator's own interactive pi session hosting the admin extension does run pi on the host; that session is out of scope (no adversarial input, operator-present, no harness credentials). Why, Evidence, Traces, and Acceptance unchanged; intent unchanged. |

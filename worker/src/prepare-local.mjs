@@ -17,7 +17,7 @@ const exec = promisify(execFile);
  * documented v1 limitation -- `git init` it first.
  *
  * The task text is DATA (CONST-ISSUE-TEXT-IS-DATA): it goes into /job/prompt.md, never the
- * instructions. The operator supplies it from the panel.
+ * instructions. The operator supplies it via the CLI (`pi-dispatch run --task`).
  */
 export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaultGit }) {
 	if (!existsSync(folder)) {

@@ -152,6 +152,33 @@ the worker handles and drains gracefully. Task Scheduler is a weaker fallback �
 hard kill, giving the worker no chance to drain; a job killed mid-flight leaves a stray container that the
 worker's **boot reaper** clears on the next start, rather than draining cleanly.
 
+## Admin (pi extension)
+
+The admin surface is a **pi extension** in [`admin/`](admin/) that loads into *your own* interactive pi
+session — no daemon, no web app, **no network port at all**. Load it with `pi -e admin/src/index.ts` from
+this checkout, add that path to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi
+inside this checkout: the in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
+
+It adds `/dispatch` commands that run **locally, with no model involvement**:
+
+- `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
+- `pause` / `resume` — the queue on/off switch
+- `runs` / `logs` — recent run records, and one run's raw log
+- `triggers` — the configured triggers (display only)
+- `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
+
+`/dispatch pause|resume|status` are a second interface over the **same durable switch** as
+`pi-dispatch pause|resume|status` (see **Steer the running worker** above), not a new mechanism; `runs`
+and `logs` read the **same** `logs/<jobId>.json` / `.log` files as **Run history** below. The extension
+reads only queue counts, run records, and the settings overlay — none of which carry credentials.
+
+The model-callable tools are **reads plus `pause`/`resume` only** — every settings write is an
+operator-typed command, never a model tool — and a raw `.log` is untrusted container output that renders
+in the overlay viewer only, never into model context. Settings land in the `settings.json` overlay
+(`PI_SETTINGS_FILE`; keys `model`, `provider`, `maxTurns`, `dailyCap`, `concurrency`) and take effect per
+job — `concurrency` at the next pickup. The supported pi version is the pinned `0.80.7`; the load-time
+capability probe is all-or-nothing and refuses loudly on any other version.
+
 ## Run history
 
 The worker keeps a durable, per-job record under `PI_LOGS_DIR` (default: your OS temp dir,
@@ -216,9 +243,12 @@ flowchart LR
   GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
   default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
   the detail.
-- A separate **admin panel** on `127.0.0.1` (never on the internet-facing receiver) will turn the queue
-  on/off, show jobs, and set the model/budgets. It will not edit your persona or skills — those live in
-  your project's `.pi/`, in git, reviewed.
+- The **admin surface** is a pi extension (`admin/`) loaded into your own interactive pi session —
+  `/dispatch` commands plus a TUI dashboard. It operates the queue (the same durable `queue.pause()` as
+  `pi-dispatch pause`), shows runs, logs, and budget, and edits runtime settings via the `settings.json`
+  overlay. It binds no port at all and triggers no jobs. It never edits your persona (those live in your
+  project's `.pi/`, in git, reviewed) and does not edit flows this slice (deferred). See **Admin (pi
+  extension)**.
 
 Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
 *before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the
@@ -251,7 +281,7 @@ minutes.
 The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitHub webhook path
 (receiver → queue → clone → PR), and scheduled (cron) triggers for local folders are built and work; the
 worker runs in a terminal or as an OS service on Linux, macOS or Windows (see **Run as a service**). The
-admin panel is in progress. The design is specified in
+admin surface ships as a pi extension (see **Admin (pi extension)**). The design is specified in
 [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
 and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 

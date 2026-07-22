@@ -16,7 +16,10 @@
     "./connection": "./src/connection.mjs",
     "./job-id": "./src/job-id.mjs",
     "./identity": "./src/identity.mjs",
-    "./get-token": "./src/get-token.mjs"
+    "./get-token": "./src/get-token.mjs",
+    "./runtime-settings": "./src/runtime-settings.mjs",
+    "./run-history": "./src/run-history.mjs",
+    "./budget": "./src/budget.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
