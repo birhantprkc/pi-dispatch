@@ -463,6 +463,9 @@ Evidence convention as in `constitution.md`.
   - Headers consumed: `X-Hub-Signature-256`, `X-GitHub-Event`, `X-GitHub-Delivery`
   - Body fields consumed: `action`, `issue.number`, `issue.title`, `issue.body`, `issue.labels[].name`,
     `comment.body`, `comment.author_association`, `sender.id`, `repository.full_name`
+  - `issue.labels[].name` is consumed as a **set**, evaluated by the per-flow `{any, all, none}` trigger
+    predicate (`REQ-TRIGGER-AUTHOR-GATE`) — this changes *how* the field is used, not which fields are
+    read; it is no new field.
   - **Everything else is ignored.**
 - **Why**: Naming the subset **is** the contract. Because everything else is ignored by construction, an
   upstream schema addition cannot change our behaviour — and a reviewer can see the entire attack

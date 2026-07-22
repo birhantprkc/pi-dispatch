@@ -144,13 +144,20 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 
 - **Statement**: The receiver shall enqueue only for allowlisted labels, or comments whose
   `author_association ∈ {OWNER, MEMBER, COLLABORATOR}` matching the trigger phrase. Events sent by our
-  own App identity shall be ignored.
+  own App identity shall be ignored. The label allowlist is a per-flow `{any, all, none}` predicate over
+  the issue's label set: `any` is an OR requirement, `all` a stricter AND requirement, and `none` is
+  **suppress-only** — it can never cause a trigger, only prevent one. A rule shall carry at least one
+  positive selector (a non-empty `any` or `all`); the whole predicate stays equal-or-stricter than a
+  single-label OR and collaborator-gated, since only collaborators can apply labels.
 - **Why**: The enforcement of `CONST-TRIGGER-AUTHOR-GATE`. The bot-loop guard matters independently: our
   own job comments on the issue, which is an `issue_comment.created` event, which without the guard
-  triggers another job — an unbounded paid recursion.
+  triggers another job — an unbounded paid recursion. The positive-selector requirement is what keeps a
+  `none`-only rule — which would match every labeled event lacking the excluded labels, wider than
+  today — from ever loading.
 - **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`
 - **Acceptance**: Given `@pi fix this` with `author_association: NONE`, 204 and zero jobs. Given a
-  comment from our own App id, 204 and zero jobs.
+  comment from our own App id, 204 and zero jobs. Given a flow rule with no positive selector (`none`
+  only, or empty), config load fails and the receiver does not boot.
 
 ## REQ-JOB-TIMEOUT-30M
 

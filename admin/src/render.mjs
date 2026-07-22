@@ -93,21 +93,31 @@ export function renderSchedulers(schedulers) {
 }
 
 /**
- * Render triggers display-only (OQ-008): the schedulers block, then the committed label->flow allowlist.
+ * Render triggers display-only (OQ-008): the schedulers block, then the committed per-flow
+ * `{any, all, none}` trigger rules.
  */
 export function renderTriggers({ schedulers, flows } = {}) {
-  const out = [renderSchedulers(schedulers), "", "Label -> flow:"];
+  const out = [renderSchedulers(schedulers), "", "Triggers:"];
   if (flows && flows.missing) {
     out.push("  (flows file not found)");
   } else if (flows && flows.invalid) {
     out.push(`  (flows file invalid: ${flows.invalid})`);
   } else {
-    const mappings = (flows && flows.mappings) ?? {};
-    const labels = Object.keys(mappings);
-    if (labels.length === 0) out.push("  (no mappings)");
-    else for (const label of labels) out.push(`  ${label} -> ${mappings[label]}`);
+    const rules = (flows && flows.rules) ?? {};
+    const flowNames = Object.keys(rules);
+    if (flowNames.length === 0) out.push("  (no rules)");
+    else for (const flowName of flowNames) out.push(`  ${flowName}: ${ruleClauses(rules[flowName])}`);
   }
   return out.join("\n");
+}
+
+function ruleClauses(rule) {
+  const clauses = [];
+  for (const key of ["any", "all", "none"]) {
+    const members = rule?.[key] ?? [];
+    if (members.length > 0) clauses.push(`${key}[${members.join(",")}]`);
+  }
+  return clauses.join(" ");
 }
 
 function schedulerLine(s) {

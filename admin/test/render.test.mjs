@@ -79,15 +79,15 @@ test("renderBudget reports unreachable", () => {
   assert.match(renderBudget({ budget: { unreachable: "down" }, settings: {} }), /unreachable/);
 });
 
-test("renderTriggers lists schedulers with next + overdue drift and the label map", () => {
+test("renderTriggers lists schedulers with next + overdue drift and the per-flow rules", () => {
   const out = renderTriggers({
     schedulers: [{ key: "s1", next: Date.UTC(2026, 6, 21, 0, 0, 0), overdueMs: 5000 }],
-    flows: { mappings: { "pi:frontend": "frontend-fix" } },
+    flows: { rules: { "frontend-fix": { any: ["pi:frontend"], all: [], none: ["wontfix"] } } },
   });
   assert.match(out, /s1/);
   assert.match(out, /next 2026-07-21T00:00:00.000Z/);
   assert.match(out, /overdue by 5s/);
-  assert.match(out, /pi:frontend -> frontend-fix/);
+  assert.match(out, /frontend-fix: any\[pi:frontend\] none\[wontfix\]/);
 });
 
 test("renderTriggers degrades on no schedulers and missing flows", () => {
@@ -97,7 +97,7 @@ test("renderTriggers degrades on no schedulers and missing flows", () => {
 });
 
 test("renderTriggers reports an unreachable scheduler read", () => {
-  assert.match(renderTriggers({ schedulers: { unreachable: "down" }, flows: { mappings: {} } }), /unreachable \(down\)/);
+  assert.match(renderTriggers({ schedulers: { unreachable: "down" }, flows: { rules: {} } }), /unreachable \(down\)/);
 });
 
 test("renderSettingsView lists all five keys, unset ones marked", () => {

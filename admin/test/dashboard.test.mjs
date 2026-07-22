@@ -242,14 +242,14 @@ test("the TRIGGERS section unifies the label allowlist with the schedulers block
     done() {},
     tui: fakeTui(),
     intervalMs: 100000,
-    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, flows: { mappings: { bug: "fix" } } }) }),
+    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, flows: { rules: { fix: { any: ["bug"] } } } }) }),
   });
   await flush();
   const out = comp.render(80).join("\n");
   await comp.dispose();
 
-  assert.match(out, /Label -> flow:/, "the committed label allowlist header");
-  assert.match(out, /bug -> fix/, "the label->flow mapping row");
+  assert.match(out, /Triggers:/, "the committed trigger-rules header");
+  assert.match(out, /fix: any\[bug\]/, "the per-flow rule row");
   assert.match(out, /Schedulers:/, "the schedulers block shares the section");
 });
 
