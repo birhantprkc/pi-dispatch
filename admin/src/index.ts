@@ -48,7 +48,7 @@ import {
   KNOWN_KEYS,
 } from "./read-model.mjs";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
-import { makeDashboard } from "./dashboard.ts";
+import { makeDashboard, createDashboardDeps } from "./dashboard.ts";
 import { matchesKey } from "./keys.mjs";
 
 // The single source of truth for the ExtensionAPI surface this extension
@@ -322,7 +322,18 @@ async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void
   }
   await custom.call(
     ctx.ui,
-    (tui: any, _theme: any, _keybindings: any, done: (value: void) => void) => makeDashboard({ paths, done, tui }),
+    (tui: any, _theme: any, _keybindings: any, done: (value: void) => void) =>
+      makeDashboard({
+        paths,
+        done,
+        tui,
+        deps: {
+          ...createDashboardDeps(paths),
+          // log read stays here; overlay-only, returns readLogTail's result verbatim
+          tailLog: ({ jobId, lines }: { jobId: string; lines: number }) =>
+            readLogTail({ logsDir: paths.logsDir, jobId, lines }),
+        },
+      }),
     { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } },
   );
 }
