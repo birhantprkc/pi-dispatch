@@ -36,6 +36,22 @@ function nonNegativeInt(env, name, fallback) {
 	return boundedInt(env, name, fallback, 0, "a non-negative integer");
 }
 
+// An OPTIONAL bounded int: an unset or empty var is `null` (the feature it gates is disabled), a present
+// one is validated in `[min, max]` (max undefined = no upper bound) and otherwise a config error. Unlike
+// `boundedInt`, absence is a first-class "off", not a fallback default -- used by the optional week/month
+// spend ceilings and the soft-hold band, which default to disabled rather than to a number.
+function optionalBoundedInt(env, name, min, max) {
+	const raw = env[name];
+	if (raw === undefined || raw === "") return null;
+	const n = Number.parseInt(raw, 10);
+	const inRange = Number.isInteger(n) && n >= min && (max === undefined || n <= max) && String(n) === String(raw).trim();
+	if (!inRange) {
+		const want = max === undefined ? `an integer >= ${min}` : `an integer ${min}-${max}`;
+		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (want ${want})`);
+	}
+	return n;
+}
+
 // Split a PATH-style list on the OS path delimiter (`;` on Windows, `:` elsewhere) so a Windows
 // drive-letter colon is not mistaken for a separator. Trims, drops empties. Entries are stored
 // verbatim; downstream (task 3.1) realpaths them, so no posix normalisation happens here.
@@ -49,7 +65,9 @@ function delimitedList(raw) {
 /**
  * Parse the worker's config from `env` (default process.env). All defaults are conservative:
  * spend controls (`PI_DAILY_CAP`, `PI_MAX_TURNS`) exist to bound money, so they default low, and a
- * cap of 0 would fail closed (budget.mjs refuses every job) rather than mean "unlimited".
+ * cap of 0 would fail closed (budget.mjs refuses every job) rather than mean "unlimited". The optional
+ * week/month ceilings and the soft-hold band default to disabled (`null`) -- the mandatory daily cap is
+ * always the primary money bound; the others are additive ceilings an operator opts into.
  */
 export function loadConfig(env = process.env, { fileExists = existsSync } = {}) {
 	const model = env.PI_MODEL ?? "claude-sonnet-4-5-20250929"; // dated snapshot; deterministic per CONST-PI-VERSION-PINNED
@@ -57,6 +75,9 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		valkeyUrl: env.VALKEY_URL ?? "redis://127.0.0.1:6379",
 		concurrency: positiveInt(env, "PI_CONCURRENCY", 3), // DES-CONCURRENCY-3
 		dailyCap: positiveInt(env, "PI_DAILY_CAP", 25), // bounds container STARTS per day (money)
+		weeklyCap: optionalBoundedInt(env, "PI_WEEKLY_CAP", 1), // REQ-SPEND-CAPS-MULTI-WINDOW; null = weekly window disabled
+		monthlyCap: optionalBoundedInt(env, "PI_MONTHLY_CAP", 1), // null = monthly window disabled
+		softHoldPct: optionalBoundedInt(env, "PI_SOFT_HOLD_PCT", 1, 99), // null = soft-hold band disabled
 		provider: env.PI_PROVIDER ?? "anthropic",
 		model,
 		maxTurns: positiveInt(env, "PI_MAX_TURNS", 30), // pi has no turn limit; we impose one

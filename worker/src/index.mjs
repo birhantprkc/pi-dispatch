@@ -22,10 +22,10 @@ export const JOB_TIMEOUT_MS = 30 * 60 * 1000; // REQ-JOB-TIMEOUT-30M
  * Once per job, before runJob, it resolves the runtime-settings overlay via `getSettings`
  * (INT-CONFIG-OVERLAY-CONTRACT). A present-but-invalid overlay resolves to a POLICY refusal RETURNED
  * (never thrown), so BullMQ marks the job completed without a retry (CONST-RETRY-INFRA-ONLY). A valid
- * overlay fills the effective `provider`/`model`/`maxTurns`/`dailyCap` under `job.data > overlay > env`
- * precedence and re-binds the worker slot count via `applyConcurrency`. The overlay changes which value
- * the daily cap takes, never when it is checked -- reserveBudget still runs inside runJob against the
- * freshly passed cap (CONST-BUDGET-BEFORE-TOKENS).
+ * overlay fills the effective `provider`/`model`/`maxTurns`/`dailyCap`/`weeklyCap`/`monthlyCap`/`softHoldPct`
+ * under `job.data > overlay > env` precedence and re-binds the worker slot count via `applyConcurrency`.
+ * The overlay changes which values the spend caps take, never when they are checked -- reserveBudget still
+ * runs inside runJob against the freshly passed caps (CONST-BUDGET-BEFORE-TOKENS).
  */
 export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, applyConcurrency = () => {}, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS }) {
 	return async function processor(job, token, signal) {
@@ -63,8 +63,8 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 			// field wins; an omitted one takes the overlay value, else env, resolved at this job's start
 			// (INT-CONFIG-OVERLAY-CONTRACT). Receiver GitHub jobs carry no provider/model/maxTurns, so this fill
 			// supplies the provider the container env allowlist requires -- absent it, the allowlist refuses a job
-			// only after its budget slot is reserved. `cap: settings.dailyCap` changes which value reserveBudget
-			// takes, never when it runs.
+			// only after its budget slot is reserved. The `caps`/`softHoldPct` passed to runJob change which
+			// values reserveBudget checks, never when it runs.
 			const effectiveJob = {
 				...job.data,
 				provider: job.data.provider ?? settings.provider,
@@ -74,7 +74,10 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 
 			const result = await runJob(effectiveJob, {
 				redis,
-				cap: settings.dailyCap,
+				// The three spend windows (week/month null when disabled) and the soft-hold band, resolved this
+				// job-start under overlay > env. reserveBudget checks them before the container.
+				caps: { day: settings.dailyCap, week: settings.weeklyCap, month: settings.monthlyCap },
+				softHoldPct: settings.softHoldPct,
 				...deps,
 				runContainer: (ctx) => deps.runContainer({ ...ctx, name, signal }),
 				// collectChain (INT-OUTBOX-CONTRACT) reads the completed parent's REAL BullMQ job: its `.id`

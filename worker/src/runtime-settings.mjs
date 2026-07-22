@@ -4,10 +4,10 @@ import { defaultSettingsFile } from "./config.mjs";
 
 /**
  * Runtime-settings overlay: the shared, durable truth between the admin extension and the worker
- * (INT-CONFIG-OVERLAY-CONTRACT, DES-RUNTIME-SETTINGS-FILE-OVERLAY). A flat `settings.json` with five
- * optional keys -- `model`, `provider` (non-empty strings), `maxTurns`, `dailyCap` (int >= 1),
- * `concurrency` (int 1-10) -- read by the worker at each job start and written atomically by the admin
- * extension (tmp + rename).
+ * (INT-CONFIG-OVERLAY-CONTRACT, DES-RUNTIME-SETTINGS-FILE-OVERLAY). A flat `settings.json` with eight
+ * optional keys -- `model`, `provider` (non-empty strings), `maxTurns`, `dailyCap`, `weeklyCap`,
+ * `monthlyCap` (int >= 1), `concurrency` (int 1-10), `softHoldPct` (int 1-99) -- read by the worker at
+ * each job start and written atomically by the admin extension (tmp + rename).
  *
  * `readOverlay` NEVER throws: a bad settings file returns a discriminated `{ invalid }` rather than an
  * exception, so the processor RETURNS a policy refusal (`settings-overlay-invalid`) instead of letting
@@ -24,7 +24,7 @@ import { defaultSettingsFile } from "./config.mjs";
  * Custom: overlay validated inline per config.mjs precedent; zod not in deps
  */
 
-export const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "concurrency"];
+export const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "concurrency", "softHoldPct"];
 
 function isNonEmptyString(value) {
 	return typeof value === "string" && value.trim() !== "";
@@ -68,6 +68,10 @@ function validateOverlay(candidate, log) {
 				break;
 			case "maxTurns":
 			case "dailyCap":
+			case "weeklyCap":
+			case "monthlyCap":
+				// Overlay caps are positive ints. A window is DISABLED by absence, not by a 0 -- `unset weeklyCap`
+				// drops the key so it falls through to env, which unset means the window is off (config.mjs).
 				if (!isIntAtLeast(value, 1)) return { invalid: `${key} must be an integer >= 1` };
 				overlay[key] = value;
 				break;
@@ -75,6 +79,12 @@ function validateOverlay(candidate, log) {
 				// Range-checked here, not via config's positiveInt: that helper has no upper bound and parses
 				// env strings, so it cannot enforce the 1-10 ceiling this key carries over a JSON number.
 				if (!isIntInRange(value, 1, 10)) return { invalid: "concurrency must be an integer 1-10" };
+				overlay[key] = value;
+				break;
+			case "softHoldPct":
+				// A percentage of each active cap; 100 would equal the hard wall (no band) and 0 has no meaning,
+				// so the enforced band is 1-99. Absence disables the soft-hold entirely.
+				if (!isIntInRange(value, 1, 99)) return { invalid: "softHoldPct must be an integer 1-99" };
 				overlay[key] = value;
 				break;
 			default:
@@ -111,9 +121,11 @@ export function readOverlay(path, { fs = nodeFs, log = () => {} } = {}) {
 }
 
 /**
- * Resolve the five effective settings from `config` and a validated `overlay`: overlay value where the
+ * Resolve the eight effective settings from `config` and a validated `overlay`: overlay value where the
  * overlay sets it, else the config value. Precedence is overlay > env > default only -- `config`
- * already carries env > default. `job.data` is NOT merged here; that layer is the processor's.
+ * already carries env > default. `weeklyCap`/`monthlyCap`/`softHoldPct` may resolve to `null` (their
+ * config value when unset), meaning that window / the soft-hold band is disabled. `job.data` is NOT
+ * merged here; that layer is the processor's.
  */
 export function effectiveSettings(config, overlay) {
 	const o = overlay ?? {};
@@ -122,7 +134,10 @@ export function effectiveSettings(config, overlay) {
 		model: o.model ?? config.model,
 		maxTurns: o.maxTurns ?? config.maxTurns,
 		dailyCap: o.dailyCap ?? config.dailyCap,
+		weeklyCap: o.weeklyCap ?? config.weeklyCap,
+		monthlyCap: o.monthlyCap ?? config.monthlyCap,
 		concurrency: o.concurrency ?? config.concurrency,
+		softHoldPct: o.softHoldPct ?? config.softHoldPct,
 	};
 }
 

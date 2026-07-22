@@ -18,7 +18,10 @@ function deps(overrides = {}) {
 	const calls = [];
 	const base = {
 		redis: fakeRedis(),
-		cap: 10,
+		// The day window is the only one active by default (week/month disabled), so the single-counter
+		// fakeRedis stays valid; soft-hold is off unless a test sets it. Mirrors a default deployment.
+		caps: { day: 10, week: null, month: null },
+		softHoldPct: null,
 		mintToken: async (repo) => (calls.push(`mint:${repo}`), "tok"),
 		isDefaultBranchProtected: async () => (calls.push("branch-check"), true),
 		prepareWorkspace: async () => (calls.push("prepare"), { workspaceDir: "/w", jobDir: "/j" }),
@@ -50,12 +53,23 @@ test("an unprotected branch refuses BEFORE any container -- and never prepares/s
 });
 
 test("over budget refuses AFTER prepare but BEFORE the container -- no provider spend", async () => {
-	// counter starts at cap, so the reservation lands over-cap.
-	const { deps: d, calls } = deps({ redis: fakeRedis(10), cap: 10 });
+	// counter starts at cap, so the reservation lands over-cap (base caps.day is 10).
+	const { deps: d, calls } = deps({ redis: fakeRedis(10) });
 	const r = await runJob(ghJob, d);
 	assert.equal(r.reason, "over-budget");
 	assert.ok(calls.includes("prepare"), "prepared (free work) before the budget gate");
 	assert.ok(!calls.includes("run-container"), "over budget => NO container, no money spent");
+});
+
+test("soft-hold refuses AFTER prepare but BEFORE the container, with a distinct soft-hold reason", async () => {
+	// day cap 5, 80% band -> threshold floor(4)=4; counter at 4 makes the reservation land at 5 (in-band).
+	const { deps: d, calls } = deps({ redis: fakeRedis(4), caps: { day: 5, week: null, month: null }, softHoldPct: 80 });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "soft-hold", "an in-band reservation is a soft-hold, distinct from over-budget");
+	assert.equal(r.budgetReserved, true, "the reservation still counts (no give-back)");
+	assert.ok(calls.includes("prepare"), "prepared (free work) before the budget gate");
+	assert.ok(!calls.includes("run-container"), "soft-hold => new start paused, NO container, no money spent");
 });
 
 test("a prepare policy outcome (sha-gone) RETURNS before reserveBudget -- no cap slot burned", async () => {
@@ -185,7 +199,7 @@ test("a completed return carries exitCode/turns from the container and budgetRes
 });
 
 test("an over-budget return carries null exit/turns but budgetReserved true (slot kept)", async () => {
-	const { deps: d } = deps({ redis: fakeRedis(10), cap: 10 });
+	const { deps: d } = deps({ redis: fakeRedis(10) });
 	const r = await runJob(ghJob, d);
 	assert.equal(r.reason, "over-budget");
 	assert.equal(r.exitCode, null);
@@ -279,7 +293,7 @@ test("collectChain runs ONLY on the completed branch, never on policy / abort / 
 	}
 	// over-budget (policy, pre-container)
 	{
-		const { deps: d, calls } = deps({ redis: fakeRedis(10), cap: 10 });
+		const { deps: d, calls } = deps({ redis: fakeRedis(10) });
 		await runJob(ghJob, d);
 		assert.ok(!calls.includes("collect-chain"), "over-budget must not chain");
 	}

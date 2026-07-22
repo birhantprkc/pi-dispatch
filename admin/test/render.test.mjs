@@ -64,15 +64,42 @@ test("renderRuns degrades on empty and unreachable inputs", () => {
   assert.match(renderRuns({ unreachable: "x" }), /unreachable/);
 });
 
-test("renderBudget shows reserved and the overlay-derived cap", () => {
-  const out = renderBudget({ budget: { reserved: 5 }, settings: { path: "/s", overlay: { dailyCap: 25 } } });
-  assert.match(out, /reserved 5/);
-  assert.match(out, /cap 25 \(overlay\)/);
+test("renderBudget shows the day window's reserved count and the overlay-derived cap", () => {
+  const out = renderBudget({ budget: { day: 5, week: 0, month: 0 }, settings: { path: "/s", overlay: { dailyCap: 25 } } });
+  assert.match(out, /day: reserved 5 \/ cap 25 \(overlay\)/);
 });
 
-test("renderBudget marks the cap unknown when the overlay omits dailyCap", () => {
-  const out = renderBudget({ budget: { reserved: 0 }, settings: { path: "/s", overlay: {} } });
-  assert.match(out, /cap unknown/);
+test("renderBudget marks the day cap unknown when the overlay omits dailyCap", () => {
+  const out = renderBudget({ budget: { day: 0 }, settings: { path: "/s", overlay: {} } });
+  assert.match(out, /day: reserved 0 \/ cap unknown/);
+});
+
+test("renderBudget shows week/month windows only when the overlay sets their cap (or they are reserving)", () => {
+  const withCaps = renderBudget({
+    budget: { day: 1, week: 4, month: 9 },
+    settings: { path: "/s", overlay: { dailyCap: 25, weeklyCap: 100, monthlyCap: 400 } },
+  });
+  assert.match(withCaps, /week: reserved 4 \/ cap 100 \(overlay\)/);
+  assert.match(withCaps, /month: reserved 9 \/ cap 400 \(overlay\)/);
+
+  // No overlay week/month caps and zero reserved -> those lines are omitted (window not in play).
+  const dayOnly = renderBudget({ budget: { day: 1, week: 0, month: 0 }, settings: { path: "/s", overlay: { dailyCap: 25 } } });
+  assert.doesNotMatch(dayOnly, /week:/);
+  assert.doesNotMatch(dayOnly, /month:/);
+
+  // An env-configured window the admin cannot read the cap for still surfaces once it is reserving.
+  const envWeek = renderBudget({ budget: { day: 1, week: 3, month: 0 }, settings: { path: "/s", overlay: { dailyCap: 25 } } });
+  assert.match(envWeek, /week: reserved 3 \/ cap unknown/);
+});
+
+test("renderBudget marks a window soft-hold / over via the shared windowState, and shows the band", () => {
+  // day cap 10, softHoldPct 80 -> threshold 8; reserved 9 is inside the band.
+  const soft = renderBudget({ budget: { day: 9 }, settings: { path: "/s", overlay: { dailyCap: 10, softHoldPct: 80 } } });
+  assert.match(soft, /day: reserved 9 \/ cap 10 \(overlay\) \[soft-hold\]/);
+  assert.match(soft, /soft-hold band: 80%/);
+
+  const over = renderBudget({ budget: { day: 11 }, settings: { path: "/s", overlay: { dailyCap: 10 } } });
+  assert.match(over, /\[over\]/);
 });
 
 test("renderBudget reports unreachable", () => {
@@ -100,12 +127,15 @@ test("renderTriggers reports an unreachable scheduler read", () => {
   assert.match(renderTriggers({ schedulers: { unreachable: "down" }, flows: { mappings: {} } }), /unreachable \(down\)/);
 });
 
-test("renderSettingsView lists all five keys, unset ones marked", () => {
-  const out = renderSettingsView({ path: "/s", overlay: { model: "claude", dailyCap: 5 } });
+test("renderSettingsView lists all eight keys, unset ones marked", () => {
+  const out = renderSettingsView({ path: "/s", overlay: { model: "claude", dailyCap: 5, weeklyCap: 100, softHoldPct: 80 } });
   assert.match(out, /Settings \(\/s\)/);
   assert.match(out, /model: claude/);
   assert.match(out, /dailyCap: 5/);
+  assert.match(out, /weeklyCap: 100/);
+  assert.match(out, /softHoldPct: 80/);
   assert.match(out, /provider: \(unset\)/);
+  assert.match(out, /monthlyCap: \(unset\)/);
   assert.match(out, /concurrency: \(unset\)/);
 });
 

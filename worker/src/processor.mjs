@@ -26,7 +26,8 @@ import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
 export async function runJob(job, deps) {
 	const {
 		redis,
-		cap,
+		caps, // { day, week, month }; week/month null when that window is disabled (REQ-SPEND-CAPS-MULTI-WINDOW)
+		softHoldPct, // int 1-99 or null; the soft-hold band applied to every active window
 		mintToken, // (repo) => scoped short-lived token | null for local-folder jobs
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
@@ -81,14 +82,23 @@ export async function runJob(job, deps) {
 			return prepared;
 		}
 
-		// Budget last-but-before-container. A refusal here spends nothing (no container starts).
-		const budget = await reserveBudget(redis, { cap, now });
+		// Budget last-but-before-container. A refusal here spends nothing (no container starts). Reserves across
+		// every active window (day + optional week/month) and the soft-hold band in one atomic pass.
+		const budget = await reserveBudget(redis, { caps, softHoldPct, now });
 		reserved = true;
 		if (!budget.allowed) {
-			await comment(job, `Over the daily budget cap (${budget.cap}). Not run.`);
-			log("over_budget", { reserved: budget.reserved, cap: budget.cap });
-			// budgetReserved true: the slot is reserved above and kept (an over-cap reservation still counts).
-			return { outcome: "policy", reason: "over-budget", exitCode: null, turns: null, budgetReserved: true }; // return => not retried
+			const w = budget.blockedWindow;
+			const win = budget.windows[w];
+			if (budget.reason === "soft-hold") {
+				await comment(job, `Soft-hold: ${w} spend ${win.reserved}/${win.cap} is inside the ${softHoldPct}% hold band. New starts paused; not run.`);
+				log("soft_hold", { window: w, reserved: win.reserved, cap: win.cap, pct: softHoldPct });
+			} else {
+				await comment(job, `Over the ${w} budget cap (${win.cap}). Not run.`);
+				log("over_budget", { window: w, reserved: win.reserved, cap: win.cap });
+			}
+			// budgetReserved true: the slot is reserved above and kept (a refused reservation still counts). Both
+			// over-budget and soft-hold are POLICY, RETURNED (not retried) -- the agent never ran.
+			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, budgetReserved: true }; // return => not retried
 		}
 
 		const { code, aborted, turns } = await runContainer({ job, token, prepared });
@@ -129,7 +139,7 @@ export async function runJob(job, deps) {
 		// true for a real container that ran and spent (exit-1 infra / unknown exit).
 		if (e instanceof InfraRetry) e.budgetReserved = reserved && e.reason !== "container-never-started";
 		if (reserved && e instanceof InfraRetry && e.reason === "container-never-started") {
-			await releaseBudget(redis, { now });
+			await releaseBudget(redis, { caps, now });
 		}
 		throw e;
 	} finally {

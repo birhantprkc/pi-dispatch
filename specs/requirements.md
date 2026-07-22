@@ -357,8 +357,8 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 ## REQ-RUNTIME-SETTINGS-PICKUP
 
 - **Statement**: The worker shall honour overlay changes without a restart: `model`, `provider`,
-  `maxTurns`, and `dailyCap` resolve per job at job start, and `concurrency` is applied at the worker's
-  next job pickup.
+  `maxTurns`, `dailyCap`, `weeklyCap`, `monthlyCap`, and `softHoldPct` resolve per job at job start, and
+  `concurrency` is applied at the worker's next job pickup.
 - **Why**: A settings edit at 11pm must not require a service restart. The worker re-reads the overlay in
   its processor at each job start — no watcher and no reload signal (see `DES-RUNTIME-SETTINGS-FILE-OVERLAY`).
 - **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `INT-CONFIG-OVERLAY-CONTRACT`,
@@ -370,6 +370,34 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   lowered below today's reserved count, when the next job starts, then it is refused over-budget before any
   container.
 
+## REQ-SPEND-CAPS-MULTI-WINDOW
+
+- **Statement**: The pre-container budget check shall bound container starts across **three windows** — a
+  **mandatory daily** cap plus **optional weekly and monthly** ceilings — and shall additionally refuse new
+  starts inside a single **soft-hold band** expressed as a percentage of each active window's cap. A job is
+  admitted only when **every** active window is within its cap **and** outside its soft-hold band; otherwise
+  it is refused pre-container with a window-named reason (`over-budget` at the hard cap, `soft-hold` in the
+  band). Week/month are disabled when their cap is unset; the soft-hold band is disabled when its percentage
+  is unset. All three windows and the band are overlay/env tunable (`weeklyCap`, `monthlyCap`, `softHoldPct`;
+  `PI_WEEKLY_CAP`, `PI_MONTHLY_CAP`, `PI_SOFT_HOLD_PCT`) and resolve `job.data > overlay > env` per job.
+- **Why**: A daily cap alone bounds a single day's blast radius but not a slow bleed — a flow that stays
+  under 25/day every day still spends unboundedly across a month. The weekly and monthly ceilings close that
+  gap on longer horizons. The soft-hold band is a distinct operator brake **before** the hard wall: crossing
+  it pauses new starts (in-flight containers finish, since the reservation is pre-container) and turns the
+  panel meter amber, so an operator is warned and can raise a cap or intervene rather than discovering the
+  ceiling only when jobs start refusing. These remain **job-count** caps (container starts), not tokens —
+  the thing knowable *before* a run — so `CONST-BUDGET-BEFORE-TOKENS` is unchanged; token caps are a
+  separate, structurally lagging problem tracked at `OQ-010`.
+- **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`,
+  `INT-CONFIG-OVERLAY-CONTRACT`, `REQ-RUNTIME-SETTINGS-PICKUP`
+- **Acceptance**: Given any active window over its cap, when a job starts, then it is refused `over-budget`
+  before `reserveBudget` admits a container, and the refusal names the blocking window; given a reservation
+  that lands inside the soft-hold band of any active window but under every hard cap, when a job starts, then
+  it is refused `soft-hold` before any container while in-flight jobs continue; given an unset `weeklyCap`
+  (and no `PI_WEEKLY_CAP`), when a job starts, then the weekly window is neither counted nor evaluated; given
+  a `softHoldPct` set live in the overlay, when the next job starts, then the band takes effect with no
+  restart; given a refused reservation, when the window rolls over, then its counter is reclaimed by TTL.
+
 ---
 
 ## Notes (not requirements)
@@ -377,8 +405,9 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 **Capacity and cost.** ~1.5–2.5 GB RAM per job (pi + dev server + headless Chromium) and roughly
 $0.5–$5 per job are **unmeasured estimates** — the design document says "measure!" and notes no
 published figures exist. A requirement needs a testable threshold; a guess is rationale at best. These
-inform `DES-CONCURRENCY-3` and are tracked at `OQ-002`. Only the daily budget cap graduates to a
-constraint (`CONST-BUDGET-BEFORE-TOKENS`).
+inform `DES-CONCURRENCY-3` and are tracked at `OQ-002`. Only the budget caps graduate to a constraint
+(`CONST-BUDGET-BEFORE-TOKENS`), now spanning day/week/month windows plus a soft-hold band
+(`REQ-SPEND-CAPS-MULTI-WINDOW`).
 
 **Burst math.** 50 triggers at concurrency 3 and ~10 min/job drains in ≈2.8 hours. That is the
 wait-list working as designed, not a failure — see `README.md`.
@@ -395,5 +424,6 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-21 | Added REQ-DURABLE-RUN-HISTORY (durable per-job run record + opt-in raw log; read model for the panel). |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |
 | 2026-07-21 | Added REQ-ADMIN-VIA-PI-EXTENSION (admin surface as a pi extension in `admin/`: operator observability/pause-resume/settings commands, reads-plus-pause/resume-only model tools, overlay-only raw logs) and REQ-RUNTIME-SETTINGS-PICKUP (per-job overlay re-read for model/provider/maxTurns/dailyCap; concurrency at next pickup). Rescoped panel references to the admin extension in Scope, `REQ-JOB-STATUS-COMMENTS`, `REQ-LOCAL-JOB-VISIBILITY`, and `REQ-DURABLE-RUN-HISTORY`. |
+| 2026-07-22 | Added REQ-SPEND-CAPS-MULTI-WINDOW: the pre-container budget check now spans a mandatory daily cap plus optional weekly/monthly ceilings and a soft-hold percentage band (enforcing — refuses new starts in-band with a distinct `soft-hold` reason). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list to include `weeklyCap`/`monthlyCap`/`softHoldPct`. `CONST-BUDGET-BEFORE-TOKENS` unchanged (still job-count, still check-before-start). |
 | 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |
 | 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
