@@ -40,6 +40,8 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | **Webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
 | **CLI** — manual run (`pi-dispatch run`) | Whoever has shell on the host / can run the CLI | Decline the PR, or **nothing** for a folder |
 | **Cron** — a schedule | **Nobody, at the time it runs.** It fires unattended. | As above |
+| **AI tool** — `dispatch_run` (operator session) | Whoever can prompt-inject the operator's model | **Nothing** — it enqueues a paid run that edits a folder in place |
+| **Outbox chain** — a completed job container | A completed local job's agent, after host-side validation | As the folder row above — a same-folder follow-up, no undo |
 
 ## Trust boundaries
 
@@ -50,6 +52,7 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | A serviced repo's contents on **any other branch** | **None** | A fork PR can contain anything. Never read for instructions. |
 | A local folder's `.pi/` | **Whatever can write that folder** | No merge gate, no reviewer, no history |
 | The job container | **None** — it is the untrusted side | It runs the agent |
+| A job container's `/outbox` request file | **None** — agent-authored | The container's **only** signal channel back to the host; validated host-side before anything is enqueued |
 | Receiver, worker, queue, admin extension | Trusted | They never execute agent-authored content — the admin extension feeds only PII-free, fixed-enum run records to the model; raw container output stays in the overlay viewer |
 
 ## What is defended
@@ -140,6 +143,21 @@ Stated openly rather than discovered later:
   on a host you care about.
 - **No multi-tenancy.** This is a single-operator tool. Nothing isolates one operator's jobs from
   another's, because there is only meant to be one.
+- **An agent that can write a folder can self-authorize a flow by committing to it.** Making a flow
+  AI-triggerable is a committed `ai-trigger: allow` in the folder's `.pi/`, so an agent that can write the
+  folder can commit that opt-in, after which a **later** operator or CLI action could run that flow. This
+  is bounded by the local trust model — "whatever can write the folder can trigger it" — and by the
+  **pre-agent SHA** the gate reads at: the SHA forecloses self-authorization within the **same** job and
+  its own children, but it does **not** stop a later operator or CLI run of the planted flow. Both halves
+  hold; neither is undo.
+- **A prompt injection in the operator's session can invoke `dispatch_run` — a paid run with no undo, and
+  it is NOT money-safe.** `dispatch_run` is a **third** model-callable tool alongside reads and
+  `pause`/`resume`, and unlike them it spends money editing a folder in place with no undo — an explicit
+  break from the pause/resume "money-safe" framing that governs the other tools. It is bounded in
+  blast-radius, not prevented, by **six** independent limits: the folder allowlist `PI_DISPATCH_RUN_ROOTS`
+  (realpath + containment); the committed per-flow opt-in (default deny, read at a pre-agent SHA); the
+  dirty-tree refusal (no force option); no spend-knob parameters on the tool; a per-hour rate limit; and
+  the daily cap (`CONST-BUDGET-BEFORE-TOKENS`). Do not read it as money-safe or reversible — it is neither.
 
 ## Operator responsibilities
 

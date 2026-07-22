@@ -292,25 +292,66 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Statement**: The admin surface shall ship as a pi extension in `admin/`, loaded into the operator's
   interactive pi session. It provides operator slash commands for observability (`status`, `runs`, `logs`,
   `budget`, `triggers`), queue on/off (`pause`/`resume`, backed by the same durable `queue.pause()`), and
-  settings editing (`set`/`unset`, writing the `settings.json` overlay). The LLM-callable tools expose
-  **reads and `pause`/`resume` only**; every settings write is an operator-typed command, never a
-  model-invocable tool.
+  settings editing (`set`/`unset`, writing the `settings.json` overlay). The model-callable tools are
+  **reads, `pause`/`resume`, and `dispatch_run`** (a gated enqueue); every settings write is an
+  operator-typed command, never a model-invocable tool, and `dispatch_run` accordingly takes **no
+  spend-knob argument** (`model`/`maxTurns`/`dailyCap`/`concurrency`).
 - **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs and
   is never materialised into a job's `/job` inputs — `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's
   own `.pi/` extensions, not this one.
 - **Why**: See `DES-ADMIN-VIA-PI-EXTENSION` — a session-bound, port-less admin surface for a
-  terminal-native operator, narrower than the superseded localhost panel. Reads plus `pause`/`resume` are
-  the only model-callable tools, so a model-invocable surface cannot raise the daily cap
-  (`CONST-BUDGET-BEFORE-TOKENS`); raw `.log` output is overlay-only, so untrusted container text never
+  terminal-native operator, narrower than the superseded localhost panel. No model-callable tool can
+  **raise** the daily cap: every settings write (dailyCap included) is operator-typed, and `dispatch_run`
+  takes no spend-knob argument — they resolve from the overlay/env per
+  `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, and the paid run `dispatch_run` enqueues spends **within** the cap
+  (`reserveBudget`, consumer-side), it does not widen it (`CONST-BUDGET-BEFORE-TOKENS`). The
+  injected-`dispatch_run` residual is bounded by structure, not undo — folder allowlist, committed
+  per-flow opt-in, dirty refusal, no spend knobs, per-hour rate limit, and the daily cap
+  (`DES-ADMIN-VIA-PI-EXTENSION`). Raw `.log` output is overlay-only, so untrusted container text never
   enters model context (`CONST-ISSUE-TEXT-IS-DATA`, one layer down).
-- **Traces to**: `DES-ADMIN-VIA-PI-EXTENSION`, `CONST-ISSUE-TEXT-IS-DATA`, `CONST-BUDGET-BEFORE-TOKENS`,
-  `REQ-DURABLE-RUN-HISTORY`
+- **Traces to**: `DES-ADMIN-VIA-PI-EXTENSION`, `DES-AI-TRIGGER-FLOW-GATE`, `DES-JOB-OUTBOX-CHAINING`,
+  `CONST-ISSUE-TEXT-IS-DATA`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-DURABLE-RUN-HISTORY`,
+  `REQ-AI-TRIGGERED-RUNS`
 - **Acceptance**: Given the extension is loaded, when the operator runs `/dispatch status`, then queue
   counts, paused state, and budget render with no model involvement; given a model-invoked tool call, when
-  it is a settings write, then no such tool exists (writes are commands only); given `/dispatch logs`, when
+  it is a settings write, then no such tool exists (writes are commands only); given `dispatch_run`, when
+  it is invoked, then it exposes no `model`/`maxTurns`/`dailyCap`/`concurrency` argument, admits a run only
+  for a folder within `PI_DISPATCH_RUN_ROOTS` and a flow whose pre-agent-SHA `SKILL.md` carries
+  `ai-trigger: allow`, and the enqueued job's spend resolves from overlay/env and is bounded by the daily
+  cap; given `/dispatch logs`, when
   the raw `.log` renders, then it renders in the overlay viewer and is never returned as a tool result or
   sent as a message into model context; given an operator pi whose API surface lacks any required member,
   when the extension loads, then it registers nothing and reports the unsupported version loudly.
+
+## REQ-AI-TRIGGERED-RUNS
+
+- **Statement**: The harness shall enqueue a local job on behalf of the AI from two sources — the
+  model-callable `dispatch_run` tool (with its operator `/dispatch run` command) and a completed job's
+  `/outbox`, collected by the worker — each subject to a **per-flow default-deny gate**: the flow's
+  `.pi/skills/<flow>/SKILL.md` must carry `ai-trigger: allow` frontmatter read at a **pre-agent SHA**. A
+  flowless AI trigger is refused. The `dispatch_run` tool's folder is confined to `PI_DISPATCH_RUN_ROOTS`;
+  chaining is bounded by depth, count, and rate caps (`PI_CHAIN_DEPTH_MAX`, `PI_CHAIN_MAX_PER_JOB`,
+  `PI_DISPATCH_RUN_PER_HOUR`). Budget is unchanged: a chained or enqueued job passes `reserveBudget`
+  consumer-side like any other local job.
+- **Scope**: Local jobs only; same-folder chaining only in this slice (the outbox `folder` field is
+  ignored — the child runs the parent's own folder). An operator-typed CLI (`pi-dispatch run`) or
+  `/dispatch run` command is **ungated** — typing it is the approval.
+- **Why**: The two model-reachable producers need a WHAT-gate the operator-typed CLI does not, because
+  they are prompt-injection-reachable; the committed, pre-agent-SHA opt-in is agent-uninfluenceable. See
+  `DES-AI-TRIGGER-FLOW-GATE` (the gate) and `DES-JOB-OUTBOX-CHAINING` (the outbox producer and its
+  host-computed depth).
+- **Traces to**: `DES-AI-TRIGGER-FLOW-GATE`, `DES-JOB-OUTBOX-CHAINING`, `DES-ADMIN-VIA-PI-EXTENSION`,
+  `DES-CLI-TRIGGER-FOR-LOCAL`, `CONST-BUDGET-BEFORE-TOKENS`, `CONST-ISSUE-TEXT-IS-DATA`,
+  `INT-OUTBOX-CONTRACT`
+- **Acceptance**: Given a flow whose pre-agent-SHA `SKILL.md` lacks `ai-trigger: allow`, when a
+  `dispatch_run` or outbox trigger names it, then it is refused, nothing is enqueued, and no budget is
+  touched; given a flow whose `SKILL.md` carries `ai-trigger: allow` at that SHA, when triggered, then it
+  is enqueued as an ordinary local job that passes `reserveBudget` consumer-side; given a `dispatch_run`
+  folder outside `PI_DISPATCH_RUN_ROOTS`, when invoked, then it is refused; given a dirty working tree,
+  when `dispatch_run` fires, then it refuses with no force option; given a chain request exceeding
+  `PI_CHAIN_DEPTH_MAX` or `PI_CHAIN_MAX_PER_JOB`, when collected, then it is refused loudly and the
+  parent's own outcome is unchanged; given an operator-typed `/dispatch run`, when invoked, then no gate
+  applies.
 
 ## REQ-RUNTIME-SETTINGS-PICKUP
 
@@ -353,3 +394,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-21 | Added REQ-DURABLE-RUN-HISTORY (durable per-job run record + opt-in raw log; read model for the panel). |
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |
 | 2026-07-21 | Added REQ-ADMIN-VIA-PI-EXTENSION (admin surface as a pi extension in `admin/`: operator observability/pause-resume/settings commands, reads-plus-pause/resume-only model tools, overlay-only raw logs) and REQ-RUNTIME-SETTINGS-PICKUP (per-job overlay re-read for model/provider/maxTurns/dailyCap; concurrency at next pickup). Rescoped panel references to the admin extension in Scope, `REQ-JOB-STATUS-COMMENTS`, `REQ-LOCAL-JOB-VISIBILITY`, and `REQ-DURABLE-RUN-HISTORY`. |
+| 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |

@@ -300,7 +300,8 @@ Evidence convention as in `constitution.md`.
 
 **worker → container.**
 
-- **Contract**: `/job` mounted **read-only**. `/workspace` is the only writable mount.
+- **Contract**: `/job` mounted **read-only**. `/workspace` is writable; a **local** job additionally
+  mounts `/outbox` (writable, `INT-OUTBOX-CONTRACT`); a **github** job does not.
   ```
   /job/prompt.md          task text (issue payload, or the operator-supplied task)
   /job/event.json         raw webhook payload — ABSENT for local-folder jobs
@@ -331,7 +332,8 @@ Evidence convention as in `constitution.md`.
   `disable-model-invocation`; validated "per Agent Skills spec")
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-ISOLATION-CONTAINER-PER-JOB`,
   `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `INT-SDK-SESSION-OPTIONS`
-- **Acceptance**: A write to any path under `/job` fails from inside the container. A hostile symlink at
+- **Acceptance**: A write to any path under `/job` fails from inside the container; `/outbox` is writable
+  for a local job and absent for a github job. A hostile symlink at
   `.pi/APPEND_SYSTEM.md` or `.pi/skills/x/SKILL.md` in the serviced repo results in **no host file
   content anywhere** in `/job` or the assembled prompt.
 
@@ -375,8 +377,9 @@ Evidence convention as in `constitution.md`.
     hand-maintained copy is exactly the reinvention `no-reimplementing-pi` forbids. For `anthropic` the
     call returns `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` — **the array order *is* the
     precedence**, which is precisely the trap this rule exists for.
-  - Mounts: `/job:ro`, `/workspace:rw` — delivered by named volume + `volume-subpath`, never a host bind
-    mount (`DES-JOB-FILES-VIA-VOLUME-SUBPATH`)
+  - Mounts: `/job:ro`, `/workspace:rw`, and — **local jobs only** — `/outbox:rw` — delivered by named
+    volume + `volume-subpath`, never a host bind mount (`DES-JOB-FILES-VIA-VOLUME-SUBPATH`). No credential
+    is ever written to `/outbox` (same rule as `/workspace`).
   - No TTY (`-it` absent)
   - **The agent dir must be writable by the non-root runtime user.** pi lazily creates
     `~/.pi/agent/` (mode `0700`) and `auth.json` (mode `0600`, contents `{}`) on the **first credential
@@ -518,7 +521,10 @@ Evidence convention as in `constitution.md`.
     "exitCode":  <int> | null,
     "turns":     <int> | null,
     "budgetReserved": <bool> | null,
-    "attempt":   <int> }
+    "attempt":   <int>,
+    "parentJobId": "<job id: same id-space as jobId>" | null,
+    "chainDepth":  <int> | null,
+    "chainRefused": <bool> | null }
   ```
   Field order is the serialisation order (`JSON.stringify` emits insertion order). The filename uses the
   **sanitized** id (`:` → `_`, because `repeat:<sched>:<millis>` is NTFS-illegal); the record **body**
@@ -540,13 +546,61 @@ Evidence convention as in `constitution.md`.
   structured record; it is opt-in, host-side (never mounted into the container), and written only under
   `PI_CAPTURE_JOB_LOGS=1`. This is a **flat per-job file, not a database**: one `.json` (plus the optional
   `.log`) keyed by the sanitized job id, no schema and no query surface — upholding this file's standing
-  invariant that **there is deliberately no database**.
+  invariant that **there is deliberately no database**. The chain fields — `parentJobId`, `chainDepth`,
+  `chainRefused` — are **additive and nullable**, set as explicit literals by the same no-spread
+  `buildRecord` (a chained job carries its parent id and host-computed depth; `chainRefused` marks a parent
+  whose own `/outbox` request was refused). The `reason` enum is **untouched**: a chain refusal is
+  **pre-enqueue of the child**, so there is no child record and no new terminal reason — `chainRefused` is
+  a separate boolean on the **parent**, never an enum value.
 - **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
 - **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
   issue or comment body text (`target` is `repo#issue` / `local:<basename>` only); `turns` is `null` when
   the container died before emitting the runner `exit` line; the `.log` exists only when
   `PI_CAPTURE_JOB_LOGS` is set.
+
+## INT-OUTBOX-CONTRACT
+
+**container (agent) → worker.**
+
+- **Contract**: A **local** job mounts a read-write `/outbox` (a **github** job does not). The agent
+  requests follow-up flows by writing `request-<n>.json`, `n = 1..PI_CHAIN_MAX_PER_JOB`:
+  ```
+  /outbox/request-<n>.json    n = 1..PI_CHAIN_MAX_PER_JOB; each file <= 4 KiB
+  { "flow": "<skill-charset flow name>",   // required
+    "task": "<freeform text>" }            // optional -- DATA, lands in the child's prompt.md
+  ```
+  The `folder` field is **ignored** — the child folder is forced to the parent's own folder, so this slice
+  is **same-folder-only**; unknown keys are ignored. `task` is agent-authored **DATA**
+  (`CONST-ISSUE-TEXT-IS-DATA`, one layer down): it becomes the child's `/job/prompt.md` user prompt and
+  **never** enters the run-history `.json` record.
+- **Validation order** (host-side, fail-closed at the first miss): count cap (`PI_CHAIN_MAX_PER_JOB`) →
+  per-file size cap (4 KiB) → regular-file-only (a symlink, directory, or device is rejected) → JSON
+  parse → flow-name charset (the skill charset) → depth cap (host-computed `parent.chainDepth + 1` against
+  `PI_CHAIN_DEPTH_MAX`, **never** read from the outbox) → `ai-trigger` gate at the **parent's pre-agent
+  SHA** (`DES-AI-TRIGGER-FLOW-GATE`) → enqueue.
+- **Retry-idempotent child id**: `parent id + content-hash(flow, task)`, so a retried parent re-enqueues
+  **identical** ids that BullMQ dedups — a retry cannot fan out duplicate follow-ups.
+- **Completed-only collection**: `/outbox` is read **only** after a completed container exit; a policy or
+  infra-thrown parent spawns nothing. A **github** parent has **no `/outbox` mount at all** — the request
+  channel does not exist for it, so an untrusted issue author cannot chain.
+- **Ro shadow**: the agent can re-read its own requests via the `/job:ro` tree (`/job/outbox/…`) —
+  harmless, since the file is agent-authored and the worker trusts nothing in it.
+- **Why**: The `/outbox` file is the container's only signal channel back to the host and is **untrusted**;
+  every field is allowlist-validated host-side before an enqueue, the child folder is forced, and depth is
+  host-computed, so a queue-blind container can neither forge a shallow chain to evade the cap nor escape
+  same-folder scope. Keeping `task` out of the `.json` preserves the record's PII-free-by-construction
+  guarantee (`INT-RUN-HISTORY-FILE-CONTRACT`), and enqueued children pass `reserveBudget` consumer-side
+  like any local job (`CONST-BUDGET-BEFORE-TOKENS`).
+- **Traces to**: `DES-JOB-OUTBOX-CHAINING`, `DES-AI-TRIGGER-FLOW-GATE`, `CONST-ISSUE-TEXT-IS-DATA`,
+  `CONST-BUDGET-BEFORE-TOKENS`, `INT-RUN-HISTORY-FILE-CONTRACT`
+- **Acceptance**: Given a completed local parent with a valid `request-1.json`, when the worker collects
+  `/outbox`, then exactly one child is enqueued on the parent's own folder with `chainDepth = parent + 1`;
+  given a request over the count or depth cap, or whose flow fails the `ai-trigger` gate, when collected,
+  then it is refused and no child is enqueued; given a **github** parent, when it exits, then no `/outbox`
+  exists to collect; given a symlink or an oversize `request-<n>.json`, when validated, then it is
+  rejected; given a **retried** parent, when its outbox is re-collected, then the idempotent child id
+  dedups and no second child is enqueued.
 
 ## INT-CONFIG-OVERLAY-CONTRACT
 
@@ -595,6 +649,7 @@ Evidence convention as in `constitution.md`.
 | Date | Change |
 |---|---|
 | 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |
+| 2026-07-22 | Added INT-OUTBOX-CONTRACT (container→worker `/outbox` request files: `request-<n>.json` byte-capped at 4 KiB, `folder`-ignored same-folder-only, validation order count→size→regular-file→parse→charset→host-computed depth→`ai-trigger` gate→enqueue, retry-idempotent child ids, completed-only collection, no mount for github parents, `task` as DATA never in the run record). Extended INT-CONTAINER-JOB-INPUTS and INT-CONTAINER-RUNTIME-CONTRACT with the writable `/outbox` mount (local jobs only; absent for github). Appended `parentJobId`/`chainDepth`/`chainRefused` (additive, nullable, no-spread) to INT-RUN-HISTORY-FILE-CONTRACT's record — the `reason` enum untouched, since a chain refusal is pre-enqueue of the child. |
 | 2026-07-21 | Added INT-CONFIG-OVERLAY-CONTRACT (admin extension → worker `settings.json` overlay: optional keys with bounds, atomic tmp+rename write, per-job-start read, fail-closed `settings-overlay-invalid` on a present-but-invalid file). Reworded INT-RUN-HISTORY-FILE-CONTRACT's boundary from worker→panel to worker→admin extension (repointing the read-model rationale to `DES-ADMIN-VIA-PI-EXTENSION`) and added `settings-overlay-invalid` to its `reason` enum. Clarified in INT-SCHEDULES-FILE-CONTRACT that `provider`/`model`/`maxTurns` are pure passthrough — absent from an entry means absent from job data, resolved against the overlay/env at job start. De-numeralized the intro (contract count no longer stated). |
 | 2026-07-21 | Added INT-RUN-HISTORY-FILE-CONTRACT (worker→panel run-history read-model files). |
 | 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
