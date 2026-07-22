@@ -383,7 +383,7 @@ function renderRunList(rows: any[], selected: number, w: number): string[] {
     const cursor = i === selected ? "›" : " ";
     if (row.kind === "active") return clip(`${cursor} * ACTIVE ${row.jobId} running`, w);
     const run = row.record;
-    const cells = [run?.jobId, run?.target, run?.flow, run?.outcome, run?.turns]
+    const cells = [run?.jobId, run?.target, run?.flow, run?.outcome, run?.turns, run?.tokens?.total]
       .map((f) => (f === null || f === undefined ? "-" : String(f)))
       .join(" · ");
     return clip(`${cursor} ${cells}`, w);
@@ -437,6 +437,10 @@ function renderRunDetail(record: any): string[] {
     ["outcome", r.outcome],
     ["reason", r.reason],
     ["turns", r.turns],
+    // Per-job token accounting (issue #25): total tokens and cost-USD, or `-` when the container died
+    // before reporting usage. r.tokens is `{ input, output, total, cost }` | null.
+    ["tokens", r.tokens?.total],
+    ["cost", typeof r.tokens?.cost === "number" ? `$${r.tokens.cost.toFixed(4)}` : null],
     ["exitCode", r.exitCode],
     ["budgetReserved", r.budgetReserved],
     ["attempt", r.attempt],

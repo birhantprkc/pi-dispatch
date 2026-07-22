@@ -16,6 +16,7 @@ import {
 	decideExit,
 	EXIT_INFRA,
 } from "./src/outcome.mjs";
+import { attachTokenBudget } from "./src/token-budget.mjs";
 import { attachTurnBudget } from "./src/turn-budget.mjs";
 
 const PROMPT_PATH = "/job/prompt.md";
@@ -89,10 +90,16 @@ async function main() {
 		onAbort: (turns) => log("turn_budget_exceeded", { turns, maxTurns: cfg.maxTurns }),
 	});
 
+	// Always-on token meter; aborts only when cfg.maxTokens is set (lagging backstop, OQ-010).
+	const tokenBudget = attachTokenBudget(session, cfg.maxTokens, {
+		onAbort: (tokens) => log("token_budget_exceeded", { tokens, maxTokens: cfg.maxTokens }),
+	});
+
 	try {
 		await session.prompt(prompt);
 	} finally {
 		budget.unsubscribe();
+		tokenBudget.unsubscribe();
 		unsubscribeTerminal();
 		// Runs the cleanup callbacks providers register via registerSessionResourceCleanup. Every
 		// official SDK example disposes; skipping it can leak a provider transport and hang the
@@ -103,9 +110,11 @@ async function main() {
 	const outcome = decideExit({
 		budgetAborted: budget.state.aborted,
 		budgetTurns: budget.state.turns,
+		tokenAborted: tokenBudget.state.aborted,
 		terminal,
 	});
-	log("exit", { ...outcome, turns: budget.state.turns });
+	const { input, output, total, cost } = tokenBudget.state;
+	log("exit", { ...outcome, turns: budget.state.turns, tokens: { input, output, total, cost } });
 	return outcome.code;
 }
 

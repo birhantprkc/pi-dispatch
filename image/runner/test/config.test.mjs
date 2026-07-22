@@ -10,8 +10,26 @@ test("parses a valid environment", () => {
 	assert.equal(cfg.provider, "anthropic");
 	assert.equal(cfg.model, "claude-x");
 	assert.equal(cfg.maxTurns, 20);
+	assert.equal(cfg.maxTokens, null); // optional, unset -> cap disabled
 	assert.equal(cfg.retry.maxRetries, 2); // default
 	assert.equal(cfg.retry.baseDelayMs, 2000); // default
+});
+
+test("PI_MAX_TOKENS is optional: unset is null, a valid value parses", () => {
+	assert.equal(parseRunnerEnv({ ...base }).maxTokens, null);
+	assert.equal(parseRunnerEnv({ ...base, PI_MAX_TOKENS: "" }).maxTokens, null);
+	assert.equal(parseRunnerEnv({ ...base, PI_MAX_TOKENS: "500000" }).maxTokens, 500000);
+});
+
+test("a malformed PI_MAX_TOKENS is a config error, not a silently-ignored cap", () => {
+	for (const bad of ["0", "-1", "1.5", "abc", "12x", " "]) {
+		try {
+			parseRunnerEnv({ ...base, PI_MAX_TOKENS: bad });
+			assert.fail(`expected throw for PI_MAX_TOKENS=${JSON.stringify(bad)}`);
+		} catch (error) {
+			assert.equal(error.piDispatchExit, EXIT_POLICY, `PI_MAX_TOKENS=${JSON.stringify(bad)}`);
+		}
+	}
 });
 
 // Every deterministic misconfiguration must be a TAGGED config error (exit 2), so the queue

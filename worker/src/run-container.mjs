@@ -28,13 +28,13 @@ export function makeRunContainer({
 	image,
 	hostEnv = process.env,
 	onOutput = (c) => process.stdout.write(c),
-	openJobLog = () => ({ write() {}, close: async () => ({ turns: null }) }),
+	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null }) }),
 	spawnFn = spawn,
 }) {
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
 	return async function runContainer({ job, token, prepared, name, signal }) {
-		if (signal?.aborted) return { code: 137, aborted: true, turns: null }; // killed before it could start
+		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null }; // killed before it could start
 
 		// Closed env allowlist: only the provider key + the declared PI_* vars. Throws (config) if
 		// the provider is unconfigured -- the processor turns that into a pre-spend refusal.
@@ -42,6 +42,7 @@ export function makeRunContainer({
 			provider: job.provider,
 			model: job.model,
 			maxTurns: job.maxTurns,
+			maxTokens: job.maxTokens, // optional per-job token budget (issue #25); undefined => runner meter only
 			jobId: name,
 			githubToken: token ?? undefined,
 			hostEnv,
@@ -80,14 +81,16 @@ export function makeRunContainer({
 			});
 			child.on("close", async (code) => {
 				const aborted = signal?.aborted === true; // capture BEFORE the await
-				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns falls back to null.
+				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns/tokens fall back to null.
 				let turns = null;
+				let tokens = null;
 				try {
-					({ turns } = await sink.close());
+					({ turns, tokens } = await sink.close());
 				} catch {
 					turns = null;
+					tokens = null;
 				}
-				resolve(aborted ? { code: code ?? 137, aborted: true, turns } : { code: code ?? 1, aborted: false, turns });
+				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens } : { code: code ?? 1, aborted: false, turns, tokens });
 			});
 		});
 	};

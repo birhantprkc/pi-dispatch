@@ -44,6 +44,14 @@ export function monthKey(now = new Date(), prefix = "budget") {
 	return `${prefix}:m:${now.toISOString().slice(0, 7)}`; // YYYY-MM, UTC
 }
 
+/**
+ * UTC day key for the daily TOKEN counter: `budget:t:YYYY-MM-DD`. The `t:` sub-namespace never collides
+ * with the job-count day/week/month keys -- token spend and job count are separate ledgers.
+ */
+export function tokenDayKey(now = new Date(), prefix = "budget") {
+	return `${prefix}:t:${now.toISOString().slice(0, 10)}`; // YYYY-MM-DD, UTC
+}
+
 // Each window's TTL outlives its bucket with slack, so a stale counter is reclaimed shortly after the
 // window rolls over. Set once, on first reservation only (reserved === 1), so a busy window cannot push
 // its own expiry forward indefinitely.
@@ -130,4 +138,42 @@ export async function releaseBudget(redis, { caps, now = new Date(), keyPrefix =
 	for (const w of activeWindows(caps, now, keyPrefix)) {
 		await redis.decr(w.key);
 	}
+}
+
+/**
+ * The daily TOKEN cap check -- read-only, no increment. Returns `{ allowed, reason, spent, cap }`.
+ *
+ * This is the deliberate ASYMMETRY to `reserveBudget` (issue #25 / OQ-010). A job's token cost is
+ * knowable only AFTER it runs, so a token cap cannot check-and-increment BEFORE the spend the way the
+ * job-COUNT cap does (CONST-BUDGET-BEFORE-TOKENS, which governs only the ordering of the job-count cap
+ * and stays unchanged). Instead the token count is a check-BEFORE read of PRIOR jobs' recorded spend
+ * (this function) paired with a record-AFTER `INCRBY` (`recordTokenSpend`). It can only stop the NEXT
+ * job once a day's accumulated spend has reached the cap -- a lagging backstop, not a before-the-spend
+ * cap; `maxTurns` remains the one proactive per-job lever. Being read-only it consumes nothing, so it
+ * safely precedes the job-count reservation and a refusal here spends no job-count slot.
+ *
+ * `cap` null/absent disables the cap (always allowed). A cap <= 0 fails closed (spent >= 0 always
+ * blocks), matching `reserveBudget`'s fail-closed posture on a nonsensical cap.
+ */
+export async function checkTokenCap(redis, { cap, now = new Date(), keyPrefix = "budget" } = {}) {
+	if (cap === null || cap === undefined) return { allowed: true, reason: "ok", spent: 0, cap: null };
+	const spent = Number(await redis.get(tokenDayKey(now, keyPrefix))) || 0;
+	if (spent >= cap) return { allowed: false, reason: "daily-token-cap", spent, cap };
+	return { allowed: true, reason: "ok", spent, cap };
+}
+
+/**
+ * Record a job's token spend against the daily counter -- the record-AFTER half of the lagging token cap
+ * (see `checkTokenCap`). `INCRBY` by the job's total tokens; set the day TTL once, on first write, so a
+ * busy day cannot push its own expiry forward (mirrors `reserveBudget`'s set-once TTL). Under concurrency
+ * the counter is best-effort: N in-flight jobs each passed `checkTokenCap` before any recorded, so the
+ * daily total can overshoot the cap by up to N per-job budgets -- expected and acceptable for a lagging
+ * backstop (OQ-010). Returns the new counter value. `tokens` is assumed a non-negative integer (the
+ * caller guards `> 0`), so the first-write TTL test `total === tokens` holds.
+ */
+export async function recordTokenSpend(redis, tokens, { now = new Date(), keyPrefix = "budget" } = {}) {
+	const key = tokenDayKey(now, keyPrefix);
+	const total = Number(await redis.incrby(key, tokens));
+	if (total === tokens) await redis.expire(key, DAY_TTL_SECONDS);
+	return total;
 }

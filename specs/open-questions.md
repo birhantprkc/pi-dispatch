@@ -195,10 +195,12 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
 - **What closed it**: spike #21, verified against the pinned npm artifact (per the evidence convention in
   `constitution.md` — a sha is not a version; cf. `OQ-005`). Recorded here so the answer is durable and
   greppable rather than dying with the closed issue.
-- **Unblocks**: the follow-up (#25) for per-job token budget + daily token counter + run-history token
-  fields (deferred deliberately — this was an investigation-only spike). The capture hook already exists:
-  the runner reads `event.message` on `turn_end` today (`captureTerminal`,
-  `image/runner/src/outcome.mjs:68-72`), it simply never touches `.usage`.
+- **Unblocks**: the follow-up (#25), now **landed** as `REQ-TOKEN-ACCOUNTING-AND-CAPS` — per-job token/cost
+  accounting in the run record + admin views, an optional in-run per-job token budget, and an optional daily
+  token counter (check-after). The capture hook this OQ pointed at (`captureTerminal`,
+  `image/runner/src/outcome.mjs`, reading `event.message` on `turn_end`) is now joined by a synchronous
+  `attachTokenBudget` meter that sums `event.message.usage`; the lagging-control constraint recorded above is
+  what shapes that REQ's check-after daily cap.
 - **Evidence (pinned artifact — authoritative)**: `npm @earendil-works/pi-coding-agent@0.80.7 →
   dist/core/agent-session.d.ts:255` (`subscribe(listener)`), `:84` (`AgentSessionEventListener`), `:40-82`
   (`AgentSessionEvent` is the `AgentEvent` union plus session-only events) · `npm
@@ -251,3 +253,4 @@ adversarial passes did.
 | 2026-07-21 | Added OQ-008 (runtime trigger editing — cron toggle, label→flow — deferred; the admin extension ships triggers display-only). |
 | 2026-07-22 | Added OQ-009 (chaining from a GitHub-job parent, and cross-folder chaining, deferred; this slice ships same-folder, local-parent-only chaining). |
 | 2026-07-22 | Added OQ-010 — spike #21 closed **YES**: pinned pi `0.80.7` emits per-turn token usage on the `subscribe()` stream (nested `event.message.usage`), verified against the npm artifact. Records the lagging-control constraint and unblocks a follow-up for the token-cap chain. |
+| 2026-07-22 | OQ-010 **Unblocks** retargeted: the #25 follow-up landed as `REQ-TOKEN-ACCOUNTING-AND-CAPS` (per-job token/cost accounting + optional in-run per-job token budget + optional check-after daily token cap). The recorded lagging-control constraint is what shapes that REQ's asymmetry with `CONST-BUDGET-BEFORE-TOKENS`. |

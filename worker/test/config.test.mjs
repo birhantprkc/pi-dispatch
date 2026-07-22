@@ -10,6 +10,8 @@ test("loads conservative defaults with an empty-ish env", () => {
 	assert.equal(c.weeklyCap, null, "the weekly ceiling defaults to disabled");
 	assert.equal(c.monthlyCap, null, "the monthly ceiling defaults to disabled");
 	assert.equal(c.softHoldPct, null, "the soft-hold band defaults to disabled");
+	assert.equal(c.maxTokens, null, "the per-job token budget defaults to disabled");
+	assert.equal(c.dailyTokenCap, null, "the daily token cap defaults to disabled");
 	assert.equal(c.provider, "anthropic");
 	assert.equal(c.model, "claude-sonnet-4-5-20250929"); // dated, deterministic
 	assert.equal(c.maxTurns, 30);
@@ -129,6 +131,19 @@ test("soft-hold pct takes 1-99, defaults to disabled, and rejects out-of-range o
 	assert.equal(loadConfig({ PI_SOFT_HOLD_PCT: "" }).softHoldPct, null);
 	for (const bad of ["0", "100", "-5", "abc", "50.5"]) {
 		assert.throws(() => loadConfig({ PI_SOFT_HOLD_PCT: bad }), (e) => e.piDispatchConfig === true, `PI_SOFT_HOLD_PCT=${bad}`);
+	}
+});
+
+test("token controls take explicit positive values, default to disabled, and reject bad values", () => {
+	const c = loadConfig({ PI_MAX_TOKENS: "500000", PI_DAILY_TOKEN_CAP: "20000000" });
+	assert.equal(c.maxTokens, 500000, "per-job token budget from env");
+	assert.equal(c.dailyTokenCap, 20000000, "daily token cap from env");
+	assert.equal(loadConfig({}).maxTokens, null, "absence disables the per-job token budget");
+	assert.equal(loadConfig({ PI_DAILY_TOKEN_CAP: "" }).dailyTokenCap, null, "empty string is disabled, not an error");
+	for (const name of ["PI_MAX_TOKENS", "PI_DAILY_TOKEN_CAP"]) {
+		for (const bad of ["0", "-1", "abc", "1.5"]) {
+			assert.throws(() => loadConfig({ [name]: bad }), (e) => e.piDispatchConfig === true, `${name}=${bad}`);
+		}
 	}
 });
 

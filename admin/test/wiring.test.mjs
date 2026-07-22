@@ -274,8 +274,12 @@ test("argument completion offers subcommands then run ids", async () => {
 
 test("argument completion offers the known settings keys for `set`/`unset`", async () => {
   const { def } = await loadRegistered();
+  // "da" prefixes both dailyCap and dailyTokenCap, in KNOWN_KEYS order.
   const set = await def.getArgumentCompletions("set da");
-  assert.deepEqual(set, [{ value: "set dailyCap", label: "dailyCap" }]);
+  assert.deepEqual(set, [
+    { value: "set dailyCap", label: "dailyCap" },
+    { value: "set dailyTokenCap", label: "dailyTokenCap" },
+  ]);
   const unset = await def.getArgumentCompletions("unset con");
   assert.deepEqual(unset, [{ value: "unset concurrency", label: "concurrency" }]);
   // No key matches -> null.

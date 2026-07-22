@@ -364,8 +364,8 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 ## REQ-RUNTIME-SETTINGS-PICKUP
 
 - **Statement**: The worker shall honour overlay changes without a restart: `model`, `provider`,
-  `maxTurns`, `dailyCap`, `weeklyCap`, `monthlyCap`, and `softHoldPct` resolve per job at job start, and
-  `concurrency` is applied at the worker's next job pickup.
+  `maxTurns`, `dailyCap`, `weeklyCap`, `monthlyCap`, `maxTokens`, `dailyTokenCap`, and `softHoldPct`
+  resolve per job at job start, and `concurrency` is applied at the worker's next job pickup.
 - **Why**: A settings edit at 11pm must not require a service restart. The worker re-reads the overlay in
   its processor at each job start — no watcher and no reload signal (see `DES-RUNTIME-SETTINGS-FILE-OVERLAY`).
 - **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `INT-CONFIG-OVERLAY-CONTRACT`,
@@ -393,8 +393,8 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   it pauses new starts (in-flight containers finish, since the reservation is pre-container) and turns the
   panel meter amber, so an operator is warned and can raise a cap or intervene rather than discovering the
   ceiling only when jobs start refusing. These remain **job-count** caps (container starts), not tokens —
-  the thing knowable *before* a run — so `CONST-BUDGET-BEFORE-TOKENS` is unchanged; token caps are a
-  separate, structurally lagging problem tracked at `OQ-010`.
+  the thing knowable *before* a run — so `CONST-BUDGET-BEFORE-TOKENS` is unchanged; the token controls are a
+  separate, structurally lagging problem addressed by `REQ-TOKEN-ACCOUNTING-AND-CAPS` (`OQ-010`).
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`,
   `INT-CONFIG-OVERLAY-CONTRACT`, `REQ-RUNTIME-SETTINGS-PICKUP`
 - **Acceptance**: Given any active window over its cap, when a job starts, then it is refused `over-budget`
@@ -404,6 +404,42 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   (and no `PI_WEEKLY_CAP`), when a job starts, then the weekly window is neither counted nor evaluated; given
   a `softHoldPct` set live in the overlay, when the next job starts, then the band takes effect with no
   restart; given a refused reservation, when the window rolls over, then its counter is reclaimed by TTL.
+
+## REQ-TOKEN-ACCOUNTING-AND-CAPS
+
+- **Statement**: The harness shall (a) **account** every job's token usage — the runner accumulates the
+  per-turn `usage` pi emits on `subscribe()` (`OQ-010`) into per-job totals `{ input, output, total, cost }`,
+  emits them on the `exit` line, and the worker persists them in the run record and surfaces them in the admin
+  run views; (b) provide an **optional per-job token budget** (`maxTokens` / `PI_MAX_TOKENS`) that the runner
+  enforces in-run by aborting the session once cumulative tokens exceed it, exiting policy (`2`) with
+  `reason: "token_budget"`; and (c) provide an **optional daily token cap** (`dailyTokenCap` /
+  `PI_DAILY_TOKEN_CAP`) that refuses a new job pre-container once the day's recorded spend has reached it.
+  Both caps are unset-means-disabled and resolve `job.data > overlay > env` per job; accounting is always on.
+- **Why**: pi bounds neither tokens nor money; before this, spend was visible only on the provider bill.
+  Accounting is the high-value piece — per-job token/cost in the run history is what lets an operator tune the
+  **proactive** levers (`maxTurns`, the job-count caps). The two token caps are **backstops**, and both are
+  structurally **lagging** (`OQ-010`): a token's cost is knowable only *after* its turn runs. So `maxTokens`
+  can only abort *after* the breaching turn is already paid for (finer-grained than `maxTurns`, since turns
+  vary wildly in token cost), and `dailyTokenCap` can only stop the *next* job. This forces a deliberate
+  **asymmetry** with `CONST-BUDGET-BEFORE-TOKENS`: the job-count cap is check-**before** (it can, a count is
+  knowable pre-run); the daily token cap is check-**after** — a read-only check of prior recorded spend before
+  the container (consuming no job-count slot) plus an `INCRBY` of the job's tokens after it. The constitution
+  governs only the *job-count* cap's ordering and is unchanged; this is a differently-shaped control, not a
+  relaxation of it. Under concurrency the daily counter is best-effort — N in-flight jobs each pass the check
+  before any records, so the day can overshoot by up to N per-job budgets — which is acceptable for a lagging
+  backstop and is not the job-count cap's atomic guarantee.
+- **Traces to**: `OQ-010`, `REQ-RUNNER-TURN-BUDGET`, `REQ-UPSTREAM-CONTRACT-TESTS`,
+  `CONST-BUDGET-BEFORE-TOKENS`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `INT-RUN-HISTORY-FILE-CONTRACT`,
+  `INT-CONFIG-OVERLAY-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`, `REQ-SPEND-CAPS-MULTI-WINDOW`
+- **Acceptance**: Given any completed job, when it ends, then its run record carries a `tokens`
+  `{ input, output, total, cost }` object and the admin run views show its total and cost; given `maxTokens`
+  set and a job whose cumulative usage exceeds it, when the budget is hit, then the runner aborts, exits `2`
+  with `reason: "token_budget"`, and the queue does not retry it; given `dailyTokenCap` set and a day whose
+  recorded spend has reached it, when the next job starts, then it is refused pre-container with
+  `daily-token-cap`, spends zero provider tokens, and consumes no job-count slot; given a container that ran
+  and spent, when it ends on any outcome, then its tokens are added to the daily counter; given both caps
+  unset, then usage is still accounted and no job is ever refused or aborted for tokens; given a pin bump that
+  drops or reshapes `Usage`, then `REQ-UPSTREAM-CONTRACT-TESTS` fails the build, not a live job.
 
 ---
 
@@ -434,3 +470,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-22 | Added REQ-SPEND-CAPS-MULTI-WINDOW: the pre-container budget check now spans a mandatory daily cap plus optional weekly/monthly ceilings and a soft-hold percentage band (enforcing — refuses new starts in-band with a distinct `soft-hold` reason). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list to include `weeklyCap`/`monthlyCap`/`softHoldPct`. `CONST-BUDGET-BEFORE-TOKENS` unchanged (still job-count, still check-before-start). |
 | 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |
 | 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
+| 2026-07-22 | Added REQ-TOKEN-ACCOUNTING-AND-CAPS (issue #25, unblocked by OQ-010): per-job token/cost accounting in the run record + admin views; an optional in-run per-job token budget (`maxTokens`/`PI_MAX_TOKENS`, exits policy `token_budget`); and an optional daily token cap (`dailyTokenCap`/`PI_DAILY_TOKEN_CAP`) enforced **check-AFTER** — the deliberate asymmetry with `CONST-BUDGET-BEFORE-TOKENS`, which is unchanged (still job-count, still check-before). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list with `maxTokens`/`dailyTokenCap`; retargeted REQ-SPEND-CAPS-MULTI-WINDOW's OQ-010 forward-reference to the new REQ. |

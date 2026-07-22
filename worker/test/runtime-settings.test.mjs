@@ -81,7 +81,7 @@ test("readOverlay: a non-object root (array, string, null) is invalid", () => {
 // ---- readOverlay: each known key ----
 
 test("readOverlay: valid known keys are accepted and returned as the overlay", () => {
-	const obj = { model: "claude-x", provider: "anthropic", maxTurns: 12, dailyCap: 40, weeklyCap: 200, monthlyCap: 800, concurrency: 5, softHoldPct: 80 };
+	const obj = { model: "claude-x", provider: "anthropic", maxTurns: 12, dailyCap: 40, weeklyCap: 200, monthlyCap: 800, maxTokens: 500000, dailyTokenCap: 2000000, concurrency: 5, softHoldPct: 80 };
 	assert.deepEqual(readObj(obj), { overlay: obj });
 });
 
@@ -110,6 +110,10 @@ test("readOverlay: an invalid known key makes the whole file invalid; the reason
 		{ obj: { weeklyCap: 0 }, key: "weeklyCap", value: null },
 			{ obj: { weeklyCap: 2.5 }, key: "weeklyCap", value: "2.5" },
 			{ obj: { monthlyCap: -1 }, key: "monthlyCap", value: "-1" },
+			{ obj: { maxTokens: 0 }, key: "maxTokens", value: null },
+			{ obj: { maxTokens: -5 }, key: "maxTokens", value: "-5" },
+			{ obj: { dailyTokenCap: 0 }, key: "dailyTokenCap", value: null },
+			{ obj: { dailyTokenCap: 2.5 }, key: "dailyTokenCap", value: "2.5" },
 			{ obj: { softHoldPct: 0 }, key: "softHoldPct", value: null },
 			{ obj: { softHoldPct: 100 }, key: "softHoldPct", value: "100" },
 			{ obj: { softHoldPct: 50.5 }, key: "softHoldPct", value: "50.5" },
@@ -161,22 +165,24 @@ test("readOverlay never throws across the nasty corpus", () => {
 
 // ---- effectiveSettings ----
 
-test("effectiveSettings: overlay wins where set, config fills the rest, result has exactly eight keys", () => {
-	const config = { provider: "anthropic", model: "cfg-model", maxTurns: 30, dailyCap: 25, weeklyCap: null, monthlyCap: null, concurrency: 3, softHoldPct: null, valkeyUrl: "x", jobImage: "y" };
-	const res = effectiveSettings(config, { model: "ovl-model", dailyCap: 5, weeklyCap: 100, softHoldPct: 80 });
+test("effectiveSettings: overlay wins where set, config fills the rest, result has exactly ten keys", () => {
+	const config = { provider: "anthropic", model: "cfg-model", maxTurns: 30, dailyCap: 25, weeklyCap: null, monthlyCap: null, maxTokens: null, dailyTokenCap: null, concurrency: 3, softHoldPct: null, valkeyUrl: "x", jobImage: "y" };
+	const res = effectiveSettings(config, { model: "ovl-model", dailyCap: 5, weeklyCap: 100, softHoldPct: 80, maxTokens: 500000, dailyTokenCap: 2000000 });
 	assert.equal(res.model, "ovl-model", "overlay wins");
 	assert.equal(res.dailyCap, 5, "overlay wins");
 	assert.equal(res.weeklyCap, 100, "overlay sets an otherwise-disabled window");
 	assert.equal(res.softHoldPct, 80, "overlay sets the soft-hold band");
+	assert.equal(res.maxTokens, 500000, "overlay sets the otherwise-disabled per-job token budget");
+	assert.equal(res.dailyTokenCap, 2000000, "overlay sets the otherwise-disabled daily token cap");
 	assert.equal(res.provider, "anthropic", "absent overlay key falls to config");
 	assert.equal(res.maxTurns, 30, "absent overlay key falls to config");
 	assert.equal(res.monthlyCap, null, "absent overlay key falls to config's null (disabled)");
 	assert.equal(res.concurrency, 3, "absent overlay key falls to config");
-	assert.deepEqual(Object.keys(res).sort(), ["concurrency", "dailyCap", "maxTurns", "model", "monthlyCap", "provider", "softHoldPct", "weeklyCap"]);
+	assert.deepEqual(Object.keys(res).sort(), ["concurrency", "dailyCap", "dailyTokenCap", "maxTokens", "maxTurns", "model", "monthlyCap", "provider", "softHoldPct", "weeklyCap"]);
 });
 
-test("effectiveSettings: an empty overlay yields the config values verbatim for all eight keys", () => {
-	const config = { provider: "anthropic", model: "cfg-model", maxTurns: 30, dailyCap: 25, weeklyCap: null, monthlyCap: null, concurrency: 3, softHoldPct: null };
+test("effectiveSettings: an empty overlay yields the config values verbatim for all ten keys", () => {
+	const config = { provider: "anthropic", model: "cfg-model", maxTurns: 30, dailyCap: 25, weeklyCap: null, monthlyCap: null, maxTokens: null, dailyTokenCap: null, concurrency: 3, softHoldPct: null };
 	assert.deepEqual(effectiveSettings(config, {}), config);
 });
 
@@ -262,10 +268,10 @@ test("writeOverlay never throws when mkdir or write fails", () => {
 
 // ---- KNOWN_KEYS ----
 
-test("KNOWN_KEYS is exported and lists exactly the eight overlay keys", () => {
+test("KNOWN_KEYS is exported and lists exactly the ten overlay keys", () => {
 	assert.deepEqual(
 		[...KNOWN_KEYS].sort(),
-		["concurrency", "dailyCap", "maxTurns", "model", "monthlyCap", "provider", "softHoldPct", "weeklyCap"],
+		["concurrency", "dailyCap", "dailyTokenCap", "maxTokens", "maxTurns", "model", "monthlyCap", "provider", "softHoldPct", "weeklyCap"],
 	);
 });
 

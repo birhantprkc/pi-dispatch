@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
 	classifyStopReason,
 	classifyThrow,
+	decideExit,
 	EXIT_COMPLETED,
 	EXIT_INFRA,
 	EXIT_POLICY,
@@ -69,4 +70,24 @@ test("an unknown stopReason is infra, not assumed benign", () => {
 
 test("no terminal message is infra -- absence of evidence is not success", () => {
 	assert.equal(classifyStopReason(undefined).code, EXIT_INFRA);
+});
+
+// decideExit: a cap-abort surfaces as stopReason "aborted"; intercepting it names WHICH cap fired
+// and keeps it a policy outcome (exit 2, not retried) rather than the generic "aborted".
+test("token-budget abort exits 2 with reason token_budget", () => {
+	const outcome = decideExit({ budgetAborted: false, tokenAborted: true, terminal: { stopReason: "aborted" } });
+	assert.equal(outcome.code, EXIT_POLICY);
+	assert.equal(outcome.reason, "token_budget");
+});
+
+test("turn-budget abort wins over token-budget for a stable reason", () => {
+	const outcome = decideExit({ budgetAborted: true, budgetTurns: 31, tokenAborted: true, terminal: {} });
+	assert.equal(outcome.reason, "turn_budget");
+	assert.equal(outcome.turns, 31);
+});
+
+test("no abort defers to the stopReason classification", () => {
+	const outcome = decideExit({ budgetAborted: false, tokenAborted: false, terminal: { stopReason: "stop" } });
+	assert.equal(outcome.code, EXIT_COMPLETED);
+	assert.equal(outcome.reason, "stop");
 });

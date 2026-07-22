@@ -81,6 +81,8 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		provider: env.PI_PROVIDER ?? "anthropic",
 		model,
 		maxTurns: positiveInt(env, "PI_MAX_TURNS", 30), // pi has no turn limit; we impose one
+		maxTokens: optionalBoundedInt(env, "PI_MAX_TOKENS", 1), // issue #25; null = per-job token budget disabled (lagging in-run backstop)
+		dailyTokenCap: optionalBoundedInt(env, "PI_DAILY_TOKEN_CAP", 1), // issue #25; null = daily token counter disabled (check-AFTER, host-side)
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		schedulesFile: env.PI_SCHEDULES_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: schedule list is a host file; null = cron disabled

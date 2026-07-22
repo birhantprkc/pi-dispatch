@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -70,6 +71,32 @@ test("the resource-loader options the instruction model depends on still exist",
 	for (const method of ["reload", "getAppendSystemPrompt", "getAgentsFiles", "getSkills"]) {
 		assert.ok(loader.includes(method), `DefaultResourceLoader.${method} missing at the pin`);
 	}
+});
+
+test("the pinned pi-ai still exposes the Usage shape the runner's token meter reads", { skip }, () => {
+  // REQ-UPSTREAM-CONTRACT-TESTS for issue #25 / OQ-010. The runner accumulates per-turn
+  // `event.message.usage` (a required `Usage` on the assistant AgentMessage). `Usage` is a TYPE-only
+  // export -- no runtime value on `mod` -- so a `typeof mod.Usage` check is the wrong tool. Assert the
+  // pinned .d.ts still declares the field and its shape, so a pin bump that drops or reshapes usage fails
+  // HERE rather than turning every job's token accounting silently to zero. Resolve pi-ai from
+  // pi-coding-agent's own context so this checks the exact copy the runner uses.
+  // pi-ai is ESM-only (its `exports` has no `require` condition and hides ./package.json), so resolve its
+  // main entry (./dist/index.js) via import.meta.resolve and read the sibling types.d.ts. The lockfile pins
+  // pi-ai to the same 0.80.7 pi-coding-agent depends on, so the hoisted copy is the pinned artifact.
+  const typesPath = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-ai"))), "types.d.ts");
+  const src = readFileSync(typesPath, "utf8");
+
+  assert.match(src, /\n\s*usage:\s*Usage;/, "AssistantMessage.usage: Usage must remain a REQUIRED field (not optional, not renamed)");
+
+  const usage = src.match(/export interface Usage \{([\s\S]*?)\n\}/);
+  assert.ok(usage, "the Usage interface must exist in the pinned pi-ai");
+  for (const field of ["input", "output", "totalTokens", "cost"]) {
+    assert.match(usage[1], new RegExp(`\\b${field}\\b`), `Usage.${field} must remain declared -- the token meter sums it`);
+  }
+  // The meter dereferences usage.cost.total, so `cost` must stay an OBJECT declaring `total`. A bare-name
+  // check on `cost` would keep passing if a pin bump flattened it to `cost: number`, while the meter
+  // silently recorded $0 for every job -- the exact silent-zero this contract test exists to prevent.
+  assert.match(usage[1], /cost:\s*\{[\s\S]*?\btotal\b/, "Usage.cost must remain an object declaring `total` -- the meter reads usage.cost.total");
 });
 
 test("the runner imports nothing the pinned package does not export", { skip }, () => {
