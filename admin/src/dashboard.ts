@@ -16,9 +16,9 @@ import { dayKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { listRuns, readSettingsView, mapSchedulers, readFlows } from "./read-model.mjs";
-import { renderStatus, renderBudget, renderRuns, renderTriggers, renderSettingsView } from "./render.mjs";
+import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
-import { box, meter } from "./panel.mjs";
+import { box, meter, clip } from "./panel.mjs";
 
 const KEY_HINTS = "[p]ause  [r]esume  [q]uit";
 const RUNS_ON_DASHBOARD = 10;
@@ -98,6 +98,11 @@ export function makeDashboard({
   let fetching = false;
   let disposed = false;
   let interval: any = null;
+  // In-component view machine: LIST is the framed panel with the interactive run list; RUN_DETAIL is the
+  // single-record dump. `selected` is the list cursor; `detailRun` is the record captured on Enter.
+  let view = "LIST";
+  let selected = 0;
+  let detailRun: any = null;
 
   const refresh = async () => {
     if (fetching || disposed) return;
@@ -140,14 +145,45 @@ export function makeDashboard({
 
   const component = {
     render(width: number): string[] {
-      return renderPanel(snapshot, width);
+      // Clamp the cursor here so a snapshot whose runs list shrank between ticks can never leave `selected`
+      // pointing past the end.
+      const runsLen = snapshot?.runs?.length ?? 0;
+      if (selected > runsLen - 1) selected = Math.max(0, runsLen - 1);
+      return renderPanel(snapshot, width, view, selected, detailRun);
     },
     invalidate(): void {
       // No cached render state to clear; the TUI redraws from render().
     },
     handleInput(data: string): void {
+      if (view === "RUN_DETAIL") {
+        // Escape backs out to the list only; it never closes the overlay or disposes the held clients.
+        // Every other key (including q/p/r) is inert in the detail view.
+        if (matchesKey(data, "escape")) {
+          view = "LIST";
+          tui?.requestRender?.();
+        }
+        return;
+      }
       if (matchesKey(data, "escape") || data === "q" || data === "Q") {
         void dispose().finally(() => done(undefined));
+        return;
+      }
+      if (data === "\r" || data === "\n") {
+        if (snapshot?.runs?.length) {
+          detailRun = snapshot.runs[selected];
+          view = "RUN_DETAIL";
+          tui?.requestRender?.();
+        }
+        return;
+      }
+      if (matchesKey(data, "up")) {
+        selected = Math.max(0, selected - 1);
+        tui?.requestRender?.();
+        return;
+      }
+      if (matchesKey(data, "down")) {
+        selected = Math.min((snapshot?.runs?.length ?? 1) - 1, selected + 1);
+        tui?.requestRender?.();
         return;
       }
       if (data === "p" || data === "P") {
@@ -175,10 +211,17 @@ function toLines(text: string): string[] {
  * that is missing, non-finite, or below `MIN_WIDTH` degrades to unframed plain lines; a sane width frames
  * the same content with `box`, its inner column count driving every meter and clip.
  */
-function renderPanel(snapshot: any, width: number): string[] {
+function renderPanel(snapshot: any, width: number, view: string, selected: number, detailRun: any): string[] {
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
+
+  if (view === "RUN_DETAIL") {
+    const detailTitle = `run ${detailRun?.jobId ?? "-"}`;
+    const detailLines = renderRunDetail(detailRun);
+    if (!framed) return [detailTitle, "", ...detailLines, "", "Esc back"];
+    return box({ title: detailTitle, footer: "Esc back", width, sections: [{ lines: detailLines }] });
+  }
 
   if (snapshot === null) {
     if (!framed) return [`${title} -- loading`, "", KEY_HINTS];
@@ -200,7 +243,7 @@ function renderPanel(snapshot: any, width: number): string[] {
       ],
     },
     { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, flows: snapshot.flows })) },
-    { title: "RUNS", lines: toLines(renderRuns(snapshot.runs)) },
+    { title: "RUNS", lines: renderRunList(snapshot.runs, selected, framed ? inner : 24) },
     { title: "SETTINGS", lines: toLines(renderSettingsView(snapshot.settings)) },
   ];
 
@@ -210,4 +253,49 @@ function renderPanel(snapshot: any, width: number): string[] {
   for (const section of sections) plain.push(section.title, ...section.lines);
   plain.push(KEY_HINTS);
   return plain.join("\n\n").split("\n");
+}
+
+/**
+ * The interactive RUNS list: one compact row per record, cursor-prefixed (`›` on the selected row, space
+ * otherwise) with `jobId` leading so a jobId match still hits. Each row is `clip`ped to the inner column
+ * count so a long target can neither overflow the frame nor mis-size a row. Operates only on the passed
+ * records -- no read, no `.log`, no `.data`.
+ */
+function renderRunList(runs: any[], selected: number, w: number): string[] {
+  if (!Array.isArray(runs) || runs.length === 0) return [clip("(no runs)", w)];
+  return runs.map((run, i) => {
+    const cursor = i === selected ? "›" : " ";
+    const cells = [run?.jobId, run?.target, run?.flow, run?.outcome, run?.turns]
+      .map((f) => (f === null || f === undefined ? "-" : String(f)))
+      .join(" · ");
+    return clip(`${cursor} ${cells}`, w);
+  });
+}
+
+/**
+ * A monochrome key/value dump of one run record, every value nullable-safe (`-` when null or undefined) so
+ * the fixture's missing fields render rather than throw. Operates only on the passed record: no read, no
+ * `.log`, no `.data` -- exactly the PII-free run-history fields (INT-RUN-HISTORY-FILE-CONTRACT).
+ */
+function renderRunDetail(record: any): string[] {
+  const r = record ?? {};
+  const show = (v: any): string => (v === null || v === undefined ? "-" : String(v));
+  const fields: [string, any][] = [
+    ["jobId", r.jobId],
+    ["kind", r.kind],
+    ["target", r.target],
+    ["flow", r.flow],
+    ["outcome", r.outcome],
+    ["reason", r.reason],
+    ["turns", r.turns],
+    ["exitCode", r.exitCode],
+    ["budgetReserved", r.budgetReserved],
+    ["attempt", r.attempt],
+    ["chainDepth", r.chainDepth],
+    ["parentJobId", r.parentJobId],
+    ["chainRefused", r.chainRefused],
+    ["startedAt", r.startedAt],
+    ["endedAt", r.endedAt],
+  ];
+  return fields.map(([k, v]) => `${k}: ${show(v)}`);
 }
