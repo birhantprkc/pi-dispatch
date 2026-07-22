@@ -15,13 +15,17 @@
 import { dayKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
-import { listRuns, readSettingsView, mapSchedulers } from "./read-model.mjs";
-import { renderStatus, renderBudget, renderRuns, renderSchedulers, renderSettingsView } from "./render.mjs";
+import { listRuns, readSettingsView, mapSchedulers, readFlows } from "./read-model.mjs";
+import { renderStatus, renderBudget, renderRuns, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
+import { box, meter } from "./panel.mjs";
 
 const KEY_HINTS = "[p]ause  [r]esume  [q]uit";
 const RUNS_ON_DASHBOARD = 10;
 const REFRESH_MS = 1000;
+// panel.mjs floors a box to this width; below it (or a missing/non-finite width) the panel degrades to
+// unframed plain lines rather than a ragged or over-width frame.
+const MIN_WIDTH = 8;
 
 /**
  * Build the read/act/close deps for a live dashboard from resolved paths: ONE failFast queue and ONE
@@ -35,12 +39,13 @@ export function createDashboardDeps(paths: any) {
   const redis = makeRedisClient(paths.valkeyUrl);
   return {
     async fetchSnapshot() {
-      const [pausedState, counts, workerList, reservedRaw, schedulerList] = await Promise.all([
+      const [pausedState, counts, workerList, reservedRaw, schedulerList, activeList] = await Promise.all([
         queue.isPaused(),
         queue.getJobCounts("waiting", "active", "paused", "delayed", "failed"),
         queue.getWorkers().catch(() => []),
         redis.get(dayKey()),
         queue.getJobSchedulers(0, -1, true),
+        queue.getActive(0, 0).catch(() => []),
       ]);
       const workers = Array.isArray(workerList) && workerList.length > 0 ? workerList.length : "unknown";
       return {
@@ -49,6 +54,10 @@ export function createDashboardDeps(paths: any) {
         schedulers: mapSchedulers(schedulerList, Date.now()),
         runs: listRuns({ logsDir: paths.logsDir, limit: RUNS_ON_DASHBOARD }),
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
+        flows: readFlows({ flowsPath: paths.flowsPath }),
+        // ONLY the id off the active Job -- a Job's `.data` holds issue title/body/username (PII), so it
+        // never enters the snapshot (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT).
+        activeJobId: activeList?.[0]?.id ?? null,
       };
     },
     async pause() {
@@ -130,8 +139,8 @@ export function makeDashboard({
   void refresh();
 
   const component = {
-    render(_width: number): string[] {
-      return renderDashboard(snapshot);
+    render(width: number): string[] {
+      return renderPanel(snapshot, width);
     },
     invalidate(): void {
       // No cached render state to clear; the TUI redraws from render().
@@ -154,26 +163,51 @@ export function makeDashboard({
   return component;
 }
 
+/** Split a renderer's multi-line string into the per-line array a `box` section expects. */
+function toLines(text: string): string[] {
+  return String(text).split("\n");
+}
+
 /**
- * Compose the panel text from the last snapshot alone, reusing the slash-command renderers so the panel
- * and the commands cannot drift. A null snapshot is the pre-first-fetch state; a snapshot carrying
- * `unreachable` degrades the whole panel to one line rather than a wall of empty sections.
+ * Compose the monochrome framed panel from the last snapshot alone, reusing the slash-command renderers so
+ * the panel and the commands cannot drift. A null snapshot is the pre-first-fetch loading state; a snapshot
+ * carrying `unreachable` degrades the whole panel to one line rather than a wall of empty sections. A width
+ * that is missing, non-finite, or below `MIN_WIDTH` degrades to unframed plain lines; a sane width frames
+ * the same content with `box`, its inner column count driving every meter and clip.
  */
-function renderDashboard(snapshot: any): string[] {
+function renderPanel(snapshot: any, width: number): string[] {
+  const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
+  const inner = Math.trunc(width) - 4;
+  const title = "pi-dispatch";
+
   if (snapshot === null) {
-    return ["pi-dispatch dashboard -- loading...", "", KEY_HINTS];
+    if (!framed) return [`${title} -- loading`, "", KEY_HINTS];
+    return box({ title, sections: [{ lines: ["loading"] }], footer: KEY_HINTS, width });
   }
   if (snapshot.unreachable) {
-    return [`pi-dispatch dashboard -- unreachable (${snapshot.unreachable})`, "", KEY_HINTS];
+    const msg = `unreachable (${snapshot.unreachable})`;
+    if (!framed) return [`${title} -- ${msg}`, "", KEY_HINTS];
+    return box({ title, sections: [{ lines: [msg] }], footer: KEY_HINTS, width });
   }
-  const blocks = [
-    "pi-dispatch dashboard",
-    renderStatus(snapshot.queue),
-    renderBudget({ budget: snapshot.budget, settings: snapshot.settings }),
-    renderRuns(snapshot.runs),
-    renderSchedulers(snapshot.schedulers),
-    renderSettingsView(snapshot.settings),
-    KEY_HINTS,
+
+  const sections = [
+    { title: "STATUS", lines: toLines(renderStatus(snapshot.queue)) },
+    {
+      title: "SPEND",
+      lines: [
+        renderBudget({ budget: snapshot.budget, settings: snapshot.settings }),
+        meter(snapshot.budget?.reserved, snapshot.settings?.overlay?.dailyCap, framed ? inner : 24),
+      ],
+    },
+    { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, flows: snapshot.flows })) },
+    { title: "RUNS", lines: toLines(renderRuns(snapshot.runs)) },
+    { title: "SETTINGS", lines: toLines(renderSettingsView(snapshot.settings)) },
   ];
-  return blocks.join("\n\n").split("\n");
+
+  if (framed) return box({ title, sections, footer: KEY_HINTS, width });
+
+  const plain = [title];
+  for (const section of sections) plain.push(section.title, ...section.lines);
+  plain.push(KEY_HINTS);
+  return plain.join("\n\n").split("\n");
 }
