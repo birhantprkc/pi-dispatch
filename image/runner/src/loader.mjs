@@ -4,6 +4,12 @@ import { DefaultResourceLoader, getAgentDir } from "@earendil-works/pi-coding-ag
 /** Where the image bakes the guardrails. Outside agentDir, on purpose -- see buildResourceLoader. */
 export const GUARDRAILS_PATH = "/opt/pi-dispatch/HARD_RULES.md";
 
+/** Where the image bakes the outbox protocol. Documentation for the /outbox signal channel. */
+export const OUTBOX_PROTOCOL_PATH = "/opt/pi-dispatch/OUTBOX_PROTOCOL.md";
+
+/** Read-write mount a local job receives; its presence is what makes the outbox protocol relevant. */
+export const OUTBOX_MOUNT = "/outbox";
+
 /** Read-only mount the worker materialises the project's .pi/ into, from the default-branch SHA. */
 export const JOB_PI_DIR = "/job/pi";
 
@@ -41,10 +47,16 @@ export function buildResourceLoader({
 	cwd = WORKSPACE,
 	guardrailsPath = GUARDRAILS_PATH,
 	jobPiDir = JOB_PI_DIR,
+	outboxMount = OUTBOX_MOUNT,
+	outboxProtocolPath = OUTBOX_PROTOCOL_PATH,
 	settingsManager,
 } = {}) {
 	const guardrails = readFileSync(guardrailsPath, "utf8");
 	const projectPersona = readIfExists(`${jobPiDir}/APPEND_SYSTEM.md`);
+	// Only a local job carries an /outbox mount; a github job has none, so its prompt never
+	// pays for the protocol. Evaluated ONCE here at loader build, not per message, so the
+	// assembled prompt is byte-identical across turns (CONST-PERSONA-IN-CACHED-PREFIX).
+	const outboxProtocol = existsSync(outboxMount) ? readIfExists(outboxProtocolPath) : undefined;
 
 	return new DefaultResourceLoader({
 		cwd,
@@ -55,7 +67,7 @@ export function buildResourceLoader({
 		noExtensions: true,
 		additionalSkillPaths: [`${jobPiDir}/skills`],
 		additionalExtensionPaths: [`${jobPiDir}/extensions`],
-		appendSystemPromptOverride: () => [guardrails, projectPersona].filter(Boolean),
+		appendSystemPromptOverride: () => [guardrails, outboxProtocol, projectPersona].filter(Boolean),
 	});
 }
 
