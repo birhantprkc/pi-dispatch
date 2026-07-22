@@ -50,7 +50,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				// job completed and does not retry a file that can never parse (CONST-RETRY-INFRA-ONLY). Resolved
 				// before runJob, so no budget slot is reserved and no container starts (CONST-BUDGET-BEFORE-TOKENS).
 				// recordRun leaves the durable settings-overlay-invalid trace for the admin extension.
-				const result = { outcome: "policy", reason: "settings-overlay-invalid", exitCode: null, turns: null, budgetReserved: false };
+				const result = { outcome: "policy", reason: "settings-overlay-invalid", exitCode: null, turns: null, tokens: null, budgetReserved: false };
 				recordRun({ job, result, startedAt, endedAt: new Date().toISOString() });
 				return result;
 			}
@@ -70,6 +70,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				provider: job.data.provider ?? settings.provider,
 				model: job.data.model ?? settings.model,
 				maxTurns: job.data.maxTurns ?? settings.maxTurns,
+				maxTokens: job.data.maxTokens ?? settings.maxTokens, // optional per-job token budget (issue #25); null => runner meter only
 			};
 
 			const result = await runJob(effectiveJob, {
@@ -78,6 +79,9 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				// job-start under overlay > env. reserveBudget checks them before the container.
 				caps: { day: settings.dailyCap, week: settings.weeklyCap, month: settings.monthlyCap },
 				softHoldPct: settings.softHoldPct,
+				// The daily TOKEN cap (issue #25), same overlay > env resolution. Check-AFTER, so it gates the
+				// NEXT job on prior recorded spend; null => the daily token counter is disabled.
+				tokenCap: settings.dailyTokenCap,
 				...deps,
 				runContainer: (ctx) => deps.runContainer({ ...ctx, name, signal }),
 				// collectChain (INT-OUTBOX-CONTRACT) reads the completed parent's REAL BullMQ job: its `.id`

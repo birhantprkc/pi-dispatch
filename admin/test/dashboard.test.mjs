@@ -32,6 +32,7 @@ const SNAPSHOT = {
       outcome: "completed",
       reason: null,
       turns: 4,
+      tokens: { input: 4000, output: 1000, total: 5000, cost: 0.0523 },
       endedAt: "2026-07-21T00:00:00.000Z",
     },
   ],
@@ -297,6 +298,8 @@ test("Enter on a run opens its detail dump, and Esc backs out to the list withou
   const detail = comp.render(80).join("\n");
   assert.match(detail, /run j1/, "the detail view titles on the selected run");
   assert.match(detail, /attempt: -/, "a detail-only field renders, absent as '-'");
+  assert.match(detail, /tokens: 5000/, "the drill-in surfaces total tokens");
+  assert.match(detail, /cost: \$0\.0523/, "the drill-in surfaces cost as $-prefixed USD");
 
   comp.handleInput("\x1b");
   await flush();

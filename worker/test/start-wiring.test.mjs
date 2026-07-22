@@ -302,8 +302,8 @@ test("runtime settings: getSettings is a top-level createWorker arg resolving ef
 	assert.equal(typeof captured.getSettings, "function", "getSettings must be a top-level createWorker arg");
 	assert.equal(captured.cap, undefined, "no static cap arg survives -- the overlay replaces the frozen daily cap");
 
-	// Calling it with an empty overlay yields the eight effective keys from env/default config (env {} here);
-	// the optional week/month ceilings and the soft-hold band default to disabled (null).
+	// Calling it with an empty overlay yields the ten effective keys from env/default config (env {} here);
+	// the optional week/month ceilings, token controls, and the soft-hold band default to disabled (null).
 	assert.deepEqual(
 		captured.getSettings(),
 		{
@@ -313,10 +313,12 @@ test("runtime settings: getSettings is a top-level createWorker arg resolving ef
 			dailyCap: 25,
 			weeklyCap: null,
 			monthlyCap: null,
+			maxTokens: null,
+			dailyTokenCap: null,
 			concurrency: 3,
 			softHoldPct: null,
 		},
-		"getSettings resolves the eight effective keys from env/default config when the overlay is empty",
+		"getSettings resolves the ten effective keys from env/default config when the overlay is empty",
 	);
 
 	const started = logs.find((l) => l.event === "worker_started");

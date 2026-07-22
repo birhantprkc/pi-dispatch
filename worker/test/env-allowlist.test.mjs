@@ -71,6 +71,15 @@ test("a local-folder job (no token) gets NO GITHUB_TOKEN var at all -- not an em
 	assert.ok(!("GITHUB_TOKEN" in env), "absent token must mean absent variable");
 });
 
+test("PI_MAX_TOKENS is forwarded only when the per-job budget is set", { skip }, () => {
+	const withCap = buildContainerEnv({ provider: "anthropic", model: "m", maxTurns: 5, maxTokens: 500000, jobId: "j", hostEnv: HOST });
+	assert.equal(withCap.PI_MAX_TOKENS, "500000", "a set cap is forwarded as a string, like PI_MAX_TURNS");
+
+	// null/absent => undefined, which docker-run.mjs skips -> the runner attaches a pure meter, no cap.
+	const noCap = buildContainerEnv({ provider: "anthropic", model: "m", maxTurns: 5, maxTokens: null, jobId: "j", hostEnv: HOST });
+	assert.equal(noCap.PI_MAX_TOKENS, undefined, "an unset cap is omitted, never an empty string");
+});
+
 test("an unconfigured provider throws a config-tagged error (=> pre-spend refusal)", { skip }, () => {
 	assert.throws(
 		() => buildContainerEnv({ provider: "google", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST }),

@@ -196,7 +196,7 @@ Evidence convention as in `constitution.md`.
   |---|---|---|
   | `0` | Agent completed — **including** concluding "I cannot fix this" | Success. Never retried |
   | `1` | Infrastructure failure (container died, network, provider 5xx/429) | Retryable |
-  | `2` | Budget or policy refusal (cap exhausted, turn budget hit) | Not retried |
+  | `2` | Budget or policy refusal (cap exhausted, turn budget hit, token budget hit) | Not retried |
 
   **A worker-initiated termination overrides the numeric code.** When the worker itself stops the
   container — `docker stop` on the 30-minute timeout (`cancelJob`) or on graceful shutdown, delivering
@@ -220,11 +220,18 @@ Evidence convention as in `constitution.md`.
   | Extension error in `before_agent_start` | **throws** (preflight) | `1` |
   | Provider 429 / 5xx / network death | `stopReason: "error"` | `1` — infra, retryable |
   | Our turn budget or timeout aborts | `stopReason: "aborted"` | `2` |
+  | Our per-job **token budget** aborts | `stopReason: "aborted"` | `2` — `decideExit` intercepts it as `reason: "token_budget"` BEFORE the generic `"aborted"`, exactly as the turn budget is intercepted (`REQ-TOKEN-ACCOUNTING-AND-CAPS`) |
   | Normal completion | `stopReason: "stop"` \| `"toolUse"` | `0` |
   | **Output truncated at the token limit** | `stopReason: "length"` | `0`, **but log it** — it is a completed run, not a silent failure, and must not be mistaken for either |
 
   `StopReason` is exactly `"stop" | "length" | "toolUse" | "error" | "aborted"` — enumerate all five. A
   default-to-`0` branch would map `"length"` to success without anyone noticing the agent was cut off.
+
+  The runner's `exit` log line carries two **read-only telemetry** fields beside the outcome — `turns` and
+  `tokens` (`{ input, output, total, cost }`, the per-job usage totals). Both are recovered host-side
+  (`parseExitTurns` / `parseExitTokens`) into the run record and **must not feed exit-code or retry
+  classification** — that is this protocol's job. The catch-path exit line (a preflight throw, no session
+  ran) omits both, so each parses to `null`.
 - **Why**: This exit code **is** the mechanism `CONST-RETRY-INFRA-ONLY` is implemented by. The worker
   has no other channel to distinguish "the agent ran and said no" from "the container died" — collapse
   them and you either burn money blind-retrying determinate outcomes, or you silently swallow real infra
@@ -359,7 +366,10 @@ Evidence convention as in `constitution.md`.
     job dies of something unrelated to its actual work.
   - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
     (see below); `GITHUB_TOKEN` (scoped, short-lived — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
-    `PI_MODEL`; `PI_MAX_TURNS`; `PI_CODING_AGENT_DIR` (if not `$HOME/.pi/agent`)
+    `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
+    otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
+    (if not `$HOME/.pi/agent`). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is NOT forwarded** — the daily
+    token counter is enforced host-side, and the container stays queue/budget-blind (`no-broad-env-into-container`).
   - Env **baked into the image**, because they are facts about the image and not choices a job makes:
     `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,
     `PLAYWRIGHT_MCP_SANDBOX=false`. **`PLAYWRIGHT_MCP_BROWSER` is load-bearing**: `playwright-cli`
@@ -524,6 +534,7 @@ Evidence convention as in `constitution.md`.
     "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
+    "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number> } | null,  // per-job usage totals; null when the container died before the exit line
     "budgetReserved": <bool> | null,
     "attempt":   <int>,
     "parentJobId": "<job id: same id-space as jobId>" | null,
@@ -557,8 +568,13 @@ Evidence convention as in `constitution.md`.
   the collector returns a running `refused` count, and the record stores it verbatim (`0` = none), so the runs
   view can surface "2 refused" rather than a bare yes/no. The `reason` enum is **untouched**: a chain refusal is
   **pre-enqueue of the child**, so there is no child record and no new terminal reason — `chainRefused` is
-  a separate count on the **parent**, never an enum value.
-- **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
+  a separate count on the **parent**, never an enum value. The `tokens` field is **additive and nullable**
+  in exactly the same way — an explicit no-spread literal `{ input, output, total, cost }` of the runner's
+  per-job usage totals (`REQ-TOKEN-ACCOUNTING-AND-CAPS`), or `null` when the container died before emitting
+  the runner `exit` line. It is PII-free by construction: integer token counts and a numeric cost only, no
+  payload text. It is read-only telemetry recovered from the exit line (`parseExitTokens`) exactly as
+  `turns` is, and like `turns` it never feeds exit-code or retry classification (`INT-RUNNER-EXIT-CODE-PROTOCOL`).
+- **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `REQ-TOKEN-ACCOUNTING-AND-CAPS`
 - **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
   issue or comment body text (`target` is `repo#issue` / `local:<basename>` only); `turns` is `null` when
@@ -622,6 +638,8 @@ Evidence convention as in `constitution.md`.
     "dailyCap":    <optional, int >= 1>,             // jobs admitted per day (mandatory window; env default 25)
     "weeklyCap":   <optional, int >= 1>,             // jobs admitted per ISO week; unset -> weekly window disabled
     "monthlyCap":  <optional, int >= 1>,             // jobs admitted per calendar month; unset -> monthly window disabled
+    "maxTokens":     <optional, int >= 1>,           // per-job token budget (in-run abort); unset -> per-job token budget disabled
+    "dailyTokenCap": <optional, int >= 1>,           // daily token cap (check-AFTER; refuses next job); unset -> daily token counter disabled
     "concurrency": <optional, int 1-10>,             // worker slot count
     "softHoldPct": <optional, int 1-99>              // soft-hold band as a % of each active cap; unset -> band disabled
   }
@@ -641,10 +659,16 @@ Evidence convention as in `constitution.md`.
   `dailyCap`/`weeklyCap`/`monthlyCap`/`softHoldPct` are resolved at the existing pre-container cap check, so
   the overlay changes *which values* the caps and band take, never *when* they are checked
   (`CONST-BUDGET-BEFORE-TOKENS`, `REQ-SPEND-CAPS-MULTI-WINDOW`). An unset `weeklyCap`/`monthlyCap` disables
-  that window; an unset `softHoldPct` disables the band. See `DES-RUNTIME-SETTINGS-FILE-OVERLAY` for why a
-  file, why atomic, and why a present-but-invalid file fails closed.
+  that window; an unset `softHoldPct` disables the band. The two token knobs (`REQ-TOKEN-ACCOUNTING-AND-CAPS`)
+  resolve the same way but differ in *where* they act: `maxTokens` is forwarded into the container
+  (`PI_MAX_TOKENS`, `INT-CONTAINER-RUNTIME-CONTRACT`) and enforced in-run by the runner; `dailyTokenCap` is
+  worker-only and, unlike the job-count caps, is enforced **check-AFTER** — a read of prior recorded spend
+  before the container plus an `INCRBY` of the job's tokens after it — because token cost is knowable only
+  post-run. This is the one overlay knob whose enforcement is not at the same pre-container check point as
+  the rest; `CONST-BUDGET-BEFORE-TOKENS` (job count, check-before) is unchanged. See
+  `DES-RUNTIME-SETTINGS-FILE-OVERLAY` for why a file, why atomic, and why a present-but-invalid file fails closed.
 - **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `DES-ADMIN-VIA-PI-EXTENSION`,
-  `CONST-BUDGET-BEFORE-TOKENS`, `CONST-RETRY-INFRA-ONLY`, `REQ-SPEND-CAPS-MULTI-WINDOW`
+  `CONST-BUDGET-BEFORE-TOKENS`, `CONST-RETRY-INFRA-ONLY`, `REQ-SPEND-CAPS-MULTI-WINDOW`, `REQ-TOKEN-ACCOUNTING-AND-CAPS`
 - **Acceptance**: Given a present-but-invalid file, when a job starts, then the processor returns a policy
   refusal `settings-overlay-invalid` before `reserveBudget` — no budget slot consumed, no container
   started, not retried; given a job whose data omits `model`/`provider`/`maxTurns`, when it starts, then
@@ -663,6 +687,7 @@ Evidence convention as in `constitution.md`.
 | 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |
 | 2026-07-22 | Added INT-OUTBOX-CONTRACT (container→worker `/outbox` request files: `request-<n>.json` byte-capped at 4 KiB, `folder`-ignored same-folder-only, validation order count→size→regular-file→parse→charset→host-computed depth→`ai-trigger` gate→enqueue, retry-idempotent child ids, completed-only collection, no mount for github parents, `task` as DATA never in the run record). Extended INT-CONTAINER-JOB-INPUTS and INT-CONTAINER-RUNTIME-CONTRACT with the writable `/outbox` mount (local jobs only; absent for github). Appended `parentJobId`/`chainDepth`/`chainRefused` (additive, nullable, no-spread) to INT-RUN-HISTORY-FILE-CONTRACT's record — the `reason` enum untouched, since a chain refusal is pre-enqueue of the child. |
 | 2026-07-21 | Added INT-CONFIG-OVERLAY-CONTRACT (admin extension → worker `settings.json` overlay: optional keys with bounds, atomic tmp+rename write, per-job-start read, fail-closed `settings-overlay-invalid` on a present-but-invalid file). Reworded INT-RUN-HISTORY-FILE-CONTRACT's boundary from worker→panel to worker→admin extension (repointing the read-model rationale to `DES-ADMIN-VIA-PI-EXTENSION`) and added `settings-overlay-invalid` to its `reason` enum. Clarified in INT-SCHEDULES-FILE-CONTRACT that `provider`/`model`/`maxTurns` are pure passthrough — absent from an entry means absent from job data, resolved against the overlay/env at job start. De-numeralized the intro (contract count no longer stated). |
+| 2026-07-22 | Token accounting (issue #25 / `REQ-TOKEN-ACCOUNTING-AND-CAPS`): INT-RUN-HISTORY-FILE-CONTRACT record gains an additive, nullable `tokens` `{ input, output, total, cost }` field (recovered from the exit line by `parseExitTokens`, read-only telemetry like `turns`); INT-RUNNER-EXIT-CODE-PROTOCOL gains the `token_budget` policy-`2` row and documents `tokens` on the exit line; INT-CONFIG-OVERLAY-CONTRACT gains the `maxTokens`/`dailyTokenCap` overlay keys and records that the daily token cap is the one knob enforced check-AFTER; INT-CONTAINER-RUNTIME-CONTRACT gains `PI_MAX_TOKENS` (forwarded only when set) and records that `PI_DAILY_TOKEN_CAP` is worker-only and never forwarded. |
 | 2026-07-21 | Added INT-RUN-HISTORY-FILE-CONTRACT (worker→panel run-history read-model files). |
 | 2026-07-17 | Added INT-SCHEDULES-FILE-CONTRACT, documenting the implemented `schedules.json` host-file shape (`PI_SCHEDULES_FILE`): `local`-only, `:`-free unique `id`, `task` as DATA, and load-time rejection of malformed/`github`/duplicate/missing-folder entries. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §5.1, §5.3, §5.4, §5.5. `INT-SDK-SESSION-OPTIONS` is **new** — the source doc left the SDK option set unverified (its §10) and was wrong about the print-mode flag shape and the mode union. `PLAYWRIGHT_BROWSERS_PATH` added to the runtime contract: the source doc's Dockerfile was broken as written for non-root execution. The source doc's code sketches are deliberately **not** carried over — the real Dockerfile and handler are the truth, and a spec that mirrors them drifts on the first commit. |

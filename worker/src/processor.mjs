@@ -1,4 +1,4 @@
-import { releaseBudget, reserveBudget } from "./budget.mjs";
+import { checkTokenCap, recordTokenSpend, releaseBudget, reserveBudget } from "./budget.mjs";
 import { configError } from "./config.mjs";
 import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
 
@@ -28,6 +28,8 @@ export async function runJob(job, deps) {
 		redis,
 		caps, // { day, week, month }; week/month null when that window is disabled (REQ-SPEND-CAPS-MULTI-WINDOW)
 		softHoldPct, // int 1-99 or null; the soft-hold band applied to every active window
+		tokenCap = null, // int or null; the daily TOKEN cap (issue #25). Check-AFTER, so it gates the NEXT job on prior spend
+		recordSpend = recordTokenSpend, // injected so the post-container INCRBY is testable/stubbable
 		mintToken, // (repo) => scoped short-lived token | null for local-folder jobs
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
@@ -68,8 +70,8 @@ export async function runJob(job, deps) {
 			if (!(await isDefaultBranchProtected(job.repo, token))) {
 				await comment(job, "Refused: the default branch is not protected. See SECURITY.md.");
 				log("refused_unprotected", { repo: job.repo });
-				// exitCode/turns null: refused pre-container, so no container exit or turn count exists.
-				return { outcome: "policy", reason: "unprotected-branch", exitCode: null, turns: null, budgetReserved: false }; // return => not retried
+				// exitCode/turns/tokens null: refused pre-container, so no container exit, turn, or token count exists.
+				return { outcome: "policy", reason: "unprotected-branch", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
 			}
 		}
 
@@ -80,6 +82,21 @@ export async function runJob(job, deps) {
 		// Mirrors the branch-protection policy return above.
 		if (prepared?.outcome === "policy") {
 			return prepared;
+		}
+
+		// Daily TOKEN cap (issue #25): the deliberate check-AFTER control. Token cost is only known
+		// post-run, so this cannot check-and-increment before the spend the way the job-count cap does
+		// (CONST-BUDGET-BEFORE-TOKENS). It is a read-only GET of prior jobs' recorded spend -- it consumes
+		// nothing, so it precedes reserveBudget's INCR and a refusal here burns no job-count slot. It can
+		// only stop the NEXT job once the day's accumulated spend has reached the cap; the actual INCRBY
+		// happens post-container via recordSpend. Reported before the job-count cap only because both are
+		// spend gates; the more-actionable branch-protection precondition is still reported first above.
+		const tokenGate = await checkTokenCap(redis, { cap: tokenCap, now });
+		if (!tokenGate.allowed) {
+			await comment(job, `Over the daily token cap (${tokenGate.spent}/${tokenGate.cap} tokens). Not run.`);
+			log("over_token_budget", { spent: tokenGate.spent, cap: tokenGate.cap });
+			// budgetReserved false: refused before reserveBudget, so no job-count slot was consumed.
+			return { outcome: "policy", reason: "daily-token-cap", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
 		}
 
 		// Budget last-but-before-container. A refusal here spends nothing (no container starts). Reserves across
@@ -98,19 +115,30 @@ export async function runJob(job, deps) {
 			}
 			// budgetReserved true: the slot is reserved above and kept (a refused reservation still counts). Both
 			// over-budget and soft-hold are POLICY, RETURNED (not retried) -- the agent never ran.
-			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, budgetReserved: true }; // return => not retried
+			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, tokens: null, budgetReserved: true }; // return => not retried
 		}
 
-		const { code, aborted, turns } = await runContainer({ job, token, prepared });
+		const { code, aborted, turns, tokens } = await runContainer({ job, token, prepared });
 		log("container_exit", { exitCode: code, aborted });
+
+		// Record token spend post-run (the check-AFTER half of the lagging token cap). The container ran,
+		// so it spent real tokens on EVERY path that reaches here -- abort, completed, policy, AND the infra
+		// throws below (an exit-1 container still spent before failing). Record before classifying so all of
+		// them are accounted. Only when the cap is enabled (nothing reads the counter otherwise) and the run
+		// reported a positive total. NEVER throws: money is already spent, so a Redis blip here must not turn
+		// a completed paid job into a failure (mirrors the sink/comment/cleanup fault-isolation posture).
+		const tokensSpent = tokens?.total ?? 0;
+		if (tokenCap !== null && tokenCap !== undefined && tokensSpent > 0) {
+			await recordSpend(redis, tokensSpent, { now }).catch((err) => log("token_spend_error", { reason: err?.message }));
+		}
 
 		// A WORKER-initiated stop (30-min timeout via cancelJob, or graceful-shutdown docker stop) kills
 		// the container -> exit 143/137. That is our decision, not an infra fault: it is POLICY and must
 		// NOT retry, or a wedged job re-runs into a second PR / double spend. Keyed on the abort FLAG,
 		// not the code -- an unbidden 137 (kernel OOM) carries `aborted: false`, falls to the switch, and
 		// stays infra-retryable.
-		// exitCode/turns carry the container's own exit and turn count; budgetReserved true post-reserve.
-		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, budgetReserved: true };
+		// exitCode/turns/tokens carry the container's own exit, turn count, and usage totals; budgetReserved true post-reserve.
+		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, tokens, budgetReserved: true };
 
 		switch (code) {
 			case EXIT_COMPLETED: {
@@ -120,14 +148,14 @@ export async function runJob(job, deps) {
 				// over-budget, infra): an InfraRetry job is retried, so chaining there would double-enqueue.
 				// collectChain never throws; chainEnqueued/chainRefused are additive telemetry only.
 				const chain = await collectChain({ job, prepared });
-				return { outcome: "completed", exitCode: code, turns, budgetReserved: true, chainEnqueued: chain.enqueued, chainRefused: chain.refused };
+				return { outcome: "completed", exitCode: code, turns, tokens, budgetReserved: true, chainEnqueued: chain.enqueued, chainRefused: chain.refused };
 			}
 			case EXIT_POLICY:
-				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, budgetReserved: true };
+				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, budgetReserved: true };
 			case EXIT_INFRA:
-				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns });
+				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens });
 			default:
-				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns });
+				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens });
 		}
 	} catch (e) {
 		// A spawn fault (docker daemon down / binary missing) reserved a slot but never started a
@@ -149,13 +177,14 @@ export async function runJob(job, deps) {
 
 /** Thrown for the retryable (infra) class only. The BullMQ processor lets this propagate to retry. */
 export class InfraRetry extends Error {
-	constructor(message, { cause, reason, exitCode, turns, budgetReserved } = {}) {
+	constructor(message, { cause, reason, exitCode, turns, tokens, budgetReserved } = {}) {
 		super(message, cause ? { cause } : undefined);
 		this.name = "InfraRetry";
 		this.piDispatchRetry = true;
 		this.reason = reason ?? message;
 		this.exitCode = exitCode ?? null;
 		this.turns = turns ?? null;
+		this.tokens = tokens ?? null;
 		this.budgetReserved = budgetReserved ?? null;
 	}
 }

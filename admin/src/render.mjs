@@ -4,7 +4,7 @@
  * testable with plain fixtures.
  *
  * PII discipline (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT): a renderer only ever sees the PII-free
- * record fields (`target` is `repo#issue` / `local:<basename>` only), the five settings keys, scheduler
+ * record fields (`target` is `repo#issue` / `local:<basename>` only), the ten settings keys, scheduler
  * keys, and flow labels. Raw `.log` bytes are untrusted, PII-bearing container output and NEVER reach a
  * renderer -- the logs overlay in index.ts is their only surface, so there is deliberately no code path
  * from here to a `.log` file (asserted by render.test.mjs).
@@ -12,7 +12,7 @@
 
 import { windowState } from "@pi-dispatch/worker/budget";
 
-const SETTINGS_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "concurrency", "softHoldPct"];
+const SETTINGS_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "maxTokens", "dailyTokenCap", "concurrency", "softHoldPct"];
 
 // The three spend windows and the overlay cap key each reads. Order is day -> week -> month.
 const BUDGET_WINDOWS = [
@@ -28,6 +28,10 @@ const RUN_COLUMNS = [
   { key: "outcome", header: "OUTCOME" },
   { key: "reason", header: "REASON" },
   { key: "turns", header: "TURNS" },
+  // Per-job token accounting (issue #25). `tokens` is `{ input, output, total, cost }` | null; a derive
+  // reaches into it so a null record still reads "-", and cost renders as a $-prefixed fixed-decimal.
+  { key: "tokens", header: "TOKENS", derive: (r) => cell(r?.tokens?.total) },
+  { key: "cost", header: "COST", derive: (r) => (typeof r?.tokens?.cost === "number" ? `$${r.tokens.cost.toFixed(4)}` : "-") },
   // Derived: a `d<n>` chain-depth marker for an outbox-chained child, "-" for a root run. A custom
   // derive is needed because `cell()` would render depth 0 as "0"; here depth 0/null/absent all read "-".
   { key: "chain", header: "CHAIN", derive: (r) => (r?.chainDepth > 0 ? `d${r.chainDepth}` : "-") },
@@ -155,7 +159,7 @@ function schedulerLine(s) {
   return `${id}  next ${next}${drift}`;
 }
 
-/** Render the settings overlay view: all five keys, unset ones marked, or the fail-closed invalid reason. */
+/** Render the settings overlay view: every overlay key, unset ones marked, or the fail-closed invalid reason. */
 export function renderSettingsView(settings) {
   const path = settings?.path ?? "(unknown path)";
   if (settings && settings.invalid) return `Settings (${path}): invalid: ${settings.invalid}`;

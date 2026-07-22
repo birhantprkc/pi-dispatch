@@ -72,14 +72,22 @@ export function captureTerminal(previous, event) {
 }
 
 /**
- * The final exit decision. Budget-abort is checked FIRST and wins over stopReason, so a future
+ * The final exit decision. A budget-abort is checked FIRST and wins over stopReason, so a future
  * upstream change to how an abort surfaces as a stopReason cannot silently turn a blown budget
  * into exit 0. This is the composition the runner's own comment calls load-bearing; it lives
  * here so it can be tested without a container.
+ *
+ * Both budgets abort via session.abort(), which surfaces as `stopReason: "aborted"`. Intercepting
+ * them here is what distinguishes an intentional cap (policy, not retried) from the generic abort,
+ * and names WHICH cap fired. The turn budget is checked before the token budget only for a stable
+ * order; in practice one abort ends the run, so at most one flag is set.
  */
-export function decideExit({ budgetAborted, budgetTurns, terminal }) {
+export function decideExit({ budgetAborted, budgetTurns, tokenAborted, terminal }) {
 	if (budgetAborted) {
 		return { code: EXIT_POLICY, reason: "turn_budget", turns: budgetTurns };
+	}
+	if (tokenAborted) {
+		return { code: EXIT_POLICY, reason: "token_budget" };
 	}
 	return classifyStopReason(terminal);
 }

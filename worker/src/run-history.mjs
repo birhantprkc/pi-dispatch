@@ -62,6 +62,38 @@ export function parseExitTurns(text) {
 }
 
 /**
+ * Recover the agent's token usage from buffered container stdout, or `null` if it is not reported.
+ *
+ * Mirrors `parseExitTurns`: scan from the end for the last `exit` event and read its `tokens` object
+ * (`{ input, output, total, cost }`). Only the success exit line carries it
+ * (`image/runner/run-job.mjs`); the catch-path exit line omits it, and a container that died before the
+ * runner's exit line yields none -- all three cases are `null`.
+ *
+ * Read-only telemetry, exactly like `parseExitTurns`: NEVER throws and MUST NOT feed exit-code or retry
+ * classification (INT-RUNNER-EXIT-CODE-PROTOCOL). A malformed or non-object `tokens` (or one missing a
+ * numeric `total`) is `null`, never a partial that could poison the daily token counter.
+ */
+export function parseExitTokens(text) {
+	if (typeof text !== "string") return null;
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i].trim();
+		if (line === "") continue;
+		let parsed;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue; // docker/agent noise or a truncated final line
+		}
+		if (parsed?.event !== "exit") continue;
+		const t = parsed?.tokens;
+		if (t && typeof t === "object" && !Array.isArray(t) && typeof t.total === "number") return t;
+		return null;
+	}
+	return null;
+}
+
+/**
  * Build the durable run record from the full BullMQ job wrapper and the run's outcome.
  *
  * The record is id-only by construction: an EXPLICIT object literal that reads exactly the stable,
@@ -90,6 +122,10 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 		reason: source.reason ?? null,
 		exitCode: source.exitCode ?? null,
 		turns: source.turns ?? null,
+		// Token accounting (INT-RUN-HISTORY-FILE-CONTRACT): additive and nullable, an explicit literal, no
+		// spread. The runner's per-job usage totals `{ input, output, total, cost }`, or null when the
+		// container died before the exit line. PII-free -- integer token counts and numeric cost only.
+		tokens: source.tokens ?? null,
 		budgetReserved: source.budgetReserved ?? null,
 		attempt: job.attemptsMade ?? 0,
 		// Chain telemetry (INT-RUN-HISTORY-FILE-CONTRACT): additive and nullable, explicit literals, no spread.
@@ -165,8 +201,9 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 		}
 
 		async function close({ timeoutMs = 2000 } = {}) {
-			// Capture turns from the tail first, so the count survives even if the flush errors or times out.
+			// Capture turns and tokens from the tail first, so they survive even if the flush errors or times out.
 			const turns = parseExitTurns(tail);
+			const tokens = parseExitTokens(tail);
 			try {
 				if (stream !== null) {
 					const s = stream;
@@ -190,7 +227,7 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 			} catch (err) {
 				log("log_sink_error", { jobId, reason: err?.message });
 			}
-			return { turns };
+			return { turns, tokens };
 		}
 
 		return { write, close };

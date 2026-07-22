@@ -52,6 +52,19 @@ test("renderRuns aligns columns with a header and a data row, including the chai
   assert.match(out, /\bd1\b/, "a chained child renders a d<n> depth marker");
 });
 
+test("renderRuns surfaces per-job tokens and cost, and dashes them when usage is absent", () => {
+  const out = renderRuns([
+    { jobId: "j1", target: "o/r#5", flow: "fix", outcome: "completed", turns: 4, tokens: { input: 4000, output: 1000, total: 5000, cost: 0.0523 }, endedAt: "2026-07-21T00:00:00.000Z" },
+    { jobId: "j2", target: "o/r#6", flow: "fix", outcome: "failed", turns: null, tokens: null, endedAt: "2026-07-21T00:01:00.000Z" },
+  ]);
+  assert.match(out, /TOKENS/);
+  assert.match(out, /COST/);
+  assert.match(out, /\b5000\b/, "total tokens render for a run that reported usage");
+  assert.match(out, /\$0\.0523/, "cost renders as a $-prefixed fixed-decimal");
+  const noUsageRow = out.split("\n").find((l) => l.includes("j2"));
+  assert.match(noUsageRow, /-/, "a run without usage dashes its token/cost cells");
+});
+
 test("renderRuns renders a fully-null record as dashes (chain column included)", () => {
   const out = renderRuns([{ jobId: null, target: null, flow: null, outcome: null, reason: null, turns: null, chainDepth: null, endedAt: null }]);
   assert.match(out, /CHAIN/);
@@ -127,15 +140,17 @@ test("renderTriggers reports an unreachable scheduler read", () => {
   assert.match(renderTriggers({ schedulers: { unreachable: "down" }, flows: { rules: {} } }), /unreachable \(down\)/);
 });
 
-test("renderSettingsView lists all eight keys, unset ones marked", () => {
-  const out = renderSettingsView({ path: "/s", overlay: { model: "claude", dailyCap: 5, weeklyCap: 100, softHoldPct: 80 } });
+test("renderSettingsView lists all ten keys, unset ones marked", () => {
+  const out = renderSettingsView({ path: "/s", overlay: { model: "claude", dailyCap: 5, weeklyCap: 100, softHoldPct: 80, maxTokens: 500000 } });
   assert.match(out, /Settings \(\/s\)/);
   assert.match(out, /model: claude/);
   assert.match(out, /dailyCap: 5/);
   assert.match(out, /weeklyCap: 100/);
   assert.match(out, /softHoldPct: 80/);
+  assert.match(out, /maxTokens: 500000/);
   assert.match(out, /provider: \(unset\)/);
   assert.match(out, /monthlyCap: \(unset\)/);
+  assert.match(out, /dailyTokenCap: \(unset\)/);
   assert.match(out, /concurrency: \(unset\)/);
 });
 

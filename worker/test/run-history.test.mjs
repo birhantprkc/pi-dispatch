@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import { test } from "node:test";
-import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
+import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
 
 /**
  * A fake writable that records chunks and lets a test drive `finish`/`error` timing.
@@ -173,6 +173,47 @@ test("parseExitTurns never throws across the full corpus", () => {
 	}
 });
 
+// ---- parseExitTokens (issue #25): mirrors parseExitTurns, reads the usage object off the exit line ----
+
+test("parseExitTokens reads the tokens object off the success exit line", () => {
+	const tokens = { input: 300, output: 50, total: 350, cost: 0.02 };
+	assert.deepEqual(parseExitTokens(`{"event":"exit","code":0,"turns":7,"tokens":${JSON.stringify(tokens)}}`), tokens);
+});
+
+test("parseExitTokens returns null for the catch-path exit line that omits tokens", () => {
+	assert.equal(parseExitTokens('{"event":"exit","code":2,"reason":"config"}'), null);
+});
+
+test("parseExitTokens returns the LAST exit line's tokens when two are present", () => {
+	const text = '{"event":"exit","tokens":{"total":1}}\n{"event":"exit","tokens":{"total":9}}';
+	assert.deepEqual(parseExitTokens(text), { total: 9 });
+});
+
+test("parseExitTokens rejects a malformed tokens value rather than storing a partial", () => {
+	// A non-object, an array, or an object missing a numeric total must not poison the daily counter.
+	assert.equal(parseExitTokens('{"event":"exit","tokens":42}'), null);
+	assert.equal(parseExitTokens('{"event":"exit","tokens":[1,2]}'), null);
+	assert.equal(parseExitTokens('{"event":"exit","tokens":{"input":10}}'), null, "no numeric total -> null");
+});
+
+test("parseExitTokens never throws across the same corpus that stresses parseExitTurns", () => {
+	for (const input of ['{"event":"exit","tokens":{"total":1}}', '{"event":"exi', "", undefined, null, 42, "null"]) {
+		assert.doesNotThrow(() => parseExitTokens(input), `input=${JSON.stringify(input)}`);
+	}
+});
+
+test("buildRecord stores a completed run's tokens object as an explicit field", () => {
+	const tokens = { input: 1000, output: 200, total: 1200, cost: 0.05 };
+	const record = buildRecord({
+		job: { id: "gh-t", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 1 } },
+		result: { outcome: "completed", turns: 4, tokens },
+		startedAt: "2026-07-18T00:00:00.000Z",
+		endedAt: "2026-07-18T00:01:00.000Z",
+	});
+	assert.deepEqual(record.tokens, tokens);
+	assert.equal(record.turns, 4);
+});
+
 test("buildRecord for a github job keeps id-only fields and admits no PII", () => {
 	const job = {
 		id: "gh-x",
@@ -192,6 +233,7 @@ test("buildRecord for a github job keeps id-only fields and admits no PII", () =
 	assert.equal(record.kind, "github");
 	assert.equal(record.flow, "fix");
 	assert.equal(record.turns, null);
+	assert.equal(record.tokens, null, "a result without tokens defaults the field to null");
 	assert.equal(record.exitCode, null);
 	assert.equal(record.budgetReserved, null);
 	assert.equal(record.reason, null);

@@ -3,13 +3,16 @@ import { test } from "node:test";
 import { InfraRetry, runJob } from "../src/processor.mjs";
 
 /** A fake redis whose counter we can preset, to force over/under budget. `decrCalls` spies
- *  releaseBudget, so tests assert the slot is (or is not) given back and never double-released. */
-function fakeRedis(start = 0) {
+ *  releaseBudget, so tests assert the slot is (or is not) given back and never double-released.
+ *  `tokenSpent` presets the daily TOKEN counter that `checkTokenCap`'s read-only GET consults. */
+function fakeRedis(start = 0, tokenSpent = 0) {
 	let n = start;
 	const redis = { decrCalls: 0, incrCalls: 0 };
 	redis.incr = async () => (redis.incrCalls++, ++n);
 	redis.decr = async () => (redis.decrCalls++, --n);
 	redis.expire = async () => {};
+	// The daily token counter is a separate key; GET returns its current value (a string) or null.
+	redis.get = async () => (tokenSpent > 0 ? String(tokenSpent) : null);
 	return redis;
 }
 
@@ -303,4 +306,69 @@ test("collectChain runs ONLY on the completed branch, never on policy / abort / 
 		await runJob(ghJob, d);
 		assert.ok(!calls.includes("collect-chain"), "an unprotected branch must not chain");
 	}
+});
+
+// ---- daily token cap (issue #25): check-BEFORE reserveBudget, record-AFTER the container ----
+
+test("daily token cap refuses BEFORE reserveBudget when the day is over budget -- no job-count slot burned", async () => {
+	// The token counter is preset over the cap; checkTokenCap runs before reserveBudget's INCR.
+	const redis = fakeRedis(0, 2000);
+	const { deps: d, calls } = deps({ redis, tokenCap: 1500 });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "daily-token-cap");
+	assert.equal(r.budgetReserved, false, "a token-cap refusal consumes no job-count slot");
+	assert.equal(redis.incrCalls, 0, "reserveBudget (job-count INCR) is never reached");
+	assert.ok(!calls.includes("run-container"), "no container, no provider spend");
+});
+
+test("under the token cap: the run proceeds and records its spend AFTER the container", async () => {
+	const recorded = [];
+	const { deps: d } = deps({
+		redis: fakeRedis(0, 500),
+		tokenCap: 1_000_000,
+		runContainer: async () => ({ code: 0, aborted: false, turns: 3, tokens: { input: 4000, output: 1000, total: 5000, cost: 0.1 } }),
+		recordSpend: async (_redis, tokens) => (recorded.push(tokens), 5500),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.deepEqual(r.tokens, { input: 4000, output: 1000, total: 5000, cost: 0.1 }, "usage totals thread into the result");
+	assert.deepEqual(recorded, [5000], "the job's total tokens are INCRBY'd into the daily counter after the run");
+});
+
+test("token spend is recorded even on a runner-policy exit -- the container still spent", async () => {
+	const recorded = [];
+	const { deps: d } = deps({
+		tokenCap: 1_000_000,
+		runContainer: async () => ({ code: 2, aborted: false, turns: 9, tokens: { total: 4000 } }),
+		recordSpend: async (_redis, tokens) => recorded.push(tokens),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "runner-policy");
+	assert.deepEqual(recorded, [4000], "a policy exit that ran a container is accounted, not free");
+});
+
+test("with the token cap disabled (null), the counter is never recorded", async () => {
+	const recorded = [];
+	const { deps: d } = deps({
+		// tokenCap omitted => defaults to null
+		runContainer: async () => ({ code: 0, aborted: false, turns: 1, tokens: { total: 5000 } }),
+		recordSpend: async (_redis, tokens) => recorded.push(tokens),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.deepEqual(recorded, [], "nothing reads the counter when the cap is off, so nothing writes it");
+});
+
+test("a Redis failure while recording token spend never fails a completed, paid job", async () => {
+	const { deps: d } = deps({
+		tokenCap: 1_000_000,
+		runContainer: async () => ({ code: 0, aborted: false, turns: 2, tokens: { total: 5000 } }),
+		recordSpend: async () => {
+			throw new Error("valkey down");
+		},
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed", "money is already spent -- a counter blip must not turn success into failure");
 });

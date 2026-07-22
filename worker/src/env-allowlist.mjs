@@ -29,7 +29,7 @@ export function providerKeyVars(provider, hostEnv) {
  * Throws if the provider is not configured -- a deterministic misconfiguration the caller maps to
  * a pre-spend refusal, never a launched-then-failed container.
  */
-export function buildContainerEnv({ provider, model, maxTurns, jobId, githubToken, hostEnv }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv }) {
 	const keyVars = providerKeyVars(provider, hostEnv);
 	if (!keyVars || keyVars.length === 0) {
 		const error = new Error(`provider ${provider} has no configured credential in the worker environment`);
@@ -41,6 +41,9 @@ export function buildContainerEnv({ provider, model, maxTurns, jobId, githubToke
 		PI_PROVIDER: provider,
 		PI_MODEL: model,
 		PI_MAX_TURNS: String(maxTurns),
+		// The optional per-job token budget (issue #25). Absent/null => variable omitted (docker-run skips
+		// undefined), so the runner attaches a pure meter with no cap. Never an empty string.
+		PI_MAX_TOKENS: maxTokens === null || maxTokens === undefined ? undefined : String(maxTokens),
 		PI_JOB_ID: jobId,
 		// Baked into the image, but harmless to restate; kept here so the container contract is
 		// visible in one place. INT-CONTAINER-RUNTIME-CONTRACT.

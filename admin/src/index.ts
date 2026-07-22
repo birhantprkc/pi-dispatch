@@ -395,13 +395,16 @@ function applyUnset(settingsFile: string, tokens: string[], notify: Notify): voi
 }
 
 /**
- * Coerce a raw token to the settings value its key expects: the three numeric keys parse via `Number` (a
- * non-numeric token becomes `NaN`, which `writeOverlay` then rejects with a key-only reason); `model` and
- * `provider` keep the raw string. Bounds and integer-ness stay in `writeOverlay`, the single validator.
+ * Coerce a raw token to the settings value its key expects: `model` and `provider` keep the raw string;
+ * every other overlay key is numeric and parses via `Number` (a non-numeric token becomes `NaN`, which
+ * `writeOverlay` then rejects with a key-only reason). Keying off the two string exceptions rather than an
+ * enumerated numeric list keeps this in lockstep with `KNOWN_KEYS` -- a new numeric knob (weekly/monthly
+ * caps, the token caps) is coerced without a second edit here. Bounds and integer-ness stay in
+ * `writeOverlay`, the single validator.
  */
 function coerceSettingValue(key: string, raw: string): number | string {
-  if (key === "maxTurns" || key === "dailyCap" || key === "concurrency") return Number(raw);
-  return raw;
+  if (key === "model" || key === "provider") return raw;
+  return Number(raw);
 }
 
 /**

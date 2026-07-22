@@ -4,10 +4,11 @@ import { defaultSettingsFile } from "./config.mjs";
 
 /**
  * Runtime-settings overlay: the shared, durable truth between the admin extension and the worker
- * (INT-CONFIG-OVERLAY-CONTRACT, DES-RUNTIME-SETTINGS-FILE-OVERLAY). A flat `settings.json` with eight
+ * (INT-CONFIG-OVERLAY-CONTRACT, DES-RUNTIME-SETTINGS-FILE-OVERLAY). A flat `settings.json` with ten
  * optional keys -- `model`, `provider` (non-empty strings), `maxTurns`, `dailyCap`, `weeklyCap`,
- * `monthlyCap` (int >= 1), `concurrency` (int 1-10), `softHoldPct` (int 1-99) -- read by the worker at
- * each job start and written atomically by the admin extension (tmp + rename).
+ * `monthlyCap`, `maxTokens`, `dailyTokenCap` (int >= 1), `concurrency` (int 1-10), `softHoldPct`
+ * (int 1-99) -- read by the worker at each job start and written atomically by the admin extension
+ * (tmp + rename). `maxTokens`/`dailyTokenCap` are the optional token controls (issue #25).
  *
  * `readOverlay` NEVER throws: a bad settings file returns a discriminated `{ invalid }` rather than an
  * exception, so the processor RETURNS a policy refusal (`settings-overlay-invalid`) instead of letting
@@ -24,7 +25,7 @@ import { defaultSettingsFile } from "./config.mjs";
  * Custom: overlay validated inline per config.mjs precedent; zod not in deps
  */
 
-export const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "concurrency", "softHoldPct"];
+export const KNOWN_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "maxTokens", "dailyTokenCap", "concurrency", "softHoldPct"];
 
 function isNonEmptyString(value) {
 	return typeof value === "string" && value.trim() !== "";
@@ -70,8 +71,11 @@ function validateOverlay(candidate, log) {
 			case "dailyCap":
 			case "weeklyCap":
 			case "monthlyCap":
-				// Overlay caps are positive ints. A window is DISABLED by absence, not by a 0 -- `unset weeklyCap`
-				// drops the key so it falls through to env, which unset means the window is off (config.mjs).
+			case "maxTokens":
+			case "dailyTokenCap":
+				// Overlay caps are positive ints. A window/cap is DISABLED by absence, not by a 0 -- `unset weeklyCap`
+				// drops the key so it falls through to env, which unset means the window is off (config.mjs). The
+				// token knobs (maxTokens, dailyTokenCap) follow the same "absent = disabled" shape (issue #25).
 				if (!isIntAtLeast(value, 1)) return { invalid: `${key} must be an integer >= 1` };
 				overlay[key] = value;
 				break;
@@ -121,11 +125,11 @@ export function readOverlay(path, { fs = nodeFs, log = () => {} } = {}) {
 }
 
 /**
- * Resolve the eight effective settings from `config` and a validated `overlay`: overlay value where the
+ * Resolve the ten effective settings from `config` and a validated `overlay`: overlay value where the
  * overlay sets it, else the config value. Precedence is overlay > env > default only -- `config`
- * already carries env > default. `weeklyCap`/`monthlyCap`/`softHoldPct` may resolve to `null` (their
- * config value when unset), meaning that window / the soft-hold band is disabled. `job.data` is NOT
- * merged here; that layer is the processor's.
+ * already carries env > default. `weeklyCap`/`monthlyCap`/`maxTokens`/`dailyTokenCap`/`softHoldPct` may
+ * resolve to `null` (their config value when unset), meaning that window / cap / band is disabled.
+ * `job.data` is NOT merged here; that layer is the processor's.
  */
 export function effectiveSettings(config, overlay) {
 	const o = overlay ?? {};
@@ -136,6 +140,8 @@ export function effectiveSettings(config, overlay) {
 		dailyCap: o.dailyCap ?? config.dailyCap,
 		weeklyCap: o.weeklyCap ?? config.weeklyCap,
 		monthlyCap: o.monthlyCap ?? config.monthlyCap,
+		maxTokens: o.maxTokens ?? config.maxTokens,
+		dailyTokenCap: o.dailyTokenCap ?? config.dailyTokenCap,
 		concurrency: o.concurrency ?? config.concurrency,
 		softHoldPct: o.softHoldPct ?? config.softHoldPct,
 	};
