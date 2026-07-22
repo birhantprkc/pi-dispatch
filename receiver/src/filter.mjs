@@ -44,11 +44,12 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 	if (eventName === "issues" && LABEL_ACTIONS.has(action)) {
 		// Label path: the label allowlist IS the human approval gate -- only collaborators can label.
 		const labels = Array.isArray(subset.issue?.labels) ? subset.issue.labels : [];
+		const L = new Set(labels.map((l) => l?.name).filter((n) => typeof n === "string"));
 		const labelFlows = cfg?.labelFlows ?? {};
-		for (const label of labels) {
-			const name = label?.name;
-			if (typeof name === "string" && Object.prototype.hasOwnProperty.call(labelFlows, name)) {
-				flow = labelFlows[name];
+		// Flow-keyed predicate: iterate flows in file (insertion) order; the first whose rule matches wins.
+		for (const [flowName, rule] of Object.entries(labelFlows)) {
+			if (matchesRule(L, rule)) {
+				flow = flowName;
 				break;
 			}
 		}
@@ -66,9 +67,9 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 			return { enqueue: false, reason: "no-trigger-phrase" };
 		}
 		// Default to the configured flow; an explicit `<phrase> <flow>` overrides only when `<flow>` is
-		// a known flow value, so a comment cannot summon an unlisted flow.
+		// a known flow name, so a comment cannot summon an unlisted flow.
 		flow = cfg?.commentTrigger?.defaultFlow;
-		const knownFlows = new Set(Object.values(cfg?.labelFlows ?? {}));
+		const knownFlows = new Set(Object.keys(cfg?.labelFlows ?? {}));
 		const match = body.match(new RegExp(escapeRegExp(phrase) + "\\s+(\\S+)"));
 		if (match && knownFlows.has(match[1])) {
 			flow = match[1];
@@ -91,6 +92,24 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 		trigger: { event: eventName, action, deliveryId, sender: { id: subset.sender.id } },
 	};
 	return { enqueue: true, job };
+}
+
+/**
+ * Per-flow label predicate over the issue's label set `L`:
+ *   (any empty OR L∩any ≠ ∅) AND (all ⊆ L) AND (L∩none = ∅).
+ * An empty `any` is vacuously true, so the `all`/`none` clauses carry the requirement; the loader
+ * guarantees at least one positive selector (`config.mjs` loadLabelFlows), so a validated rule can never
+ * match every event. Reads only its arguments and never throws -- the gate's purity extends here, and
+ * the defensive `?? []` covers a rule the loader has already validated.
+ */
+function matchesRule(L, rule) {
+	const any = rule?.any ?? [];
+	const all = rule?.all ?? [];
+	const none = rule?.none ?? [];
+	if (any.length > 0 && !any.some((x) => L.has(x))) return false;
+	if (!all.every((x) => L.has(x))) return false;
+	if (none.some((x) => L.has(x))) return false;
+	return true;
 }
 
 /** Escape a literal string for safe embedding in a RegExp -- the trigger phrase is config, not a pattern. */

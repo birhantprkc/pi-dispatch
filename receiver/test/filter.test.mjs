@@ -4,7 +4,16 @@ import { filter } from "../src/filter.mjs";
 
 // The reviewed allowlist + comment trigger, mirroring loadReceiverConfig's shape.
 const cfg = {
-	labelFlows: { "pi:frontend": "frontend-fix" },
+	labelFlows: { "frontend-fix": { any: ["pi:frontend"] } },
+	commentTrigger: { phrase: "@pi", defaultFlow: "triage" },
+};
+// A richer allowlist exercising every predicate clause: any-of-many, a required `all`, exclusion `none`,
+// and a second flow to prove first-match-in-file-order and single-clause routing.
+const matrixCfg = {
+	labelFlows: {
+		fix: { any: ["ai-fix", "urgent-fix"], all: ["triaged"], none: ["blocked", "wontfix"] },
+		review: { any: ["ai-review"] },
+	},
 	commentTrigger: { phrase: "@pi", defaultFlow: "triage" },
 };
 const SELF_ID = 999;
@@ -30,6 +39,11 @@ function issuesSubset(over = {}) {
 		issue: { number: 42, title: "T", body: "B", labels: [{ name: "pi:frontend" }] },
 		...over,
 	};
+}
+
+/** An `issues.labeled` subset carrying exactly the named labels -- for the predicate matrix. */
+function labeledSubset(labelNames) {
+	return issuesSubset({ issue: { number: 42, title: "T", body: "B", labels: labelNames.map((name) => ({ name })) } });
 }
 
 test("self-comment is dropped even though it would clear the author gate + phrase (PAT owner mode)", () => {
@@ -124,6 +138,42 @@ test("issues.opened and issues.reopened also route the label path", () => {
 		assert.equal(r.enqueue, true);
 		assert.equal(r.job.trigger.action, action);
 	}
+});
+
+test("predicate: an `any` hit with all required labels and no exclusion enqueues the flow", () => {
+	const r = filter("issues", labeledSubset(["ai-fix", "triaged"]), matrixCfg, SELF_ID, "d-m1");
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.flow, "fix");
+});
+
+test("predicate: an `any` hit missing a required `all` label is dropped (all makes it stricter)", () => {
+	const r = filter("issues", labeledSubset(["ai-fix"]), matrixCfg, SELF_ID, "d-m2");
+	assert.equal(r.enqueue, false);
+	assert.equal(r.reason, "no-allowlisted-label");
+});
+
+test("predicate: a `none` label suppresses the flow (exclusion brake); no other flow matches", () => {
+	const r = filter("issues", labeledSubset(["ai-fix", "triaged", "blocked"]), matrixCfg, SELF_ID, "d-m3");
+	assert.equal(r.enqueue, false);
+	assert.equal(r.reason, "no-allowlisted-label");
+});
+
+test("predicate: no positive (`any`) label present is dropped", () => {
+	const r = filter("issues", labeledSubset(["triaged"]), matrixCfg, SELF_ID, "d-m4");
+	assert.equal(r.enqueue, false);
+	assert.equal(r.reason, "no-allowlisted-label");
+});
+
+test("predicate: the first flow in file order wins when several rules could match", () => {
+	const r = filter("issues", labeledSubset(["ai-fix", "triaged", "ai-review"]), matrixCfg, SELF_ID, "d-m5");
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.flow, "fix");
+});
+
+test("predicate: a label matching only the second flow routes to it (single-clause any)", () => {
+	const r = filter("issues", labeledSubset(["ai-review"]), matrixCfg, SELF_ID, "d-m6");
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.flow, "review");
 });
 
 test("comment with the phrase but no defaultFlow and no @pi <flow> is dropped as no-flow", () => {
