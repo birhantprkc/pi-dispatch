@@ -127,7 +127,7 @@ export async function startWorker(
 		writeRecord(buildRecord({ job, result, error, startedAt, endedAt }));
 
 	// INT-CONFIG-OVERLAY-CONTRACT: the worker reads the runtime-settings overlay at EACH job start, so this
-	// closure -- not a value frozen at boot -- is what the processor calls per job. It resolves the five
+	// closure -- not a value frozen at boot -- is what the processor calls per job. It resolves the eight
 	// effective settings from the overlay over env; an invalid overlay returns `{ invalid }` (logged loudly,
 	// key-name-only per no-pii-in-logs) so the processor RETURNS a settings-overlay-invalid refusal instead
 	// of the run.
@@ -238,6 +238,9 @@ export async function startWorker(
 		queue: "pi-jobs",
 		concurrency: bootConcurrency, // the slot count the Worker is actually constructed with (overlay may raise/lower it)
 		dailyCap: config.dailyCap,
+		weeklyCap: config.weeklyCap, // null when the weekly window is disabled
+		monthlyCap: config.monthlyCap, // null when the monthly window is disabled
+		softHoldPct: config.softHoldPct, // null when the soft-hold band is disabled
 		image: config.jobImage,
 		valkey: config.valkeyUrl,
 		logsDir: config.logsDir,

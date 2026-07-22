@@ -164,15 +164,18 @@ that always fires is one nobody reads.
 
 ## CONST-BUDGET-BEFORE-TOKENS
 
-- **Statement**: The daily cap shall be checked and incremented **before** an agent run begins — before
-  any provider call is made.
+- **Statement**: The spend cap shall be checked and incremented **before** an agent run begins — before
+  any provider call is made. The cap is a **job count** (container starts), not tokens. What is counted may
+  span several windows (day/week/month) and carry a soft-hold band (`REQ-SPEND-CAPS-MULTI-WINDOW`); this
+  constraint governs only the **ordering** — check-and-increment before the container — which is invariant
+  across however many windows exist.
 - **Why**: The ordering **is** the mechanism. Check-after-spend means fifty junk triggers cost fifty jobs
   of real money before the cap engages, which is the exact scenario the cap exists for. Adopted from
   pi-routines, the one idea worth taking from it, whose README states the principle exactly: the cap is
   *"applied BEFORE acquiring the guard so capped fires consume zero provider tokens."* Relaxed to
   check-after, the cap is decorative.
 - **Evidence (upstream)**: `Davidcreador/pi-routines @ 6d2aa64 (v0.5.1)` — `maxRunsPerDay`
-- **Traces to**: `REQ-RUNNER-TURN-BUDGET`, `CONST-RETRY-INFRA-ONLY`
+- **Traces to**: `REQ-RUNNER-TURN-BUDGET`, `CONST-RETRY-INFRA-ONLY`, `REQ-SPEND-CAPS-MULTI-WINDOW`
 - **Acceptance**: Given the cap is exhausted, a new trigger consumes zero provider tokens and comments
   on the issue.
 

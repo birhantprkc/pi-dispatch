@@ -66,7 +66,17 @@ const receiverGhJob = () => ({
 	data: { kind: "github", repo: "o/r", issueNumber: 1, flow: "fix", trigger: { deliveryId: "d", sender: { id: 1 } } },
 });
 
-const effective = (over = {}) => ({ provider: "anthropic", model: "claude-sonnet-4-5", maxTurns: 30, dailyCap: 10, concurrency: 3, ...over });
+const effective = (over = {}) => ({
+	provider: "anthropic",
+	model: "claude-sonnet-4-5",
+	maxTurns: 30,
+	dailyCap: 10,
+	weeklyCap: null,
+	monthlyCap: null,
+	concurrency: 3,
+	softHoldPct: null,
+	...over,
+});
 
 test("(a) P0: a receiver GitHub job with no provider/model/maxTurns reaches the container with effective values; slot reserved once", { skip }, async () => {
 	const { processor, seen, redis } = harness({ getSettings: () => effective() });
@@ -123,6 +133,19 @@ test("(d) explicit job.data values win over the overlay", { skip }, async () => 
 	assert.equal(seen.container.provider, "explicit-provider", "job.data.provider wins over the overlay");
 	assert.equal(seen.container.model, "explicit-model", "job.data.model wins over the overlay");
 	assert.equal(seen.container.maxTurns, 7, "job.data.maxTurns wins over the overlay");
+});
+
+test("(f) a soft-hold percentage set live in the overlay refuses the next in-band job before the container", { skip }, async () => {
+	// The counter sits at 4; an overlay dailyCap of 5 with softHoldPct 80 (threshold floor(4)=4) makes the
+	// next reservation land at 5 -- inside the band -- so the job is soft-held. Proves a live overlay knob
+	// takes effect at the very next job start with no restart (INT-CONFIG-OVERLAY-CONTRACT).
+	const { processor, seen } = harness({ getSettings: () => effective({ dailyCap: 5, softHoldPct: 80 }), redis: fakeRedis(4) });
+
+	const result = await processor(receiverGhJob(), "tok", new AbortController().signal);
+
+	assert.equal(result.outcome, "policy");
+	assert.equal(result.reason, "soft-hold", "the live soft-hold band is what reserveBudget checks against");
+	assert.equal(seen.containerCalls, 0, "soft-hold => new start paused, no provider spend");
 });
 
 test("(e) applyConcurrency runs with the effective concurrency on the happy path, never when the overlay is invalid", { skip }, async () => {

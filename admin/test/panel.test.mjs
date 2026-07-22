@@ -53,6 +53,14 @@ test("meter renders a bar glyph and reserved/cap", () => {
   assert.match(out, /3\/10/);
 });
 
+test("meter appends a textual state marker for soft-hold and over (no colour in a monochrome panel)", () => {
+  assert.match(meter(9, 10, 24, "soft-hold"), /9\/10 soft-hold/);
+  assert.match(meter(11, 10, 24, "over"), /11\/10 over/);
+  // "ok" (the default) adds nothing, so a plain call is unchanged.
+  assert.doesNotMatch(meter(3, 10, 24, "ok"), /soft-hold|over/);
+  assert.doesNotMatch(meter(3, 10, 24), /soft-hold|over/);
+});
+
 test("meter renders (cap unknown) with no bar glyph when cap is not a positive integer", () => {
   const out = meter(5, null, 24);
   assert.match(out, /\(cap unknown\)/);

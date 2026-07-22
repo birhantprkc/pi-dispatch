@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 import { defaultLogsDir } from "@pi-dispatch/worker/config";
 import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
-import { dayKey } from "@pi-dispatch/worker/budget";
+import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
 import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
@@ -321,17 +321,19 @@ export function mapSchedulers(list, nowMs) {
 }
 
 /**
- * Read today's reserved budget count with a plain, side-effect-free GET of the worker's own `dayKey()` --
- * NEVER an INCR/EXPIRE, so observing the budget cannot consume a slot. `makeRedisClient` has no failFast
- * option and would otherwise buffer the GET forever while disconnected, so the read is bounded by a
- * timeout that degrades to `{ unreachable }`; the client is force-disconnected in `finally`.
+ * Read the reserved counts for all three spend windows with plain, side-effect-free GETs of the worker's own
+ * `dayKey()` / `weekKey()` / `monthKey()` -- NEVER an INCR/EXPIRE, so observing the budget cannot consume a
+ * slot. Returns `{ day, week, month }` reserved counts (the caps live in the settings overlay, resolved by
+ * the renderer). `makeRedisClient` has no failFast option and would otherwise buffer the GETs forever while
+ * disconnected, so the read is bounded by a timeout that degrades to `{ unreachable }`; the client is
+ * force-disconnected in `finally`.
  */
 export async function readBudget({ url, redisFn = makeRedisClient, timeoutMs = 2500 } = {}) {
   let redis;
   try {
     redis = redisFn(url);
-    const settled = Promise.resolve(redis.get(dayKey())).then(
-      (value) => ({ reserved: Number(value ?? 0) }),
+    const settled = Promise.all([redis.get(dayKey()), redis.get(weekKey()), redis.get(monthKey())]).then(
+      ([day, week, month]) => ({ day: Number(day ?? 0), week: Number(week ?? 0), month: Number(month ?? 0) }),
       (err) => ({ unreachable: err?.message ?? String(err) }),
     );
     return await withTimeout(settled, timeoutMs, { unreachable: "timed out reaching the queue" });

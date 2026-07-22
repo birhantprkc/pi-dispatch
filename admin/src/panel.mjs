@@ -101,13 +101,18 @@ export function box({ title = "", sections = [], footer, width = 40 } = {}) {
  * A block-char progress bar `[####....] reserved/cap` fitted to `width`. When `cap` is not a positive
  * integer the true cap is unknown to this process, so it renders `reserved / ? (cap unknown)` with no bar
  * rather than a bar against a guessed denominator.
+ *
+ * `state` ("ok" | "soft-hold" | "over") appends a textual marker to the label: the panel is monochrome and
+ * `clip` strips ANSI, so the amber/red of a soft-hold or over-budget window is carried as a word, not a
+ * color. "ok" (the default) adds nothing, so a plain call renders exactly as before.
  */
-export function meter(reserved, cap, width = 24) {
+export function meter(reserved, cap, width = 24, state = "ok") {
   const r = Number.isFinite(reserved) ? Math.max(0, Math.trunc(reserved)) : 0;
   if (!Number.isInteger(cap) || cap <= 0) {
     return clip(`${r} / ? (cap unknown)`, width);
   }
-  const label = ` ${r}/${cap}`;
+  const tag = state === "soft-hold" ? " soft-hold" : state === "over" ? " over" : "";
+  const label = ` ${r}/${cap}${tag}`;
   const barCells = Math.max(0, Math.trunc(width) - label.length - 2); // "[" + cells + "]" + label
   const filled = Math.min(barCells, Math.round((Math.min(r, cap) / cap) * barCells));
   const bar = `[${GLYPHS.full.repeat(filled)}${GLYPHS.empty.repeat(barCells - filled)}]`;

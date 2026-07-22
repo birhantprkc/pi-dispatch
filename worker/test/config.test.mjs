@@ -7,6 +7,9 @@ test("loads conservative defaults with an empty-ish env", () => {
 	const c = loadConfig({});
 	assert.equal(c.concurrency, 3);
 	assert.equal(c.dailyCap, 25);
+	assert.equal(c.weeklyCap, null, "the weekly ceiling defaults to disabled");
+	assert.equal(c.monthlyCap, null, "the monthly ceiling defaults to disabled");
+	assert.equal(c.softHoldPct, null, "the soft-hold band defaults to disabled");
 	assert.equal(c.provider, "anthropic");
 	assert.equal(c.model, "claude-sonnet-4-5-20250929"); // dated, deterministic
 	assert.equal(c.maxTurns, 30);
@@ -100,6 +103,33 @@ test("logRetentionDays rejects negative and non-integer values as config errors"
 
 test("positiveInt is unchanged: a spend var of 0 still throws", () => {
 	assert.throws(() => loadConfig({ PI_DAILY_CAP: "0" }), (e) => e.piDispatchConfig === true);
+});
+
+test("weekly/monthly ceilings take explicit positive values, and absence is disabled (null)", () => {
+	const c = loadConfig({ PI_WEEKLY_CAP: "100", PI_MONTHLY_CAP: "400" });
+	assert.equal(c.weeklyCap, 100);
+	assert.equal(c.monthlyCap, 400);
+	// empty string is also "disabled", not a parse error
+	assert.equal(loadConfig({ PI_WEEKLY_CAP: "" }).weeklyCap, null);
+});
+
+test("weekly/monthly ceilings reject 0, negatives, and non-integers as config errors", () => {
+	for (const name of ["PI_WEEKLY_CAP", "PI_MONTHLY_CAP"]) {
+		for (const bad of ["0", "-1", "abc", "1.5"]) {
+			assert.throws(() => loadConfig({ [name]: bad }), (e) => e.piDispatchConfig === true, `${name}=${bad}`);
+		}
+	}
+});
+
+test("soft-hold pct takes 1-99, defaults to disabled, and rejects out-of-range or non-integer", () => {
+	assert.equal(loadConfig({ PI_SOFT_HOLD_PCT: "80" }).softHoldPct, 80);
+	assert.equal(loadConfig({ PI_SOFT_HOLD_PCT: "1" }).softHoldPct, 1);
+	assert.equal(loadConfig({ PI_SOFT_HOLD_PCT: "99" }).softHoldPct, 99);
+	assert.equal(loadConfig({}).softHoldPct, null);
+	assert.equal(loadConfig({ PI_SOFT_HOLD_PCT: "" }).softHoldPct, null);
+	for (const bad of ["0", "100", "-5", "abc", "50.5"]) {
+		assert.throws(() => loadConfig({ PI_SOFT_HOLD_PCT: bad }), (e) => e.piDispatchConfig === true, `PI_SOFT_HOLD_PCT=${bad}`);
+	}
 });
 
 test("env overrides every field", () => {

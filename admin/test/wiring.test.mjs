@@ -147,7 +147,7 @@ test("dispatch_run advertises PAID/ai-trigger/no-force, is sequential, and takes
   assert.equal(run.executionMode, "sequential");
   const props = run.parameters.properties ?? {};
   assert.deepEqual(Object.keys(props).sort(), ["flow", "folder", "task"], "exactly the three job inputs");
-  for (const knob of ["model", "maxTurns", "dailyCap", "concurrency"]) {
+  for (const knob of ["model", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "concurrency", "softHoldPct"]) {
     assert.ok(!(knob in props), `no spend-knob param: ${knob}`);
   }
 });

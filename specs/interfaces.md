@@ -619,8 +619,11 @@ Evidence convention as in `constitution.md`.
     "model":       "<optional, non-empty string>",   // provider-native model id
     "provider":    "<optional, non-empty string>",   // pi provider id
     "maxTurns":    <optional, int >= 1>,             // runner turn budget
-    "dailyCap":    <optional, int >= 1>,             // jobs admitted per day
-    "concurrency": <optional, int 1-10>              // worker slot count
+    "dailyCap":    <optional, int >= 1>,             // jobs admitted per day (mandatory window; env default 25)
+    "weeklyCap":   <optional, int >= 1>,             // jobs admitted per ISO week; unset -> weekly window disabled
+    "monthlyCap":  <optional, int >= 1>,             // jobs admitted per calendar month; unset -> monthly window disabled
+    "concurrency": <optional, int 1-10>,             // worker slot count
+    "softHoldPct": <optional, int 1-99>              // soft-hold band as a % of each active cap; unset -> band disabled
   }
   ```
   All keys are optional; a missing file is an empty overlay. **Write protocol** (admin extension): validate
@@ -635,11 +638,13 @@ Evidence convention as in `constitution.md`.
 - **Why**: The worker resolves the effective job settings at job start — precedence
   `job.data > overlay > env > default` — so this file is the shared, durable truth between the admin
   extension and the worker: a write made while the worker is down is simply read at the next job start.
-  `dailyCap` is resolved at the existing pre-container cap check, so the overlay changes *which value* the
-  cap takes, never *when* it is checked (`CONST-BUDGET-BEFORE-TOKENS`). See `DES-RUNTIME-SETTINGS-FILE-OVERLAY`
-  for why a file, why atomic, and why a present-but-invalid file fails closed.
+  `dailyCap`/`weeklyCap`/`monthlyCap`/`softHoldPct` are resolved at the existing pre-container cap check, so
+  the overlay changes *which values* the caps and band take, never *when* they are checked
+  (`CONST-BUDGET-BEFORE-TOKENS`, `REQ-SPEND-CAPS-MULTI-WINDOW`). An unset `weeklyCap`/`monthlyCap` disables
+  that window; an unset `softHoldPct` disables the band. See `DES-RUNTIME-SETTINGS-FILE-OVERLAY` for why a
+  file, why atomic, and why a present-but-invalid file fails closed.
 - **Traces to**: `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `DES-ADMIN-VIA-PI-EXTENSION`,
-  `CONST-BUDGET-BEFORE-TOKENS`, `CONST-RETRY-INFRA-ONLY`
+  `CONST-BUDGET-BEFORE-TOKENS`, `CONST-RETRY-INFRA-ONLY`, `REQ-SPEND-CAPS-MULTI-WINDOW`
 - **Acceptance**: Given a present-but-invalid file, when a job starts, then the processor returns a policy
   refusal `settings-overlay-invalid` before `reserveBudget` — no budget slot consumed, no container
   started, not retried; given a job whose data omits `model`/`provider`/`maxTurns`, when it starts, then

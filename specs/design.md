@@ -526,9 +526,12 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Decision**: Runtime-tunable settings are a flat `settings.json` **overlay** — path `PI_SETTINGS_FILE`,
   default `<OS temp>/pi-dispatch/settings.json` — written **atomically** (tmp + rename) by the admin
   extension and **re-read by the worker at each job start**. The keys are exactly `model`, `provider`
-  (non-empty strings), `maxTurns` (int ≥1), `dailyCap` (int ≥1), and `concurrency` (int 1–10). Resolution
-  precedence is **`job.data > overlay > env > default`**; producers stop baking env defaults into job
-  data, so an unset job field falls through to the overlay rather than to a value frozen at enqueue time.
+  (non-empty strings), `maxTurns`, `dailyCap`, `weeklyCap`, `monthlyCap` (int ≥1), `concurrency` (int 1–10),
+  and `softHoldPct` (int 1–99). `weeklyCap`/`monthlyCap`/`softHoldPct` are optional ceilings/band that
+  default to **disabled** when unset (the mandatory daily cap is always the primary bound —
+  `REQ-SPEND-CAPS-MULTI-WINDOW`). Resolution precedence is **`job.data > overlay > env > default`**;
+  producers stop baking env defaults into job data, so an unset job field falls through to the overlay
+  rather than to a value frozen at enqueue time.
 - **Why**:
   - **Per-job re-read needs no watcher and no IPC.** The worker already opens each job in its processor;
     reading one small file there costs a `stat` + parse and removes any need for `fs.watch`, a pub/sub

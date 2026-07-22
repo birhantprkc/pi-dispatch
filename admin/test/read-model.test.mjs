@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dayKey } from "@pi-dispatch/worker/budget";
+import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
 import {
   resolvePaths,
   readQueueState,
@@ -152,25 +152,27 @@ test("readLogTail returns the last N lines, dropping the trailing-newline segmen
   assert.deepEqual(rec.lines, ["l4", "l5"]);
 });
 
-test("readBudget issues only a GET of the day key and never mutates", async () => {
+test("readBudget GETs the day/week/month keys and never mutates", async () => {
   const commands = [];
+  const values = { [dayKey()]: "7", [weekKey()]: "20", [monthKey()]: "55" };
   const redis = {
     async get(key) {
       commands.push(["get", key]);
-      return "7";
+      return values[key] ?? null;
     },
     disconnect() {
       commands.push(["disconnect"]);
     },
   };
   const res = await readBudget({ url: "redis://x", redisFn: () => redis });
-  assert.deepEqual(res, { reserved: 7 });
+  assert.deepEqual(res, { day: 7, week: 20, month: 55 });
+  const ops = commands.filter((c) => c[0] !== "disconnect");
+  assert.deepEqual(new Set(ops.map((c) => c[0])), new Set(["get"]), "only GET -- never INCR/EXPIRE");
   assert.deepEqual(
-    commands.filter((c) => c[0] !== "disconnect").map((c) => c[0]),
-    ["get"],
-    "only GET -- never INCR/EXPIRE",
+    new Set(ops.map((c) => c[1])),
+    new Set([dayKey(), weekKey(), monthKey()]),
+    "GETs the worker's own day/week/month keys",
   );
-  assert.equal(commands[0][1], dayKey(), "GET is keyed on the worker's own dayKey()");
 });
 
 test("readBudget returns { unreachable } when the client errors", async () => {

@@ -18,7 +18,7 @@
  * touches the filesystem -- the bytes reach the overlay alone, never `snapshot`, never a shared renderer,
  * never a message.
  */
-import { dayKey } from "@pi-dispatch/worker/budget";
+import { dayKey, weekKey, monthKey, windowState } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { listRuns, readSettingsView, mapSchedulers, readFlows } from "./read-model.mjs";
@@ -48,18 +48,20 @@ export function createDashboardDeps(paths: any) {
   const redis = makeRedisClient(paths.valkeyUrl);
   return {
     async fetchSnapshot() {
-      const [pausedState, counts, workerList, reservedRaw, schedulerList, activeList] = await Promise.all([
+      const [pausedState, counts, workerList, dayRaw, weekRaw, monthRaw, schedulerList, activeList] = await Promise.all([
         queue.isPaused(),
         queue.getJobCounts("waiting", "active", "paused", "delayed", "failed"),
         queue.getWorkers().catch(() => []),
         redis.get(dayKey()),
+        redis.get(weekKey()),
+        redis.get(monthKey()),
         queue.getJobSchedulers(0, -1, true),
         queue.getActive(0, 0).catch(() => []),
       ]);
       const workers = Array.isArray(workerList) && workerList.length > 0 ? workerList.length : "unknown";
       return {
         queue: { pausedState, counts, workers },
-        budget: { reserved: Number(reservedRaw ?? 0) },
+        budget: { day: Number(dayRaw ?? 0), week: Number(weekRaw ?? 0), month: Number(monthRaw ?? 0) },
         schedulers: mapSchedulers(schedulerList, Date.now()),
         runs: listRuns({ logsDir: paths.logsDir, limit: RUNS_ON_DASHBOARD }),
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
@@ -277,6 +279,31 @@ function toLines(text: string): string[] {
 }
 
 /**
+ * One meter per spend window whose cap the admin can read (the overlay sets it). The day meter always shows
+ * (parity with the single-window panel); week/month meters show only when their overlay cap is set. Each
+ * meter's state comes from the worker's own `windowState`, so the bar's amber/red marker cannot drift from
+ * what `reserveBudget` enforces. `meter` renders "cap unknown" for a window with no readable cap, so a
+ * missing overlay cap degrades in place rather than guessing a denominator.
+ */
+function budgetMeters(budget: any, settings: any, width: number): string[] {
+  const overlay = settings?.overlay ?? {};
+  const pct = Number.isInteger(overlay.softHoldPct) ? overlay.softHoldPct : null;
+  const specs = [
+    { key: "day", cap: overlay.dailyCap, always: true },
+    { key: "week", cap: overlay.weeklyCap, always: false },
+    { key: "month", cap: overlay.monthlyCap, always: false },
+  ];
+  const out: string[] = [];
+  for (const s of specs) {
+    if (!s.always && !Number.isInteger(s.cap)) continue;
+    const reserved = Number(budget?.[s.key] ?? 0);
+    const state = Number.isInteger(s.cap) ? windowState(reserved, s.cap, pct) : "ok";
+    out.push(meter(reserved, s.cap, width, state));
+  }
+  return out;
+}
+
+/**
  * Compose the monochrome framed panel from the last snapshot alone, reusing the slash-command renderers so
  * the panel and the commands cannot drift. A null snapshot is the pre-first-fetch loading state; a snapshot
  * carrying `unreachable` degrades the whole panel to one line rather than a wall of empty sections. A width
@@ -315,8 +342,8 @@ function renderPanel(snapshot: any, width: number, state: any): string[] {
     {
       title: "SPEND",
       lines: [
-        renderBudget({ budget: snapshot.budget, settings: snapshot.settings }),
-        meter(snapshot.budget?.reserved, snapshot.settings?.overlay?.dailyCap, framed ? inner : 24),
+        ...toLines(renderBudget({ budget: snapshot.budget, settings: snapshot.settings })),
+        ...budgetMeters(snapshot.budget, snapshot.settings, framed ? inner : 24),
       ],
     },
     { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, flows: snapshot.flows })) },

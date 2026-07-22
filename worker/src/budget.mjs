@@ -1,55 +1,133 @@
 /**
  * CONST-BUDGET-BEFORE-TOKENS. The ordering IS the mechanism.
  *
- * Reserve a slot against the daily cap BEFORE a container starts. Check-after-spend means fifty
+ * Reserve a slot against the spend caps BEFORE a container starts. Check-after-spend means fifty
  * junk triggers cost fifty jobs of real money before the cap engages -- the exact scenario the cap
- * exists for. So: atomically INCR the day's counter, and only start the container if the reserved
- * number is within the cap.
+ * exists for. So: atomically INCR each active window's counter, and only start the container if every
+ * window is within its cap and outside its soft-hold band.
  *
  * INCR is atomic -- verified against a real Valkey under 20 parallel increments yielding exactly
  * 20, no lost updates -- so this needs no lock even at concurrency 3. Three jobs racing at count 9
  * with cap 10 reserve 10, 11, 12; exactly one proceeds, the others are refused, and no container
  * starts over budget.
  *
+ * Three windows bound spend on different horizons: a mandatory DAY cap, plus OPTIONAL WEEK and MONTH
+ * ceilings (REQ-SPEND-CAPS-MULTI-WINDOW). A window whose cap is null/absent is disabled -- not counted,
+ * not evaluated. On top of the hard caps a single SOFT-HOLD percentage refuses new starts once any
+ * window enters its band (e.g. >= 80% of that window's cap), a distinct operator-visible brake before
+ * the hard wall; in-flight containers are untouched because the reservation happens pre-container.
+ *
  * `redis` is any ioredis-compatible client (BullMQ bundles ioredis). Injected so the logic is
  * testable without a running server.
  */
 
-/** UTC date key. The worker is ordinary node, so Date is available (unlike the workflow sandbox). */
+/** UTC day key: `budget:YYYY-MM-DD`. */
 export function dayKey(now = new Date(), prefix = "budget") {
-	const d = now.toISOString().slice(0, 10); // YYYY-MM-DD, UTC
-	return `${prefix}:${d}`;
-}
-
-const TWO_DAYS_SECONDS = 2 * 24 * 60 * 60;
-
-/**
- * Atomically reserve one slot against today's cap. Returns { allowed, reserved, cap }.
- *
- * A refused reservation still counts -- the counter bounds container STARTS per day, and a refused
- * job spends nothing (no container) and reports on its issue. We deliberately do NOT decrement on
- * refusal: the cap is a hard daily ceiling on attempts, and letting refused attempts "give back"
- * their slot would let a burst probe the cap for free.
- *
- * A cap of 0 or negative disables running entirely (every job refused) rather than meaning
- * "unlimited" -- fail closed, since this guards money.
- */
-export async function reserveBudget(redis, { cap, now = new Date(), keyPrefix = "budget" } = {}) {
-	const key = dayKey(now, keyPrefix);
-	const reserved = Number(await redis.incr(key));
-	// Set the TTL only once, when the key is first created (reserved === 1), so a long-running
-	// day cannot have its expiry pushed forward indefinitely.
-	if (reserved === 1) await redis.expire(key, TWO_DAYS_SECONDS);
-	return { allowed: reserved <= cap, reserved, cap };
+	return `${prefix}:${now.toISOString().slice(0, 10)}`; // YYYY-MM-DD, UTC
 }
 
 /**
- * Give a reservation back. Used ONLY when the container never started because of an INFRA fault
- * AFTER reserving (e.g. the docker daemon was unreachable) -- an infra failure that spent nothing
- * should not permanently consume a cap slot. NOT used for a completed run (0/2), which really did
- * consume its slot, nor for an exit-1 infra retry (the container ran and spent), nor for a refusal
- * (which never incremented past the cap deliberately).
+ * UTC week key, bucketed by the Monday of the run's week: `budget:w:YYYY-MM-DD` (that Monday's date).
+ * Keying by an actual date sidesteps ISO week-number edge cases (week 53, year rollovers) while still
+ * mapping every run in one Mon-Sun week to one key. The `w:` sub-namespace never collides with the day
+ * key (`budget:YYYY-MM-DD`).
  */
-export async function releaseBudget(redis, { now = new Date(), keyPrefix = "budget" } = {}) {
-	await redis.decr(dayKey(now, keyPrefix));
+export function weekKey(now = new Date(), prefix = "budget") {
+	const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+	const sinceMonday = (d.getUTCDay() + 6) % 7; // Mon=0 .. Sun=6
+	d.setUTCDate(d.getUTCDate() - sinceMonday);
+	return `${prefix}:w:${d.toISOString().slice(0, 10)}`;
+}
+
+/** UTC month key: `budget:m:YYYY-MM`. The `m:` sub-namespace never collides with the day/week keys. */
+export function monthKey(now = new Date(), prefix = "budget") {
+	return `${prefix}:m:${now.toISOString().slice(0, 7)}`; // YYYY-MM, UTC
+}
+
+// Each window's TTL outlives its bucket with slack, so a stale counter is reclaimed shortly after the
+// window rolls over. Set once, on first reservation only (reserved === 1), so a busy window cannot push
+// its own expiry forward indefinitely.
+const DAY_TTL_SECONDS = 2 * 24 * 60 * 60; // outlives the UTC day
+const WEEK_TTL_SECONDS = 9 * 24 * 60 * 60; // outlives the Mon-Sun week
+const MONTH_TTL_SECONDS = 40 * 24 * 60 * 60; // outlives the longest month
+
+/**
+ * Classify one window's reserved count against its cap and the soft-hold band. PURE, and exported so the
+ * worker's `reserveBudget` and the admin panel compute the same state from the same inputs and cannot
+ * drift on where the band and the wall begin (the read-model already imports `dayKey` for the same reason).
+ *
+ *   reserved > cap                      -> "over"       (hard cap exceeded; also fails closed for cap <= 0)
+ *   reserved > floor(cap * pct / 100)   -> "soft-hold"  (inside the band; only when pct is set)
+ *   otherwise                           -> "ok"
+ *
+ * `softHoldPct` null/absent disables the band. Callers only classify ACTIVE windows (cap is a real number);
+ * a disabled window (cap null) is never passed here.
+ */
+export function windowState(reserved, cap, softHoldPct = null) {
+	if (reserved > cap) return "over";
+	if (Number.isInteger(softHoldPct) && reserved > Math.floor((cap * softHoldPct) / 100)) return "soft-hold";
+	return "ok";
+}
+
+/** The active windows for a `caps` set: day plus week/month only when their cap is set (not null/undefined). */
+function activeWindows(caps, now, keyPrefix) {
+	return [
+		{ name: "day", key: dayKey(now, keyPrefix), cap: caps?.day, ttl: DAY_TTL_SECONDS },
+		{ name: "week", key: weekKey(now, keyPrefix), cap: caps?.week, ttl: WEEK_TTL_SECONDS },
+		{ name: "month", key: monthKey(now, keyPrefix), cap: caps?.month, ttl: MONTH_TTL_SECONDS },
+	].filter((w) => w.cap !== null && w.cap !== undefined);
+}
+
+/**
+ * Atomically reserve one slot across every ACTIVE window. Returns
+ * `{ allowed, reason, blockedWindow, windows }` where `windows[name]` is `{ reserved, cap, state }` for an
+ * active window or `null` for a disabled one, and `reason` is the worst window state:
+ *   any "over"       -> "over-budget"
+ *   else any "soft-hold" -> "soft-hold"
+ *   else                 -> "ok"  (allowed)
+ * `blockedWindow` names the day>week>month-first window carrying that worst state, so the caller can say
+ * WHICH ceiling blocked. Both refusals are pre-container, so a refused job spends nothing; a soft-hold is
+ * refused exactly like over-budget, only under a distinct reason and an amber panel state.
+ *
+ * Every active window is INCR'd UNCONDITIONALLY -- the same "a refused reservation still counts, no
+ * give-back" invariant the daily cap has always had, now per window. This is deliberate: conditional
+ * increments would reintroduce the read-then-write race the atomic INCR design exists to avoid, and
+ * unconditional INCR keeps `releaseBudget` a clean symmetric DECR of the same windows. It fails closed --
+ * a burst that exhausts one window counts against the others too -- which is the money-safe direction.
+ *
+ * A cap of 0/negative on an ACTIVE window fails closed (every job "over") rather than meaning "unlimited";
+ * a DISABLED window (cap null/absent) is not counted or evaluated at all.
+ */
+export async function reserveBudget(redis, { caps, softHoldPct = null, now = new Date(), keyPrefix = "budget" } = {}) {
+	const windows = { day: null, week: null, month: null };
+	for (const w of activeWindows(caps, now, keyPrefix)) {
+		const reserved = Number(await redis.incr(w.key));
+		// Set the TTL only when the key is first created, so a long window cannot push its expiry forward.
+		if (reserved === 1) await redis.expire(w.key, w.ttl);
+		windows[w.name] = { reserved, cap: w.cap, state: windowState(reserved, w.cap, softHoldPct) };
+	}
+
+	const order = ["day", "week", "month"];
+	for (const [state, reason] of [
+		["over", "over-budget"],
+		["soft-hold", "soft-hold"],
+	]) {
+		const hit = order.find((name) => windows[name]?.state === state);
+		if (hit) return { allowed: false, reason, blockedWindow: hit, windows };
+	}
+	return { allowed: true, reason: "ok", blockedWindow: null, windows };
+}
+
+/**
+ * Give a reservation back in every window `reserveBudget` would have reserved. Used ONLY when the container
+ * never started because of an INFRA fault AFTER reserving (e.g. the docker daemon was unreachable) -- an
+ * infra failure that spent nothing should not permanently consume a slot. DECRs exactly the ACTIVE windows,
+ * mirroring `reserveBudget` so the refund cannot drift from the reservation. NOT used for a completed run
+ * (which really consumed its slot), an exit-1 infra retry (the container ran and spent), or an
+ * over-budget/soft-hold refusal (which never gives back its slot, deliberately).
+ */
+export async function releaseBudget(redis, { caps, now = new Date(), keyPrefix = "budget" } = {}) {
+	for (const w of activeWindows(caps, now, keyPrefix)) {
+		await redis.decr(w.key);
+	}
 }

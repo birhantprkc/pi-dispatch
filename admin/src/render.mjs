@@ -10,7 +10,16 @@
  * from here to a `.log` file (asserted by render.test.mjs).
  */
 
-const SETTINGS_KEYS = ["model", "provider", "maxTurns", "dailyCap", "concurrency"];
+import { windowState } from "@pi-dispatch/worker/budget";
+
+const SETTINGS_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "concurrency", "softHoldPct"];
+
+// The three spend windows and the overlay cap key each reads. Order is day -> week -> month.
+const BUDGET_WINDOWS = [
+  { key: "day", label: "day", capKey: "dailyCap" },
+  { key: "week", label: "week", capKey: "weeklyCap" },
+  { key: "month", label: "month", capKey: "monthlyCap" },
+];
 
 const RUN_COLUMNS = [
   { key: "jobId", header: "JOB ID" },
@@ -58,21 +67,39 @@ export function renderRuns(runs) {
 }
 
 /**
- * Render the budget: reserved count and the daily cap. The cap is only known to the admin when the
- * overlay sets `dailyCap`; otherwise the worker resolves it from its own env/default, which this process
- * cannot read authoritatively, so it renders as unknown rather than a guessed number.
+ * Render the budget across the day/week/month windows, each `reserved / cap [state]`. A cap is only known
+ * to the admin when the overlay sets it; otherwise the worker resolves it from its own env/default, which
+ * this process cannot read authoritatively, so it renders as unknown rather than a guessed number. The
+ * per-window state ("soft-hold" / "over") is computed via the worker's own `windowState` -- the same
+ * classifier `reserveBudget` uses -- so the panel and the enforcement cannot drift.
+ *
+ * The day line always shows (parity with the single-window view). Week/month lines show only when they are
+ * actually in play -- the overlay sets their cap, or the window has a non-zero reserved count (an
+ * env-configured window the admin can see reserving but whose cap it cannot read). The soft-hold line shows
+ * only when the overlay sets `softHoldPct`.
  */
 export function renderBudget({ budget, settings } = {}) {
   if (!budget || budget.unreachable) {
     return `Budget: unreachable (${budget?.unreachable ?? "unknown"})`;
   }
-  return `Budget: reserved ${budget.reserved ?? 0} / cap ${capLabel(settings)}`;
+  const overlay = (settings && settings.overlay) ?? {};
+  const pct = Number.isInteger(overlay.softHoldPct) ? overlay.softHoldPct : null;
+  const lines = ["Budget:"];
+  for (const w of BUDGET_WINDOWS) {
+    const reserved = Number(budget[w.key] ?? 0);
+    const cap = overlay[w.capKey];
+    if (w.key !== "day" && !Number.isInteger(cap) && reserved === 0) continue; // window not in play
+    lines.push(`  ${w.label}: reserved ${reserved} / cap ${capLabel(cap, reserved, pct)}`);
+  }
+  if (pct !== null) lines.push(`  soft-hold band: ${pct}%`);
+  return lines.join("\n");
 }
 
-function capLabel(settings) {
-  const overlay = settings && settings.overlay;
-  if (overlay && Number.isInteger(overlay.dailyCap)) return `${overlay.dailyCap} (overlay)`;
-  return "unknown (worker env/default)";
+/** One window's cap + state suffix: the overlay cap and its classified state, or the unknown-cap notice. */
+function capLabel(cap, reserved, pct) {
+  if (!Number.isInteger(cap)) return "unknown (worker env/default)";
+  const state = windowState(reserved, cap, pct);
+  return state === "ok" ? `${cap} (overlay)` : `${cap} (overlay) [${state}]`;
 }
 
 /**

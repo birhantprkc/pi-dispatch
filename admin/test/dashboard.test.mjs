@@ -22,7 +22,7 @@ const fakeTui = () => ({ requestRender() {} });
 
 const SNAPSHOT = {
   queue: { pausedState: true, counts: { waiting: 2, active: 1, paused: 0, delayed: 0, failed: 3 }, workers: 1 },
-  budget: { reserved: 5 },
+  budget: { day: 5, week: 0, month: 0 },
   settings: { path: "/s", overlay: { model: "claude-x", dailyCap: 25 } },
   runs: [
     {
@@ -234,6 +234,31 @@ test("the spend meter shows a filled bar against a known cap, and (cap unknown) 
   assert.match(knownOut, /[█]/, "a filled block glyph fills the bar");
   assert.match(unknownOut, /cap unknown/, "an unknown cap renders as text");
   assert.doesNotMatch(unknownOut, /[█]/, "no bar is drawn against an unknown denominator");
+});
+
+test("the spend panel shows the soft-hold state (amber-as-text) when a window is in the band", async () => {
+  // day cap 10, softHoldPct 80 -> threshold 8; reserved 9 is in-band, week/month set so all three meter.
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => ({
+        ...SNAPSHOT,
+        budget: { day: 9, week: 1, month: 1 },
+        settings: { path: "/s", overlay: { dailyCap: 10, weeklyCap: 50, monthlyCap: 200, softHoldPct: 80 } },
+      }),
+    }),
+  });
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+
+  assert.match(out, /day: reserved 9 \/ cap 10 \(overlay\) \[soft-hold\]/, "the day window text shows soft-hold");
+  assert.match(out, /soft-hold band: 80%/, "the configured band is shown");
+  assert.match(out, /9\/10 soft-hold/, "the day meter carries the soft-hold marker (monochrome, so text not colour)");
+  assert.match(out, /week: reserved 1 \/ cap 50/, "the week window is listed once its cap is set");
 });
 
 test("the TRIGGERS section unifies the label allowlist with the schedulers block", async () => {
