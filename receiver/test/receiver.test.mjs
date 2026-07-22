@@ -8,7 +8,7 @@ const SECRET = "test-webhook-secret";
 const SELF_ID = 999;
 const cfg = {
 	webhookSecret: SECRET,
-	labelFlows: { "pi:frontend": "frontend-fix" },
+	labelFlows: { "frontend-fix": { any: ["pi:frontend"] } },
 	commentTrigger: { phrase: "@pi", defaultFlow: null },
 };
 

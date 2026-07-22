@@ -445,7 +445,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and one
   self-refreshing TUI overlay component with **three in-component views**: **LIST** — a framed
   monochrome panel carrying a status bar, a SPEND meter, a unified **TRIGGERS** pane that shows
-  schedulers plus `label -> flow` mappings **display-only**, and an interactive runs list with `↑↓`
+  schedulers plus the per-flow `{any, all, none}` trigger rules **display-only**, and an interactive runs list with `↑↓`
   selection; **RUN_DETAIL** — a drill-in dump of the selected run's PII-free `.json` run-record fields;
   and **LIVE_TAIL** — a view that tails a running job's `.log` **inside the overlay** through an
   injected `deps.tailLog` seam whose `fs` read lives in `index.ts`. The LLM-callable tools are reads,

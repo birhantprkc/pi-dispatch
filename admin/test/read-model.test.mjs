@@ -265,10 +265,32 @@ test("readSchedulers returns { unreachable } on a connection error", async () =>
   assert.match(res.unreachable, /down/);
 });
 
-test("readFlows returns the label->flow mappings", () => {
-  const files = { "receiver.flows.json": JSON.stringify({ "pi:frontend": "frontend-fix", "pi:backend": "backend-fix" }) };
+test("readFlows returns the normalized per-flow rules", () => {
+  const files = {
+    "receiver.flows.json": JSON.stringify({
+      "frontend-fix": { any: ["pi:frontend"] },
+      "backend-fix": { any: ["pi:backend"], none: ["wontfix"] },
+    }),
+  };
   const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
-  assert.deepEqual(res.mappings, { "pi:frontend": "frontend-fix", "pi:backend": "backend-fix" });
+  assert.deepEqual(res.rules, {
+    "frontend-fix": { any: ["pi:frontend"], all: [], none: [] },
+    "backend-fix": { any: ["pi:backend"], all: [], none: ["wontfix"] },
+  });
+});
+
+test("readFlows skips a rule whose value is not an object (viewer degrades)", () => {
+  const files = {
+    "receiver.flows.json": JSON.stringify({ "frontend-fix": { any: ["pi:frontend"] }, "backend-fix": "backend-fix" }),
+  };
+  const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
+  assert.deepEqual(res.rules, { "frontend-fix": { any: ["pi:frontend"], all: [], none: [] } });
+});
+
+test("readFlows returns { invalid } when the file is a JSON array", () => {
+  const files = { "receiver.flows.json": JSON.stringify(["frontend-fix"]) };
+  const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
+  assert.ok(res.invalid, "a top-level array is invalid, not a rule object");
 });
 
 test("readFlows returns { missing:true } when the file is absent (viewer degrades)", () => {

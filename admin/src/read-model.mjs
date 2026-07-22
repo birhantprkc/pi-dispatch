@@ -414,9 +414,11 @@ export function readSettingsView({ settingsFile, fs = nodeFs }) {
 }
 
 /**
- * Read the receiver's committed label->flow allowlist for display. Unlike the receiver's fail-loud loader
- * (boot semantics), a viewer degrades: an absent file is `{ missing: true }`, malformed content is
- * `{ invalid }`, and only string flows survive into `{ mappings }`.
+ * Read the receiver's committed per-flow `{any, all, none}` trigger rules for display. Unlike the
+ * receiver's fail-loud loader (boot semantics), a viewer degrades: an absent file is `{ missing: true }`,
+ * malformed content is `{ invalid }`, and each rule normalizes into `{ rules: { <flow>: {any, all, none} } }`
+ * with missing selectors defaulting to `[]` and non-string members dropped. A value that is not an object
+ * is skipped, not fatal.
  */
 export function readFlows({ flowsPath, fs = nodeFs }) {
   let text;
@@ -432,13 +434,24 @@ export function readFlows({ flowsPath, fs = nodeFs }) {
     return { invalid: "flows file is not valid JSON" };
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { invalid: "flows file must be a label -> flow object" };
+    return { invalid: "flows file must be a flow -> rule object" };
   }
-  const mappings = {};
-  for (const [label, flow] of Object.entries(parsed)) {
-    if (typeof flow === "string" && flow.trim() !== "") mappings[label] = flow;
+  const rules = {};
+  for (const [flowName, rule] of Object.entries(parsed)) {
+    if (rule === null || typeof rule !== "object" || Array.isArray(rule)) continue;
+    rules[flowName] = {
+      any: normalizeSelector(rule.any),
+      all: normalizeSelector(rule.all),
+      none: normalizeSelector(rule.none),
+    };
   }
-  return { mappings };
+  return { rules };
+}
+
+// Custom: fail-soft display normalizer, not the receiver's fail-loud validator; a viewer degrades, never throws.
+function normalizeSelector(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((member) => typeof member === "string");
 }
 
 /** The sanitized ids present in the logs dir (from `*.json` filenames), for `logs <id>` autocomplete. */
