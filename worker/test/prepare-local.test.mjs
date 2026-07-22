@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -43,6 +43,14 @@ test("prepares a local git folder: materialises .pi/ from HEAD, writes the task,
 	assert.ok(result.materialised.includes("pi/skills/tidy/SKILL.md"));
 	// the symlink is NOT materialised -- the local path inherits the git materialiser's safety
 	assert.ok(!result.materialised.some((p) => p.includes("EVIL")), "a hostile symlink must not materialise locally either");
+});
+
+test("creates a writable /outbox host dir and returns its path (the container's chain-request channel)", async () => {
+	const folder = localRepo();
+	const jobDir = mkdtempSync(join(tmpdir(), "pi-job-"));
+	const result = await prepareLocalWorkspace({ folder, task: "x", jobDir });
+	assert.equal(result.outboxDir, join(jobDir, "outbox"), "outboxDir is <jobDir>/outbox");
+	assert.ok(existsSync(result.outboxDir), "the outbox dir must exist on disk for the bind mount");
 });
 
 test("no GitHub anything: a local job needs no token, no repo, no network", async () => {

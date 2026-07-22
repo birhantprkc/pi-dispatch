@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { delimiter } from "node:path";
 import { test } from "node:test";
 import { configError, loadConfig } from "../src/config.mjs";
 
@@ -17,6 +18,50 @@ test("loads conservative defaults with an empty-ish env", () => {
 	assert.ok(c.logsDir.endsWith("/pi-dispatch/logs"), c.logsDir);
 	assert.equal(c.captureJobLogs, false);
 	assert.equal(c.logRetentionDays, 30);
+});
+
+test("AI-trigger / chaining knobs default conservatively", () => {
+	const c = loadConfig({});
+	assert.equal(c.chainDepthMax, 1);
+	assert.equal(c.chainMaxPerJob, 2);
+	assert.equal(c.dispatchRunPerHour, 3);
+	assert.deepEqual(c.dispatchRunRoots, []);
+});
+
+test("chaining / dispatch knobs take explicit values", () => {
+	const c = loadConfig({ PI_CHAIN_DEPTH_MAX: "3", PI_CHAIN_MAX_PER_JOB: "5", PI_DISPATCH_RUN_PER_HOUR: "10" });
+	assert.equal(c.chainDepthMax, 3);
+	assert.equal(c.chainMaxPerJob, 5);
+	assert.equal(c.dispatchRunPerHour, 10);
+});
+
+test("chaining / dispatch knobs accept 0 as a kill-switch (nonNegativeInt)", () => {
+	const c = loadConfig({ PI_CHAIN_DEPTH_MAX: "0", PI_CHAIN_MAX_PER_JOB: "0", PI_DISPATCH_RUN_PER_HOUR: "0" });
+	assert.equal(c.chainDepthMax, 0);
+	assert.equal(c.chainMaxPerJob, 0);
+	assert.equal(c.dispatchRunPerHour, 0);
+});
+
+test("chaining / dispatch knobs reject negatives and non-integers as config errors", () => {
+	for (const name of ["PI_CHAIN_DEPTH_MAX", "PI_CHAIN_MAX_PER_JOB", "PI_DISPATCH_RUN_PER_HOUR"]) {
+		for (const bad of ["-1", "abc", "1.5"]) {
+			assert.throws(() => loadConfig({ [name]: bad }), (e) => e.piDispatchConfig === true, `${name}=${bad}`);
+		}
+	}
+});
+
+test("dispatchRunRoots splits on path.delimiter, trims, drops empties", () => {
+	assert.deepEqual(loadConfig({ PI_DISPATCH_RUN_ROOTS: ["/srv/a", "/srv/b"].join(delimiter) }).dispatchRunRoots, ["/srv/a", "/srv/b"]);
+	assert.deepEqual(
+		loadConfig({ PI_DISPATCH_RUN_ROOTS: `  /srv/a ${delimiter}${delimiter} /srv/b  ` }).dispatchRunRoots,
+		["/srv/a", "/srv/b"],
+	);
+});
+
+test("dispatchRunRoots defaults to [] and empty/whitespace yields [] (fail-closed)", () => {
+	assert.deepEqual(loadConfig({}).dispatchRunRoots, []);
+	assert.deepEqual(loadConfig({ PI_DISPATCH_RUN_ROOTS: "" }).dispatchRunRoots, []);
+	assert.deepEqual(loadConfig({ PI_DISPATCH_RUN_ROOTS: `   ${delimiter}  ` }).dispatchRunRoots, []);
 });
 
 test("run-history env overrides logsDir, captureJobLogs, and logRetentionDays", () => {

@@ -6,6 +6,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { delimiter } from "node:path";
 
 export function configError(message) {
 	const error = new Error(message);
@@ -35,6 +36,16 @@ function nonNegativeInt(env, name, fallback) {
 	return boundedInt(env, name, fallback, 0, "a non-negative integer");
 }
 
+// Split a PATH-style list on the OS path delimiter (`;` on Windows, `:` elsewhere) so a Windows
+// drive-letter colon is not mistaken for a separator. Trims, drops empties. Entries are stored
+// verbatim; downstream (task 3.1) realpaths them, so no posix normalisation happens here.
+function delimitedList(raw) {
+	return (raw ?? "")
+		.split(delimiter)
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+}
+
 /**
  * Parse the worker's config from `env` (default process.env). All defaults are conservative:
  * spend controls (`PI_DAILY_CAP`, `PI_MAX_TURNS`) exist to bound money, so they default low, and a
@@ -57,6 +68,10 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		settingsFile: env.PI_SETTINGS_FILE || defaultSettingsFile(), // || (not ??) so an empty string falls back; INT-CONFIG-OVERLAY-CONTRACT
 		captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1", // no-pii-in-logs: raw job-log capture is opt-in; anything but "1" is off
 		logRetentionDays: nonNegativeInt(env, "PI_LOG_RETENTION_DAYS", 30), // 0 = keep forever
+		chainDepthMax: nonNegativeInt(env, "PI_CHAIN_DEPTH_MAX", 1), // DES-JOB-OUTBOX-CHAINING; 0 = chaining kill-switch (fail-closed)
+		chainMaxPerJob: nonNegativeInt(env, "PI_CHAIN_MAX_PER_JOB", 2), // INT-OUTBOX-CONTRACT: max request-<n>.json collected per parent
+		dispatchRunPerHour: nonNegativeInt(env, "PI_DISPATCH_RUN_PER_HOUR", 3), // DES-ADMIN-VIA-PI-EXTENSION; 0 = disable dispatch_run
+		dispatchRunRoots: delimitedList(env.PI_DISPATCH_RUN_ROOTS), // DES-AI-TRIGGER-FLOW-GATE: default [] fails closed — no folder passes, dispatch_run refuses everything
 		github: loadGitHubAuth(env, fileExists),
 	};
 }

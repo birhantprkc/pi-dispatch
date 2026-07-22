@@ -99,7 +99,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 
 	const captured = calls[0];
 	captured?.redis?.disconnect?.(); // release the background reconnect handle
-	// The persistent schedulerQueue opens its own ioredis connection; close it so the suite leaks no handle.
+	// The persistent runtimeQueue opens its own ioredis connection; close it so the suite leaks no handle.
 	await captured?.extraClosers?.[0]?.close?.().catch(() => {});
 
 	const logs = lines.map((l) => {
@@ -229,6 +229,12 @@ test("job_completed carries reason when the result has one and omits it otherwis
 	assert.ok(!("reason" in nr), "reason must be omitted from a clean success line");
 });
 
+test("chain wiring: the outbox collectChain is wired into deps as a function", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { deps } = await runStart({ makeAuth, makeHost: () => fakeHost() });
+	assert.equal(typeof deps.collectChain, "function", "the outbox chain collector must be wired into deps.collectChain");
+});
+
 // Cron wiring. DEFAULT env => no PI_SCHEDULES_FILE => schedules=[] => reconcile is skipped, so these
 // assert the wiring that runs even with cron disabled: no live Valkey required.
 test("cron wiring: a stalled listener is registered and schedules_installed precedes worker_started", { skip }, async () => {
@@ -238,11 +244,11 @@ test("cron wiring: a stalled listener is registered and schedules_installed prec
 	// (a) the money backstop is keyed on "stalled" -- the guard's onStalled is registered there.
 	assert.equal(typeof registered.stalled, "function", "a stalled listener (the scheduler stall guard) must be registered");
 
-	// (c) the persistent schedulerQueue is handed to createWorker as an extraCloser so shutdown drains it.
+	// (c) the persistent runtimeQueue is handed to createWorker as an extraCloser so shutdown drains it.
 	assert.equal(
 		typeof captured.extraClosers?.[0]?.close,
 		"function",
-		"the schedulerQueue must be registered as extraClosers[0] with a close()",
+		"the runtimeQueue must be registered as extraClosers[0] with a close()",
 	);
 
 	// (d) empty schedule set still emits schedules_installed {0,0} so the operator sees cron is off.

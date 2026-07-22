@@ -92,6 +92,13 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 		turns: source.turns ?? null,
 		budgetReserved: source.budgetReserved ?? null,
 		attempt: job.attemptsMade ?? 0,
+		// Chain telemetry (INT-RUN-HISTORY-FILE-CONTRACT): additive and nullable, explicit literals, no spread.
+		// parentJobId/chainDepth come from a chained child's own job.data; chainRefused counts a PARENT's
+		// /outbox requests that were refused. A chain refusal is pre-enqueue of the child, so the `reason` enum
+		// stays untouched -- chainRefused is a separate int count, never a terminal reason.
+		parentJobId: data.parentJobId ?? null,
+		chainDepth: data.chainDepth ?? null,
+		chainRefused: source.chainRefused ?? null,
 	};
 }
 

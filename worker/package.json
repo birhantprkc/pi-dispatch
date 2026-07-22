@@ -12,6 +12,8 @@
   "exports": {
     ".": "./src/index.mjs",
     "./config": "./src/config.mjs",
+    "./flow-gate": "./src/flow-gate.mjs",
+    "./git-dirty": "./src/git-dirty.mjs",
     "./queue": "./src/queue.mjs",
     "./connection": "./src/connection.mjs",
     "./job-id": "./src/job-id.mjs",

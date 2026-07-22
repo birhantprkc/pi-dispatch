@@ -37,6 +37,10 @@ export async function runJob(job, deps) {
 		cleanup, // (dirs) => void
 		comment, // (job, text) => void   (issue status; no-op for local jobs)
 		log = () => {},
+		// The outbox chain collector (INT-OUTBOX-CONTRACT). No-op default so a job whose wiring omits it --
+		// or a github job with no /outbox -- chains nothing. It NEVER throws (outbox.mjs), so its counts are
+		// additive telemetry that can never flip the parent's completed outcome (CONST-RETRY-INFRA-ONLY).
+		collectChain = async () => ({ enqueued: 0, refused: 0 }),
 		now = new Date(),
 	} = deps;
 
@@ -99,8 +103,15 @@ export async function runJob(job, deps) {
 		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, budgetReserved: true };
 
 		switch (code) {
-			case EXIT_COMPLETED:
-				return { outcome: "completed", exitCode: code, turns, budgetReserved: true };
+			case EXIT_COMPLETED: {
+				// The SOLE chain-collection point. Read the completed parent's /outbox and enqueue children
+				// BEFORE the `finally` deletes jobDir -- the await resolves inside this case, so the read
+				// finishes before control leaves to cleanup. NOT reached on any other branch (policy, abort,
+				// over-budget, infra): an InfraRetry job is retried, so chaining there would double-enqueue.
+				// collectChain never throws; chainEnqueued/chainRefused are additive telemetry only.
+				const chain = await collectChain({ job, prepared });
+				return { outcome: "completed", exitCode: code, turns, budgetReserved: true, chainEnqueued: chain.enqueued, chainRefused: chain.refused };
+			}
 			case EXIT_POLICY:
 				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, budgetReserved: true };
 			case EXIT_INFRA:

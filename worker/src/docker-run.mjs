@@ -26,6 +26,7 @@ export const ISOLATION_FLAGS = [
  * @param env        the closed env map from buildContainerEnv -- passed as explicit -e NAME=VALUE
  * @param jobDir     host path to the /job inputs dir (contains prompt.md and pi/); mounted /job:ro
  * @param workspace  host path to the fresh clone / local folder (mounted /workspace:rw)
+ * @param outboxDir  host path to the /outbox chain-request dir (local jobs only); mounted /outbox:rw
  * @param name       container name (for `docker stop` at the timeout)
  * @param memory     e.g. "4g"; cpus e.g. "2"
  * @param extraFlags escape hatch for a Linux-only --user uid:gid on a bind-mounted local folder
@@ -35,6 +36,7 @@ export function buildDockerRunArgs({
 	env,
 	jobDir,
 	workspace,
+	outboxDir,
 	name,
 	memory = "4g",
 	cpus = "2",
@@ -58,6 +60,10 @@ export function buildDockerRunArgs({
 	// the agent cannot rewrite any of it. /workspace is the only writable mount.
 	if (jobDir) args.push("-v", `${jobDir}:/job:ro`);
 	args.push("-v", `${workspace}:/workspace`);
+	// Local jobs get a writable /outbox host bind, the same host-bind mechanism as /workspace
+	// (DES-WORKER-ON-HOST). github jobs pass no outboxDir, so the request channel does not exist for
+	// them -- an untrusted issue author cannot chain (INT-OUTBOX-CONTRACT).
+	if (outboxDir) args.push("-v", `${outboxDir}:/outbox`);
 
 	args.push(image);
 	return args;

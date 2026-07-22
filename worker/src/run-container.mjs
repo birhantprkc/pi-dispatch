@@ -52,6 +52,7 @@ export function makeRunContainer({
 			env,
 			jobDir: prepared.jobDir,
 			workspace: prepared.workspace,
+			outboxDir: prepared.outboxDir, // undefined for github jobs -> docker-run's guard skips the /outbox mount
 			name,
 		});
 

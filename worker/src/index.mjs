@@ -77,6 +77,12 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				cap: settings.dailyCap,
 				...deps,
 				runContainer: (ctx) => deps.runContainer({ ...ctx, name, signal }),
+				// collectChain (INT-OUTBOX-CONTRACT) reads the completed parent's REAL BullMQ job: its `.id`
+				// (the parent id children carry) and `.data` (kind/chainDepth). runJob's own `job` is the
+				// effectiveJob -- a spread of job.data with no `.id`/`.data` -- so inject the real wrapper here,
+				// mirroring the name/signal injection above. Omitted when unwired so a bare processor falls back
+				// to runJob's no-op default (a chain fault can never flip a completed outcome either way).
+				...(deps.collectChain ? { collectChain: (ctx) => deps.collectChain({ ...ctx, job }) } : {}),
 			});
 			recordRun({ job, result, startedAt, endedAt: new Date().toISOString() });
 			return result;

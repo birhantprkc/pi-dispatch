@@ -377,9 +377,10 @@ Evidence convention as in `constitution.md`.
     hand-maintained copy is exactly the reinvention `no-reimplementing-pi` forbids. For `anthropic` the
     call returns `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` — **the array order *is* the
     precedence**, which is precisely the trap this rule exists for.
-  - Mounts: `/job:ro`, `/workspace:rw`, and — **local jobs only** — `/outbox:rw` — delivered by named
-    volume + `volume-subpath`, never a host bind mount (`DES-JOB-FILES-VIA-VOLUME-SUBPATH`). No credential
-    is ever written to `/outbox` (same rule as `/workspace`).
+  - Mounts: `/job:ro`, `/workspace:rw`, and — **local jobs only** — `/outbox:rw` — delivered by host bind
+    mounts (`-v <hostPath>:<containerPath>`, per `DES-WORKER-ON-HOST` and `worker/src/docker-run.mjs`): the
+    worker runs on the host and binds the per-job inputs dir, the workspace folder, and the outbox dir
+    directly. No credential is ever written to `/outbox` (same rule as `/workspace`).
   - No TTY (`-it` absent)
   - **The agent dir must be writable by the non-root runtime user.** pi lazily creates
     `~/.pi/agent/` (mode `0700`) and `auth.json` (mode `0600`, contents `{}`) on the **first credential
@@ -524,7 +525,7 @@ Evidence convention as in `constitution.md`.
     "attempt":   <int>,
     "parentJobId": "<job id: same id-space as jobId>" | null,
     "chainDepth":  <int> | null,
-    "chainRefused": <bool> | null }
+    "chainRefused": <int> | null }   // count of chain requests refused on this parent; 0 = none
   ```
   Field order is the serialisation order (`JSON.stringify` emits insertion order). The filename uses the
   **sanitized** id (`:` → `_`, because `repeat:<sched>:<millis>` is NTFS-illegal); the record **body**
@@ -548,10 +549,12 @@ Evidence convention as in `constitution.md`.
   `.log`) keyed by the sanitized job id, no schema and no query surface — upholding this file's standing
   invariant that **there is deliberately no database**. The chain fields — `parentJobId`, `chainDepth`,
   `chainRefused` — are **additive and nullable**, set as explicit literals by the same no-spread
-  `buildRecord` (a chained job carries its parent id and host-computed depth; `chainRefused` marks a parent
-  whose own `/outbox` request was refused). The `reason` enum is **untouched**: a chain refusal is
+  `buildRecord` (a chained job carries its parent id and host-computed depth; `chainRefused` records how many
+  of a parent's own `/outbox` requests were refused). `chainRefused` is an **`<int>` count, not a boolean** —
+  the collector returns a running `refused` count, and the record stores it verbatim (`0` = none), so the runs
+  view can surface "2 refused" rather than a bare yes/no. The `reason` enum is **untouched**: a chain refusal is
   **pre-enqueue of the child**, so there is no child record and no new terminal reason — `chainRefused` is
-  a separate boolean on the **parent**, never an enum value.
+  a separate count on the **parent**, never an enum value.
 - **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`
 - **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
@@ -648,6 +651,7 @@ Evidence convention as in `constitution.md`.
 
 | Date | Change |
 |---|---|
+| 2026-07-22 | Corrected INT-CONTAINER-RUNTIME-CONTRACT's mount-mechanism sentence: the `/job:ro`, `/workspace:rw`, and local-only `/outbox:rw` mounts are host bind mounts (`-v host:container`), not the superseded named-volume + `volume-subpath` mechanism. Aligns the INT with `DES-WORKER-ON-HOST` and the shipped `worker/src/docker-run.mjs`. Also corrected INT-RUN-HISTORY-FILE-CONTRACT's `chainRefused` annotation from `<bool>` to `<int>` (a count of refused `/outbox` requests on the parent; `0` = none), matching the shipped `buildRecord`, which stores the collector's running `refused` count verbatim. |
 | 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |
 | 2026-07-22 | Added INT-OUTBOX-CONTRACT (container→worker `/outbox` request files: `request-<n>.json` byte-capped at 4 KiB, `folder`-ignored same-folder-only, validation order count→size→regular-file→parse→charset→host-computed depth→`ai-trigger` gate→enqueue, retry-idempotent child ids, completed-only collection, no mount for github parents, `task` as DATA never in the run record). Extended INT-CONTAINER-JOB-INPUTS and INT-CONTAINER-RUNTIME-CONTRACT with the writable `/outbox` mount (local jobs only; absent for github). Appended `parentJobId`/`chainDepth`/`chainRefused` (additive, nullable, no-spread) to INT-RUN-HISTORY-FILE-CONTRACT's record — the `reason` enum untouched, since a chain refusal is pre-enqueue of the child. |
 | 2026-07-21 | Added INT-CONFIG-OVERLAY-CONTRACT (admin extension → worker `settings.json` overlay: optional keys with bounds, atomic tmp+rename write, per-job-start read, fail-closed `settings-overlay-invalid` on a present-but-invalid file). Reworded INT-RUN-HISTORY-FILE-CONTRACT's boundary from worker→panel to worker→admin extension (repointing the read-model rationale to `DES-ADMIN-VIA-PI-EXTENSION`) and added `settings-overlay-invalid` to its `reason` enum. Clarified in INT-SCHEDULES-FILE-CONTRACT that `provider`/`model`/`maxTurns` are pure passthrough — absent from an entry means absent from job data, resolved against the overlay/env at job start. De-numeralized the intro (contract count no longer stated). |
