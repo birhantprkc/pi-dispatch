@@ -16,7 +16,8 @@ A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
   use, needs only a provider key), or a **GitHub repo** (cloned, worked, opened as a PR — needs a GitHub
   App).
 - **Triggers**: the **CLI** (operator-initiated, `DES-CLI-TRIGGER-FOR-LOCAL`; the admin extension operates
-  the queue but triggers no jobs), a **webhook** (GitHub issue activity), or **cron** (a schedule).
+  the queue and triggers no jobs except the gated `dispatch_run` enqueue), a **webhook** (GitHub issue
+  activity), or **cron** (a schedule).
 
 Everything below the trigger is identical: budget check → `/job:ro` inputs → one container → the runner
 → an exit code. What differs is authz (a label/collaborator gate for webhooks vs CLI access for
@@ -296,9 +297,9 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   **reads, `pause`/`resume`, and `dispatch_run`** (a gated enqueue); every settings write is an
   operator-typed command, never a model-invocable tool, and `dispatch_run` accordingly takes **no
   spend-knob argument** (`model`/`maxTurns`/`dailyCap`/`concurrency`).
-- **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs and
-  is never materialised into a job's `/job` inputs — `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's
-  own `.pi/` extensions, not this one.
+- **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs
+  except the gated `dispatch_run` enqueue, and is never materialised into a job's `/job` inputs —
+  `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's own `.pi/` extensions, not this one.
 - **Why**: See `DES-ADMIN-VIA-PI-EXTENSION` — a session-bound, port-less admin surface for a
   terminal-native operator, narrower than the superseded localhost panel. No model-callable tool can
   **raise** the daily cap: every settings write (dailyCap included) is operator-typed, and `dispatch_run`
@@ -395,3 +396,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-16 | **Scope de-GitHub-ified.** It said "triggers on GitHub issue activity" and never mentioned local folders, the CLI/panel, or cron -- stale, since local is now first-class and built. Rewritten as trigger × target. `REQ-JOB-STATUS-COMMENTS` scoped to GitHub jobs explicitly (a local job has no issue). New `REQ-LOCAL-JOB-VISIBILITY`: local jobs surface their outcome on the worker console (and later the panel) -- the local counterpart of the issue comment and the same signal for `CONST-PI-VERSION-PINNED`'s silent-no-op mode. Code updated to match: startWorker now logs one terminal line per job. |
 | 2026-07-21 | Added REQ-ADMIN-VIA-PI-EXTENSION (admin surface as a pi extension in `admin/`: operator observability/pause-resume/settings commands, reads-plus-pause/resume-only model tools, overlay-only raw logs) and REQ-RUNTIME-SETTINGS-PICKUP (per-job overlay re-read for model/provider/maxTurns/dailyCap; concurrency at next pickup). Rescoped panel references to the admin extension in Scope, `REQ-JOB-STATUS-COMMENTS`, `REQ-LOCAL-JOB-VISIBILITY`, and `REQ-DURABLE-RUN-HISTORY`. |
 | 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |
+| 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
