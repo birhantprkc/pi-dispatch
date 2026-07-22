@@ -159,6 +159,11 @@ session — no daemon, no web app, **no network port at all**. Load it with `pi 
 this checkout, add that path to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi
 inside this checkout: the in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
 
+Bare `/dispatch` opens a live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
+queue in place:
+
+![The /dispatch dashboard overlay: queue state, budget, recent runs, schedulers with next-fire drift, and the settings overlay in one live TUI panel](docs/images/dispatch-dashboard.svg)
+
 It adds `/dispatch` commands that run **locally, with no model involvement**:
 
 - `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
@@ -166,6 +171,8 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 - `runs` / `logs` — recent run records, and one run's raw log
 - `triggers` — the configured triggers (display only)
 - `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
+
+![Transcript of /dispatch status, /dispatch runs and /dispatch triggers output in a pi session](docs/images/dispatch-commands.svg)
 
 `/dispatch pause|resume|status` are a second interface over the **same durable switch** as
 `pi-dispatch pause|resume|status` (see **Steer the running worker** above), not a new mechanism; `runs`
