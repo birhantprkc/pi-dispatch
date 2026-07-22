@@ -8,20 +8,24 @@
  * key derivations and validators are IMPORTED from the worker, never re-implemented, so the admin and the
  * worker cannot drift on the budget key, the settings contract, or the id sanitiser.
  *
- * Read-only by construction: the budget read is a plain side-effect-free GET (never reserveBudget /
- * INCR / EXPIRE), the settings read never writes, and a viewer degrades -- an unreachable queue or an
- * absent file returns a discriminated `{ unreachable }` / `{ missing }` rather than throwing to the
- * command handler.
+ * Reads plus a small set of explicit writes: most functions are side-effect-free (the budget read is a
+ * plain GET, never reserveBudget / INCR / EXPIRE; the settings read never writes), and the writes are
+ * few and named -- `setQueuePaused`, `writeSettings`, and the one gated `enqueueDispatchRun`. A viewer
+ * degrades: an unreachable queue or an absent file returns a discriminated `{ unreachable }` /
+ * `{ missing }` rather than throwing to the command handler.
  */
 
 import * as nodeFs from "node:fs";
-import { join } from "node:path";
+import { join, delimiter, sep } from "node:path";
+import { execFileSync } from "node:child_process";
 import { defaultLogsDir } from "@pi-dispatch/worker/config";
 import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
-import { makeQueue } from "@pi-dispatch/worker/queue";
+import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
+import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
+import { gitDirty } from "@pi-dispatch/worker/git-dirty";
 
 // Re-exported so the command layer reaches the key contract through the admin's single worker-coupling
 // funnel, never re-deriving the five known keys.
@@ -40,7 +44,24 @@ export function resolvePaths(env = process.env) {
     settingsFile: settingsFilePath(env),
     flowsPath: env.RECEIVER_FLOWS_PATH ?? "deploy/receiver.flows.json",
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
+    // The two dispatch_run bounds the extension enforces producer-side, read DIRECTLY from env (never
+    // loadConfig, which throws on unrelated GitHub-auth problems). `delimitedList`/`nonNegativeInt` are
+    // private to the worker's config, so the same shapes are reimplemented here. Default roots [] fails
+    // closed: no folder passes the allowlist, so an AI-invoked dispatch_run refuses everything
+    // (DES-AI-TRIGGER-FLOW-GATE). Default per-hour cap 3 (DES-ADMIN-VIA-PI-EXTENSION).
+    dispatchRunRoots: (env.PI_DISPATCH_RUN_ROOTS ?? "")
+      .split(delimiter)
+      .map((s) => s.trim())
+      .filter(Boolean),
+    dispatchRunPerHour: parseNonNegInt(env.PI_DISPATCH_RUN_PER_HOUR, 3),
   };
+}
+
+/** Parse a non-negative integer from a raw env string; absent/empty/invalid falls back to `fallback`. */
+function parseNonNegInt(raw, fallback) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 && String(n) === String(raw).trim() ? n : fallback;
 }
 
 /**
@@ -80,6 +101,156 @@ export async function setQueuePaused({ url, paused, makeQueueFn = makeQueue, par
   } finally {
     if (queue) await queue.close().catch(() => {});
   }
+}
+
+// ~2h so a rolling-hour bucket outlives its hour and is reclaimed shortly after (mirrors budget's TTL idiom).
+const DISPATCH_RUN_TTL_SECONDS = 2 * 60 * 60;
+
+/**
+ * Resolve a folder's committed HEAD sha via `git -C <folder> rev-parse HEAD`, trimmed, or `null` on any
+ * error (mirrors gitDirty's shape). Operator-host-trusted and pre-enqueue: the sha pins the flow-gate read
+ * to the commit BEFORE the agent runs, so an agent cannot self-authorize by committing its own SKILL.md
+ * (DES-AI-TRIGGER-FLOW-GATE). `exec` is injectable for tests.
+ */
+export function revParseHead(folder, { exec = execFileSync } = {}) {
+  try {
+    const out = exec("git", ["-C", folder, "rev-parse", "HEAD"], { encoding: "utf8" });
+    const sha = out.trim();
+    return sha.length > 0 ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Enqueue a PAID local run -- the extension's one model-callable WRITE. Producer-side only: it spends
+ * nothing here, so every bound refuses BEFORE any container starts; the daily cap stays the worker
+ * processor's job (CONST-BUDGET-BEFORE-TOKENS). Returns a discriminated
+ * `{ ok, jobId } | { refused } | { unreachable }` (mirrors setQueuePaused's failFast open/close-in-finally).
+ *
+ * `aiInvoked` selects the bound set from the six-control analysis (DES-ADMIN-VIA-PI-EXTENSION):
+ *   - `true`  (the `dispatch_run` tool): folder allowlist + committed flow gate + per-hour rate limit,
+ *     plus the dirty-tree refusal.
+ *   - `false` (the operator's `/dispatch run`): the dirty-tree refusal ONLY -- typing the command IS the
+ *     approval, so the allowlist, gate, and rate limit are the AI path's compensating controls and are skipped.
+ * Validation runs cheapest/most-definitive first. No spend-knob param (model/maxTurns/dailyCap/concurrency)
+ * exists here; those resolve worker-side from the overlay/env. Refusal reasons carry folder/flow (operator
+ * config) but NEVER task text, and nothing here logs.
+ */
+export async function enqueueDispatchRun({
+  folder,
+  flow,
+  task,
+  aiInvoked,
+  env = process.env,
+  makeQueueFn = makeQueue,
+  parseConnectionFn = parseConnection,
+  readFlowGateFn = readFlowGate,
+  gitDirtyFn = gitDirty,
+  revParseHeadFn = revParseHead,
+  redisFn = makeRedisClient,
+  now = () => Date.now(),
+}) {
+  // 1. flow required (both paths). Cheapest and most definitive: a flowless AI trigger is refused, and the
+  // tool's `flow` is mandatory even though the CLI's `--flow` is optional.
+  if (typeof flow !== "string" || flow.trim() === "") {
+    return { refused: "no flow — a flow is required to trigger a run" };
+  }
+
+  const { valkeyUrl, dispatchRunRoots, dispatchRunPerHour } = resolvePaths(env);
+
+  // 2. aiInvoked ONLY -- fail-closed folder allowlist (realpath + containment). Default roots [] refuses all.
+  if (aiInvoked && !folderUnderRoots(folder, dispatchRunRoots)) {
+    return { refused: "folder not under PI_DISPATCH_RUN_ROOTS" };
+  }
+
+  // 3. dirty-tree, no force (BOTH paths). A local run edits the folder in place with no undo.
+  const dirty = gitDirtyFn(folder);
+  if (dirty === null) return { refused: "not a usable git repository" };
+  if (dirty) {
+    return { refused: "uncommitted changes — commit/stash, or use the CLI `pi-dispatch run --force`" };
+  }
+
+  // 4. aiInvoked ONLY -- committed flow gate at the pre-agent SHA. The sha is resolved here and NOT pinned
+  // into job data: the worker re-resolves at prepare, and the enqueue->run TOCTOU window is accepted
+  // (DES-AI-TRIGGER-FLOW-GATE). Only an exact `ai-trigger: allow` passes.
+  if (aiInvoked) {
+    const notTriggerable = `flow '${flow}' is not AI-triggerable (.pi/skills/${flow}/SKILL.md needs ai-trigger: allow at HEAD)`;
+    const sha = revParseHeadFn(folder);
+    if (typeof sha !== "string" || sha.trim() === "") return { refused: notTriggerable };
+    const { gate } = await readFlowGateFn({ folder, flow, sha });
+    if (gate !== "allow") return { refused: notTriggerable };
+  }
+
+  // 5. aiInvoked ONLY -- per-hour rate limit. INCR-then-compare like reserveBudget: a refused attempt still
+  // counts (no give-back), so a burst cannot probe the cap for free. A per-hour cap of 0 disables the tool.
+  if (aiInvoked) {
+    if (dispatchRunPerHour === 0) return { refused: "dispatch_run hourly limit (0) reached" };
+    let redis;
+    try {
+      redis = redisFn(valkeyUrl);
+      const key = hourKey(now());
+      const count = Number(await redis.incr(key));
+      if (count === 1) await redis.expire(key, DISPATCH_RUN_TTL_SECONDS);
+      if (count > dispatchRunPerHour) {
+        return { refused: `dispatch_run hourly limit (${dispatchRunPerHour}) reached` };
+      }
+    } catch (err) {
+      return { unreachable: err?.message ?? String(err) };
+    } finally {
+      if (redis) {
+        try {
+          redis.disconnect();
+        } catch {
+          // already closed
+        }
+      }
+    }
+  }
+
+  // 6. enqueue. A root run: no chainDepth/parentJobId, and provider/model/maxTurns stay absent so they
+  // resolve worker-side against the overlay/env (INT-CONFIG-OVERLAY-CONTRACT).
+  let queue;
+  try {
+    queue = makeQueueFn(parseConnectionFn(valkeyUrl, { failFast: true }));
+    const jobId = await enqueueLocalJob(queue, { folder, flow, task });
+    return { ok: true, jobId };
+  } catch (err) {
+    return { unreachable: err?.message ?? String(err) };
+  } finally {
+    if (queue) await queue.close().catch(() => {});
+  }
+}
+
+/**
+ * Fail-closed folder allowlist for the AI-invoked path: resolve the target's realpath and each root's
+ * realpath, and admit only when the target IS a root or is nested under one. Realpath defeats a symlink
+ * pointing out of a root; the `+ sep` containment defeats a sibling-prefix match (`/a/rootX` vs `/a/root`).
+ * Empty roots or any realpath error refuses (DES-ADMIN-VIA-PI-EXTENSION control 1).
+ */
+function folderUnderRoots(folder, roots) {
+  if (!Array.isArray(roots) || roots.length === 0) return false;
+  let realTarget;
+  try {
+    realTarget = nodeFs.realpathSync(folder);
+  } catch {
+    return false;
+  }
+  for (const root of roots) {
+    let realRoot;
+    try {
+      realRoot = nodeFs.realpathSync(root);
+    } catch {
+      continue; // an unresolvable root cannot admit anything; try the next
+    }
+    if (realTarget === realRoot || realTarget.startsWith(realRoot + sep)) return true;
+  }
+  return false;
+}
+
+/** Rolling-hour bucket key for the dispatch_run rate limit: `dispatch-run:YYYY-MM-DD-HH` (UTC). */
+function hourKey(nowMs) {
+  return `dispatch-run:${new Date(nowMs).toISOString().slice(0, 13).replace("T", "-")}`;
 }
 
 /**

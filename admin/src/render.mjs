@@ -19,6 +19,9 @@ const RUN_COLUMNS = [
   { key: "outcome", header: "OUTCOME" },
   { key: "reason", header: "REASON" },
   { key: "turns", header: "TURNS" },
+  // Derived: a `d<n>` chain-depth marker for an outbox-chained child, "-" for a root run. A custom
+  // derive is needed because `cell()` would render depth 0 as "0"; here depth 0/null/absent all read "-".
+  { key: "chain", header: "CHAIN", derive: (r) => (r?.chainDepth > 0 ? `d${r.chainDepth}` : "-") },
   { key: "endedAt", header: "ENDED" },
 ];
 
@@ -48,7 +51,7 @@ export function renderRuns(runs) {
   if (list.length === 0) return "No runs recorded.";
 
   const headers = RUN_COLUMNS.map((c) => c.header);
-  const rows = list.map((r) => RUN_COLUMNS.map((c) => cell(r?.[c.key])));
+  const rows = list.map((r) => RUN_COLUMNS.map((c) => (c.derive ? c.derive(r) : cell(r?.[c.key]))));
   const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i].length)));
   const fmt = (cells) => cells.map((v, i) => v.padEnd(widths[i])).join("  ").trimEnd();
   return [fmt(headers), ...rows.map(fmt)].join("\n");

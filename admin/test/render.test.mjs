@@ -31,7 +31,7 @@ test("renderStatus reports paused and unreachable", () => {
   assert.match(renderStatus({ unreachable: "down" }), /unreachable \(down\)/);
 });
 
-test("renderRuns aligns columns with a header and a data row", () => {
+test("renderRuns aligns columns with a header and a data row, including the chain marker", () => {
   const out = renderRuns([
     {
       jobId: "j1",
@@ -40,19 +40,23 @@ test("renderRuns aligns columns with a header and a data row", () => {
       outcome: "completed",
       reason: null,
       turns: 4,
+      chainDepth: 1,
       endedAt: "2026-07-21T00:00:00.000Z",
     },
   ]);
   assert.match(out, /JOB ID/);
+  assert.match(out, /CHAIN/);
   assert.match(out, /j1/);
   assert.match(out, /o\/r#5/);
   assert.match(out, /completed/);
+  assert.match(out, /\bd1\b/, "a chained child renders a d<n> depth marker");
 });
 
-test("renderRuns renders a fully-null record as dashes", () => {
-  const out = renderRuns([{ jobId: null, target: null, flow: null, outcome: null, reason: null, turns: null, endedAt: null }]);
+test("renderRuns renders a fully-null record as dashes (chain column included)", () => {
+  const out = renderRuns([{ jobId: null, target: null, flow: null, outcome: null, reason: null, turns: null, chainDepth: null, endedAt: null }]);
+  assert.match(out, /CHAIN/);
   const dataRow = out.split("\n")[1];
-  assert.match(dataRow, /^-(\s+-)+\s*$/);
+  assert.match(dataRow, /^-(\s+-)+\s*$/, "a non-chain record renders '-' in the chain column");
 });
 
 test("renderRuns degrades on empty and unreachable inputs", () => {
