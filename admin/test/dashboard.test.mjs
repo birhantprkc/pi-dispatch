@@ -67,6 +67,17 @@ test("renders every section from the last snapshot, reusing the command renderer
   assert.match(out, /q quit/, "key hints");
 });
 
+test("the LIST shows a PAUSE WINDOWS section and marks an active window with a resume countdown", async () => {
+  const snap = { ...SNAPSHOT, pauseWindows: { windows: [{ scope: "acme/web", from: "00:00", to: "23:59", tz: "UTC", fromMin: 0, toMin: 1439 }] } };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  const out = comp.render(90).join("\n");
+  await comp.dispose();
+  assert.match(out, /PAUSE WINDOWS/, "the pause-windows section renders");
+  assert.match(out, /acme\/web/, "the window's scope");
+  assert.match(out, /resumes in/, "an all-day window is active now -> resume countdown");
+});
+
 test("with a theme, the framed LIST is colored (ANSI present) but every line still fits the width", async () => {
   // A theme whose fg/bold emit real SGR, so the overlay is colored and the width stays ANSI-aware.
   const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };

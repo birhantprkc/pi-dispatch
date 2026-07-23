@@ -805,6 +805,34 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ---
 
+## DES-SCOPED-PAUSE-VIA-MOVE-TO-DELAYED
+
+- **Decision**: A per-folder/repo scheduled pause (`REQ-SCOPED-PAUSE-WINDOWS`) is enforced by **deferring**
+  the job, not dropping it: in the processor, before any spend, `pauseUntilMs(windows, job.data, now)` returns
+  the window-end ms for a scope-matching active window, and the worker calls `job.moveToDelayed(end, token)`
+  then throws `DelayedError` (BullMQ's own recognise-as-delayed signal). Windows live in a validated
+  `pause-windows.json`, boot-loaded fail-loud and live-reloaded through a directory watch — the exact
+  `triggers.json` machinery (shared validator, atomic write, keep-last-good-on-bad-edit). The predicate
+  `pauseUntilMs` and its timezone helpers are pure and injected-`now` testable; timezones use the built-in
+  `Intl` (a one-pass offset correction, DST-correct outside the ~1h transition seam).
+- **Why**:
+  - **Defer, not drop.** A `{ outcome: "policy" }` return (the existing refusal shape) would *drop* the job —
+    fine for over-budget, wrong for "pause then run after": a github issue job has no re-trigger, so dropping
+    loses it. `moveToDelayed` keeps the job's identity/dedup (the delivery-GUID jobId), survives restart
+    (Redis-persisted delayed set), and **auto-resumes** with no explicit unpause when BullMQ re-picks it.
+  - **Not the global pause.** BullMQ's `queue.pause()` is whole-queue, untimed, and has no per-job worker
+    hook to scope by folder/repo. The scoped gate is a separate check inside the pickup path; the two compose.
+  - **Before `reserveBudget`.** The gate sits first in the processor wrapper — before the kill timer, the
+    settings read, and the budget reservation — so a deferred job arms no timer, reserves no slot, and spends
+    nothing. Same placement discipline as the branch-protection and token-cap gates; consistent with
+    `CONST-BUDGET-BEFORE-TOKENS` (a deferred job is not a job start).
+  - **Library-first + no new dependency.** BullMQ owns the delay; `Intl` owns the timezone math. Keyed on
+    `job.data.repo` (github) / `job.data.folder` (local) by `job.data.kind`, `"*"` matching all.
+- **Traces to**: `REQ-SCOPED-PAUSE-WINDOWS`, `INT-PAUSE-WINDOWS-FILE-CONTRACT`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `DES-CRON-VIA-BULLMQ-SCHEDULER` (the live-reload template), `DES-ADMIN-VIA-PI-EXTENSION` (the confirm-gated CRUD)
+
+---
+
 ## Rejected alternatives (whole-project)
 
 Considered and declined. Recorded so they are not re-proposed.

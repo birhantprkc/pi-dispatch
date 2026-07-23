@@ -10,6 +10,7 @@ import { makeGitHubHost } from "./github-host.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
 import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
+import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
 import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter } from "./run-history.mjs";
@@ -55,6 +56,36 @@ function watchTriggersFile(config, queue, log) {
 		log("triggers_watching", { path });
 	} catch (err) {
 		log("triggers_watch_unavailable", { reason: err?.message });
+	}
+}
+
+/**
+ * Watch the DIRECTORY holding the pause-windows file (same atomic-rename robustness as the triggers watch)
+ * and hot-swap the in-memory windows in `ref.current` on change. A bad edit keeps the last-good windows in
+ * effect (OQ-008 live-edit safety) — the pause gate never loses its config to a typo. Best-effort + unref'd.
+ */
+function watchPauseWindowsFile(config, ref, log) {
+	const path = config.pauseWindowsFile;
+	const dir = dirname(path) || ".";
+	const file = basename(path);
+	let timer = null;
+	const reload = () => {
+		try {
+			ref.current = loadPauseWindows(config);
+			log("pause_windows_reloaded", { count: ref.current.length });
+		} catch (err) {
+			log("pause_windows_reload_invalid", { reason: err?.message });
+		}
+	};
+	try {
+		watch(dir, (_event, changed) => {
+			if (changed && changed !== file) return;
+			clearTimeout(timer);
+			timer = setTimeout(reload, 150);
+		}).unref?.();
+		log("pause_windows_watching", { path });
+	} catch (err) {
+		log("pause_windows_watch_unavailable", { reason: err?.message });
 	}
 }
 
@@ -105,6 +136,11 @@ export async function startWorker(
 	// before any Valkey contact, so a misconfigured schedule refuses startup loudly (configError) rather
 	// than upserting a broken scheduler. [] means cron disabled (no PI_TRIGGERS_FILE, or no cron triggers).
 	const schedules = loadSchedules(config);
+
+	// REQ-SCOPED-PAUSE-WINDOWS: load + validate the pause-windows file with the operator present and before any
+	// Valkey contact, so a malformed file refuses startup (configError) rather than silently disabling scoped
+	// pauses. Held in a mutable ref so the live-reload watcher can hot-swap it. [] means no scoped pauses.
+	const pauseWindows = { current: loadPauseWindows(config) };
 
 	let gh = null;
 	try {
@@ -185,6 +221,9 @@ export async function startWorker(
 		redis,
 		recordRun,
 		extraClosers: [runtimeQueue],
+		// REQ-SCOPED-PAUSE-WINDOWS: the processor defers a job whose folder/repo is inside an active window.
+		// Reads the live-reloaded ref, so an operator edit takes effect on the next job without a restart.
+		pauseUntil: (job, now) => pauseUntilMs(pauseWindows.current, job, now),
 		deps: {
 			collectChain,
 			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env, openJobLog }),
@@ -264,6 +303,12 @@ export async function startWorker(
 	// Only when a triggers file is configured; best-effort + unref'd; a bad edit keeps the running schedulers.
 	if (config.triggersFile) {
 		watchTriggersFile(config, runtimeQueue, log);
+	}
+
+	// REQ-SCOPED-PAUSE-WINDOWS live edit: watch the pause-windows file and hot-swap the in-memory windows, so
+	// an operator's add/delete of a pause window takes effect without a worker restart. A bad edit is kept out.
+	if (config.pauseWindowsFile) {
+		watchPauseWindowsFile(config, pauseWindows, log);
 	}
 
 	log("worker_started", {

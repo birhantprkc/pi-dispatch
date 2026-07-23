@@ -18,6 +18,8 @@ import {
   setQueuePaused,
   writeSettings,
   writeTriggers,
+  readPauseWindows,
+  writePauseWindows,
   enqueueDispatchRun,
   revParseHead,
 } from "../src/read-model.mjs";
@@ -136,6 +138,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
     schedulerStallMax: 2,
+    pauseWindowsPath: "deploy/pause-windows.json",
   });
 });
 
@@ -330,6 +333,28 @@ test("readSchedulers returns { unreachable } on a connection error", async () =>
   });
   const res = await readSchedulers({ url: "redis://x", makeQueueFn, parseConnectionFn: () => ({}) });
   assert.match(res.unreachable, /down/);
+});
+
+test("readPauseWindows returns normalized windows, and degrades on missing/invalid", () => {
+  const fs = triggerFs({ "pw.json": JSON.stringify({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00", tz: "Europe/Amsterdam" }] }) });
+  const ok = readPauseWindows({ pauseWindowsPath: "pw.json", fs });
+  assert.equal(ok.windows.length, 1);
+  assert.equal(ok.windows[0].tz, "Europe/Amsterdam");
+  assert.equal(ok.windows[0].fromMin, 22 * 60);
+  assert.deepEqual(readPauseWindows({ pauseWindowsPath: "absent.json", fs }), { missing: true });
+  const bad = readPauseWindows({ pauseWindowsPath: "b.json", fs: triggerFs({ "b.json": JSON.stringify({ windows: [{ scope: "x", from: "9", to: "10:00" }] }) }) });
+  assert.match(bad.invalid, /must be "HH:MM"/);
+});
+
+test("writePauseWindows validates through the shared parser and writes atomically; rejects a bad edit", () => {
+  const fs = triggerFs({ "pw.json": JSON.stringify({ windows: [] }) });
+  const add = writePauseWindows({ pauseWindowsPath: "pw.json", fs, mutate: (list) => [...list, { scope: "acme/web", from: "22:00", to: "06:00" }] });
+  assert.deepEqual(add, { ok: true });
+  assert.equal(JSON.parse(fs.files["pw.json"]).windows[0].scope, "acme/web");
+  assert.ok(!("pw.json.tmp" in fs.files), "the tmp file was renamed away (atomic)");
+  const bad = writePauseWindows({ pauseWindowsPath: "pw.json", fs, mutate: (list) => [...list, { scope: "x", from: "09:00", to: "09:00" }] });
+  assert.match(bad.invalid, /from and to must differ/);
+  assert.equal(JSON.parse(fs.files["pw.json"]).windows.length, 1, "a rejected edit leaves the file unchanged");
 });
 
 test("readTriggers normalizes each on.type into its discriminated display record", () => {

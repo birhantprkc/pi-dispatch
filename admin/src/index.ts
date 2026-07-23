@@ -47,10 +47,12 @@ import {
   readLogTail,
   readSettingsView,
   readTriggers,
+  readPauseWindows,
   listRunIds,
   setQueuePaused,
   writeSettings,
   writeTriggers,
+  writePauseWindows,
   enqueueDispatchRun,
   KNOWN_KEYS,
 } from "./read-model.mjs";
@@ -367,6 +369,83 @@ function registerTools(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "dispatch_pauses",
+    label: "pi-dispatch pause windows",
+    description:
+      "Read-only. Lists the scheduled pause windows (per folder/repo quiet hours) with their array index. " +
+      "Use the index for dispatch_pause_delete.",
+    parameters: Type.Object({}),
+    async execute() {
+      const paths = resolvePaths(process.env);
+      const p = readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath });
+      const data = Array.isArray(p?.windows) ? p.windows.map((w: any, index: number) => ({ index, ...w })) : p;
+      return toolText(JSON.stringify(data));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_pause_add",
+    label: "pi-dispatch add pause window",
+    description:
+      "Adds a scheduled pause window and applies it live: runs for `scope` (a repo \"owner/name\", a local " +
+      "folder path, or \"*\" for all) are DEFERRED between `from` and `to` (\"HH:MM\" 24h; from>to = overnight) " +
+      "and resume automatically after — nothing is dropped, and deferring costs no budget. Optional `tz` (IANA, " +
+      "default UTC), `days` (mon..sun), `dateFrom`/`dateTo` (\"YYYY-MM-DD\"). The operator MUST approve a confirm " +
+      "dialog showing the window; refused with no interactive operator.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      scope: Type.String(),
+      from: Type.String(),
+      to: Type.String(),
+      tz: Type.Optional(Type.String()),
+      days: Type.Optional(Type.Array(Type.String())),
+      dateFrom: Type.Optional(Type.String()),
+      dateTo: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const paths = resolvePaths(process.env);
+      const w = buildPauseWindow(params);
+      const result = await confirmedWrite(
+        ctx,
+        { title: "Add pause window", message: `Add to pause-windows.json:\n${JSON.stringify(w)}` },
+        () => {
+          const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (list: any[]) => [...list, w] });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, added: w };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_pause_delete",
+    label: "pi-dispatch delete pause window",
+    description:
+      "Removes a scheduled pause window (by array index from dispatch_pauses) and applies it live. The operator " +
+      "MUST approve a confirm dialog showing the window; refused with no interactive operator.",
+    executionMode: "sequential",
+    parameters: Type.Object({ index: Type.Integer({ minimum: 0 }) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const paths = resolvePaths(process.env);
+      const p = readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath });
+      const list = Array.isArray(p?.windows) ? p.windows : [];
+      const cur = list[params.index];
+      if (!cur) throw new Error(`no pause window at index ${params.index} (have ${list.length})`);
+      const result = await confirmedWrite(
+        ctx,
+        { title: `Delete pause window #${params.index + 1}`, message: `Remove pause window #${params.index + 1}: ${cur.scope} ${cur.from}-${cur.to} ${cur.tz}` },
+        () => {
+          const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (l: any[]) => l.filter((_, i) => i !== params.index) });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, deletedIndex: params.index };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
     name: "dispatch_trigger_delete",
     label: "pi-dispatch delete trigger",
     description:
@@ -453,6 +532,26 @@ function buildTriggerEntry(kind: string, f: any): any {
     return { on, run: { kind: "github", flow: f.flow } };
   }
   return null;
+}
+
+/**
+ * Build one pause-window entry from a kind-less field bag (shared by the `dispatch_pause_add` tool and the
+ * operator dialog). Required scope/from/to; optional tz/days/dateFrom/dateTo included only when non-blank so
+ * an omitted field drops out of the JSON. `days` accepts an array (tool) or a space-separated string (dialog).
+ * All value validation (time format, IANA tz, weekday names, date format) lives in the shared
+ * `parsePauseWindows`, which the write goes through — a bad value is rejected there, never written.
+ */
+function buildPauseWindow(f: any): any {
+  const w: any = { scope: String(f.scope ?? "").trim(), from: String(f.from ?? "").trim(), to: String(f.to ?? "").trim() };
+  const tz = optStr(f.tz);
+  const days = asWords(f.days);
+  const dateFrom = optStr(f.dateFrom);
+  const dateTo = optStr(f.dateTo);
+  if (tz) w.tz = tz;
+  if (days.length > 0) w.days = days;
+  if (dateFrom) w.dateFrom = dateFrom;
+  if (dateTo) w.dateTo = dateTo;
+  return w;
 }
 
 /** Normalise a labels/action field to a trimmed non-empty string list, accepting an array or a string. */
@@ -638,7 +737,54 @@ export async function handleDashboardAction(result: any, paths: any, ctx: any): 
       return deleteTriggerEntry(paths, ui, notify, result.index);
     case "editSettings":
       return editSettingsViaDialogs(paths, ui, notify);
+    case "managePauses":
+      return managePausesViaDialogs(paths, ui, notify);
   }
+}
+
+/** Pause-window management: pick add or delete, then run the matching dialog. Keeps one overlay key (`w`). */
+async function managePausesViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const action = await ui.select("Pause windows", ["Add a pause window", "Delete a pause window"]);
+  if (!action) return;
+  if (action.startsWith("Add")) return addPauseWindowViaDialogs(paths, ui, notify);
+  return deletePauseWindowViaDialogs(paths, ui, notify);
+}
+
+/** Add a pause window: scope + from/to, then the optional tz/days/date bounds (blank = omit). Validated + live. */
+async function addPauseWindowViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const scope = await ui.input("scope — a repo \"owner/name\", a local folder path, or \"*\" for all", "");
+  if (scope === undefined || scope.trim() === "") return;
+  const from = await ui.input("from — pause start \"HH:MM\" 24h (from > to = overnight)", "22:00");
+  if (from === undefined) return;
+  const to = await ui.input("to — resume time \"HH:MM\" 24h", "06:00");
+  if (to === undefined) return;
+  const tz = await ui.input("tz — IANA timezone (blank = UTC), e.g. Europe/Amsterdam", "");
+  if (tz === undefined) return;
+  const days = await ui.input("days — space-separated weekdays to restrict to (blank = every day), e.g. mon tue", "");
+  if (days === undefined) return;
+  const dateFrom = await ui.input("dateFrom — only on/after \"YYYY-MM-DD\" (blank = no bound)", "");
+  if (dateFrom === undefined) return;
+  const dateTo = await ui.input("dateTo — only on/before \"YYYY-MM-DD\" (blank = no bound)", "");
+  if (dateTo === undefined) return;
+  const w = buildPauseWindow({ scope, from, to, tz, days, dateFrom, dateTo });
+  const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (list: any[]) => [...list, w] });
+  notify?.(res.ok ? `pause window added (live) — ${w.scope} ${w.from}-${w.to}` : `add rejected: ${res.invalid}`, res.ok ? "info" : "error");
+}
+
+/** Delete a pause window: select which (by a scope/time label), confirm, remove. */
+async function deletePauseWindowViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const p = readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath });
+  const list: any[] = Array.isArray(p?.windows) ? p.windows : [];
+  if (list.length === 0) { notify?.("no pause windows to delete", "info"); return; }
+  const labels = list.map((w, i) => `#${i + 1}  ${w.scope}  ${w.from}-${w.to} ${w.tz}${w.days ? ` [${w.days.join(",")}]` : ""}`);
+  const picked = await ui.select("Delete which pause window", labels);
+  if (!picked) return;
+  const index = labels.indexOf(picked);
+  if (index < 0) return;
+  const ok = await ui.confirm("Delete pause window", `Remove ${labels[index]}?`);
+  if (!ok) return;
+  const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (l: any[]) => l.filter((_, i) => i !== index) });
+  notify?.(res.ok ? `pause window #${index + 1} deleted (live)` : `delete rejected: ${res.invalid}`, res.ok ? "info" : "error");
 }
 
 /** Add a trigger: kind-first (the on x run diagonal is locked by construction), then the per-kind fields. */

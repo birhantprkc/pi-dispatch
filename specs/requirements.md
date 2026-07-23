@@ -464,6 +464,35 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   unset, then usage is still accounted and no job is ever refused or aborted for tokens; given a pin bump that
   drops or reshapes `Usage`, then `REQ-UPSTREAM-CONTRACT-TESTS` fails the build, not a live job.
 
+## REQ-SCOPED-PAUSE-WINDOWS
+
+- **Statement**: The worker shall support **per-scope scheduled pause windows**: a `pause-windows.json`
+  (`PI_PAUSE_WINDOWS_FILE`) of `{ scope, from, to, tz?, days?, dateFrom?, dateTo? }` entries, where `scope`
+  matches a job's `repo` (github) or `folder` (local), or `"*"` for all. A job whose scope is inside an
+  active window is **deferred** to the window's end via BullMQ's delayed set (`job.moveToDelayed`), **not
+  dropped** — it keeps its jobId/dedup, survives restart, and resumes automatically when re-picked. The gate
+  runs **before the budget reservation**, so a deferred job reserves no slot and spends nothing. Windows
+  recur daily (`from`–`to`, overnight when `from > to`), optionally restricted to weekdays (`days`) and a
+  date range (`dateFrom`/`dateTo`), interpreted in the window's IANA `tz` (default UTC). The file is
+  validated fail-loud at boot and **live-reloaded** (a bad edit keeps the last-good windows). Pause windows
+  are managed operator-typed (`/dispatch` overlay) and via **confirm-gated** model tools
+  (`dispatch_pause_add`/`_delete`, `dispatch_pauses`), the same human-approval gate as the trigger/setting
+  writes (`REQ-ADMIN-VIA-PI-EXTENSION`).
+- **Scope**: The worker's pickup path (the receiver is unaffected — a github job is deferred at pickup, not
+  at enqueue). Distinct from the global `queue.pause()` (whole-queue, untimed) and additive to it.
+- **Why**: "Pause runs for this repo/folder between certain times and resume after" is quiet-hours. Deferring
+  (not dropping) is the point of "unpause after" — a github issue job paused at 22:00 runs after 06:00, not
+  lost. Placing the gate before `reserveBudget` keeps it consistent with `CONST-BUDGET-BEFORE-TOKENS` (a
+  deferred job costs nothing and does not count). BullMQ owns the delay (library-first); the timezone math
+  uses the built-in `Intl` (no dependency).
+- **Traces to**: `DES-SCOPED-PAUSE-VIA-MOVE-TO-DELAYED`, `INT-PAUSE-WINDOWS-FILE-CONTRACT`,
+  `CONST-BUDGET-BEFORE-TOKENS`, `REQ-ADMIN-VIA-PI-EXTENSION`
+- **Acceptance**: Given a window covering now for a job's scope, when the job is picked, then it is moved to
+  delayed until the window end and reserves no budget slot; given the same job out of the window, it runs;
+  given a malformed pause-windows edit at runtime, the worker logs `pause_windows_reload_invalid` and keeps
+  the last-good windows; given `dispatch_pause_add` with no interactive operator, it refuses and writes
+  nothing; given an approved confirm, it writes exactly the shown window.
+
 ---
 
 ## Notes (not requirements)

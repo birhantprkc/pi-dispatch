@@ -241,3 +241,63 @@ test("the extension advertises the operate-pi-dispatch skill via resources_disco
   assert.ok(Array.isArray(res.skillPaths) && res.skillPaths.length === 1, "advertises one skill dir");
   assert.ok(existsSync(join(res.skillPaths[0], "operate-pi-dispatch", "SKILL.md")), "the dir holds the skill");
 });
+
+// ── scoped pause windows (REQ-SCOPED-PAUSE-WINDOWS): same confirm-gated CRUD as triggers ─────────────────
+function tmpPauses(initial) {
+  const path = join(mkdtempSync(join(tmpdir(), "pi-pw-")), "pause-windows.json");
+  writeFileSync(path, JSON.stringify(initial));
+  process.env.PI_PAUSE_WINDOWS_FILE = path;
+  return path;
+}
+
+test("dispatch_pause_add: an approved confirm writes a validated window (tz/days carried)", async () => {
+  const path = tmpPauses({ windows: [] });
+  const { ctx, shown } = toolCtx({ answer: true });
+  const out = textOf(await toolByName("dispatch_pause_add").execute("id", { scope: "acme/web", from: "22:00", to: "06:00", tz: "Europe/Amsterdam", days: ["fri"] }, undefined, undefined, ctx));
+  assert.equal(out.applied, true);
+  const w = read(path).windows[0];
+  assert.equal(w.scope, "acme/web");
+  assert.equal(w.from, "22:00");
+  assert.equal(w.tz, "Europe/Amsterdam");
+  assert.deepEqual(w.days, ["fri"]);
+  assert.match(shown[0].message, /pause-windows\.json/);
+});
+
+test("dispatch_pause_add: an invalid window (from==to) is rejected, nothing written", async () => {
+  const path = tmpPauses({ windows: [] });
+  const { ctx } = toolCtx({ answer: true });
+  await assert.rejects(() => toolByName("dispatch_pause_add").execute("id", { scope: "x", from: "09:00", to: "09:00" }, undefined, undefined, ctx), /rejected|differ/);
+  assert.equal(read(path).windows.length, 0);
+});
+
+test("dispatch_pause_add: refuses with no interactive operator and writes nothing", async () => {
+  const path = tmpPauses({ windows: [] });
+  const { ctx } = toolCtx({ hasUI: false });
+  await assert.rejects(() => toolByName("dispatch_pause_add").execute("id", { scope: "x", from: "22:00", to: "06:00" }, undefined, undefined, ctx), /refused|interactive operator/);
+  assert.equal(read(path).windows.length, 0);
+});
+
+test("dispatch_pause_delete: out-of-range index throws and writes nothing", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00" }] });
+  const { ctx } = toolCtx({ answer: true });
+  await assert.rejects(() => toolByName("dispatch_pause_delete").execute("id", { index: 9 }, undefined, undefined, ctx), /no pause window at index/);
+  assert.equal(read(path).windows.length, 1);
+});
+
+test("managePauses: Add writes a validated pause window (live)", async () => {
+  const path = tmpPauses({ windows: [] });
+  const ui = mockUi({ select: ["Add a pause window"], input: ["acme/web", "22:00", "06:00", "", "", "", ""] });
+  await handleDashboardAction({ action: "managePauses" }, { pauseWindowsPath: path }, { ui });
+  const w = read(path).windows;
+  assert.equal(w.length, 1);
+  assert.equal(w[0].scope, "acme/web");
+  assert.equal(w[0].to, "06:00");
+  assert.ok(ui.notes.some((n) => /added \(live\)/.test(n.m)), "a live-added notice is shown");
+});
+
+test("managePauses: Delete removes the picked window on confirm", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00" }, { scope: "*", from: "00:00", to: "01:00" }] });
+  const ui = mockUi({ select: ["Delete a pause window", "#1  acme/web  22:00-06:00 UTC"], confirm: [true] });
+  await handleDashboardAction({ action: "managePauses" }, { pauseWindowsPath: path }, { ui });
+  assert.deepEqual(read(path).windows.map((w) => w.scope), ["*"], "only the picked window is removed");
+});

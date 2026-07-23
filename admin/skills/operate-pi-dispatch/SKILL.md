@@ -30,6 +30,9 @@ dialog before it takes effect**:
 - `dispatch_set` — change a limit/setting (e.g. `dailyCap`, `weeklyCap`, `maxTurns`, `model`). Omit `value`
   to unset.
 - `dispatch_trigger_add` / `dispatch_trigger_edit` / `dispatch_trigger_delete` — manage triggers.
+- `dispatch_pause_add` / `dispatch_pause_delete` — manage scheduled pause windows (per folder/repo "quiet
+  hours": runs for a scope are deferred between certain times and auto-resume after; `dispatch_pauses` lists
+  them). Deferring never drops a job and costs no budget.
 
 Use them like this:
 

@@ -706,6 +706,35 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
 
 ---
 
+## INT-PAUSE-WINDOWS-FILE-CONTRACT
+
+- **Producer/Consumer**: The admin extension (operator dialogs + confirm-gated tools) writes; the worker
+  reads and enforces (`REQ-SCOPED-PAUSE-WINDOWS`, `DES-SCOPED-PAUSE-VIA-MOVE-TO-DELAYED`). The receiver does
+  not read it.
+- **Location**: `PI_PAUSE_WINDOWS_FILE` (unset = feature off; the worker loads `[]`).
+- **Shape**: `{ "windows": [ { scope, from, to, tz?, days?, dateFrom?, dateTo? } ] }`.
+  - `scope` (required): a github `"owner/name"`, a local folder path, or `"*"` (all). Matched against a job's
+    `repo`/`folder` by `kind`, exact.
+  - `from` / `to` (required): `"HH:MM"` 24h. `from > to` is an overnight window. `from == to` is **rejected**
+    (a 24h pause is not expressible).
+  - `tz` (optional, default `"UTC"`): IANA zone, validated by constructing an `Intl.DateTimeFormat`.
+  - `days` (optional, default all): weekday allow-list (`mon`..`sun`) gating the occurrence's **start** day.
+  - `dateFrom` / `dateTo` (optional, default unbounded): inclusive `"YYYY-MM-DD"` bound on the start date.
+- **Validation**: the SHARED `parsePauseWindows` (worker `./pause-windows`) validates the WHOLE file fail-loud
+  (`configError`); the admin writes through it (fail-closed — a rejected file is never written) and the worker
+  boot-loads through it. Neither side re-derives the schema, so they cannot drift (mirrors
+  `INT-TRIGGERS-FILE-CONTRACT`).
+- **Write protocol**: atomic tmp + rename (`writePauseWindows`); the worker's directory watch hot-swaps the
+  in-memory windows on change and **keeps the last-good set on a bad edit** (no restart).
+- **Enforcement**: at pickup, before `reserveBudget`, a scope-matching active window defers the job with
+  `job.moveToDelayed(windowEndMs, token)` + `DelayedError`; it consumes no budget and auto-resumes at the end.
+- **Acceptance**: Given a well-formed file with a window covering now for a job's scope, the job is delayed to
+  the window end and reserves nothing; given `from == to` or a bad tz/day/date, the write is rejected and the
+  file is unchanged; given a mid-run malformed edit, the worker keeps the last-good windows and logs
+  `pause_windows_reload_invalid`.
+
+---
+
 ## Revision History
 
 | Date | Change |
