@@ -23,6 +23,7 @@ import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dis
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
 import { parseTriggers } from "@pi-dispatch/worker/triggers";
+import { parsePauseWindows } from "@pi-dispatch/worker/pause-windows";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
 import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
@@ -44,6 +45,7 @@ export function resolvePaths(env = process.env) {
     logsDir: env.PI_LOGS_DIR || defaultLogsDir(),
     settingsFile: settingsFilePath(env),
     triggersPath: env.PI_TRIGGERS_FILE ?? "deploy/triggers.json",
+    pauseWindowsPath: env.PI_PAUSE_WINDOWS_FILE ?? "deploy/pause-windows.json",
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
     // The two dispatch_run bounds the extension enforces producer-side, read DIRECTLY from env (never
     // loadConfig, which throws on unrelated GitHub-auth problems). `delimitedList`/`nonNegativeInt` are
@@ -304,6 +306,54 @@ export function writeTriggers({ triggersPath, mutate, fs = nodeFs }) {
   const tmp = `${triggersPath}.tmp`;
   fs.writeFileSync(tmp, text, { mode: 0o644 });
   fs.renameSync(tmp, triggersPath);
+  return { ok: true };
+}
+
+/**
+ * Read + validate the pause-windows file for display (REQ-SCOPED-PAUSE-WINDOWS). Returns `{ windows }` of
+ * normalized entries (with `fromMin`/`toMin`), or `{ missing }` / `{ invalid }` so the viewer degrades rather
+ * than throwing. Uses the SHARED `parsePauseWindows`, so the admin and the worker cannot drift on the schema.
+ */
+export function readPauseWindows({ pauseWindowsPath, fs = nodeFs }) {
+  let text;
+  try {
+    text = fs.readFileSync(pauseWindowsPath, "utf8");
+  } catch {
+    return { missing: true };
+  }
+  try {
+    return { windows: parsePauseWindows(text, pauseWindowsPath) };
+  } catch (e) {
+    return { invalid: e?.message ?? String(e) };
+  }
+}
+
+/**
+ * Read-modify-write the pause-windows file (mirrors `writeTriggers`): `mutate(windows)` receives a copy of the
+ * current raw `windows` array and returns the new array; the result is re-serialized, VALIDATED through the
+ * SHARED `parsePauseWindows` (fail-closed — a rejected result is NEVER written, so the worker loader can always
+ * parse it), and written ATOMICALLY (tmp + rename) so the live-reload watcher never sees a half-written file.
+ * Reached from operator-typed `/dispatch pause …` handlers AND the confirm-gated `dispatch_pause_*` tools; the
+ * tools route through `confirmedWrite` (an operator approves before this runs). Returns `{ ok }` or `{ invalid }`.
+ */
+export function writePauseWindows({ pauseWindowsPath, mutate, fs = nodeFs }) {
+  let current = [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(pauseWindowsPath, "utf8"));
+    if (Array.isArray(raw?.windows)) current = raw.windows;
+  } catch {
+    // Missing/invalid file: start from empty; the validated atomic write below repairs it.
+  }
+  const next = mutate(current.map((w) => ({ ...w })));
+  const text = `${JSON.stringify({ windows: next }, null, 2)}\n`;
+  try {
+    parsePauseWindows(text, pauseWindowsPath); // the loader's own validator -- never write a file it would reject
+  } catch (e) {
+    return { invalid: e?.message ?? String(e) };
+  }
+  const tmp = `${pauseWindowsPath}.tmp`;
+  fs.writeFileSync(tmp, text, { mode: 0o644 });
+  fs.renameSync(tmp, pauseWindowsPath);
   return { ok: true };
 }
 

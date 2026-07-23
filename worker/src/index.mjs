@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { UnrecoverableError, Worker } from "bullmq";
+import { DelayedError, UnrecoverableError, Worker } from "bullmq";
 import { InfraRetry, runJob } from "./processor.mjs";
 
 const exec = promisify(execFile);
@@ -27,8 +27,21 @@ export const JOB_TIMEOUT_MS = 30 * 60 * 1000; // REQ-JOB-TIMEOUT-30M
  * The overlay changes which values the spend caps take, never when they are checked -- reserveBudget still
  * runs inside runJob against the freshly passed caps (CONST-BUDGET-BEFORE-TOKENS).
  */
-export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, applyConcurrency = () => {}, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS }) {
+export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, applyConcurrency = () => {}, pauseUntil = () => null, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS }) {
 	return async function processor(job, token, signal) {
+		// Scoped pause windows (REQ-SCOPED-PAUSE-WINDOWS): if this job's folder/repo is inside an active pause
+		// window, DEFER it to the window end via BullMQ's delayed set -- the job keeps its identity/dedup and
+		// auto-resumes when re-picked. This is FIRST, before the kill timer, the settings read, and the budget
+		// reservation, so a deferred job arms no timer, reserves no slot, and spends nothing
+		// (CONST-BUDGET-BEFORE-TOKENS). `moveToDelayed` needs the worker's `token`; the `> now + 1s` guard keeps
+		// a boundary tick from busy-deferring. A thrown `DelayedError` is how BullMQ learns the job was deferred
+		// (worker.js recognises it) rather than completed or failed.
+		const until = pauseUntil(job.data, Date.now());
+		if (until && until > Date.now() + 1000) {
+			await job.moveToDelayed(until, token);
+			throw new DelayedError();
+		}
+
 		const startedAt = new Date().toISOString();
 		const name = `pi-job-${job.id}`;
 		const timer = setTimeout(() => {
@@ -106,7 +119,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 	};
 }
 
-export function createWorker({ connection, concurrency, getSettings, redis, deps, recordRun, limiter, extraClosers = [] }) {
+export function createWorker({ connection, concurrency, getSettings, redis, deps, recordRun, limiter, pauseUntil, extraClosers = [] }) {
 	let worker; // referenced by cancelJob/applyConcurrency before assignment; only called later, so the TDZ is fine
 	const processor = makeProcessor({
 		cancelJob: (id, reason) => worker.cancelJob(id, reason),
@@ -118,6 +131,7 @@ export function createWorker({ connection, concurrency, getSettings, redis, deps
 		applyConcurrency: (n) => {
 			if (Number.isInteger(n) && worker.concurrency !== n) worker.concurrency = n;
 		},
+		pauseUntil,
 		deps,
 		recordRun,
 	});

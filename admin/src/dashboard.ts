@@ -22,7 +22,8 @@ import { dayKey, weekKey, monthKey, tokenDayKey, windowState } from "@pi-dispatc
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { STALL_KEY } from "@pi-dispatch/worker/scheduler-stall-guard";
-import { listRuns, readSettingsView, mapSchedulers, readTriggers } from "./read-model.mjs";
+import { windowEndAt } from "@pi-dispatch/worker/pause-windows";
+import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
 import { box, meter, clip } from "./panel.mjs";
@@ -85,6 +86,7 @@ export function createDashboardDeps(paths: any) {
         runs: listRuns({ logsDir: paths.logsDir, limit: RUNS_ON_DASHBOARD }),
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
         triggers: readTriggers({ triggersPath: paths.triggersPath }),
+        pauseWindows: readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath }),
         // ONLY the id off the active Job -- a Job's `.data` holds issue title/body/username (PII), so it
         // never enters the snapshot (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT).
         activeJobId: activeList?.[0]?.id ?? null,
@@ -308,6 +310,10 @@ export function makeDashboard({
         void dispose().finally(() => done({ action: "editSettings" }));
         return;
       }
+      if (data === "w" || data === "W") {
+        void dispose().finally(() => done({ action: "managePauses" }));
+        return;
+      }
       if (matchesKey(data, "up")) {
         selected = Math.max(0, selected - 1);
         tui?.requestRender?.();
@@ -465,6 +471,11 @@ function buildListLines(snapshot: any, selected: number, inner: number, styler: 
   for (const l of trg.lines) lines.push(l);
   lines.push(RULE);
 
+  const pw = pauseLines(snapshot.pauseWindows, inner, styler);
+  lines.push(styler.divider("pause windows", `${pw.count} · w manage`, inner));
+  for (const l of pw.lines) lines.push(l);
+  lines.push(RULE);
+
   // Active + run rows follow the triggers in buildRows, so offset the selection index by the trigger count.
   const runRows = buildRows(snapshot).slice(trg.count);
   const runCount = Array.isArray(snapshot.runs) ? snapshot.runs.length : 0;
@@ -610,6 +621,31 @@ function targetColored(t: any, styler: any): string {
     return `${arrow} ${styler.fg("success", "local")} ${folderPart}${flow}`;
   }
   return `${arrow} ${styler.fg("accent", "github")} ${flow}`;
+}
+
+/** The scheduled pause windows as colored rows, each marked `●` (paused now, with a resume countdown) or `○`. */
+function pauseLines(pauseWindows: any, inner: number, styler: any): { count: number; lines: string[] } {
+  const lines: string[] = [];
+  if (pauseWindows && pauseWindows.missing) { lines.push(styler.cell("(no pause windows · w to manage)", inner, { color: "dim" })); return { count: 0, lines }; }
+  if (pauseWindows && pauseWindows.invalid) { lines.push(styler.cell(`(pause-windows file invalid: ${pauseWindows.invalid})`, inner, { color: "error" })); return { count: 0, lines }; }
+  const list = (pauseWindows && pauseWindows.windows) ?? [];
+  if (list.length === 0) { lines.push(styler.cell("(no pause windows · w to manage)", inner, { color: "dim" })); return { count: 0, lines }; }
+  const now = Date.now();
+  for (const w of list) lines.push(pauseRow(w, now, inner, styler));
+  return { count: list.length, lines };
+}
+
+function pauseRow(w: any, now: number, inner: number, styler: any): string {
+  const until = windowEndAt(w, now); // ms when this window resumes, or null when not active now
+  const dot = until ? styler.fg("warning", "●") : styler.fg("dim", "○");
+  const bits = [
+    `${dot} ${styler.fg("accent", w.scope ?? "-")}`,
+    styler.fg("text", `${w.from ?? "-"}–${w.to ?? "-"}`) + " " + styler.fg("dim", w.tz ?? "UTC"),
+  ];
+  if (w.days) bits.push(styler.fg("muted", `[${w.days.join(",")}]`));
+  if (w.dateFrom || w.dateTo) bits.push(styler.fg("dim", `${w.dateFrom ?? "…"}→${w.dateTo ?? "…"}`));
+  if (until) bits.push(styler.fg("warning", `resumes in ${humanizeMs(until - now) || "<1m"}`));
+  return fitLine(bits.join(styler.fg("dim", "  ")), inner, styler);
 }
 
 /** The interactive RUNS list, colored: cursor, id, target, flow, outcome (✔/⚠/✘), turns, tokens. */
@@ -760,7 +796,7 @@ function triggerDetailHints(inner: number, styler: any): string {
 /** The colored key-hint footer. */
 function keyHints(inner: number, styler: any): string {
   const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
-  const hints = [k("↑↓", "select"), k("↵", "open"), k("a", "add"), k("l", "logs"), k("p", "pause"), k("r", "resume"), k("q", "quit")].join(styler.fg("dim", " · "));
+  const hints = [k("↑↓", "select"), k("↵", "open"), k("a", "add"), k("w", "pauses"), k("l", "logs"), k("p", "pause"), k("r", "resume"), k("q", "quit")].join(styler.fg("dim", " · "));
   return fitLine(hints, inner, styler);
 }
 

@@ -86,6 +86,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")
+		pauseWindowsFile: env.PI_PAUSE_WINDOWS_FILE ?? null, // REQ-SCOPED-PAUSE-WINDOWS: per-folder/repo timed pause; null = no scoped pauses
 		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
 		logsDir: env.PI_LOGS_DIR || defaultLogsDir(), // || (not ??) so an empty string falls back to the default
 		settingsFile: env.PI_SETTINGS_FILE || defaultSettingsFile(), // || (not ??) so an empty string falls back; INT-CONFIG-OVERLAY-CONTRACT
