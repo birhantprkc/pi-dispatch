@@ -1,16 +1,53 @@
 {
-  "name": "@pi-dispatch/admin",
+  "name": "@edgehero/pi-dispatch-admin",
   "version": "0.1.0",
-  "private": true,
+  "description": "Operator console (a pi extension) + skill for the pi-dispatch self-hosted agent service: a /dispatch TUI for queue, spend, run history, triggers, and scheduled pause windows. Runs against a live pi-dispatch deployment.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "coding-agent",
+    "extension"
+  ],
+  "license": "MIT",
+  "author": "Rob Boerman",
+  "homepage": "https://github.com/edgehero/pi-dispatch/tree/main/admin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edgehero/pi-dispatch.git",
+    "directory": "admin"
+  },
+  "bugs": "https://github.com/edgehero/pi-dispatch/issues",
   "type": "module",
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.mjs"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "image": "https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/dispatch-dashboard.svg"
+  },
   "scripts": {
+    "build": "node build.mjs",
+    "prepublishOnly": "node build.mjs",
     "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
-    "@pi-dispatch/worker": "*",
-    "typebox": "1.1.38"
+    "bullmq": "5.80.4",
+    "ioredis": "5.11.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.7"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.7"
+    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@pi-dispatch/worker": "*",
+    "esbuild": "^0.28.1",
+    "typebox": "1.1.38"
   }
 }

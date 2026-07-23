@@ -45,6 +45,12 @@ npx pi-dispatch worker       # (or: npm --workspace worker start)
 npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 ```
 
+> **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
+> which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It
+> is **not** the unrelated npm package `pi-dispatch` (see [License](#license)); this project isn't published
+> to npm. If a shell can't find the local bin, use the explicit form:
+> `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
+
 The worker picks up the job, mounts your folder into a container, and pi edits it **in place**. It
 refuses a dirty git working tree unless you pass `--force`, because there is no undo — point it at
 folders you can restore, and commit first.
