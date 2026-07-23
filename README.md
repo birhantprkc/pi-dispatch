@@ -1,54 +1,27 @@
 # pi-dispatch
 
-**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service: it opens a repo or folder
-in a locked-down container, does the work, and shuts the container down — triggered on demand, on a
-schedule, or by a GitHub issue or pull request, with a durable queue, a spend cap, and a live admin
-panel.**
-
-pi is an excellent agent. It has no job queue, no concurrency control, no spend limit, and — by its own
-README — no permission system. **pi-dispatch is exactly that missing operational layer, and nothing
-else.** Everything below the container is pi; everything above it is a few hundred reviewed lines.
-
-```
-npx pi-dispatch run ./my-project --task "dedupe the imports in src/" --flow tidy
-```
-
-> `pi-dispatch` above is `npx pi-dispatch` from this repo (a workspace bin); or `npm link` it onto your PATH.
+**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service — triggered on demand, on a
+cron schedule, or by a GitHub issue or pull request — in a container you control, with a durable queue, a
+spend cap, and a live admin panel.**
 
 ![The /dispatch dashboard overlay — live queue state, day/week/month spend meters, the unified triggers pane (cron, label, comment, pull_request), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
 
-## Why pi-dispatch
+![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg)
 
-- **The container is the security boundary, not a promise.** pi has no permission system, so every job
-  runs `--cap-drop=ALL`, non-root, ephemeral, `no-new-privileges`, with your instructions mounted
-  read-only — the agent cannot rewrite its own guardrails or reach your host.
-- **Spend is bounded before a container starts** — a per-job **turn budget** (pi has none of its own) and
-  a **daily cap** checked *before* any tokens are spent, so a runaway can't quietly drain your API budget.
-- **Nothing is dropped.** Fifty triggers at once become fifty durable queued jobs, drained at a fixed
-  concurrency (default 3) and surviving a reboot (Valkey with AOF).
-- **Three triggers, one job contract.** A CLI command, a **cron schedule**, or a GitHub issue/PR — each
-  produces the same job, runs through the same box, and shows up in the same panel. The scheduler is the
-  unattended one: recurring work on your own hardware — a nightly tidy, a weekly dependency bump, a docs
-  regen, a scheduled frontend visual check — the same autonomous-agent-on-a-timer idea as a hosted
-  routine, but the run happens in *your* container under *your* queue and spend caps.
-- **The container image is yours to shape.** Every job runs in your
-  [`image/Dockerfile`](image/Dockerfile) — bake in a project's exact toolchain and system libraries. It
-  already ships **Playwright + Chromium**, so a flow can build your frontend, screenshot it, and iterate
-  on the *rendered* result (before/after images attach to the PR). A hosted routine runs in a fixed
-  environment; here the box bends to the project.
-- **Your project steers the agent** using pi's native layout — `.pi/APPEND_SYSTEM.md` for the persona,
-  `.pi/skills/<name>/SKILL.md` for skills, read from your committed files. pi-dispatch ships no persona of
-  its own, only a small immutable safety floor baked into the image that your instructions add to and
-  cannot remove.
-- **A live admin panel that binds no network port** — a pi extension in your own session: watch the
-  queue, meter spend, browse every run's PII-free record, tail a running job, and pause/resume, all
-  locally with no model involvement.
+pi has no job queue, no concurrency control, no spend limit, and — by its own README — no permission
+system. **pi-dispatch is exactly that missing operational layer, and nothing else.**
 
-Drive it and read its output from the `/dispatch` overlay above, or the matching slash commands:
-
-![Transcript of /dispatch status, /dispatch runs, and /dispatch triggers in a pi session — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg)
-
----
+- **The container is the boundary.** Every job runs `--cap-drop=ALL`, non-root, ephemeral, instructions
+  mounted read-only — pi's missing permission system, enforced by Docker.
+- **Spend is bounded before a container starts** — a per-job turn budget and a daily cap, checked before
+  a single token is spent.
+- **The image is yours to shape.** Bake a project's toolchain into [`image/Dockerfile`](image/Dockerfile);
+  it ships **Playwright + Chromium**, so a flow can build a frontend, screenshot it, and iterate on the
+  rendered result — the edge over a fixed hosted routine or `/loop`.
+- **Three triggers, one job.** A CLI command, a cron schedule, or a GitHub issue/PR — same job, same box,
+  same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control.
+- **Your project steers it** — pi's native `.pi/skills` and persona, from your committed files, over a
+  small immutable safety floor the agent can't remove.
 
 ## Quickstart (local folders)
 
@@ -90,9 +63,9 @@ flowchart LR
   PI -->|"edits in place"| F[("your folder")]
 ```
 
-The three guarantees from **Why pi-dispatch** — a container boundary, spend bounded *before* a container
-starts, and nothing dropped — are exactly what this path enforces. Read [`SECURITY.md`](SECURITY.md)
-before you rely on it: it states plainly what is and is not defended.
+A container boundary, spend bounded *before* a container starts, nothing dropped — that is what this path
+enforces. Read [`SECURITY.md`](SECURITY.md) before you rely on it: it states plainly what is and is not
+defended.
 
 ## Run as a service
 
@@ -183,8 +156,12 @@ to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi insid
 in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
 
 Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
-queue in place, `↑`/`↓` and `Enter` to drill into a run or tail the active job. It adds `/dispatch`
-commands that run **locally, with no model involvement**:
+queue in place, `↑`/`↓` and `Enter` to drill into a run or tail the active job. `Enter` on a run opens its
+full PII-free record:
+
+![The RUN_DETAIL drill-in — a framed key/value dump of one run's record: target, flow, outcome, turns, tokens, cost, exit code, timings](docs/images/dispatch-run-detail.svg)
+
+It adds `/dispatch` commands that run **locally, with no model involvement**:
 
 - `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
 - `pause` / `resume` — the queue on/off switch
