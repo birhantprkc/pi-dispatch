@@ -17,9 +17,73 @@ import {
   listRunIds,
   setQueuePaused,
   writeSettings,
+  writeTriggers,
   enqueueDispatchRun,
   revParseHead,
 } from "../src/read-model.mjs";
+
+// In-memory fs for the triggers write tests: readFileSync/writeFileSync/renameSync over a plain object.
+function triggerFs(initial = {}) {
+  const files = { ...initial };
+  return {
+    files,
+    readFileSync(p) {
+      if (!(p in files)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return files[p];
+    },
+    writeFileSync(p, data) {
+      files[p] = String(data);
+    },
+    renameSync(a, b) {
+      files[b] = files[a];
+      delete files[a];
+    },
+  };
+}
+
+const T_PATH = "/triggers.json";
+const labelTrigger = { on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "fix" } };
+
+test("writeTriggers adds a validated entry and writes atomically (tmp renamed away)", () => {
+  const fs = triggerFs({ [T_PATH]: JSON.stringify({ triggers: [labelTrigger] }) });
+  const res = writeTriggers({
+    triggersPath: T_PATH,
+    fs,
+    mutate: (list) => [...list, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "review" } }],
+  });
+  assert.deepEqual(res, { ok: true });
+  const written = JSON.parse(fs.files[T_PATH]);
+  assert.equal(written.triggers.length, 2);
+  assert.equal(written.triggers[1].on.type, "comment");
+  assert.equal(`${T_PATH}.tmp` in fs.files, false, "the tmp file is renamed away — the write is atomic");
+});
+
+test("writeTriggers rejects an off-diagonal result (cron -> github) and leaves the file unchanged", () => {
+  const orig = JSON.stringify({ triggers: [labelTrigger] });
+  const fs = triggerFs({ [T_PATH]: orig });
+  const res = writeTriggers({
+    triggersPath: T_PATH,
+    fs,
+    mutate: (list) => [...list, { on: { type: "cron", id: "c", pattern: "0 3 * * *" }, run: { kind: "github", flow: "x" } }],
+  });
+  assert.ok(res.invalid, "the shared parseTriggers rejects the diagonal violation");
+  assert.equal(fs.files[T_PATH], orig, "an invalid write never touches the file (fail-closed)");
+});
+
+test("writeTriggers edits a flow and deletes an entry", () => {
+  const fs = triggerFs({ [T_PATH]: JSON.stringify({ triggers: [labelTrigger, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "review" } }] }) });
+  writeTriggers({ triggersPath: T_PATH, fs, mutate: (l) => l.map((t, i) => (i === 0 ? { ...t, run: { ...t.run, flow: "frontend-fix" } } : t)) });
+  assert.equal(JSON.parse(fs.files[T_PATH]).triggers[0].run.flow, "frontend-fix");
+  writeTriggers({ triggersPath: T_PATH, fs, mutate: (l) => l.filter((_, i) => i !== 1) });
+  assert.equal(JSON.parse(fs.files[T_PATH]).triggers.length, 1);
+});
+
+test("writeTriggers on a missing file starts from empty and writes a valid file", () => {
+  const fs = triggerFs({});
+  const res = writeTriggers({ triggersPath: T_PATH, fs, mutate: (l) => [...l, labelTrigger] });
+  assert.deepEqual(res, { ok: true });
+  assert.equal(JSON.parse(fs.files[T_PATH]).triggers.length, 1);
+});
 
 /**
  * An in-memory fs keyed by basename. A file value that is `{ __throw, code }` throws on read (to model a
@@ -139,11 +203,11 @@ test("readRun resolves the sanitized filename for a colon-bearing id", () => {
 });
 
 test("readRun returns null when the record is absent", () => {
-  assert.equal(readRun({ logsDir: "/logs", jobId: "nope", fs: fakeFs({}) }), null);
+  assert.equal(readRun({ logsDir: "/logs", jobId: "nope", fs: triggerFs({}) }), null);
 });
 
 test("readLogTail returns { missing:true } when the .log is absent (capture off)", () => {
-  assert.deepEqual(readLogTail({ logsDir: "/logs", jobId: "x", fs: fakeFs({}) }), { missing: true });
+  assert.deepEqual(readLogTail({ logsDir: "/logs", jobId: "x", fs: triggerFs({}) }), { missing: true });
 });
 
 test("readLogTail returns the last N lines, dropping the trailing-newline segment", () => {
@@ -315,7 +379,7 @@ test("readTriggers returns { invalid } when the file is not valid JSON", () => {
 });
 
 test("readTriggers returns { missing:true } when the file is absent (viewer degrades)", () => {
-  assert.deepEqual(readTriggers({ triggersPath: "/x/none.json", fs: fakeFs({}) }), { missing: true });
+  assert.deepEqual(readTriggers({ triggersPath: "/x/none.json", fs: triggerFs({}) }), { missing: true });
 });
 
 test("readSettingsView returns the validated overlay via the worker's own reader", () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { loadReceiverConfig } from "../src/config.mjs";
+import { loadReceiverConfig, reloadTriggers } from "../src/config.mjs";
 
 // A valid unified triggers file, injected: exists and parses to one of each webhook type. The exhaustive
 // schema validation lives in the shared validator's own suite (worker/test/triggers.test.mjs); here we
@@ -134,4 +134,31 @@ test("github block reflects env just as the worker loader does (source=pat echoe
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh", GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT: "ghp_x" }, validTriggers);
 	assert.equal(c.github.source, "pat");
 	assert.equal(c.github.patVar, "GITHUB_PAT");
+});
+
+// -- live reload (the testable core of the receiver's trigger watcher) ---------------------------
+
+test("reloadTriggers swaps cfg.triggers in place from the new file (live, no restart)", () => {
+	const cfg = { triggers: { label: [{ predicate: { any: ["old"] }, flow: "old-flow" }], comment: null, pullRequest: [], knownFlows: new Set(["old-flow"]) } };
+	const json = JSON.stringify({ triggers: [{ on: { type: "label", any: ["new"] }, run: { kind: "github", flow: "new-flow" } }] });
+	const res = reloadTriggers({}, cfg, { fileExists: () => true, readFile: () => json });
+	assert.deepEqual(res, { ok: true });
+	assert.equal(cfg.triggers.label[0].flow, "new-flow");
+	assert.deepEqual(cfg.triggers.label[0].predicate.any, ["new"]);
+});
+
+test("reloadTriggers keeps the running triggers when the new file is invalid (never crash a live receiver)", () => {
+	const original = { label: [{ predicate: { any: ["old"] }, flow: "keep" }], comment: null, pullRequest: [], knownFlows: new Set() };
+	const cfg = { triggers: original };
+	const res = reloadTriggers({}, cfg, { fileExists: () => true, readFile: () => "{ not json" });
+	assert.ok(res.invalid, "an invalid reload reports the reason");
+	assert.equal(cfg.triggers, original, "cfg.triggers is left untouched on an invalid reload");
+});
+
+test("reloadTriggers keeps the running triggers when the file goes missing", () => {
+	const original = { label: [], comment: null, pullRequest: [], knownFlows: new Set() };
+	const cfg = { triggers: original };
+	const res = reloadTriggers({}, cfg, { fileExists: () => false, readFile: () => "" });
+	assert.ok(res.invalid);
+	assert.equal(cfg.triggers, original);
 });

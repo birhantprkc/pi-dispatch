@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
+import { watch } from "node:fs";
+import { dirname, basename } from "node:path";
 import { promisify } from "node:util";
 import { configError, loadConfig } from "./config.mjs";
 import { makeRedisClient, parseConnection } from "./connection.mjs";
-import { reconcile } from "./cron.mjs";
+import { reconcile, reloadSchedules } from "./cron.mjs";
 import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
 import { createWorker } from "./index.mjs";
@@ -33,6 +35,29 @@ const exec = promisify(execFile);
  * `reap()` NEVER throws: a missing docker binary or a down daemon is caught, logged as
  * `reaper_skipped`, and boot continues to the worker.
  */
+/**
+ * Watch the DIRECTORY holding the triggers file (robust to the admin's atomic tmp+rename, which swaps the
+ * inode a file-watch would lose), debounce, and re-reconcile the cron schedulers on change via
+ * `reloadSchedules`. Best-effort and unref'd so it never blocks shutdown; a platform without `fs.watch`
+ * logs and the worker keeps its boot-time schedulers.
+ */
+function watchTriggersFile(config, queue, log) {
+	const path = config.triggersFile;
+	const dir = dirname(path) || ".";
+	const file = basename(path);
+	let timer = null;
+	try {
+		watch(dir, (_event, changed) => {
+			if (changed && changed !== file) return; // only our file (a null name -> reload to be safe)
+			clearTimeout(timer);
+			timer = setTimeout(() => void reloadSchedules(config, queue, { log }), 150);
+		}).unref?.();
+		log("triggers_watching", { path });
+	} catch (err) {
+		log("triggers_watch_unavailable", { reason: err?.message });
+	}
+}
+
 export function makeReaper({ log }) {
 	return async function reap() {
 		try {
@@ -232,6 +257,13 @@ export async function startWorker(
 		}
 	} else {
 		log("schedules_installed", { installed: 0, removed: 0 });
+	}
+
+	// DES-CRON-VIA-BULLMQ-SCHEDULER live edit (OQ-008): watch the triggers file and re-reconcile schedulers
+	// on change, so an operator's add/edit/delete of a cron trigger takes effect without a worker restart.
+	// Only when a triggers file is configured; best-effort + unref'd; a bad edit keeps the running schedulers.
+	if (config.triggersFile) {
+		watchTriggersFile(config, runtimeQueue, log);
 	}
 
 	log("worker_started", {

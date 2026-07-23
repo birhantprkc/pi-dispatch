@@ -486,14 +486,22 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   operator's own interactive pi session (via `-e`, `~/.pi/agent/extensions`, or a trust-gated
   `.pi/extensions`). It provides operator-only slash commands
   (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and one
-  self-refreshing TUI overlay component with **three in-component views**: **LIST** — a framed
-  monochrome panel carrying a status bar, a SPEND meter, a unified **TRIGGERS** pane that shows
-  schedulers plus the per-flow `{any, all, none}` trigger rules **display-only**, and an interactive runs list with `↑↓`
-  selection; **RUN_DETAIL** — a drill-in dump of the selected run's PII-free `.json` run-record fields;
-  and **LIVE_TAIL** — a view that tails a running job's `.log` **inside the overlay** through an
-  injected `deps.tailLog` seam whose `fs` read lives in `index.ts`. The LLM-callable tools are reads,
-  `pause`/`resume`, and the gated `dispatch_run` enqueue;
-  every settings write is an operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
+  self-refreshing TUI overlay component with **four in-component views**: **LIST** — a framed,
+  **theme-colored** panel (color via pi's injected `Theme`, applied post-layout so pi's ANSI-aware
+  `visibleWidth` still frames it) carrying a status header, day/week/month **SPEND meters** (colored by the
+  same `windowState` the worker enforces) plus a daily **token** counter, a unified **TRIGGERS** pane whose
+  `{on, run}` rows are **selectable and editable**, and an interactive runs list — all navigated with `↑↓`;
+  **TRIGGER_DETAIL** — Enter on a trigger opens its filter and a per-kind **trust model** (who authorizes it,
+  how it dedups, which service owns it), with `e` edit-flow / `x` delete; **RUN_DETAIL** — a drill-in dump of
+  the selected run's PII-free `.json` run-record fields; and **LIVE_TAIL** — a view that tails a running
+  job's `.log` **inside the overlay** through an injected `deps.tailLog` seam whose `fs` read lives in
+  `index.ts` (the log CONTENT stays `clip`-stripped and uncolored — only the chrome is themed). The
+  LLM-callable tools are reads, `pause`/`resume`, and the gated `dispatch_run` enqueue; **every write —
+  settings AND triggers — is operator-typed** (`ctx.ui` `select`/`input`/`confirm` dialogs from the overlay,
+  or a `/dispatch set` command), never a model-invocable tool. A trigger add/edit/delete goes through
+  `writeTriggers` (validated by the shared `parseTriggers`, atomic tmp+rename, fail-closed) and both services
+  **live-reload** `triggers.json`, so it takes effect without a restart (`OQ-008`), keeping the running
+  config on an invalid edit. The extension talks to the same Valkey
   (`VALKEY_URL`) and reads the run-history sidecar files; it **binds no network port at all**. Bull Board
   is dropped.
 - **Why**:

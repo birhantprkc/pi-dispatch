@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { stripAnsi, visibleLen } from "../src/style.mjs";
 
 /**
  * The live dashboard overlay. `makeDashboard` takes one injection seam -- `deps` (fetchSnapshot + the
@@ -55,15 +56,30 @@ test("renders every section from the last snapshot, reusing the command renderer
   const out = comp.render(80).join("\n");
   await comp.dispose();
 
-  assert.match(out, /Queue: paused/, "header shows the paused state");
-  assert.match(out, /waiting 2/, "counts line");
-  assert.match(out, /workers: 1/, "worker count");
-  assert.match(out, /reserved 5 \/ cap 25 \(overlay\)/, "budget line");
+  // The colored LIST layout (rendered plain here — no theme passed, so PLAIN_THEME, no ANSI).
+  assert.match(out, /PAUSED/, "the status header shows the paused state");
+  assert.match(out, /2 waiting/, "counts line");
+  assert.match(out, /1 workers/, "worker count");
+  assert.match(out, /5\/25/, "the day spend meter shows reserved/cap");
   assert.match(out, /j1/, "last runs");
-  assert.match(out, /Schedulers:/);
-  assert.match(out, /overdue by 5s/, "scheduler drift");
-  assert.match(out, /Settings \(\/s\)/, "settings summary");
-  assert.match(out, /\[p\]ause {2}\[r\]esume {2}\[q\]uit/, "key hints");
+  assert.match(out, /model claude-x/, "settings summary");
+  assert.match(out, /p pause/, "key hints");
+  assert.match(out, /q quit/, "key hints");
+});
+
+test("with a theme, the framed LIST is colored (ANSI present) but every line still fits the width", async () => {
+  // A theme whose fg/bold emit real SGR, so the overlay is colored and the width stays ANSI-aware.
+  const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, theme, deps: cannedDeps() });
+  await flush();
+  const lines = comp.render(80);
+  await comp.dispose();
+
+  assert.ok(lines.some((l) => l.includes("\x1b[")), "the overlay applies ANSI color");
+  for (const l of lines) {
+    assert.equal(visibleLen(l), 80, `every framed line is exactly 80 visible cols: ${JSON.stringify(stripAnsi(l))}`);
+  }
+  assert.match(stripAnsi(lines.join("\n")), /PAUSED/, "plain content survives under the color");
 });
 
 test("before the first fetch resolves it renders a loading panel, not a crash", () => {
@@ -256,10 +272,10 @@ test("the spend panel shows the soft-hold state (amber-as-text) when a window is
   const out = comp.render(80).join("\n");
   await comp.dispose();
 
-  assert.match(out, /day: reserved 9 \/ cap 10 \(overlay\) \[soft-hold\]/, "the day window text shows soft-hold");
+  assert.match(out, /9\/10/, "the day meter shows reserved/cap");
+  assert.match(out, /· soft-hold/, "the day meter carries the soft-hold marker");
   assert.match(out, /soft-hold band: 80%/, "the configured band is shown");
-  assert.match(out, /9\/10 soft-hold/, "the day meter carries the soft-hold marker (monochrome, so text not colour)");
-  assert.match(out, /week: reserved 1 \/ cap 50/, "the week window is listed once its cap is set");
+  assert.match(out, /1\/50/, "the week window is listed once its cap is set");
 });
 
 test("the TRIGGERS section unifies the label allowlist with the schedulers block", async () => {
@@ -279,9 +295,8 @@ test("the TRIGGERS section unifies the label allowlist with the schedulers block
   const out = comp.render(80).join("\n");
   await comp.dispose();
 
-  assert.match(out, /Triggers:/, "the committed triggers header");
-  assert.match(out, /label {2}any\[bug\] → fix/, "the label trigger row");
-  assert.match(out, /Schedulers:/, "the schedulers block shares the section");
+  assert.match(out, /TRIGGERS/, "the triggers section divider");
+  assert.match(out, /bug → github fix/, "the label trigger row: match → target flow");
 });
 
 test("Enter on a run opens its detail dump, and Esc backs out to the list without quitting", async () => {
@@ -310,7 +325,7 @@ test("Enter on a run opens its detail dump, and Esc backs out to the list withou
   await flush();
   const back = comp.render(80).join("\n");
   await comp.dispose();
-  assert.match(back, /\[p\]ause/, "Esc returns to the interactive list");
+  assert.match(back, /p pause/, "Esc returns to the interactive list");
   assert.equal(closed, 0, "Esc from a sub-view never closes the overlay");
 });
 
@@ -409,4 +424,71 @@ test("PageDown scrolls the live tail window past the first viewport", async () =
   const after = comp.render(80).join("\n");
   await comp.dispose();
   assert.match(after, /\[40\/50\]/, "PageDown advances the window a full viewport past line 20");
+});
+
+// --- CRUD signaling: overlay keys close with an action the command loop drives via ctx.ui dialogs ---
+
+const triggerSnap = (triggers) => ({ ...SNAPSHOT, runs: [], activeJobId: null, triggers: { triggers } });
+
+test("pressing 'a' in the list signals an addTrigger action", async () => {
+  const actions = [];
+  const comp = makeDashboard({ paths: {}, done: (v) => actions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  comp.handleInput("a");
+  await flush();
+  await flush();
+  assert.deepEqual(actions, [{ action: "addTrigger" }]);
+});
+
+test("pressing 's' in the list signals an editSettings action", async () => {
+  const actions = [];
+  const comp = makeDashboard({ paths: {}, done: (v) => actions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  comp.handleInput("s");
+  await flush();
+  await flush();
+  assert.deepEqual(actions, [{ action: "editSettings" }]);
+});
+
+test("Enter on a trigger opens TRIGGER_DETAIL (trust model); e/x signal edit/delete with the file index", async () => {
+  const actions = [];
+  const snap = triggerSnap([{ type: "label", any: ["bug"], all: [], none: [], flow: "fix" }]);
+  const comp = makeDashboard({ paths: {}, done: (v) => actions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+
+  comp.handleInput("\r"); // selected 0 is the trigger -> TRIGGER_DETAIL
+  await flush();
+  const detail = stripAnsi(comp.render(80).join("\n"));
+  assert.match(detail, /TRUST MODEL/, "the drill-in shows the per-kind trust model");
+  assert.match(detail, /collaborator's label/, "the label trust model text");
+
+  comp.handleInput("e");
+  await flush();
+  await flush();
+  assert.deepEqual(actions, [{ action: "editTrigger", index: 0 }], "e signals editTrigger with the file index");
+});
+
+test("x in TRIGGER_DETAIL signals deleteTrigger; Esc backs out without signaling", async () => {
+  const snap = triggerSnap([{ type: "cron", id: "n", pattern: "0 3 * * *", folder: "/p", flow: "tidy" }]);
+  // delete path
+  const delActions = [];
+  const c1 = makeDashboard({ paths: {}, done: (v) => delActions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  c1.handleInput("\r");
+  await flush();
+  c1.handleInput("x");
+  await flush();
+  await flush();
+  assert.deepEqual(delActions, [{ action: "deleteTrigger", index: 0 }]);
+
+  // esc path: no action, back to LIST
+  const escActions = [];
+  const c2 = makeDashboard({ paths: {}, done: (v) => escActions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  c2.handleInput("\r");
+  await flush();
+  c2.handleInput("\x1b"); // Esc
+  await flush();
+  assert.deepEqual(escActions, [], "Esc from the trigger detail signals no CRUD action");
+  await c2.dispose();
 });

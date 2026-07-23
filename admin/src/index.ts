@@ -44,6 +44,7 @@ import {
   listRunIds,
   setQueuePaused,
   writeSettings,
+  writeTriggers,
   enqueueDispatchRun,
   KNOWN_KEYS,
 } from "./read-model.mjs";
@@ -320,22 +321,138 @@ async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void
     notify?.(`${USAGE} — the dashboard needs a TUI (this pi build has no overlay support)`, "info");
     return;
   }
-  await custom.call(
-    ctx.ui,
-    (tui: any, _theme: any, _keybindings: any, done: (value: void) => void) =>
-      makeDashboard({
-        paths,
-        done,
-        tui,
-        deps: {
-          ...createDashboardDeps(paths),
-          // log read stays here; overlay-only, returns readLogTail's result verbatim
-          tailLog: ({ jobId, lines }: { jobId: string; lines: number }) =>
-            readLogTail({ logsDir: paths.logsDir, jobId, lines }),
-        },
-      }),
-    { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } },
-  );
+  const factory = (tui: any, theme: any, _keybindings: any, done: (value: any) => void) =>
+    makeDashboard({
+      paths,
+      done,
+      tui,
+      theme,
+      deps: {
+        ...createDashboardDeps(paths),
+        // log read stays here; overlay-only, returns readLogTail's result verbatim
+        tailLog: ({ jobId, lines }: { jobId: string; lines: number }) => readLogTail({ logsDir: paths.logsDir, jobId, lines }),
+      },
+    });
+  const opts = { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } };
+  // The overlay resolves with a CRUD action the operator triggered (add/edit/delete a trigger, edit
+  // settings) or `undefined` to quit. A CRUD action is driven here via ctx.ui dialogs -- writes are
+  // validated + atomic (`writeTriggers`/`writeSettings`) and the worker/receiver reload the file live -- then
+  // the overlay REOPENS so the change is visible immediately. Only-operator-typed, never an LLM tool.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const result = await custom.call(ctx.ui, factory, opts);
+    if (!result || !result.action) return;
+    await handleDashboardAction(result, paths, ctx);
+  }
+}
+
+/** Split a space-separated dialog answer into trimmed, non-empty words (label/action lists). */
+function splitWords(s: string | undefined): string[] {
+  return String(s ?? "")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Drive a CRUD action the dashboard overlay signalled, using pi's `ctx.ui` dialogs (`select`/`input`/
+ * `confirm`). Every write goes through `writeTriggers`/`writeSettings` (validated + atomic + fail-closed);
+ * the live-reload watchers apply it without a restart. A build without the dialog primitives degrades to a
+ * notice rather than a crash. `undefined` from any dialog is a cancel.
+ */
+export async function handleDashboardAction(result: any, paths: any, ctx: any): Promise<void> {
+  const ui = ctx?.ui;
+  const notify: Notify = ui?.notify?.bind(ui);
+  if (typeof ui?.input !== "function" || typeof ui?.select !== "function" || typeof ui?.confirm !== "function") {
+    notify?.("editing needs a newer pi (no input/select/confirm dialogs)", "warning");
+    return;
+  }
+  switch (result.action) {
+    case "addTrigger":
+      return addTriggerViaDialogs(paths, ui, notify);
+    case "editTrigger":
+      return editTriggerFlow(paths, ui, notify, result.index);
+    case "deleteTrigger":
+      return deleteTriggerEntry(paths, ui, notify, result.index);
+    case "editSettings":
+      return editSettingsViaDialogs(paths, ui, notify);
+  }
+}
+
+/** Add a trigger: kind-first (the on x run diagonal is locked by construction), then the per-kind fields. */
+async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const kind = await ui.select("Add trigger — kind", ["cron", "label", "comment", "pull_request"]);
+  if (!kind) return;
+  let entry: any;
+  if (kind === "cron") {
+    const id = await ui.input("cron id (unique, no ':')", "nightly");
+    if (id === undefined) return;
+    const pattern = await ui.input("cron pattern (5 or 6 fields)", "0 3 * * *");
+    if (pattern === undefined) return;
+    const folder = await ui.input("folder (absolute host path, must exist)", "");
+    if (folder === undefined) return;
+    const flow = await ui.input("flow (skill name)", "fix");
+    if (flow === undefined) return;
+    const task = await ui.input("task (prompt text)", "run the flow");
+    if (task === undefined) return;
+    entry = { on: { type: "cron", id, pattern }, run: { kind: "local", folder, flow, task } };
+  } else if (kind === "label") {
+    const any = await ui.input("label(s) — space-separated (any-of)", "pi:fix");
+    if (any === undefined) return;
+    const flow = await ui.input("flow", "fix");
+    if (flow === undefined) return;
+    entry = { on: { type: "label", any: splitWords(any) }, run: { kind: "github", flow } };
+  } else if (kind === "comment") {
+    const phrase = await ui.input("trigger phrase", "@pi");
+    if (phrase === undefined) return;
+    const flow = await ui.input("default flow", "fix");
+    if (flow === undefined) return;
+    entry = { on: { type: "comment", phrase }, run: { kind: "github", flow } };
+  } else {
+    const action = await ui.input("PR actions — space-separated (labeled opened synchronize reopened)", "labeled");
+    if (action === undefined) return;
+    const any = await ui.input("label(s) for 'labeled' — space-separated (blank for auto actions)", "pi:review");
+    if (any === undefined) return;
+    const flow = await ui.input("flow", "review");
+    if (flow === undefined) return;
+    const on: any = { type: "pull_request", action: splitWords(action) };
+    if (splitWords(any).length > 0) on.any = splitWords(any);
+    entry = { on, run: { kind: "github", flow } };
+  }
+  const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (list: any[]) => [...list, entry] });
+  notify?.(res.ok ? `trigger added (live) — ${kind} → ${entry.run.flow}` : `add rejected: ${res.invalid}`, res.ok ? "info" : "error");
+}
+
+/** Edit a trigger's flow in place (the common "change what a trigger runs" edit). */
+async function editTriggerFlow(paths: any, ui: any, notify: Notify, index: number): Promise<void> {
+  if (typeof index !== "number") return;
+  const flow = await ui.input(`new flow for trigger #${index + 1}`, "");
+  if (flow === undefined || flow.trim() === "") return;
+  const res = writeTriggers({
+    triggersPath: paths.triggersPath,
+    mutate: (list: any[]) => list.map((t, i) => (i === index ? { ...t, run: { ...t.run, flow: flow.trim() } } : t)),
+  });
+  notify?.(res.ok ? `flow updated (live) → ${flow.trim()}` : `edit rejected: ${res.invalid}`, res.ok ? "info" : "error");
+}
+
+/** Delete a trigger after an explicit confirm. */
+async function deleteTriggerEntry(paths: any, ui: any, notify: Notify, index: number): Promise<void> {
+  if (typeof index !== "number") return;
+  const ok = await ui.confirm("Delete trigger", `Remove trigger #${index + 1} from triggers.json?`);
+  if (!ok) return;
+  const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (list: any[]) => list.filter((_, i) => i !== index) });
+  notify?.(res.ok ? `trigger #${index + 1} deleted (live)` : `delete rejected: ${res.invalid}`, res.ok ? "info" : "error");
+}
+
+/** Edit a limit / runtime setting: pick a key, then a value (blank unsets). Reuses the operator-typed
+ * `set`/`unset` path, so the same validation + effect-next-job semantics apply. */
+async function editSettingsViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const key = await ui.select("Change a limit / setting", [...KNOWN_KEYS]);
+  if (!key) return;
+  const value = await ui.input(`${key} — new value (blank to unset)`, "");
+  if (value === undefined) return;
+  if (value.trim() === "") applyUnset(paths.settingsFile, ["unset", key], notify);
+  else applySet(paths.settingsFile, ["set", key, value.trim()], notify);
 }
 
 type Notify = ((message: string, type?: string) => void) | undefined;

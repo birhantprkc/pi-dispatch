@@ -21,7 +21,9 @@
  */
 
 import http from "node:http";
-import { loadReceiverConfig } from "./config.mjs";
+import { watch } from "node:fs";
+import { dirname, basename } from "node:path";
+import { loadReceiverConfig, triggersFilePath, reloadTriggers } from "./config.mjs";
 import { makeReceiver } from "./receiver.mjs";
 import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
 import { makeQueue } from "@pi-dispatch/worker/queue";
@@ -56,9 +58,11 @@ export async function startReceiver(
 		log({ event: "receiver_started", port: cfg.port, bind: cfg.bind, valkey: cfg.valkeyUrl }),
 	);
 
-	// Graceful shutdown only on the real entry (default createServer). Under test injection the fakes
-	// are per-test, so registering process-wide signal handlers would leak listeners across tests.
+	// Graceful shutdown AND the live-trigger watcher only on the real entry (default createServer). Under
+	// test injection the fakes are per-test, so a process-wide signal handler or an fs watcher would leak
+	// across tests; the reload LOGIC (`reloadTriggers`) is unit-tested directly instead.
 	if (createServer === http.createServer) {
+		watchTriggers(env, cfg, log);
 		const shutdown = async (signal) => {
 			log({ event: "receiver_stopping", signal });
 			await new Promise((resolve) => server.close(resolve));
@@ -70,6 +74,33 @@ export async function startReceiver(
 	}
 
 	return server;
+}
+
+/**
+ * Live-reload watcher: watch the DIRECTORY holding the triggers file (robust to the atomic tmp+rename the
+ * admin writes with, which swaps the inode a file-watch would lose), debounce, and re-read on change. A bad
+ * edit keeps the running triggers (reloadTriggers never throws) and logs a kept-old notice. Best-effort: a
+ * platform without `fs.watch` logs and the receiver simply keeps its boot-time triggers.
+ */
+function watchTriggers(env, cfg, log) {
+	const path = triggersFilePath(env);
+	const dir = dirname(path) || ".";
+	const file = basename(path);
+	let timer = null;
+	try {
+		watch(dir, (_event, changed) => {
+			if (changed && changed !== file) return; // only our file (null changed name -> reload to be safe)
+			clearTimeout(timer);
+			timer = setTimeout(() => {
+				const res = reloadTriggers(env, cfg);
+				if (res.ok) log({ event: "triggers_reloaded" });
+				else log({ event: "triggers_reload_invalid", reason: res.invalid, kept: true });
+			}, 150);
+		}).unref?.();
+		log({ event: "triggers_watching", path });
+	} catch (err) {
+		log({ event: "triggers_watch_unavailable", reason: err?.message });
+	}
 }
 
 // Entry point when run directly (main: src/start.mjs, no bin). Kept out of startReceiver so tests call

@@ -308,10 +308,12 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Statement**: The admin surface shall ship as a pi extension in `admin/`, loaded into the operator's
   interactive pi session. It provides operator slash commands for observability (`status`, `runs`, `logs`,
   `budget`, `triggers`), queue on/off (`pause`/`resume`, backed by the same durable `queue.pause()`), and
-  settings editing (`set`/`unset`, writing the `settings.json` overlay). The model-callable tools are
-  **reads, `pause`/`resume`, and `dispatch_run`** (a gated enqueue); every settings write is an
-  operator-typed command, never a model-invocable tool, and `dispatch_run` accordingly takes **no
-  spend-knob argument** (`model`/`maxTurns`/`dailyCap`/`concurrency`).
+  settings editing (`set`/`unset`, writing the `settings.json` overlay), plus **operator-typed trigger CRUD**
+  from the overlay (add / edit-flow / delete, writing `triggers.json` — validated by the shared
+  `parseTriggers`, atomic — and reloaded **live** by both services, `OQ-008`). The model-callable tools are
+  **reads, `pause`/`resume`, and `dispatch_run`** (a gated enqueue); **every write — settings AND triggers —
+  is operator-typed, never a model-invocable tool**, and `dispatch_run` accordingly takes **no spend-knob
+  argument** (`model`/`maxTurns`/`dailyCap`/`concurrency`).
 - **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs
   except the gated `dispatch_run` enqueue, and is never materialised into a job's `/job` inputs —
   `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's own `.pi/` extensions, not this one.
@@ -330,7 +332,9 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   `REQ-AI-TRIGGERED-RUNS`
 - **Acceptance**: Given the extension is loaded, when the operator runs `/dispatch status`, then queue
   counts, paused state, and budget render with no model involvement; given a model-invoked tool call, when
-  it is a settings write, then no such tool exists (writes are commands only); given `dispatch_run`, when
+  it is a settings OR trigger write, then no such tool exists (both are operator-typed only); given an
+  operator trigger edit through the overlay, when it is written, then it validates through the shared
+  `parseTriggers` (a bad edit is rejected, the file untouched) and both services apply it without a restart; given `dispatch_run`, when
   it is invoked, then it exposes no `model`/`maxTurns`/`dailyCap`/`concurrency` argument, admits a run only
   for a folder within `PI_DISPATCH_RUN_ROOTS` and a flow whose pre-agent-SHA `SKILL.md` carries
   `ai-trigger: allow`, and the enqueued job's spend resolves from overlay/env and is bounded by the daily

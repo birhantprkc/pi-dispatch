@@ -4,7 +4,7 @@
 cron schedule, or by a GitHub issue or pull request — in a container you control, with a durable queue, a
 spend cap, and a live admin panel.**
 
-![The /dispatch dashboard overlay — live queue state, day/week/month spend meters, the unified triggers pane (cron, label, comment, pull_request), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
+![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
 
 ![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg)
 
@@ -156,8 +156,10 @@ to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi insid
 in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
 
 Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
-queue in place, `↑`/`↓` and `Enter` to drill into a run or tail the active job. `Enter` on a run opens its
-full PII-free record:
+queue in place, `↑`/`↓` to move across the triggers and runs, `Enter` to drill into either. **Triggers are
+editable in place**: `Enter` on a trigger shows its trust model, `e` edits its flow, `x` deletes it, `a`
+adds one (guided, kind-first), and `s` edits a limit — every write is operator-typed, validated, atomic, and
+**reloaded live** by the worker/receiver (no restart). `Enter` on a run opens its full PII-free record:
 
 ![The RUN_DETAIL drill-in — a framed key/value dump of one run's record: target, flow, outcome, turns, tokens, cost, exit code, timings](docs/images/dispatch-run-detail.svg)
 
@@ -166,7 +168,7 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 - `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
 - `pause` / `resume` — the queue on/off switch
 - `runs` / `logs` — recent run records, and one run's raw log
-- `triggers` — the configured triggers (display only)
+- `triggers` — the configured triggers (also editable from the overlay: `a`/`e`/`x`, applied live)
 - `run <folder> <flow> [task]` — enqueue a flow against a local folder (operator-typed; the dirty-tree guard still applies)
 - `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
 

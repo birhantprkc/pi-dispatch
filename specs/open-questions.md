@@ -134,20 +134,26 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   with a hash suffix only if it is ever observed.
 - **Blocks**: nothing from shipping. The boot sweep bounds growth across restarts today.
 
-## OQ-008 — Runtime trigger editing (cron toggle, label→flow) is deferred
+## OQ-008 — Runtime trigger editing: RESOLVED (the file is the write target, applied live)
 
-- **Status**: **OPEN**
-- **Question**: Should the admin extension edit triggers — toggling a cron schedule, remapping a
-  label→flow — and via what mechanism that survives a worker or receiver restart?
-- **Why it matters**: A Redis-side scheduler toggle is overwritten by the worker's boot reconcile
-  (`REQ-CRON-SCHEDULED-JOBS` acceptance: startup removes schedulers absent from the triggers file), so a
-  runtime edit that silently reverts at the next boot is worse than no edit at all. The label→flow and
-  pull_request mappings live in the unified `triggers.json`, loaded fail-loud at receiver boot, so an edit
-  there needs a receiver restart. Two sources of truth — a live toggle and a file the boot reconcile
-  trusts — is the failure mode.
-- **How to answer**: Either make the file the write target (the extension edits `triggers.json` and gains
-  a reload story), or ratify trigger editing as display-only.
-- **Blocks**: Nothing this slice — the admin extension ships triggers **display-only**.
+- **Status**: **RESOLVED** — the admin extension edits `triggers.json`, and both services reload it live.
+- **Question**: Should the admin extension edit triggers — add / edit-flow / delete a cron, label, comment,
+  or pull_request trigger — and via what mechanism that survives a worker or receiver restart?
+- **Why it mattered**: A Redis-side scheduler toggle is overwritten by the worker's boot reconcile
+  (`REQ-CRON-SCHEDULED-JOBS`: startup removes schedulers absent from the triggers file), so a runtime edit
+  that silently reverts at the next boot is worse than no edit at all. Two sources of truth — a live toggle
+  and a file the boot reconcile trusts — is the failure mode.
+- **Resolution**: **The file is the single write target, and the file is what reloads.** The extension's
+  operator-typed CRUD dialogs (`ctx.ui` `select`/`input`/`confirm`) write `triggers.json` through
+  `writeTriggers` — validated by the SHARED `parseTriggers` (fail-closed: an off-diagonal or malformed edit
+  is never written) and atomic (tmp+rename, so a watcher never sees a half-written file). Both services then
+  **live-reload the same file**: the worker watches it and re-`reconcile`s the cron schedulers (idempotent —
+  add installs, delete prunes, edit re-upserts); the receiver watches it and hot-swaps `cfg.triggers`. A bad
+  edit **keeps the running config** and logs a kept-old notice — a live service is never taken down by a
+  malformed trigger file. Because the file is the one source and the reload re-reads it, the boot reconcile
+  and the live edit can never diverge. Writes stay **operator-typed** — no LLM tool reaches `writeTriggers` —
+  so `CONST-TRIGGER-AUTHOR-GATE` holds.
+- **Blocks**: Nothing. Shipped.
 
 ## OQ-009 — Chaining from a GitHub-job parent (and cross-folder chaining) is deferred
 
