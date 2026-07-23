@@ -632,7 +632,7 @@ function runRow(row: any, sel: boolean, inner: number, styler: any): string {
     styler.fg("accent", r.flow ?? "-"),
     outcomeColored(r.outcome, r.reason, styler),
     styler.fg("dim", `${r.turns ?? "-"}t`),
-    styler.fg("dim", `${r.tokens?.total ?? "-"}`),
+    styler.fg("dim", Number.isFinite(r.tokens?.total) ? fmtTokens(r.tokens.total) : "-"),
   ];
   return fitLine(`${cursor} ${tree}${cells.join(sep)}`, inner, styler);
 }
@@ -648,9 +648,12 @@ function settingsLines(settings: any, inner: number, styler: any): string[] {
   if (settings && settings.invalid) return [styler.cell(`settings invalid: ${settings.invalid}`, inner, { color: "error" })];
   const o = (settings && settings.overlay) ?? {};
   const kv = (k: string, v: any) => styler.fg("muted", k) + " " + styler.fg("text", v === undefined ? "·" : String(v));
+  // Token caps render compact (5000000 -> "5M") so the limits line never clips on a narrower overlay.
+  const tk = (k: string, v: any) => styler.fg("muted", k) + " " + styler.fg("text", Number.isInteger(v) ? fmtTokens(v) : "·");
+  const pctVal = Number.isInteger(o.softHoldPct) ? `${o.softHoldPct}%` : "·";
   const gap = styler.fg("dim", "   ");
-  const l1 = [kv("model", o.model), kv("provider", o.provider), kv("maxTurns", o.maxTurns)].join(gap);
-  const l2 = [kv("dailyCap", o.dailyCap), kv("dailyTokenCap", o.dailyTokenCap), kv("concurrency", o.concurrency), kv("softHold", o.softHoldPct)].join(gap);
+  const l1 = [kv("model", o.model), kv("provider", o.provider), kv("maxTurns", o.maxTurns), tk("maxTokens", o.maxTokens)].join(gap);
+  const l2 = [kv("dailyCap", o.dailyCap), tk("dailyTokenCap", o.dailyTokenCap), kv("concurrency", o.concurrency), styler.fg("muted", "softHold") + " " + styler.fg("text", pctVal)].join(gap);
   return [fitLine(l1, inner, styler), fitLine(l2, inner, styler)];
 }
 

@@ -297,11 +297,13 @@ function registerTools(pi: ExtensionAPI): void {
     label: "pi-dispatch add trigger",
     description:
       "Adds a trigger to triggers.json and applies it live. The operator MUST approve a confirm dialog showing " +
-      "the entry; with no interactive operator it is refused. `kind` is cron|label|comment|pull_request. cron " +
-      "needs id/pattern/folder/flow/task and may set optional model/provider/maxTurns (the flow's default model " +
-      "for that schedule; omit to use the deployment default); label needs labels[]+flow; comment needs " +
-      "phrase+flow; pull_request needs action[] (+ optional labels[]) + flow. Only cron carries model/provider/" +
-      "maxTurns — github triggers run under the deployment default.",
+      "the entry; with no interactive operator it is refused. `flow` is the .pi/skills/<name> skill the job runs " +
+      "(its SKILL.md is the agent's instructions). `kind` = cron|label|comment|pull_request. cron (local) needs " +
+      "id, pattern, `folder` (absolute host path the job runs in), `flow`, and `task` (the prompt text handed to " +
+      "the agent), and may set optional model/provider/maxTurns for that schedule (omit = deployment default). " +
+      "label needs labels[]+flow; comment needs phrase+flow; pull_request needs action[] (+ optional labels[]) + " +
+      "flow. For github triggers the repo and the task come from the triggering issue/PR event — set only the " +
+      "match + flow — and they run under the deployment default model.",
     executionMode: "sequential",
     parameters: Type.Object({
       kind: Type.String(),
@@ -645,42 +647,43 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
   if (!kind) return;
   let entry: any;
   if (kind === "cron") {
-    const id = await ui.input("cron id (unique, no ':')", "nightly");
+    const id = await ui.input("cron id — unique name for this schedule, no ':'", "nightly");
     if (id === undefined) return;
-    const pattern = await ui.input("cron pattern (5 or 6 fields)", "0 3 * * *");
+    const pattern = await ui.input("schedule — cron pattern, 5 or 6 fields (min hour day month weekday)", "0 3 * * *");
     if (pattern === undefined) return;
-    const folder = await ui.input("folder (absolute host path, must exist)", "");
+    const folder = await ui.input("folder — absolute host path the job runs in (must exist)", "");
     if (folder === undefined) return;
-    const flow = await ui.input("flow (skill name)", "fix");
+    const flow = await ui.input("flow — the .pi/skills/<name> skill to run (its SKILL.md is the agent's instructions)", "fix");
     if (flow === undefined) return;
-    const task = await ui.input("task (prompt text)", "run the flow");
+    const task = await ui.input("task — the prompt text handed to the agent for this run", "run the flow");
     if (task === undefined) return;
-    // Optional per-cron overrides — blank keeps the global overlay/env value at job start.
-    const model = await ui.input("model (blank = default)", "");
+    // Optional per-cron overrides — blank keeps the deployment default (overlay/env) at job start.
+    const model = await ui.input("model — this schedule's model (blank = deployment default)", "");
     if (model === undefined) return;
-    const provider = await ui.input("provider (blank = default)", "");
+    const provider = await ui.input("provider — this schedule's provider (blank = deployment default)", "");
     if (provider === undefined) return;
-    const maxTurns = await ui.input("maxTurns (blank = default)", "");
+    const maxTurns = await ui.input("maxTurns — turn budget for this schedule (blank = deployment default)", "");
     if (maxTurns === undefined) return;
     entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task, model, provider, maxTurns });
   } else if (kind === "label") {
-    const labels = await ui.input("label(s) — space-separated (any-of)", "pi:fix");
+    // github triggers run against the triggering repo, and the issue/PR text is the task — neither is set here.
+    const labels = await ui.input("labels — space-separated, any-of (a collaborator applies one to fire)", "pi:fix");
     if (labels === undefined) return;
-    const flow = await ui.input("flow", "fix");
+    const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the issue text is the task)", "fix");
     if (flow === undefined) return;
     entry = buildTriggerEntry("label", { labels, flow });
   } else if (kind === "comment") {
-    const phrase = await ui.input("trigger phrase", "@pi");
+    const phrase = await ui.input("trigger phrase — a comment containing this fires the flow (e.g. @pi)", "@pi");
     if (phrase === undefined) return;
-    const flow = await ui.input("default flow", "fix");
+    const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the comment/issue text is the task)", "fix");
     if (flow === undefined) return;
     entry = buildTriggerEntry("comment", { phrase, flow });
   } else {
-    const action = await ui.input("PR actions — space-separated (labeled opened synchronize reopened)", "labeled");
+    const action = await ui.input("PR actions — space-separated: labeled opened synchronize reopened", "labeled");
     if (action === undefined) return;
-    const labels = await ui.input("label(s) for 'labeled' — space-separated (blank for auto actions)", "pi:review");
+    const labels = await ui.input("labels for 'labeled' — space-separated (blank for the auto actions)", "pi:review");
     if (labels === undefined) return;
-    const flow = await ui.input("flow", "review");
+    const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the PR text is the task)", "review");
     if (flow === undefined) return;
     entry = buildTriggerEntry("pull_request", { action, labels, flow });
   }
@@ -691,7 +694,7 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
 /** Edit a trigger's flow in place (the common "change what a trigger runs" edit). */
 async function editTriggerFlow(paths: any, ui: any, notify: Notify, index: number): Promise<void> {
   if (typeof index !== "number") return;
-  const flow = await ui.input(`new flow for trigger #${index + 1}`, "");
+  const flow = await ui.input(`new flow for trigger #${index + 1} — the .pi/skills/<name> skill it runs`, "");
   if (flow === undefined || flow.trim() === "") return;
   const res = writeTriggers({
     triggersPath: paths.triggersPath,
