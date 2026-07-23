@@ -26,8 +26,16 @@ npx pi-dispatch run ./my-project --task "dedupe the imports in src/" --flow tidy
   a **daily cap** checked *before* any tokens are spent, so a runaway can't quietly drain your API budget.
 - **Nothing is dropped.** Fifty triggers at once become fifty durable queued jobs, drained at a fixed
   concurrency (default 3) and surviving a reboot (Valkey with AOF).
-- **Three triggers, one job contract.** A CLI command, a cron schedule, or a GitHub issue/PR — each
-  produces the same job, runs through the same box, and shows up in the same panel.
+- **Three triggers, one job contract.** A CLI command, a **cron schedule**, or a GitHub issue/PR — each
+  produces the same job, runs through the same box, and shows up in the same panel. The scheduler is the
+  unattended one: recurring work on your own hardware — a nightly tidy, a weekly dependency bump, a docs
+  regen, a scheduled frontend visual check — the same autonomous-agent-on-a-timer idea as a hosted
+  routine, but the run happens in *your* container under *your* queue and spend caps.
+- **The container image is yours to shape.** Every job runs in your
+  [`image/Dockerfile`](image/Dockerfile) — bake in a project's exact toolchain and system libraries. It
+  already ships **Playwright + Chromium**, so a flow can build your frontend, screenshot it, and iterate
+  on the *rendered* result (before/after images attach to the PR). A hosted routine runs in a fixed
+  environment; here the box bends to the project.
 - **Your project steers the agent** using pi's native layout — `.pi/APPEND_SYSTEM.md` for the persona,
   `.pi/skills/<name>/SKILL.md` for skills, read from your committed files. pi-dispatch ships no persona of
   its own, only a small immutable safety floor baked into the image that your instructions add to and
@@ -310,14 +318,25 @@ flowchart TD
   EN -->|"Valkey down"| E503["503 — GitHub redelivers,<br/>deduped by GUID"]
 ```
 
-## Should you use this instead of the Claude Code GitHub Action?
+## How it compares
 
-For GitHub automation, often no — and you should know that up front.
+**vs the Claude Code GitHub Action.** For GitHub automation, often reach for the action —
 [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action) (MIT, ~8.4k stars) is
 GA and does label-triggered issue automation for 10% of the effort. pi-dispatch is for a narrower case:
 **you run pi, on your own hardware, and you want a real queue, a container boundary, and — the part the
 action can't do — to run flows against local folders**, not just GitHub repos, without hosted-runner
 minutes.
+
+**vs Claude Code routines and `/loop`.** A routine runs a recurring agent task on a cron schedule (managed,
+in the cloud); `/loop` repeats a prompt on an interval inside your session. For generic recurring work
+they're simpler — nothing to host — and often the right call. pi-dispatch's cron trigger is the same idea
+with a different centre of gravity: the run happens in **a container image you build**, on **your**
+hardware, under **your** queue and spend caps. That is the edge when the task needs an environment a hosted
+routine cannot give it — a project's exact toolchain and system libraries, or the baked-in **Playwright +
+Chromium** that lets a scheduled flow build a frontend, screenshot it, and iterate until it renders right,
+then attach the before/after to a PR. Rule of thumb: if the recurring task is *"run a prompt,"* use a
+routine; if it is *"run this project's real build / test / visual loop on a schedule, in an image I
+control,"* that is this.
 
 ## Status
 
