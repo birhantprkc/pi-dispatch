@@ -22,6 +22,7 @@ import { defaultLogsDir } from "@pi-dispatch/worker/config";
 import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
+import { parseTriggers } from "@pi-dispatch/worker/triggers";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
 import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
@@ -54,6 +55,9 @@ export function resolvePaths(env = process.env) {
       .map((s) => s.trim())
       .filter(Boolean),
     dispatchRunPerHour: parseNonNegInt(env.PI_DISPATCH_RUN_PER_HOUR, 3),
+    // The per-scheduler stall threshold, mirrored from the worker's PI_SCHEDULER_STALL_MAX (default 2) so the
+    // cron drill-in can show `stalls n/threshold`. Read directly from env for the same reason as above.
+    schedulerStallMax: parseNonNegInt(env.PI_SCHEDULER_STALL_MAX, 2),
   };
 }
 
@@ -269,6 +273,40 @@ export function writeSettings({ settingsFile, mutate, fs = nodeFs }) {
   return res.invalid ? { ok: true, overlay: next, rebuiltFrom: res.invalid } : { ok: true, overlay: next };
 }
 
+/**
+ * Read-modify-write the unified triggers.json. `mutate(entries)` receives a copy of the current raw
+ * `{ on, run }` entry array and returns the new array; the result is re-serialized to the
+ * `{ triggers: [...] }` file shape, VALIDATED through the SHARED `parseTriggers` (fail-closed -- an invalid
+ * result is NEVER written, so the worker/receiver loaders can always parse the file), and written
+ * ATOMICALLY (tmp + rename), so a live-reload watcher never observes a half-written file.
+ *
+ * Human-approved writes only: reached from the operator-typed `/dispatch trigger …` handlers AND from the
+ * `dispatch_trigger_*` LLM tools, but the tools route through `confirmedWrite`, which requires an operator to
+ * approve a confirm dialog before this runs. The human keypress is the approval, so CONST-TRIGGER-AUTHOR-GATE's
+ * principle holds either way. A missing or unparseable existing file starts from an empty set; the validated
+ * write repairs it. Returns `{ ok: true }` or `{ invalid }` with the parser's reason.
+ */
+export function writeTriggers({ triggersPath, mutate, fs = nodeFs }) {
+  let current = [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(triggersPath, "utf8"));
+    if (Array.isArray(raw?.triggers)) current = raw.triggers;
+  } catch {
+    // Missing/invalid file: start from empty; the validated atomic write below repairs it.
+  }
+  const next = mutate(current.map((t) => ({ ...t })));
+  const text = `${JSON.stringify({ triggers: next }, null, 2)}\n`;
+  try {
+    parseTriggers(text, triggersPath); // the loaders' own validator -- never write a file they would reject
+  } catch (e) {
+    return { invalid: e?.message ?? String(e) };
+  }
+  const tmp = `${triggersPath}.tmp`;
+  fs.writeFileSync(tmp, text, { mode: 0o644 });
+  fs.renameSync(tmp, triggersPath);
+  return { ok: true };
+}
+
 async function readWorkerCount(queue) {
   try {
     const list = await queue.getWorkers();
@@ -466,6 +504,9 @@ function normalizeTriggerForDisplay(entry) {
         pattern: typeof on.pattern === "string" ? on.pattern : null,
         folder: typeof run.folder === "string" ? run.folder : null,
         flow,
+        // Optional per-cron model override (passthrough into job.data); null when the entry resolves the
+        // deployment default. Surfaced so the drill-in shows which schedules pin their own model.
+        model: typeof run.model === "string" ? run.model : null,
       };
     case "label":
       return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow };

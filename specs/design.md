@@ -486,14 +486,28 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   operator's own interactive pi session (via `-e`, `~/.pi/agent/extensions`, or a trust-gated
   `.pi/extensions`). It provides operator-only slash commands
   (`/dispatch status|pause|resume|runs|logs|budget|triggers|settings|set|unset`) and one
-  self-refreshing TUI overlay component with **three in-component views**: **LIST** — a framed
-  monochrome panel carrying a status bar, a SPEND meter, a unified **TRIGGERS** pane that shows
-  schedulers plus the per-flow `{any, all, none}` trigger rules **display-only**, and an interactive runs list with `↑↓`
-  selection; **RUN_DETAIL** — a drill-in dump of the selected run's PII-free `.json` run-record fields;
-  and **LIVE_TAIL** — a view that tails a running job's `.log` **inside the overlay** through an
-  injected `deps.tailLog` seam whose `fs` read lives in `index.ts`. The LLM-callable tools are reads,
-  `pause`/`resume`, and the gated `dispatch_run` enqueue;
-  every settings write is an operator-typed command, never a model-invocable tool. The extension talks to the same Valkey
+  self-refreshing TUI overlay component with **four in-component views**: **LIST** — a framed,
+  **theme-colored** panel (color via pi's injected `Theme`, applied post-layout so pi's ANSI-aware
+  `visibleWidth` still frames it) carrying a status header, day/week/month **SPEND meters** (colored by the
+  same `windowState` the worker enforces) plus a daily **token** counter, a unified **TRIGGERS** pane whose
+  `{on, run}` rows are **selectable and editable**, and an interactive runs list — all navigated with `↑↓`;
+  **TRIGGER_DETAIL** — Enter on a trigger opens its filter and a per-kind **trust model** (who authorizes it,
+  how it dedups, which service owns it), with `e` edit-flow / `x` delete; **RUN_DETAIL** — a drill-in dump of
+  the selected run's PII-free `.json` run-record fields; and **LIVE_TAIL** — a view that tails a running
+  job's `.log` **inside the overlay** through an injected `deps.tailLog` seam whose `fs` read lives in
+  `index.ts` (the log CONTENT stays `clip`-stripped and uncolored — only the chrome is themed). The
+  LLM-callable tools are reads (`status`/`runs`/`triggers`), `pause`/`resume`, the gated `dispatch_run`
+  enqueue, and the **confirm-gated writes** `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete`. A
+  write can be **operator-typed** (`ctx.ui` `select`/`input`/`confirm` dialogs from the overlay, or a
+  `/dispatch set` command) **or model-initiated but operator-approved**: a write tool routes through
+  `confirmedWrite`, which applies the change only after the operator approves a `ctx.ui.confirm` showing the
+  concrete before/after, and **refuses — writing nothing — when no interactive operator is present**
+  (`ctx.hasUI` false). The model emits the call; the human answers the confirm. Both paths reach the same
+  `writeTriggers`/`writeSettings` (validated by the shared `parseTriggers`/`writeOverlay`, atomic tmp+rename,
+  fail-closed) and both services **live-reload** `triggers.json`/`settings.json`, so a change takes effect
+  without a restart (`OQ-008`), keeping the running config on an invalid edit. The extension also ships an
+  `operate-pi-dispatch` skill (advertised via the `resources_discover` event) that recommends how to use
+  those human confirm gates. The extension talks to the same Valkey
   (`VALKEY_URL`) and reads the run-history sidecar files; it **binds no network port at all**. Bull Board
   is dropped.
 - **Why**:
@@ -527,9 +541,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     enqueues a **paid** run that edits a folder in place with no undo. This **supersedes the Decision's
     "reads plus `pause`/`resume` only" categorical** — `dispatch_run` is a **third** model-callable tool,
     an enqueue, admitted under `DES-AI-TRIGGER-FLOW-GATE` and its companion requirement (the
-    `requirements.md` amendment lands in a sibling task). The surviving half of that categorical still
-    holds: **every settings write is operator-typed, never a model tool**, which is exactly why
-    `dispatch_run` takes no spend knobs. The injected call is bounded by six independent limits, not by
+    `requirements.md` amendment lands in a sibling task). `dispatch_run` still takes no spend knobs. The
+    injected call is bounded by six independent limits, not by
     undo: (1) the operator-preconfigured **folder allowlist** (`PI_DISPATCH_RUN_ROOTS`, realpath +
     containment) — the tool can fire only inside folders the operator chose; (2) the **per-flow committed
     opt-in** (default deny, read at a pre-agent SHA, `DES-AI-TRIGGER-FLOW-GATE`); (3) the final
@@ -539,6 +552,21 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     widen per-job spend; (5) a **per-hour rate limit** on `dispatch_run`; and (6) the **daily cap**
     (`CONST-BUDGET-BEFORE-TOKENS`), the ultimate money bound, resolved consumer-side in the processor. The
     money-safe framing therefore applies only to `dispatch_pause`/`dispatch_resume`, not to `dispatch_run`.
+    A **third residual is named and bounded by a human confirm, not by structure**: the model-callable write
+    tools `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete` can change a limit (the daily cap
+    included) or add a paid trigger. Each routes through `confirmedWrite`, which **refuses unless the operator
+    is present** (`ctx.hasUI`) **and approves a `ctx.ui.confirm` dialog showing the concrete before/after** —
+    so a prompt-injected session emits only the *call*; the *approval* is a human keypress it cannot forge,
+    and with no interactive UI (print/headless) the write is refused, not silently applied. This is the same
+    human-approval gate the operator-typed `/dispatch set` and overlay CRUD already were; it does not weaken
+    `CONST-BUDGET-BEFORE-TOKENS` (the cap is still checked before tokens — only its *value* changes, under an
+    operator confirm, exactly as a typed `set` would) or `CONST-TRIGGER-AUTHOR-GATE` (whose webhook
+    author-gating is untouched; the confirm is the human approval for a locally-configured trigger). The
+    residual that remains is an inattentive operator rubber-stamping a confirm; the dialog defaults to deny
+    and shows the concrete change to make that a deliberate act, and the `operate-pi-dispatch` skill tells the
+    model to state the change plainly and to accept a decline rather than retry it. Strictly, tool absence was
+    safer than a confirm — that trade is taken deliberately to make the surface AI-operable, and the write
+    tools are `sequential` so two writes cannot interleave.
   - **The operator's pi version is uncontrolled**, so the extension runs a **load-time capability probe**
     of the exact API surface it uses and, on any miss, registers **nothing** — all-or-nothing rather than
     half-loading. The supported version is the pin, `0.80.7` (`CONST-PI-VERSION-PINNED`). Residual risk,
@@ -858,3 +886,4 @@ a tunnel.
 | 2026-07-22 | `DES-JOB-OUTBOX-CHAINING` records how the agent learns the outbox protocol: a **separate baked persona file** (`guardrails/OUTBOX_PROTOCOL.md`, immutable `chmod a-w`), composed into `appendSystemPromptOverride` **only when `/outbox` is mounted** (a github job is never billed for it) and evaluated once at loader build per `CONST-PERSONA-IN-CACHED-PREFIX`; kept out of `HARD_RULES.md` (the always-billed safety floor) and framed as documentation — the caps and `ai-trigger` gate are host-enforced, the persona controls nothing. |
 | 2026-07-22 | Coherence fix: reworded the `DES-ADMIN-VIA-PI-EXTENSION` `Decision` line — "reads plus `pause`/`resume` only" now reads "reads, `pause`/`resume`, and the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's second injection residual (every settings write stays operator-typed). |
 | 2026-07-22 | `DES-ADMIN-VIA-PI-EXTENSION` dashboard amended to three in-component views — LIST (framed monochrome panel with unified TRIGGERS pane + `↑↓` runs selection), RUN_DETAIL (PII-free `.json` fields), and LIVE_TAIL — in one self-refreshing overlay. LIVE_TAIL renders raw `.log` bytes through an injected `deps.tailLog` seam whose `fs` read lives in `index.ts`, preserving the overlay-only `.log` boundary (never a tool result, never model context); USED_API stays the three pi members, `tailLog` being an internal `custom`-seam dependency, not a pi member. |
+| 2026-07-23 | `DES-ADMIN-VIA-PI-EXTENSION` amended for **AI-operable, confirm-gated writes**: the model-callable surface gains `dispatch_triggers` (read) and the write tools `dispatch_set` + `dispatch_trigger_add`/`_edit`/`_delete`, each routed through `confirmedWrite` — applied only after an operator approves a `ctx.ui.confirm` showing the concrete before/after, refused (writing nothing) when `ctx.hasUI` is false. Adds a **third named injection residual** bounded by that human confirm rather than by structure; supersedes the "every settings write is operator-typed, never a model tool" clause. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged — the confirm is the human approval, and both write paths reach the same validated/atomic `writeTriggers`/`writeSettings`. Extension also ships an `operate-pi-dispatch` skill (advertised via `resources_discover`) recommending how to use the gates. `USED_API` gains `on`. Companion `requirements.md`/`constitution.md` amendments land with it. |

@@ -89,3 +89,24 @@ function loadTriggers(env, readFile, fileExists) {
 
 	return { label, comment, pullRequest, knownFlows };
 }
+
+/** The triggers file path the receiver reads (env override or the committed deploy default). */
+export function triggersFilePath(env = process.env) {
+	return env.PI_TRIGGERS_FILE ?? DEFAULT_TRIGGERS_PATH;
+}
+
+/**
+ * Live-reload the receiver's triggers: re-read + re-group the file and swap `cfg.triggers` IN PLACE, so the
+ * already-wired handler (which closes over `cfg`) picks up the new triggers on its next request -- no
+ * restart, mirroring how the worker re-reads the settings overlay per job. If the new file is
+ * missing/unparseable/invalid, the running triggers are KEPT (never crash a live receiver on a bad edit)
+ * and the reason is returned. Returns `{ ok: true }` or `{ invalid }`.
+ */
+export function reloadTriggers(env, cfg, { readFile = readFileSync, fileExists = existsSync } = {}) {
+	try {
+		cfg.triggers = loadTriggers(env, readFile, fileExists);
+		return { ok: true };
+	} catch (e) {
+		return { invalid: e?.message ?? String(e) };
+	}
+}

@@ -14,6 +14,7 @@
  */
 
 import { configError } from "./config.mjs";
+import { loadSchedules } from "./schedules.mjs";
 
 function sentinelName(code) {
 	if (code === -10) return "SchedulerJobIdCollision";
@@ -64,4 +65,30 @@ export async function reconcile(queue, schedules, { log = () => {} } = {}) {
 	}
 
 	return { installed: schedules.length, removed: orphanIds.length };
+}
+
+/**
+ * Live-reload the cron schedulers from the (changed) triggers file: re-select the cron subset and reconcile
+ * it against the resident schedulers -- an add installs, a delete prunes (reconcile already removes orphans),
+ * an edit re-upserts. Idempotent, so a spurious watch event costs one no-op reconcile. A bad edit
+ * (`loadSchedules` throws a `configError`) is logged and the RUNNING schedulers are KEPT -- a live worker is
+ * never taken down by a malformed trigger file (the OQ-008 live-edit safety). Returns `{ ok }` /
+ * `{ invalid }` / `{ failed }`. `loadFn`/`reconcileFn` are injectable so the reload is unit-tested with no fs.
+ */
+export async function reloadSchedules(config, queue, { log = () => {}, loadFn = loadSchedules, reconcileFn = reconcile } = {}) {
+	let schedules;
+	try {
+		schedules = loadFn(config);
+	} catch (error) {
+		log("schedules_reload_invalid", { reason: error?.message ?? String(error), kept: true });
+		return { invalid: error?.message ?? String(error) };
+	}
+	try {
+		const r = await reconcileFn(queue, schedules, { log });
+		log("schedules_reloaded", { installed: r.installed, removed: r.removed });
+		return { ok: true, ...r };
+	} catch (error) {
+		log("schedules_reload_failed", { reason: error?.message ?? String(error) });
+		return { failed: error?.message ?? String(error) };
+	}
 }

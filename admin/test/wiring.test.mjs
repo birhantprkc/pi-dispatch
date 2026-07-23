@@ -82,7 +82,8 @@ test("registers exactly the dispatch command with a handler and completions", as
 
 test("USED_API is exactly the members the extension reaches", async () => {
   const { mod } = await loadRegistered();
-  assert.deepEqual([...mod.USED_API].sort(), ["registerCommand", "registerTool", "sendMessage"]);
+  // `on` joins the set: the extension advertises its bundled skill via the `resources_discover` event.
+  assert.deepEqual([...mod.USED_API].sort(), ["on", "registerCommand", "registerTool", "sendMessage"]);
 });
 
 test("the bare command opens the dashboard overlay and never touches the model channel", async () => {
@@ -113,18 +114,35 @@ test("an unknown subcommand notifies and never touches the model channel", async
 });
 
 /**
- * The five LLM-callable tools are the whole model-facing control surface. The structural acceptance
- * (DES-ADMIN-VIA-PI-EXTENSION): reads plus pause/resume plus the one gated `dispatch_run` enqueue -- no
- * tool writes settings, no tool exposes raw `.log` bytes. These assertions lock that surface so a later
- * edit that adds a `dispatch_set` or a `dispatch_logs` tool fails here.
+ * The model-facing control surface (DES-ADMIN-VIA-PI-EXTENSION, amended): reads
+ * (`dispatch_status`/`_runs`/`_triggers`), the on/off controls (`_pause`/`_resume`), the gated PAID enqueue
+ * (`_run`), and the confirm-gated writes (`_set`, `_trigger_add`/`_edit`/`_delete`). Two invariants are locked
+ * here: there is still NO raw-log tool (no name contains "log"), and every WRITE tool is `sequential` so two
+ * writes cannot interleave. This test is the deliberate record that model-callable writes were added on
+ * purpose -- gated by an operator confirm (behaviour proven in crud.test.mjs), not tool absence.
  */
-test("registers exactly the five dispatch tools, and no write or log tool", async () => {
+const WRITE_TOOLS = ["dispatch_set", "dispatch_trigger_add", "dispatch_trigger_edit", "dispatch_trigger_delete"];
+test("registers exactly the read/control/enqueue/write tools, and never a raw-log tool", async () => {
   const { calls } = await loadRegistered();
   const names = calls.registerTool.map((t) => t.name).sort();
-  assert.equal(calls.registerTool.length, 5, "exactly five tools");
-  assert.deepEqual(names, ["dispatch_pause", "dispatch_resume", "dispatch_run", "dispatch_runs", "dispatch_status"]);
+  assert.equal(calls.registerTool.length, 10, "exactly ten tools");
+  assert.deepEqual(names, [
+    "dispatch_pause",
+    "dispatch_resume",
+    "dispatch_run",
+    "dispatch_runs",
+    "dispatch_set",
+    "dispatch_status",
+    "dispatch_trigger_add",
+    "dispatch_trigger_delete",
+    "dispatch_trigger_edit",
+    "dispatch_triggers",
+  ]);
   for (const name of names) {
-    assert.ok(!/set|unset|log/.test(name), `no write/log tool: ${name}`);
+    assert.ok(!/log/.test(name), `no raw-log tool: ${name}`);
+  }
+  for (const name of WRITE_TOOLS) {
+    assert.equal(toolByName(calls, name).executionMode, "sequential", `${name} is sequential`);
   }
   for (const tool of calls.registerTool) {
     assert.equal(typeof tool.execute, "function", `${tool.name}.execute is a function`);

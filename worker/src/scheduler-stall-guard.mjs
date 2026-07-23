@@ -13,7 +13,9 @@
  * Custom: per-scheduler stall accounting; BullMQ's maxStalledCount does not cover scheduler jobs -- constitution.md:203-216 carve-out ("BullMQ will never do this for us")
  */
 
-const STALL_KEY = "pi-dispatch:sched-stalls";
+// The Redis hash of per-scheduler stall counts (field = schedulerId, value = count). Exported so the admin
+// panel can read it (HGETALL) for the cron drill-in without re-deriving the key string.
+export const STALL_KEY = "pi-dispatch:sched-stalls";
 
 // A rolling window: the EXPIRE is re-set on every stall, so a scheduler that stops stalling for a full
 // day drops back to zero. This prevents unrelated transient stalls weeks apart from accumulating into a

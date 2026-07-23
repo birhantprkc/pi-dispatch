@@ -308,19 +308,29 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Statement**: The admin surface shall ship as a pi extension in `admin/`, loaded into the operator's
   interactive pi session. It provides operator slash commands for observability (`status`, `runs`, `logs`,
   `budget`, `triggers`), queue on/off (`pause`/`resume`, backed by the same durable `queue.pause()`), and
-  settings editing (`set`/`unset`, writing the `settings.json` overlay). The model-callable tools are
-  **reads, `pause`/`resume`, and `dispatch_run`** (a gated enqueue); every settings write is an
-  operator-typed command, never a model-invocable tool, and `dispatch_run` accordingly takes **no
-  spend-knob argument** (`model`/`maxTurns`/`dailyCap`/`concurrency`).
+  settings editing (`set`/`unset`, writing the `settings.json` overlay), plus **operator-typed trigger CRUD**
+  from the overlay (add / edit-flow / delete, writing `triggers.json` — validated by the shared
+  `parseTriggers`, atomic — and reloaded **live** by both services, `OQ-008`). The model-callable tools are
+  **reads (`status`/`runs`/`triggers`), `pause`/`resume`, `dispatch_run`** (a gated enqueue), and the
+  **confirm-gated writes** `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete`. A write tool applies
+  its change **only after a human operator approves a `ctx.ui.confirm` dialog showing the concrete
+  before→after**, and **refuses — writing nothing — when no interactive operator is present** (`ctx.hasUI`
+  false; print/headless). The operator-typed overlay CRUD and the confirm-gated tools reach the **same**
+  validated, atomic `writeTriggers`/`writeSettings`. `dispatch_run` still takes **no spend-knob argument**
+  (`model`/`maxTurns`/`dailyCap`/`concurrency`).
 - **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs
   except the gated `dispatch_run` enqueue, and is never materialised into a job's `/job` inputs —
   `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's own `.pi/` extensions, not this one.
 - **Why**: See `DES-ADMIN-VIA-PI-EXTENSION` — a session-bound, port-less admin surface for a
-  terminal-native operator, narrower than the superseded localhost panel. No model-callable tool can
-  **raise** the daily cap: every settings write (dailyCap included) is operator-typed, and `dispatch_run`
-  takes no spend-knob argument — they resolve from the overlay/env per
-  `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, and the paid run `dispatch_run` enqueues spends **within** the cap
-  (`reserveBudget`, consumer-side), it does not widen it (`CONST-BUDGET-BEFORE-TOKENS`). The
+  terminal-native operator, narrower than the superseded localhost panel. The daily cap can be raised only
+  **with an operator's approval**: a settings write (dailyCap included) is either operator-typed or a
+  confirm-gated tool the model **cannot self-approve** — the model emits the call, the human answers the
+  confirm — so a prompt-injected session cannot raise the cap without a human keypress it cannot forge.
+  `CONST-BUDGET-BEFORE-TOKENS`'s ordering is untouched (the cap is still checked before tokens; only its
+  value changes, under human approval); `CONST-TRIGGER-AUTHOR-GATE`'s webhook author-gating is untouched (the
+  confirm is the human approval for a locally-configured trigger). `dispatch_run` takes no spend-knob argument
+  — values resolve from the overlay/env per `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, and the paid run enqueues
+  spends **within** the cap (`reserveBudget`, consumer-side), it does not widen it (`CONST-BUDGET-BEFORE-TOKENS`). The
   injected-`dispatch_run` residual is bounded by structure, not undo — folder allowlist, committed
   per-flow opt-in, dirty refusal, no spend knobs, per-hour rate limit, and the daily cap
   (`DES-ADMIN-VIA-PI-EXTENSION`). Raw `.log` output is overlay-only, so untrusted container text never
@@ -329,8 +339,13 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   `CONST-ISSUE-TEXT-IS-DATA`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-DURABLE-RUN-HISTORY`,
   `REQ-AI-TRIGGERED-RUNS`
 - **Acceptance**: Given the extension is loaded, when the operator runs `/dispatch status`, then queue
-  counts, paused state, and budget render with no model involvement; given a model-invoked tool call, when
-  it is a settings write, then no such tool exists (writes are commands only); given `dispatch_run`, when
+  counts, paused state, and budget render with no model involvement; given a model-invoked settings OR
+  trigger write tool, when no interactive operator is present (`ctx.hasUI` false), then it refuses and writes
+  nothing; when an operator is present but declines the confirm, then it writes nothing and reports
+  `applied:false`; when the operator approves, then it writes exactly the change the confirm showed; given an
+  operator trigger edit through the overlay OR an approved write tool, when it is written, then it validates
+  through the shared `parseTriggers` (a bad edit is rejected, the file untouched) and both services apply it
+  without a restart; given `dispatch_run`, when
   it is invoked, then it exposes no `model`/`maxTurns`/`dailyCap`/`concurrency` argument, admits a run only
   for a folder within `PI_DISPATCH_RUN_ROOTS` and a flow whose pre-agent-SHA `SKILL.md` carries
   `ai-trigger: allow`, and the enqueued job's spend resolves from overlay/env and is bounded by the daily
@@ -477,5 +492,6 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-21 | Added REQ-ADMIN-VIA-PI-EXTENSION (admin surface as a pi extension in `admin/`: operator observability/pause-resume/settings commands, reads-plus-pause/resume-only model tools, overlay-only raw logs) and REQ-RUNTIME-SETTINGS-PICKUP (per-job overlay re-read for model/provider/maxTurns/dailyCap; concurrency at next pickup). Rescoped panel references to the admin extension in Scope, `REQ-JOB-STATUS-COMMENTS`, `REQ-LOCAL-JOB-VISIBILITY`, and `REQ-DURABLE-RUN-HISTORY`. |
 | 2026-07-22 | Added REQ-SPEND-CAPS-MULTI-WINDOW: the pre-container budget check now spans a mandatory daily cap plus optional weekly/monthly ceilings and a soft-hold percentage band (enforcing — refuses new starts in-band with a distinct `soft-hold` reason). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list to include `weeklyCap`/`monthlyCap`/`softHoldPct`. `CONST-BUDGET-BEFORE-TOKENS` unchanged (still job-count, still check-before-start). |
 | 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |
+| 2026-07-23 | Amended REQ-ADMIN-VIA-PI-EXTENSION: the admin surface is now AI-operable for writes via **confirm-gated** model tools — `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete` (plus a `dispatch_triggers` read) — each applying its change only after a human operator approves a `ctx.ui.confirm` showing the concrete before→after, and refusing (writing nothing) with no interactive UI. Replaces the "every write is operator-typed, never a model tool" categorical in `Statement`/`Why`/`Acceptance`; the cap-integrity rationale now rests on the un-forgeable human confirm rather than tool absence. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged. Added the bundled `operate-pi-dispatch` skill (advertised via `resources_discover`) that recommends how to use those human gates. |
 | 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
 | 2026-07-22 | Added REQ-TOKEN-ACCOUNTING-AND-CAPS (issue #25, unblocked by OQ-010): per-job token/cost accounting in the run record + admin views; an optional in-run per-job token budget (`maxTokens`/`PI_MAX_TOKENS`, exits policy `token_budget`); and an optional daily token cap (`dailyTokenCap`/`PI_DAILY_TOKEN_CAP`) enforced **check-AFTER** — the deliberate asymmetry with `CONST-BUDGET-BEFORE-TOKENS`, which is unchanged (still job-count, still check-before). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list with `maxTokens`/`dailyTokenCap`; retargeted REQ-SPEND-CAPS-MULTI-WINDOW's OQ-010 forward-reference to the new REQ. |

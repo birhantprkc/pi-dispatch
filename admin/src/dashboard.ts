@@ -18,13 +18,15 @@
  * touches the filesystem -- the bytes reach the overlay alone, never `snapshot`, never a shared renderer,
  * never a message.
  */
-import { dayKey, weekKey, monthKey, windowState } from "@pi-dispatch/worker/budget";
+import { dayKey, weekKey, monthKey, tokenDayKey, windowState } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
+import { STALL_KEY } from "@pi-dispatch/worker/scheduler-stall-guard";
 import { listRuns, readSettingsView, mapSchedulers, readTriggers } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
 import { box, meter, clip } from "./panel.mjs";
+import { makeStyler, frame, RULE } from "./style.mjs";
 
 const KEY_HINTS = "[p]ause  [r]esume  [q]uit";
 const RUNS_ON_DASHBOARD = 10;
@@ -35,6 +37,17 @@ const TAIL_VIEWPORT = 20;
 // panel.mjs floors a box to this width; below it (or a missing/non-finite width) the panel degrades to
 // unframed plain lines rather than a ragged or over-width frame.
 const MIN_WIDTH = 8;
+// Drill-in views (TRIGGER_DETAIL, RUN_DETAIL) are small; they frame to a compact width and center within
+// the wider overlay rather than stretching a handful of key/value lines across the full LIST width.
+const DRILL_WIDTH = 70;
+
+/** Left-pad each line to center a `blockWidth`-wide frame within the `overlayWidth` overlay. */
+function centerBlock(lines: string[], overlayWidth: number, blockWidth: number): string[] {
+  const pad = Math.max(0, Math.floor((overlayWidth - blockWidth) / 2));
+  if (pad === 0) return lines;
+  const prefix = " ".repeat(pad);
+  return lines.map((l) => prefix + l);
+}
 
 /**
  * Build the read/act/close deps for a live dashboard from resolved paths: ONE failFast queue and ONE
@@ -48,21 +61,27 @@ export function createDashboardDeps(paths: any) {
   const redis = makeRedisClient(paths.valkeyUrl);
   return {
     async fetchSnapshot() {
-      const [pausedState, counts, workerList, dayRaw, weekRaw, monthRaw, schedulerList, activeList] = await Promise.all([
+      const [pausedState, counts, workerList, dayRaw, weekRaw, monthRaw, tokenRaw, schedulerList, activeList, stallHash] = await Promise.all([
         queue.isPaused(),
         queue.getJobCounts("waiting", "active", "paused", "delayed", "failed"),
         queue.getWorkers().catch(() => []),
         redis.get(dayKey()),
         redis.get(weekKey()),
         redis.get(monthKey()),
+        redis.get(tokenDayKey()), // issue #25 daily token spend (budget:t:YYYY-MM-DD)
         queue.getJobSchedulers(0, -1, true),
         queue.getActive(0, 0).catch(() => []),
+        // Per-scheduler stall counts (money backstop) for the cron drill-in; reuses the held client like the
+        // budget GETs. HGETALL of an absent key is `{}`, so a never-stalled deployment shows 0 stalls.
+        redis.hgetall(STALL_KEY).catch(() => ({})),
       ]);
       const workers = Array.isArray(workerList) && workerList.length > 0 ? workerList.length : "unknown";
       return {
         queue: { pausedState, counts, workers },
-        budget: { day: Number(dayRaw ?? 0), week: Number(weekRaw ?? 0), month: Number(monthRaw ?? 0) },
+        budget: { day: Number(dayRaw ?? 0), week: Number(weekRaw ?? 0), month: Number(monthRaw ?? 0), tokensToday: Number(tokenRaw ?? 0) },
         schedulers: mapSchedulers(schedulerList, Date.now()),
+        schedulerStalls: stallHash ?? {},
+        schedulerStallMax: paths.schedulerStallMax,
         runs: listRuns({ logsDir: paths.logsDir, limit: RUNS_ON_DASHBOARD }),
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
         triggers: readTriggers({ triggersPath: paths.triggersPath }),
@@ -102,9 +121,12 @@ export function makeDashboard({
   paths,
   done,
   tui,
+  theme,
   intervalMs = REFRESH_MS,
   deps = createDashboardDeps(paths),
 }: any = {}) {
+  // The overlay-only color styler, bound to pi's injected theme (null in tests -> plain, same geometry).
+  const styler = makeStyler(theme);
   let snapshot: any = null;
   let fetching = false;
   let disposed = false;
@@ -115,6 +137,7 @@ export function makeDashboard({
   let view = "LIST";
   let selected = 0;
   let detailRun: any = null;
+  let detailTrigger: any = null; // the trigger opened in TRIGGER_DETAIL (its display record + file index)
   // LIVE_TAIL state, held here in dedicated component fields keyed only by the id-only `activeJobId`. The
   // raw `.log` bytes in `tail` are PII-bearing and untrusted: they live here and reach the TUI overlay via
   // render() alone -- never `snapshot`, never a shared renderer, never `sendMessage` (INT-RUN-HISTORY-FILE-CONTRACT).
@@ -164,6 +187,7 @@ export function makeDashboard({
   };
 
   interval = setInterval(() => void refresh(), intervalMs);
+  interval?.unref?.(); // never keep the process alive on the poll timer alone (dispose still clears it)
   void refresh();
 
   const component = {
@@ -182,11 +206,12 @@ export function makeDashboard({
         view,
         selected,
         detailRun,
+        detailTrigger,
         tailJobId,
         tail,
         tailTop,
         tailAvailable: typeof deps?.tailLog === "function",
-      });
+      }, styler);
     },
     invalidate(): void {
       // No cached render state to clear; the TUI redraws from render().
@@ -198,6 +223,25 @@ export function makeDashboard({
         if (matchesKey(data, "escape")) {
           view = "LIST";
           tui?.requestRender?.();
+        }
+        return;
+      }
+      if (view === "TRIGGER_DETAIL") {
+        // Read-only trust-model view. `e` edits the flow, `x` deletes -- both close the overlay with a CRUD
+        // action the command loop drives via ctx.ui dialogs, then reopens; Esc backs out to the list.
+        if (matchesKey(data, "escape")) {
+          view = "LIST";
+          detailTrigger = null;
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "e" || data === "E") {
+          void dispose().finally(() => done({ action: "editTrigger", index: detailTrigger?.index }));
+          return;
+        }
+        if (data === "x" || data === "X") {
+          void dispose().finally(() => done({ action: "deleteTrigger", index: detailTrigger?.index }));
+          return;
         }
         return;
       }
@@ -237,7 +281,11 @@ export function makeDashboard({
         const rows = buildRows(snapshot);
         const row = rows[selected];
         if (!row) return;
-        if (row.kind === "active") {
+        if (row.kind === "trigger") {
+          detailTrigger = { record: row.trigger, index: row.index };
+          view = "TRIGGER_DETAIL";
+          tui?.requestRender?.();
+        } else if (row.kind === "active") {
           // Opening the tail: fire an immediate fetch so the first frame carries the tail, not the next tick.
           tailJobId = row.jobId;
           tailTop = 0;
@@ -248,6 +296,16 @@ export function makeDashboard({
           view = "RUN_DETAIL";
           tui?.requestRender?.();
         }
+        return;
+      }
+      // CRUD (operator-typed, live via the reload watchers): add a trigger, or edit the limits/settings.
+      // Both close the overlay with an action the command loop drives via ctx.ui dialogs, then reopen.
+      if (data === "a" || data === "A") {
+        void dispose().finally(() => done({ action: "addTrigger" }));
+        return;
+      }
+      if (data === "s" || data === "S") {
+        void dispose().finally(() => done({ action: "editSettings" }));
         return;
       }
       if (matchesKey(data, "up")) {
@@ -310,17 +368,31 @@ function budgetMeters(budget: any, settings: any, width: number): string[] {
  * that is missing, non-finite, or below `MIN_WIDTH` degrades to unframed plain lines; a sane width frames
  * the same content with `box`, its inner column count driving every meter and clip.
  */
-function renderPanel(snapshot: any, width: number, state: any): string[] {
-  const { view, selected, detailRun, tailJobId, tail, tailTop, tailAvailable } = state;
+function renderPanel(snapshot: any, width: number, state: any, styler: any): string[] {
+  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailAvailable } = state;
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
 
+  if (view === "TRIGGER_DETAIL") {
+    const t = detailTrigger?.record;
+    const detailTitle = `trigger · ${t?.type ?? "?"}`;
+    const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
+    const sched = cronSchedInfo(t, snapshot);
+    const lines = renderTriggerDetail(t, framed ? dw - 4 : 24, styler, sched);
+    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "e edit · x delete · esc back"];
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: triggerDetailHints(dw - 4, styler) });
+    return centerBlock(boxed, Math.trunc(width), dw);
+  }
+
   if (view === "RUN_DETAIL") {
     const detailTitle = `run ${detailRun?.jobId ?? "-"}`;
-    const detailLines = renderRunDetail(detailRun);
-    if (!framed) return [detailTitle, "", ...detailLines, "", "Esc back"];
-    return box({ title: detailTitle, footer: "Esc back", width, sections: [{ lines: detailLines }] });
+    const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
+    const allRuns = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
+    const lines = renderRunDetail(detailRun, framed ? dw - 4 : 24, styler, allRuns);
+    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "esc back"];
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler) });
+    return centerBlock(boxed, Math.trunc(width), dw);
   }
 
   if (view === "LIVE_TAIL") {
@@ -337,26 +409,387 @@ function renderPanel(snapshot: any, width: number, state: any): string[] {
     return box({ title, sections: [{ lines: [msg] }], footer: KEY_HINTS, width });
   }
 
+  // LIST — the colored dashboard. Content is composed on PLAIN text (widths via styler.cell/visibleLen)
+  // and colored last, so pi's ANSI-aware visibleWidth frames it correctly.
+  if (framed) {
+    const lines = buildListLines(snapshot, selected, inner, styler);
+    return frame(styler, { title, width, lines, footer: keyHints(inner, styler) });
+  }
+
+  // Degraded (too-narrow) plain path — reuse the shared, plain renderers unframed.
   const sections = [
     { title: "STATUS", lines: toLines(renderStatus(snapshot.queue)) },
     {
       title: "SPEND",
       lines: [
         ...toLines(renderBudget({ budget: snapshot.budget, settings: snapshot.settings })),
-        ...budgetMeters(snapshot.budget, snapshot.settings, framed ? inner : 24),
+        ...budgetMeters(snapshot.budget, snapshot.settings, 24),
       ],
     },
     { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, triggers: snapshot.triggers })) },
-    { title: "RUNS", lines: renderRunList(buildRows(snapshot), selected, framed ? inner : 24) },
+    { title: "RUNS", lines: renderRunList(buildRows(snapshot), selected, 24) },
     { title: "SETTINGS", lines: toLines(renderSettingsView(snapshot.settings)) },
   ];
-
-  if (framed) return box({ title, sections, footer: KEY_HINTS, width });
-
   const plain = [title];
   for (const section of sections) plain.push(section.title, ...section.lines);
   plain.push(KEY_HINTS);
   return plain.join("\n\n").split("\n");
+}
+
+// ── colored LIST builders (overlay-only; every returned line is exactly `inner` visible columns) ────────
+
+const KIND_COLOR: Record<string, string> = { cron: "accent", label: "syntaxType", comment: "syntaxKeyword", pull_request: "syntaxFunction" };
+const KIND_WIDTH = 13; // fits "pull_request "
+
+/** Pad an already-colored line up to `inner` visible columns; if it overflows, clip its plain form. */
+function fitLine(line: string, inner: number, styler: any): string {
+  const vis = styler.visibleLen(line);
+  if (vis === inner) return line;
+  if (vis < inner) return line + " ".repeat(inner - vis);
+  return styler.cell(styler.stripAnsi(line), inner);
+}
+
+/** Compose the colored LIST body lines (RULE marks a `├──┤` separator). */
+function buildListLines(snapshot: any, selected: number, inner: number, styler: any): any[] {
+  const lines: any[] = [];
+  lines.push(statusHeader(snapshot.queue, inner, styler));
+  lines.push(RULE);
+
+  lines.push(styler.divider("spend & limits", "jobs & tokens/day · s set", inner));
+  for (const l of spendLines(snapshot.budget, snapshot.settings, inner, styler)) lines.push(l);
+  lines.push(RULE);
+
+  // Triggers are selectable and come FIRST in buildRows, so a trigger's file index == its selection index.
+  const trg = triggerLines(snapshot.triggers, selected, inner, styler);
+  lines.push(styler.divider("triggers", `${trg.count} standing · a add · ↵ open`, inner));
+  for (const l of trg.lines) lines.push(l);
+  lines.push(RULE);
+
+  // Active + run rows follow the triggers in buildRows, so offset the selection index by the trigger count.
+  const runRows = buildRows(snapshot).slice(trg.count);
+  const runCount = Array.isArray(snapshot.runs) ? snapshot.runs.length : 0;
+  lines.push(styler.divider("runs", `last ${runCount}`, inner));
+  for (const l of runLines(runRows, selected - trg.count, inner, styler)) lines.push(l);
+  lines.push(RULE);
+
+  lines.push(styler.divider("settings", "s edit", inner));
+  for (const l of settingsLines(snapshot.settings, inner, styler)) lines.push(l);
+  return lines;
+}
+
+/** The one-line STATUS header: `● RUNNING  N waiting · … · K workers        HH:MM:SS`. */
+function statusHeader(queue: any, inner: number, styler: any): string {
+  if (!queue || queue.unreachable) {
+    return styler.cell(`queue unreachable (${queue?.unreachable ?? "?"})`, inner, { color: "error" });
+  }
+  const c = queue.counts ?? {};
+  const running = !queue.pausedState;
+  const failed = Number(c.failed ?? 0);
+  const stateColor = running ? "success" : "warning";
+  const dot = styler.fg(stateColor, "●");
+  const word = styler.bold(styler.fg(stateColor, running ? "RUNNING" : "PAUSED"));
+  const sep = styler.fg("dim", " · ");
+  const vitals =
+    `${c.waiting ?? 0} waiting` + sep + `${c.active ?? 0} active` + sep +
+    (failed > 0 ? styler.fg("error", `${failed} failed`) : `${failed} failed`) + sep +
+    `${queue.workers ?? "?"} workers`;
+  const clock = new Date().toISOString().slice(11, 19); // HH:MM:SS UTC
+  const left = `${dot} ${word}  ${vitals}`;
+  const gap = inner - styler.visibleLen(left) - clock.length;
+  if (gap < 1) return styler.cell(styler.stripAnsi(left), inner);
+  return left + " ".repeat(gap) + styler.fg("dim", clock);
+}
+
+/** Colored spend meters (day/week/month) with reset countdown + soft-hold marker. */
+function spendLines(budget: any, settings: any, inner: number, styler: any): string[] {
+  if (!budget || budget.unreachable) {
+    return [styler.cell(`budget unreachable (${budget?.unreachable ?? "?"})`, inner, { color: "error" })];
+  }
+  const overlay = (settings && settings.overlay) ?? {};
+  const pct = Number.isInteger(overlay.softHoldPct) ? overlay.softHoldPct : null;
+  const now = new Date();
+  const specs = [
+    { key: "day", label: "day", cap: overlay.dailyCap, reset: nextDayResetMs(now), always: true },
+    { key: "week", label: "week", cap: overlay.weeklyCap, reset: nextWeekResetMs(now), always: false },
+    { key: "month", label: "month", cap: overlay.monthlyCap, reset: nextMonthResetMs(now), always: false },
+  ];
+  const out: string[] = [];
+  const labW = 6;
+  for (const s of specs) {
+    const reserved = Number(budget[s.key] ?? 0);
+    const capSet = Number.isInteger(s.cap);
+    // The day cap always applies (env default even when the overlay is silent). Week/month default to
+    // disabled, so when the overlay sets no cap and nothing has reserved, show them as an off, enableable
+    // window rather than hiding them — the operator sees every limit and which are switched off.
+    if (!capSet && !s.always && reserved === 0) {
+      out.push(styler.fg("muted", s.label.padEnd(labW)) + styler.fg("dim", "off · no cap set (s to enable)"));
+      continue;
+    }
+    const state = capSet ? windowState(reserved, s.cap, pct) : "ok";
+    const marker = state === "soft-hold" ? " · soft-hold" : state === "over" ? " · over" : "";
+    const tail = countdownText(s.reset) + marker;
+    const barW = Math.max(8, inner - labW - 2 - tail.length);
+    const line =
+      styler.cell(s.label, labW, { color: "muted" }) + " " +
+      styler.meter(reserved, s.cap, barW, state) + " " +
+      styler.fg("dim", tail);
+    out.push(fitLine(line, inner, styler));
+  }
+  if (pct !== null) out.push(styler.cell(`soft-hold band: ${pct}% of each cap`, inner, { color: "muted" }));
+  out.push(tokenLine(budget, overlay, pct, inner, styler));
+  return out;
+}
+
+/** The daily token counter (issue #25): today's spend vs the daily token cap, plus the per-job budget. */
+function tokenLine(budget: any, overlay: any, pct: number | null, inner: number, styler: any): string {
+  const spent = Number(budget?.tokensToday ?? 0);
+  const cap = overlay?.dailyTokenCap;
+  const perJob = overlay?.maxTokens;
+  const perJobNote = Number.isInteger(perJob) ? ` · per-job ${fmtTokens(perJob)}` : " · per-job budget off";
+  const lab = styler.fg("muted", "tokens") + " "; // 6-wide label + space, matching the meter rows
+  if (Number.isInteger(cap)) {
+    const state = spent >= cap ? "over" : Number.isInteger(pct) && spent > Math.floor((cap * pct) / 100) ? "soft-hold" : "ok";
+    const color = state === "over" ? "error" : state === "soft-hold" ? "warning" : "success";
+    const marker = state === "soft-hold" ? " soft-hold" : state === "over" ? " over" : "";
+    return fitLine(lab + styler.fg(color, `${fmtTokens(spent)} / ${fmtTokens(cap)} today${marker}`) + styler.fg("dim", perJobNote), inner, styler);
+  }
+  return fitLine(lab + styler.fg("text", `${fmtTokens(spent)} today`) + styler.fg("dim", ` · daily cap off${perJobNote}`), inner, styler);
+}
+
+/** Compact token count: 1234 -> "1.2k", 1234567 -> "1.2M". */
+function fmtTokens(n: number): string {
+  if (!Number.isFinite(n)) return "-";
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(n);
+}
+
+/** The configured triggers as colored rows: `<kind>  <match>  → <target> <flow>`. */
+function triggerLines(triggers: any, selected: number, inner: number, styler: any): { count: number; lines: string[] } {
+  const lines: string[] = [];
+  if (triggers && triggers.missing) { lines.push(styler.cell("(triggers file not found · a to add)", inner, { color: "dim" })); return { count: 0, lines }; }
+  if (triggers && triggers.invalid) { lines.push(styler.cell(`(triggers file invalid: ${triggers.invalid})`, inner, { color: "error" })); return { count: 0, lines }; }
+  const list = (triggers && triggers.triggers) ?? [];
+  if (list.length === 0) { lines.push(styler.cell("(no triggers · a to add)", inner, { color: "dim" })); return { count: 0, lines }; }
+  list.forEach((t: any, i: number) => lines.push(triggerRow(t, i === selected, inner, styler)));
+  return { count: list.length, lines };
+}
+
+function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
+  const cursor = sel ? styler.fg("accent", "›") : " ";
+  const kind = t?.type ?? "?";
+  const badge = styler.cell(kind, KIND_WIDTH, { color: KIND_COLOR[kind] ?? "muted" });
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}`, inner, styler);
+}
+
+function matchColored(t: any, styler: any): string {
+  switch (t?.type) {
+    case "cron": return styler.fg("text", `${t.id ?? "-"}  ${t.pattern ?? "-"}`);
+    case "comment": return styler.fg("text", `"${t.phrase ?? "-"}"`);
+    case "label":
+    case "pull_request": {
+      const parts: string[] = [];
+      if (t.type === "pull_request") parts.push(styler.fg("muted", `[${(t.action ?? []).join(",")}]`));
+      for (const x of t.any ?? []) parts.push(styler.fg("success", x));
+      for (const x of t.all ?? []) parts.push(styler.fg("success", `+${x}`));
+      for (const x of t.none ?? []) parts.push(styler.fg("error", `!${x}`));
+      return parts.length ? parts.join(" ") : styler.fg("dim", "(any)");
+    }
+    default: return styler.fg("dim", "?");
+  }
+}
+
+function targetColored(t: any, styler: any): string {
+  const arrow = styler.fg("dim", "→");
+  const flow = styler.bold(styler.fg("text", t?.flow ?? "-"));
+  if (t?.type === "cron") {
+    // A local/cron trigger runs its flow against a folder — show `local <folder>/<flow>` so the target
+    // (not just the flow name) is visible; github triggers get their repo from the webhook, so none there.
+    const base = t.folder ? String(t.folder).split(/[/\\]/).filter(Boolean).pop() ?? "" : "";
+    const folderPart = base ? styler.fg("muted", base) + styler.fg("dim", "/") : "";
+    return `${arrow} ${styler.fg("success", "local")} ${folderPart}${flow}`;
+  }
+  return `${arrow} ${styler.fg("accent", "github")} ${flow}`;
+}
+
+/** The interactive RUNS list, colored: cursor, id, target, flow, outcome (✔/⚠/✘), turns, tokens. */
+function runLines(rows: any[], selected: number, inner: number, styler: any): string[] {
+  if (!Array.isArray(rows) || rows.length === 0) return [styler.cell("(no runs)", inner, { color: "dim" })];
+  return rows.map((row, i) => runRow(row, i === selected, inner, styler));
+}
+
+function runRow(row: any, sel: boolean, inner: number, styler: any): string {
+  const cursor = sel ? styler.fg("accent", "›") : " ";
+  if (row.kind === "active") {
+    return fitLine(`${cursor} ${styler.fg("success", "● ACTIVE")} ${styler.fg("text", row.jobId)} ${styler.fg("dim", "running")}`, inner, styler);
+  }
+  const r = row.record ?? {};
+  const tree = r.chainDepth > 0 ? styler.fg("dim", "└ ") : "";
+  const sep = styler.fg("dim", " · ");
+  const cells = [
+    styler.fg("text", r.jobId ?? "-"),
+    styler.fg("muted", r.target ?? "-"),
+    styler.fg("accent", r.flow ?? "-"),
+    outcomeColored(r.outcome, r.reason, styler),
+    styler.fg("dim", `${r.turns ?? "-"}t`),
+    styler.fg("dim", Number.isFinite(r.tokens?.total) ? fmtTokens(r.tokens.total) : "-"),
+  ];
+  return fitLine(`${cursor} ${tree}${cells.join(sep)}`, inner, styler);
+}
+
+function outcomeColored(outcome: any, reason: any, styler: any): string {
+  if (outcome === "completed") return styler.fg("success", "✔ done");
+  if (outcome === "policy") return styler.fg("warning", `⚠ ${reason ?? "policy"}`);
+  return styler.fg("error", `✘ ${reason ?? outcome ?? "failed"}`);
+}
+
+/** A compact colored settings summary (the full editor is the `s` drill-in). */
+function settingsLines(settings: any, inner: number, styler: any): string[] {
+  if (settings && settings.invalid) return [styler.cell(`settings invalid: ${settings.invalid}`, inner, { color: "error" })];
+  const o = (settings && settings.overlay) ?? {};
+  const kv = (k: string, v: any) => styler.fg("muted", k) + " " + styler.fg("text", v === undefined ? "·" : String(v));
+  // Token caps render compact (5000000 -> "5M") so the limits line never clips on a narrower overlay.
+  const tk = (k: string, v: any) => styler.fg("muted", k) + " " + styler.fg("text", Number.isInteger(v) ? fmtTokens(v) : "·");
+  const pctVal = Number.isInteger(o.softHoldPct) ? `${o.softHoldPct}%` : "·";
+  const gap = styler.fg("dim", "   ");
+  const l1 = [kv("model", o.model), kv("provider", o.provider), kv("maxTurns", o.maxTurns), tk("maxTokens", o.maxTokens)].join(gap);
+  const l2 = [kv("dailyCap", o.dailyCap), tk("dailyTokenCap", o.dailyTokenCap), kv("concurrency", o.concurrency), styler.fg("muted", "softHold") + " " + styler.fg("text", pctVal)].join(gap);
+  return [fitLine(l1, inner, styler), fitLine(l2, inner, styler)];
+}
+
+/**
+ * The TRIGGER_DETAIL drill-in, three scannable sections: MATCHES (what fires it), RUNS (what it produces),
+ * and a per-kind TRUST MODEL. The flow lives once in the header, so the sections carry only distinct facts —
+ * no crammed "produces" line. Read-only; `e`/`x` drive edit/delete through the command loop. Every line is
+ * `inner` cols.
+ */
+function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = null): string[] {
+  if (!t) return [styler.cell("(no trigger)", inner, { color: "dim" })];
+  const out: string[] = [];
+  const kv = (k: string, v: string, color = "text") =>
+    fitLine(styler.cell(k, 12, { color: "muted" }) + " " + styler.fg(color, v), inner, styler);
+  const blank = () => out.push(styler.cell("", inner));
+  const section = (label: string) => out.push(styler.divider(label, null, inner));
+
+  // Header: kind badge -> flow, plus a health marker for cron (✔ healthy / ⚠ overdue) derived from the
+  // scheduler's overdueMs. A trigger with no matching scheduler shows no health marker rather than a guess.
+  let header = styler.fg(KIND_COLOR[t.type] ?? "muted", t.type ?? "?") + "  " + styler.bold(styler.fg("text", `→ ${t.flow ?? "-"}`));
+  if (t.type === "cron" && sched) {
+    const healthy = !sched.overdueMs;
+    header += "   " + (healthy ? styler.fg("success", "✔ healthy") : styler.fg("warning", `⚠ overdue ${formatDuration(sched.overdueMs)}`));
+  }
+  out.push(fitLine(header, inner, styler));
+
+  // MATCHES — the condition that fires this trigger.
+  blank();
+  section("matches");
+  if (t.type === "cron") {
+    out.push(kv("schedule", `${t.pattern ?? "-"}`));
+    // next fire + countdown, and drift/stalls, from the resident scheduler + the stall backstop counter.
+    // `next` is real (BullMQ scheduler); `last` fire time is not stored on the scheduler, so it is omitted
+    // rather than faked. Absent scheduler -> next unknown.
+    if (sched) {
+      const inMs = typeof sched.next === "number" ? sched.next - Date.now() : NaN;
+      const next = typeof sched.next === "number" ? `${formatTs(sched.next)} (${humanizeMs(inMs) ? `in ${humanizeMs(inMs)}` : "due"})` : "—";
+      out.push(kv("next fire", next, "accent"));
+      const drift = sched.overdueMs ? formatDuration(sched.overdueMs) : "0s";
+      out.push(kv("health", `drift ${drift} · stalls ${sched.stalls}/${sched.stallMax}`, sched.overdueMs ? "warning" : "success"));
+    }
+  } else if (t.type === "label" || t.type === "pull_request") {
+    if (t.type === "pull_request") out.push(kv("PR actions", (t.action ?? []).join(", ") || "-"));
+    out.push(kv("any of", (t.any ?? []).join(" · ") || "-", "success"));
+    out.push(kv("all of", (t.all ?? []).join(" · ") || "-", "success"));
+    out.push(kv("none of", (t.none ?? []).join(" · ") || "-", "error"));
+  } else if (t.type === "comment") {
+    out.push(kv("phrase", `"${t.phrase ?? "-"}"`));
+  }
+
+  // RUNS — what it produces when it fires. One fact per row.
+  blank();
+  section("runs");
+  if (t.type === "cron") {
+    out.push(kv("job", "local", "success"));
+    out.push(kv("folder", `${t.folder ?? "-"}`, "success"));
+    out.push(kv("model", t.model ?? "deployment default", t.model ? "accent" : "dim"));
+  } else {
+    out.push(kv("job", "github", "accent"));
+    out.push(kv("target", "the triggering repo#issue / PR", "accent"));
+    out.push(kv("model", "deployment default", "dim"));
+  }
+
+  // TRUST MODEL — who authorizes it, how it dedups, which service owns it.
+  blank();
+  section("trust model");
+  for (const line of trustModel(t)) out.push(fitLine(styler.fg("border", "· ") + styler.fg("text", line), inner, styler));
+  return out;
+}
+
+/** The static per-kind trust model (who authorizes it, how it dedups, which service owns it). */
+function trustModel(t: any): string[] {
+  switch (t?.type) {
+    case "cron":
+      return [
+        "authorized by the operator's triggers file, at boot",
+        "dedup by time — deterministic repeat:<id>:<millis> id",
+        "lives in the worker · task is operator-authored",
+      ];
+    case "label":
+    case "pull_request":
+      return [
+        "authorized by a collaborator's label + HMAC webhook + author gate",
+        "dedup by X-GitHub-Delivery GUID (redelivery-safe)",
+        "lives in the receiver · task is adversarial issue/PR text",
+      ];
+    case "comment":
+      return [
+        "authorized by a collaborator comment (author_association) + HMAC",
+        "dedup by X-GitHub-Delivery GUID",
+        "lives in the receiver · task is adversarial comment text",
+      ];
+    default:
+      return [];
+  }
+}
+
+/** The TRIGGER_DETAIL footer hints. */
+function triggerDetailHints(inner: number, styler: any): string {
+  const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
+  return fitLine([k("e", "edit flow"), k("x", "delete"), k("esc", "back")].join(styler.fg("dim", "  ·  ")), inner, styler);
+}
+
+/** The colored key-hint footer. */
+function keyHints(inner: number, styler: any): string {
+  const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
+  const hints = [k("↑↓", "select"), k("↵", "open"), k("a", "add"), k("l", "logs"), k("p", "pause"), k("r", "resume"), k("q", "quit")].join(styler.fg("dim", " · "));
+  return fitLine(hints, inner, styler);
+}
+
+/** ms until the next UTC midnight / Monday 00:00 UTC / month-1 00:00 UTC. */
+function nextDayResetMs(now: Date): number {
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1) - now.getTime();
+}
+function nextWeekResetMs(now: Date): number {
+  const daysUntilMon = ((1 - now.getUTCDay() + 7) % 7) || 7;
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + daysUntilMon) - now.getTime();
+}
+function nextMonthResetMs(now: Date): number {
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) - now.getTime();
+}
+
+/** A bare positive span as "9h 54m" / "12m" / "3d"; "" when unknown or non-positive. */
+function humanizeMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin >= 2 * 1440) return `${Math.round(totalMin / 1440)}d`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+/** "resets 9h 54m" / "resets 12m" / "" when unknown -- the spend-window reset countdown. */
+function countdownText(ms: number): string {
+  const h = humanizeMs(ms);
+  return h ? `resets ${h}` : "";
 }
 
 /**
@@ -366,9 +799,12 @@ function renderPanel(snapshot: any, width: number, state: any): string[] {
  * ACTIVE row carries only the id-only job id.
  */
 function buildRows(snapshot: any): any[] {
-  const runs = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
+  // Triggers lead the selectable list (Enter -> TRIGGER_DETAIL), then the optional ACTIVE row, then runs.
+  // A trigger row carries its file `index` so a CRUD action can target the right entry in triggers.json.
+  const triggers = (snapshot?.triggers?.triggers ?? []).map((t: any, i: number) => ({ kind: "trigger", trigger: t, index: i }));
   const active = snapshot?.activeJobId ? [{ kind: "active", jobId: snapshot.activeJobId }] : [];
-  return [...active, ...runs.map((record: any) => ({ kind: "run", record }))];
+  const runs = (Array.isArray(snapshot?.runs) ? snapshot.runs : []).map((record: any) => ({ kind: "run", record }));
+  return [...triggers, ...active, ...runs];
 }
 
 /**
@@ -422,33 +858,110 @@ function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tai
 }
 
 /**
- * A monochrome key/value dump of one run record, every value nullable-safe (`-` when null or undefined) so
- * the fixture's missing fields render rather than throw. Operates only on the passed record: no read, no
- * `.log`, no `.data` -- exactly the PII-free run-history fields (INT-RUN-HISTORY-FILE-CONTRACT).
+ * The RUN_DETAIL post-mortem: one run's PII-free record rendered as a colored, grouped drill-in (following
+ * the design mock) -- outcome, target, timing (+ duration), turns/exit/budget, tokens/cost, and a chain line
+ * that names spawned children found in the run window. Operates only on the passed record and the runs list
+ * already in the snapshot: no read, no `.log`, no `.data` -- exactly the PII-free run-history fields
+ * (INT-RUN-HISTORY-FILE-CONTRACT). Every line is `inner` cols; a missing field renders `-` rather than throw.
  */
-function renderRunDetail(record: any): string[] {
+function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[] = []): string[] {
   const r = record ?? {};
   const show = (v: any): string => (v === null || v === undefined ? "-" : String(v));
-  const fields: [string, any][] = [
-    ["jobId", r.jobId],
-    ["kind", r.kind],
-    ["target", r.target],
-    ["flow", r.flow],
-    ["outcome", r.outcome],
-    ["reason", r.reason],
-    ["turns", r.turns],
-    // Per-job token accounting (issue #25): total tokens and cost-USD, or `-` when the container died
-    // before reporting usage. r.tokens is `{ input, output, total, cost }` | null.
-    ["tokens", r.tokens?.total],
-    ["cost", typeof r.tokens?.cost === "number" ? `$${r.tokens.cost.toFixed(4)}` : null],
-    ["exitCode", r.exitCode],
-    ["budgetReserved", r.budgetReserved],
-    ["attempt", r.attempt],
-    ["chainDepth", r.chainDepth],
-    ["parentJobId", r.parentJobId],
-    ["chainRefused", r.chainRefused],
-    ["startedAt", r.startedAt],
-    ["endedAt", r.endedAt],
-  ];
-  return fields.map(([k, v]) => `${k}: ${show(v)}`);
+  const out: string[] = [];
+  const kv = (k: string, v: string, color = "text") =>
+    fitLine(styler.cell(k, 12, { color: "muted" }) + " " + styler.fg(color, v), inner, styler);
+
+  // Header: colored outcome glyph + word, plus the reason when it is not a clean completion.
+  const oc = String(r.outcome ?? "-");
+  const outcomeColor = oc === "completed" ? "success" : oc === "policy" ? "warning" : "error";
+  const glyph = oc === "completed" ? "✔" : oc === "policy" ? "⚠" : "✘";
+  let head = styler.bold(styler.fg(outcomeColor, `${glyph} ${oc}`));
+  if (r.reason) head += styler.fg("dim", ` · ${r.reason}`);
+  out.push(fitLine(head, inner, styler));
+  out.push(styler.cell("", inner));
+
+  out.push(kv("target", `${show(r.target)} · flow ${show(r.flow)}`, "accent"));
+
+  // timing: start -> end (+ duration when both timestamps resolve; they may be ms or ISO strings).
+  const startMs = toMs(r.startedAt);
+  const endMs = toMs(r.endedAt);
+  const dur = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs ? ` (${formatDuration(endMs - startMs)})` : "";
+  out.push(kv("timing", `${fmtStamp(r.startedAt)} → ${fmtStamp(r.endedAt)}${dur}`));
+
+  // turns · exit · budget slot · attempt (each present only when the field is).
+  const turnBits = [`${show(r.turns)} turns`, `exit ${show(r.exitCode)}`];
+  if (r.budgetReserved !== null && r.budgetReserved !== undefined) turnBits.push(`${r.budgetReserved} budget slot`);
+  if (r.attempt !== null && r.attempt !== undefined) turnBits.push(`attempt ${r.attempt}`);
+  out.push(kv("turns", turnBits.join(" · ")));
+
+  // Per-job token accounting (issue #25): total + cost-USD, or `-` when the container died before reporting.
+  const cost = typeof r.tokens?.cost === "number" ? ` · $${r.tokens.cost.toFixed(4)}` : "";
+  out.push(kv("tokens", `${show(r.tokens?.total)}${cost}`));
+
+  // chain: root vs child, depth, spawned children (scanned from the run window -- best-effort, no new I/O),
+  // and refused-child count.
+  const children = (Array.isArray(allRuns) ? allRuns : []).filter((x) => x?.parentJobId && r.jobId && x.parentJobId === r.jobId);
+  const chainBits = [r.parentJobId ? `child of ${r.parentJobId}` : "root"];
+  if (r.chainDepth !== null && r.chainDepth !== undefined) chainBits.push(`depth ${r.chainDepth}`);
+  if (children.length > 0) chainBits.push(`spawned ${children.length} → ${children.map((c) => c.jobId).join(", ")}`);
+  if (r.chainRefused) chainBits.push(`${r.chainRefused} refused`);
+  out.push(kv("chain", chainBits.join(" · ")));
+
+  out.push(styler.cell("", inner));
+  out.push(styler.divider("post-mortem", null, inner));
+  out.push(fitLine(styler.fg("dim", "container torn down at job end · stored PII-free fields + optional raw-log overlay only"), inner, styler));
+  return out;
+}
+
+/**
+ * Join a cron trigger to its resident scheduler + stall counter for the drill-in's next/health fields. Matches
+ * by scheduler key/name === the cron id, else by pattern. Returns null for a non-cron trigger or no match, so
+ * the detail view renders only real schedule data (`next` is the BullMQ scheduler's; `stalls` the money
+ * backstop's). `last` is not stored on the scheduler and is deliberately not shown rather than faked.
+ */
+function cronSchedInfo(t: any, snapshot: any): any {
+  if (t?.type !== "cron") return null;
+  const schedulers = Array.isArray(snapshot?.schedulers) ? snapshot.schedulers : [];
+  const s = schedulers.find((x: any) => (t.id && (x.key === t.id || x.name === t.id)) || (t.pattern && x.pattern === t.pattern));
+  if (!s) return null;
+  const stalls = Number(snapshot?.schedulerStalls?.[t.id] ?? 0) || 0;
+  const stallMax = Number.isFinite(snapshot?.schedulerStallMax) ? snapshot.schedulerStallMax : 2;
+  return { next: s.next, overdueMs: s.overdueMs, stalls, stallMax };
+}
+
+/** Coerce a timestamp field (ms number or ISO string) to ms, or NaN when it cannot resolve. */
+function toMs(v: any): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") return Date.parse(v);
+  return NaN;
+}
+
+/** A stored timestamp for display: `—` when absent, else a compact UTC stamp (parsing an ISO string), or the
+ * string verbatim when it does not parse. Keeps the timing line short enough to carry its duration. */
+function fmtStamp(v: any): string {
+  if (v === null || v === undefined) return "—";
+  const ms = toMs(v);
+  return Number.isFinite(ms) ? formatTs(ms) : String(v);
+}
+
+/** A timestamp (ms) as compact UTC `YYYY-MM-DD HH:MM`; `—` when not a finite number. */
+function formatTs(ms: number): string {
+  if (!Number.isFinite(ms)) return "—";
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+}
+
+/** A span in ms as `45s` / `1m 32s` / `2h 3m`; `0s` when not a positive finite number. */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "0s";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+/** The RUN_DETAIL footer hint (read-only post-mortem; Esc backs out). */
+function runDetailHints(inner: number, styler: any): string {
+  return fitLine(styler.fg("accent", "esc") + " " + styler.fg("dim", "back"), inner, styler);
 }

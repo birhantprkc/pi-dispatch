@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { reconcile } from "../src/cron.mjs";
+import { reconcile, reloadSchedules } from "../src/cron.mjs";
 
 // reconcile is pure over the injected queue -- no bullmq, no real Valkey. The fake queue captures every
 // call so tests assert on exact arguments, and its return values / throws are configurable per case.
@@ -146,4 +146,30 @@ test("returns {installed, removed} reflecting config size and orphan count", asy
 	assert.equal(res.installed, 2); // both schedules upserted
 	assert.equal(res.removed, 2); // gone1 + gone2 pruned
 	assert.deepEqual(q.calls.removed, ["gone1", "gone2"]);
+});
+
+// reloadSchedules: the live-edit path (OQ-008). loadFn/reconcileFn injected -> no fs, no bullmq.
+
+test("reloadSchedules re-selects cron and reconciles on a valid file", async () => {
+	const reconciled = [];
+	const res = await reloadSchedules({ triggersFile: "/t.json" }, {}, {
+		log: () => {},
+		loadFn: () => [{ schedulerId: "a", name: "local", pattern: "0 3 * * *", data: {}, opts: {} }],
+		reconcileFn: async (_q, s) => (reconciled.push(s.length), { installed: s.length, removed: 0 }),
+	});
+	assert.deepEqual(res, { ok: true, installed: 1, removed: 0 });
+	assert.deepEqual(reconciled, [1], "the new schedule set is reconciled");
+});
+
+test("reloadSchedules keeps the running schedulers when the new file is invalid (never reconciles a bad file)", async () => {
+	let reconciled = false;
+	const res = await reloadSchedules({ triggersFile: "/t.json" }, {}, {
+		log: () => {},
+		loadFn: () => {
+			throw Object.assign(new Error("bad cron id"), { piDispatchConfig: true });
+		},
+		reconcileFn: async () => ((reconciled = true), {}),
+	});
+	assert.ok(res.invalid, "an invalid reload reports the reason");
+	assert.equal(reconciled, false, "a bad edit never reconciles -- the running schedulers are kept");
 });
