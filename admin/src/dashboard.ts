@@ -655,14 +655,18 @@ function settingsLines(settings: any, inner: number, styler: any): string[] {
 }
 
 /**
- * The TRIGGER_DETAIL drill-in: the trigger's filter + a per-kind TRUST MODEL block (following the design
- * mock). Read-only; the `e`/`x` keys drive edit/delete through the command loop. Every line is `inner` cols.
+ * The TRIGGER_DETAIL drill-in, three scannable sections: MATCHES (what fires it), RUNS (what it produces),
+ * and a per-kind TRUST MODEL. The flow lives once in the header, so the sections carry only distinct facts —
+ * no crammed "produces" line. Read-only; `e`/`x` drive edit/delete through the command loop. Every line is
+ * `inner` cols.
  */
 function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = null): string[] {
   if (!t) return [styler.cell("(no trigger)", inner, { color: "dim" })];
   const out: string[] = [];
   const kv = (k: string, v: string, color = "text") =>
     fitLine(styler.cell(k, 12, { color: "muted" }) + " " + styler.fg(color, v), inner, styler);
+  const blank = () => out.push(styler.cell("", inner));
+  const section = (label: string) => out.push(styler.divider(label, null, inner));
 
   // Header: kind badge -> flow, plus a health marker for cron (✔ healthy / ⚠ overdue) derived from the
   // scheduler's overdueMs. A trigger with no matching scheduler shows no health marker rather than a guess.
@@ -672,33 +676,47 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
     header += "   " + (healthy ? styler.fg("success", "✔ healthy") : styler.fg("warning", `⚠ overdue ${formatDuration(sched.overdueMs)}`));
   }
   out.push(fitLine(header, inner, styler));
-  out.push(styler.cell("", inner));
+
+  // MATCHES — the condition that fires this trigger.
+  blank();
+  section("matches");
   if (t.type === "cron") {
-    out.push(kv("when", `${t.pattern ?? "-"}`));
+    out.push(kv("schedule", `${t.pattern ?? "-"}`));
     // next fire + countdown, and drift/stalls, from the resident scheduler + the stall backstop counter.
     // `next` is real (BullMQ scheduler); `last` fire time is not stored on the scheduler, so it is omitted
     // rather than faked. Absent scheduler -> next unknown.
     if (sched) {
       const inMs = typeof sched.next === "number" ? sched.next - Date.now() : NaN;
       const next = typeof sched.next === "number" ? `${formatTs(sched.next)} (${humanizeMs(inMs) ? `in ${humanizeMs(inMs)}` : "due"})` : "—";
-      out.push(kv("next", next, "accent"));
+      out.push(kv("next fire", next, "accent"));
       const drift = sched.overdueMs ? formatDuration(sched.overdueMs) : "0s";
       out.push(kv("health", `drift ${drift} · stalls ${sched.stalls}/${sched.stallMax}`, sched.overdueMs ? "warning" : "success"));
     }
-    const model = t.model ? ` · model ${t.model}` : " · model default";
-    out.push(kv("produces", `local · ${t.folder ?? "-"} · flow ${t.flow ?? "-"}${model}`, "success"));
   } else if (t.type === "label" || t.type === "pull_request") {
-    if (t.type === "pull_request") out.push(kv("actions", (t.action ?? []).join(", ") || "-"));
+    if (t.type === "pull_request") out.push(kv("PR actions", (t.action ?? []).join(", ") || "-"));
     out.push(kv("any of", (t.any ?? []).join(" · ") || "-", "success"));
     out.push(kv("all of", (t.all ?? []).join(" · ") || "-", "success"));
     out.push(kv("none of", (t.none ?? []).join(" · ") || "-", "error"));
-    out.push(kv("produces", `github · repo#issue · flow ${t.flow ?? "-"}`, "accent"));
   } else if (t.type === "comment") {
     out.push(kv("phrase", `"${t.phrase ?? "-"}"`));
-    out.push(kv("produces", `github · flow ${t.flow ?? "-"}`, "accent"));
   }
-  out.push(styler.cell("", inner));
-  out.push(styler.divider("trust model", null, inner));
+
+  // RUNS — what it produces when it fires. One fact per row.
+  blank();
+  section("runs");
+  if (t.type === "cron") {
+    out.push(kv("job", "local", "success"));
+    out.push(kv("folder", `${t.folder ?? "-"}`, "success"));
+    out.push(kv("model", t.model ?? "deployment default", t.model ? "accent" : "dim"));
+  } else {
+    out.push(kv("job", "github", "accent"));
+    out.push(kv("target", "the triggering repo#issue / PR", "accent"));
+    out.push(kv("model", "deployment default", "dim"));
+  }
+
+  // TRUST MODEL — who authorizes it, how it dedups, which service owns it.
+  blank();
+  section("trust model");
   for (const line of trustModel(t)) out.push(fitLine(styler.fg("border", "· ") + styler.fg("text", line), inner, styler));
   return out;
 }
