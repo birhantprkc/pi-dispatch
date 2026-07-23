@@ -125,12 +125,11 @@ test("enqueueGitHubJob builds the github data shape and dedup opts (fake queue c
 	};
 
 	const trigger = { event: "issues", action: "labeled", deliveryId: "guid-123", sender: { id: 42, login: "octocat" } };
+	const target = { type: "issue", number: 7, title: "Button is misaligned", body: "The submit button overflows on mobile" };
 	const jobId = await enqueueGitHubJob(fakeQueue, {
 		repo: "owner/repo",
-		issueNumber: 7,
+		target,
 		flow: "frontend-fix",
-		title: "Button is misaligned",
-		body: "The submit button overflows on mobile",
 		trigger,
 		provider: "anthropic",
 		model: "m",
@@ -140,11 +139,12 @@ test("enqueueGitHubJob builds the github data shape and dedup opts (fake queue c
 	assert.equal(jobId, "gh-guid-123");
 	assert.equal(captured.name, "github");
 
-	// Data shape: kind:"github", NO sha, trigger passed through verbatim.
+	// Data shape: kind:"github", NO sha, target discriminator + trigger passed through verbatim.
 	assert.equal(captured.data.kind, "github");
 	assert.equal("sha" in captured.data, false, "no sha -- resolved fresh in prepare (C1)");
+	assert.equal("issueNumber" in captured.data, false, "the flat issueNumber field is gone -- target carries the number");
 	assert.equal(captured.data.repo, "owner/repo");
-	assert.equal(captured.data.issueNumber, 7);
+	assert.deepEqual(captured.data.target, target);
 	assert.equal(captured.data.flow, "frontend-fix");
 	assert.deepEqual(captured.data.trigger, trigger);
 
@@ -193,7 +193,7 @@ test("same delivery GUID twice -> one job (exact redelivery dedup)", { skip }, a
 	const { enqueueGitHubJob } = await import("../src/queue.mjs");
 	const q = await freshGitHubQueue();
 	try {
-		const base = { repo: "owner/repo", issueNumber: 7, flow: "frontend-fix", title: "t", body: "b", provider: "anthropic", model: "m", maxTurns: 5 };
+		const base = { repo: "owner/repo", target: { type: "issue", number: 7, title: "t", body: "b" }, flow: "frontend-fix", provider: "anthropic", model: "m", maxTurns: 5 };
 		const trigger = { event: "issues", action: "labeled", deliveryId: "guid-same", sender: { id: 1, login: "u" } };
 		const id1 = await enqueueGitHubJob(q, { ...base, trigger });
 		const id2 = await enqueueGitHubJob(q, { ...base, trigger }); // redelivery -> same jobId
@@ -213,9 +213,9 @@ test("two different GUIDs on distinct issues -> two jobs", { skip }, async () =>
 	const { enqueueGitHubJob } = await import("../src/queue.mjs");
 	const q = await freshGitHubQueue();
 	try {
-		const base = { repo: "owner/repo", flow: "frontend-fix", title: "t", body: "b", provider: "anthropic", model: "m", maxTurns: 5 };
-		const id1 = await enqueueGitHubJob(q, { ...base, issueNumber: 1, trigger: { event: "issues", action: "labeled", deliveryId: "guid-a", sender: { id: 1, login: "u" } } });
-		const id2 = await enqueueGitHubJob(q, { ...base, issueNumber: 2, trigger: { event: "issues", action: "labeled", deliveryId: "guid-b", sender: { id: 1, login: "u" } } });
+		const base = { repo: "owner/repo", flow: "frontend-fix", provider: "anthropic", model: "m", maxTurns: 5 };
+		const id1 = await enqueueGitHubJob(q, { ...base, target: { type: "issue", number: 1, title: "t", body: "b" }, trigger: { event: "issues", action: "labeled", deliveryId: "guid-a", sender: { id: 1, login: "u" } } });
+		const id2 = await enqueueGitHubJob(q, { ...base, target: { type: "issue", number: 2, title: "t", body: "b" }, trigger: { event: "issues", action: "labeled", deliveryId: "guid-b", sender: { id: 1, login: "u" } } });
 		assert.notEqual(id1, id2);
 		const counts = await q.getJobCounts("waiting");
 		assert.equal(counts.waiting, 2, "distinct deliveries on distinct issues are distinct jobs");
@@ -229,7 +229,7 @@ test("two different GUIDs, same repo#issue:flow within the window -> one active 
 	const { enqueueGitHubJob } = await import("../src/queue.mjs");
 	const q = await freshGitHubQueue();
 	try {
-		const base = { repo: "owner/repo", issueNumber: 7, flow: "frontend-fix", title: "t", body: "b", provider: "anthropic", model: "m", maxTurns: 5 };
+		const base = { repo: "owner/repo", target: { type: "issue", number: 7, title: "t", body: "b" }, flow: "frontend-fix", provider: "anthropic", model: "m", maxTurns: 5 };
 		const id1 = await enqueueGitHubJob(q, { ...base, trigger: { event: "issues", action: "labeled", deliveryId: "guid-x", sender: { id: 1, login: "u" } } });
 		const id2 = await enqueueGitHubJob(q, { ...base, trigger: { event: "issues", action: "labeled", deliveryId: "guid-y", sender: { id: 1, login: "u" } } });
 		assert.notEqual(id1, id2, "distinct GUIDs -> distinct jobIds");

@@ -1,4 +1,0 @@
-{
-  "frontend-fix": { "any": ["pi:frontend"] },
-  "backend-fix": { "any": ["pi:backend"] }
-}

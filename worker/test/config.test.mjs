@@ -18,7 +18,7 @@ test("loads conservative defaults with an empty-ish env", () => {
 	assert.equal(c.valkeyUrl, "redis://127.0.0.1:6379");
 	assert.equal(c.jobImage, "pi-job:latest");
 	assert.ok(c.jobsDir.length > 0);
-	assert.equal(c.schedulesFile, null);
+	assert.equal(c.triggersFile, null);
 	assert.equal(c.schedulerStallMax, 2);
 	assert.ok(c.logsDir.endsWith("/pi-dispatch/logs"), c.logsDir);
 	assert.equal(c.captureJobLogs, false);
@@ -183,9 +183,9 @@ test("scheduler stall max non-integer is a config error, not a silent NaN", () =
 	assert.throws(() => loadConfig({ PI_SCHEDULER_STALL_MAX: "abc" }), (e) => e.piDispatchConfig === true);
 });
 
-test("schedules file is honored verbatim -- no default path, null means cron disabled", () => {
-	const c = loadConfig({ PI_SCHEDULES_FILE: "/abs/x.json" });
-	assert.equal(c.schedulesFile, "/abs/x.json");
+test("triggers file is honored verbatim -- no default path, null means cron disabled", () => {
+	const c = loadConfig({ PI_TRIGGERS_FILE: "/abs/x.json" });
+	assert.equal(c.triggersFile, "/abs/x.json");
 });
 
 test("configError is tagged for clean CLI reporting", () => {

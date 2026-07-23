@@ -119,25 +119,48 @@ test("renderBudget reports unreachable", () => {
   assert.match(renderBudget({ budget: { unreachable: "down" }, settings: {} }), /unreachable/);
 });
 
-test("renderTriggers lists schedulers with next + overdue drift and the per-flow rules", () => {
+test("renderTriggers lists schedulers with next + overdue drift and a label trigger line", () => {
   const out = renderTriggers({
     schedulers: [{ key: "s1", next: Date.UTC(2026, 6, 21, 0, 0, 0), overdueMs: 5000 }],
-    flows: { rules: { "frontend-fix": { any: ["pi:frontend"], all: [], none: ["wontfix"] } } },
+    triggers: { triggers: [{ type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix" }] },
   });
   assert.match(out, /s1/);
   assert.match(out, /next 2026-07-21T00:00:00.000Z/);
   assert.match(out, /overdue by 5s/);
-  assert.match(out, /frontend-fix: any\[pi:frontend\] none\[wontfix\]/);
+  assert.match(out, /label {2}any\[pi:frontend\] none\[wontfix\] → frontend-fix/);
 });
 
-test("renderTriggers degrades on no schedulers and missing flows", () => {
-  const out = renderTriggers({ schedulers: [], flows: { missing: true } });
+test("renderTriggers renders each of the four on.types", () => {
+  const out = renderTriggers({
+    schedulers: [],
+    triggers: {
+      triggers: [
+        { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy" },
+        { type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix" },
+        { type: "comment", phrase: "@pi", flow: "fix" },
+        { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review" },
+      ],
+    },
+  });
+  assert.match(out, /cron {2}nightly {2}0 3 \* \* \* → \/srv\/p\/tidy/);
+  assert.match(out, /label {2}any\[pi:frontend\] → frontend-fix/);
+  assert.match(out, /comment {2}"@pi" → fix/);
+  assert.match(out, /pull_request {2}action\[labeled\] any\[pi:review\] → review/);
+});
+
+test("renderTriggers degrades on no schedulers and a missing triggers file", () => {
+  const out = renderTriggers({ schedulers: [], triggers: { missing: true } });
   assert.match(out, /none configured/);
-  assert.match(out, /flows file not found/);
+  assert.match(out, /triggers file not found/);
+});
+
+test("renderTriggers reports an invalid triggers file and an empty list", () => {
+  assert.match(renderTriggers({ schedulers: [], triggers: { invalid: "bad" } }), /triggers file invalid: bad/);
+  assert.match(renderTriggers({ schedulers: [], triggers: { triggers: [] } }), /\(no triggers\)/);
 });
 
 test("renderTriggers reports an unreachable scheduler read", () => {
-  assert.match(renderTriggers({ schedulers: { unreachable: "down" }, flows: { rules: {} } }), /unreachable \(down\)/);
+  assert.match(renderTriggers({ schedulers: { unreachable: "down" }, triggers: { triggers: [] } }), /unreachable \(down\)/);
 });
 
 test("renderSettingsView lists all ten keys, unset ones marked", () => {

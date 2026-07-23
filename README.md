@@ -1,25 +1,52 @@
 # pi-dispatch
 
-**Run the [pi](https://github.com/earendil-works/pi) coding agent, in a container, against your own
-folders — on your own machine or server.**
+**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service: it opens a repo or folder
+in a locked-down container, does the work, and shuts the container down — triggered on demand, on a
+schedule, or by a GitHub issue or pull request, with a durable queue, a spend cap, and a live admin
+panel.**
 
-> `pi-dispatch` below is `npx pi-dispatch` from the repo (a workspace bin); or `npm link` it onto your PATH.
-
-Point it at a project folder, give it a task, and pi does the work inside a locked-down container:
+pi is an excellent agent. It has no job queue, no concurrency control, no spend limit, and — by its own
+README — no permission system. **pi-dispatch is exactly that missing operational layer, and nothing
+else.** Everything below the container is pi; everything above it is a few hundred reviewed lines.
 
 ```
 npx pi-dispatch run ./my-project --task "dedupe the imports in src/" --flow tidy
 ```
 
-pi is an excellent agent. It has no job queue, no concurrency control, no spend limit, and — by its own
-README — no permission system. pi-dispatch is that missing layer, and nothing else: a durable queue, a
-per-job container boundary, a turn budget, and a daily spend cap. Everything below the container is pi;
-everything above it is a few hundred lines of code.
+> `pi-dispatch` above is `npx pi-dispatch` from this repo (a workspace bin); or `npm link` it onto your PATH.
 
-**Your project tells the agent what to do**, using pi's own layout — `.pi/APPEND_SYSTEM.md` for the
-persona, `.pi/skills/<name>/SKILL.md` for skills. Not a format we invented; pi's native skills, read
-from your committed files. pi-dispatch ships no persona of its own — only a small, immutable safety floor
-baked into the image that your instructions add to and cannot remove.
+![The /dispatch dashboard overlay — live queue state, day/week/month spend meters, the unified triggers pane (cron, label, comment, pull_request), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
+
+## Why pi-dispatch
+
+- **The container is the security boundary, not a promise.** pi has no permission system, so every job
+  runs `--cap-drop=ALL`, non-root, ephemeral, `no-new-privileges`, with your instructions mounted
+  read-only — the agent cannot rewrite its own guardrails or reach your host.
+- **Spend is bounded before a container starts** — a per-job **turn budget** (pi has none of its own) and
+  a **daily cap** checked *before* any tokens are spent, so a runaway can't quietly drain your API budget.
+- **Nothing is dropped.** Fifty triggers at once become fifty durable queued jobs, drained at a fixed
+  concurrency (default 3) and surviving a reboot (Valkey with AOF).
+- **Three triggers, one job contract.** A CLI command, a **cron schedule**, or a GitHub issue/PR — each
+  produces the same job, runs through the same box, and shows up in the same panel. The scheduler is the
+  unattended one: recurring work on your own hardware — a nightly tidy, a weekly dependency bump, a docs
+  regen, a scheduled frontend visual check — the same autonomous-agent-on-a-timer idea as a hosted
+  routine, but the run happens in *your* container under *your* queue and spend caps.
+- **The container image is yours to shape.** Every job runs in your
+  [`image/Dockerfile`](image/Dockerfile) — bake in a project's exact toolchain and system libraries. It
+  already ships **Playwright + Chromium**, so a flow can build your frontend, screenshot it, and iterate
+  on the *rendered* result (before/after images attach to the PR). A hosted routine runs in a fixed
+  environment; here the box bends to the project.
+- **Your project steers the agent** using pi's native layout — `.pi/APPEND_SYSTEM.md` for the persona,
+  `.pi/skills/<name>/SKILL.md` for skills, read from your committed files. pi-dispatch ships no persona of
+  its own, only a small immutable safety floor baked into the image that your instructions add to and
+  cannot remove.
+- **A live admin panel that binds no network port** — a pi extension in your own session: watch the
+  queue, meter spend, browse every run's PII-free record, tail a running job, and pause/resume, all
+  locally with no model involvement.
+
+Drive it and read its output from the `/dispatch` overlay above, or the matching slash commands:
+
+![Transcript of /dispatch status, /dispatch runs, and /dispatch triggers in a pi session — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg)
 
 ---
 
@@ -51,6 +78,8 @@ folders you can restore, and commit first.
 
 ## What runs, and what protects you
 
+The local path, end to end — the same queue, container, and budget every trigger flows through:
+
 ```mermaid
 flowchart LR
   CLI["pi-dispatch run ./folder --task ..."] -->|enqueue| Q[("Valkey + BullMQ<br/>the wait-list, AOF")]
@@ -61,16 +90,9 @@ flowchart LR
   PI -->|"edits in place"| F[("your folder")]
 ```
 
-- **The container is the security boundary.** pi has no permission system, so every job runs
-  `--cap-drop=ALL`, non-root, ephemeral, with your instructions mounted read-only. The agent cannot
-  rewrite its own guardrails or reach your host.
-- **Spend is bounded twice.** A per-job **turn budget** (pi has none of its own) and a **daily cap**
-  checked *before* a container starts, so a runaway can't quietly burn your API budget. Also set a spend
-  limit on the API key itself.
-- **Nothing is dropped.** Fifty jobs at once become fifty queued jobs, drained at a fixed concurrency
-  (default 3). Valkey persists them across a reboot.
-
-Read [`SECURITY.md`](SECURITY.md) before you rely on it — it states plainly what is and is not defended.
+The three guarantees from **Why pi-dispatch** — a container boundary, spend bounded *before* a container
+starts, and nothing dropped — are exactly what this path enforces. Read [`SECURITY.md`](SECURITY.md)
+before you rely on it: it states plainly what is and is not defended.
 
 ## Run as a service
 
@@ -154,17 +176,15 @@ worker's **boot reaper** clears on the next start, rather than draining cleanly.
 
 ## Admin (pi extension)
 
-The admin surface is a **pi extension** in [`admin/`](admin/) that loads into *your own* interactive pi
-session — no daemon, no web app, **no network port at all**. Load it with `pi -e admin/src/index.ts` from
-this checkout, add that path to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi
-inside this checkout: the in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
+The admin surface — the dashboard and command transcript shown at the top of this README — is a **pi
+extension** in [`admin/`](admin/) that loads into *your own* interactive pi session — no daemon, no web
+app, **no network port at all**. Load it with `pi -e admin/src/index.ts` from this checkout, add that path
+to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi inside this checkout: the
+in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
 
-Bare `/dispatch` opens a live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
-queue in place:
-
-![The /dispatch dashboard overlay: queue state, budget, recent runs, schedulers with next-fire drift, and the settings overlay in one live TUI panel](docs/images/dispatch-dashboard.svg)
-
-It adds `/dispatch` commands that run **locally, with no model involvement**:
+Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
+queue in place, `↑`/`↓` and `Enter` to drill into a run or tail the active job. It adds `/dispatch`
+commands that run **locally, with no model involvement**:
 
 - `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
 - `pause` / `resume` — the queue on/off switch
@@ -172,8 +192,6 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 - `triggers` — the configured triggers (display only)
 - `run <folder> <flow> [task]` — enqueue a flow against a local folder (operator-typed; the dirty-tree guard still applies)
 - `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
-
-![Transcript of /dispatch status, /dispatch runs and /dispatch triggers output in a pi session](docs/images/dispatch-commands.svg)
 
 `/dispatch pause|resume|status` are a second interface over the **same durable switch** as
 `pi-dispatch pause|resume|status` (see **Steer the running worker** above), not a new mechanism; `runs`
@@ -205,49 +223,62 @@ host-enforced, so the in-container agent controls nothing.
 
 The worker keeps a durable, per-job record under `PI_LOGS_DIR` (default: your OS temp dir,
 `.../pi-dispatch/logs`). Every job writes an id-only status record `logs/<jobId>.json` — stable ids only
-(the delivery GUID, `repo#issue`), never issue or comment text. Set `PI_CAPTURE_JOB_LOGS=1` to **also**
+(the delivery GUID, `repo#number`), never issue or comment text. Set `PI_CAPTURE_JOB_LOGS=1` to **also**
 capture the container's raw stdout/stderr to `logs/<jobId>.log`; this is **opt-in and off by default**,
 because that raw stream can contain issue and comment text (PII). Both files stay host-side, are never
 mounted into the job container, and are gitignored. A boot-time sweep prunes anything older than
 `PI_LOG_RETENTION_DAYS` (default 30; `0` keeps them forever).
 
-## Scheduling recurring jobs
+## Triggers: cron, labels, comments, pull requests
 
-A cron schedule is a trigger, not a new job kind: each entry runs a local folder through a flow on a cron
-pattern. Cron is **off by default** — the worker reads schedules only when `PI_SCHEDULES_FILE` points at a
-file.
+Every standing trigger — cron schedules and GitHub triggers alike — lives in one unified
+**`triggers.json`**, a list of `{ on, run }` pairs read by both the worker (cron) and the receiver
+(GitHub). Point both services at it with `PI_TRIGGERS_FILE`; the worker treats it as optional (unset =
+cron off), the receiver requires it.
+
+```jsonc
+{ "triggers": [
+  { "on": { "type": "cron", "id": "nightly", "pattern": "0 3 * * *" },
+    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy" } },
+  { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
+  { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
+  { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } }
+] }
+```
+
+The `on × run` matrix is the trust boundary, enforced fail-loud at load: a `cron` trigger must run
+`local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs `github`.
+
+### Scheduling recurring jobs
+
+A cron trigger runs a local folder through a flow on a cron pattern — `pattern` is a 5- or 6-field cron
+expression; `provider`, `model`, and `maxTurns` are optional on `run` and fall back to the worker's
+defaults. A cron `folder` is a **host path** — the worker runs on the host
+([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must be
+readable by the worker's user.
 
 ```bash
-# 1. Copy the template and edit it
-cp schedules.example.json schedules.json   # then edit "folder" to a REAL absolute path
-
-# 2. Point the worker at it (absolute path), and restart the worker
-#    In .env:  PI_SCHEDULES_FILE=/absolute/path/to/schedules.json
+cp triggers.example.json triggers.json   # then edit the cron entry's "folder" to a REAL absolute path
+# In .env:  PI_TRIGGERS_FILE=/absolute/path/to/triggers.json
 npx pi-dispatch worker
 ```
 
-Each entry sets `id`, `cron` (5 or 6 fields), `folder`, `flow`, and `task`; `provider`, `model`, and
-`maxTurns` are optional and fall back to the worker's defaults. A schedule's `folder` is a **host path** —
-the worker runs on the host ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job
-container, so it must be readable by the worker's user.
+Copying `triggers.example.json` verbatim makes the worker **refuse to start** with
+`configError: folder does not exist` until a cron trigger's `folder` names a real path — fail-loud on
+purpose, so a broken trigger never silently fails to fire.
 
-- **Local schedules only this slice.** `kind` must be `"local"`; the loader rejects `kind:"github"` at
-  startup — a schedule has no webhook delivery, issue number, or body to work.
-- **Editing `folder` is mandatory.** Copying `schedules.example.json` verbatim makes the worker **refuse
-  to start** with `configError: folder does not exist` until `folder` names a real path. This is
-  fail-loud on purpose: a broken schedule never silently fails to fire.
-
-## Advanced: GitHub automation
+## GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
 opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECRET`), and the worker
 authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
 **PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
-for multi-tenant.
+for multi-tenant. Which labels, comment phrases, and pull_request actions fire which flow is configured in
+the same unified **`triggers.json`** above; the receiver **requires** `PI_TRIGGERS_FILE`.
 
 ```mermaid
 flowchart LR
-  GH["GitHub repo<br/>issue labeled, or @pi comment"] -->|"webhook, HMAC-signed"| R
+  GH["GitHub repo<br/>issue labeled, @pi comment, or PR"] -->|"webhook, HMAC-signed"| R
   subgraph EDGE["receiver/ — public edge, binds 0.0.0.0"]
     R["verify raw-body HMAC (401 on mismatch)<br/>filter: label allowlist, author gate, bot-loop"]
   end
@@ -261,20 +292,18 @@ flowchart LR
 ```
 
 - Only a collaborator's label or `@pi` comment starts a job (the label *is* the approval step).
+- Beyond labeled issues, pi-dispatch also handles **pull requests**: label a PR, comment on a PR, or fire
+  automatically when a PR is opened or updated — the auto (`opened`/`synchronize`/`reopened`) path is
+  gated on the PR author being a collaborator, so a fork PR from a stranger never auto-fires. A PR trigger
+  just runs the configured flow; the flow (a repo skill) reviews, comments, or pushes to the PR via `gh`.
 - The agent gets a **repo-scoped, short-lived token** — and, honestly: that token *can* merge, because
   GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
   default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
   the detail.
-- The **admin surface** is a pi extension (`admin/`) loaded into your own interactive pi session —
-  `/dispatch` commands plus a TUI dashboard. It operates the queue (the same durable `queue.pause()` as
-  `pi-dispatch pause`), shows runs, logs, and budget, and edits runtime settings via the `settings.json`
-  overlay. It binds no port at all; its one job-triggering tool, `dispatch_run`, is folder-allowlisted,
-  flow-gated, and rate-limited. It never edits your persona (those live in your project's `.pi/`, in git,
-  reviewed) and does not edit flows this slice (deferred). See **Admin (pi extension)**.
 
 Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
 *before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the
-receiver's own comments can never re-trigger a job):
+receiver's own comments, and the agent's own push to a PR head, can never re-trigger a job):
 
 ```mermaid
 flowchart TD
@@ -282,30 +311,41 @@ flowchart TD
   V -->|no| E401["401 — reject, enqueue nothing"]
   V -->|yes| S{"sender.id ==<br/>our own id?"}
   S -->|"yes"| D204a["204 — drop (bot-loop guard)"]
-  S -->|no| A{"allowlisted label,<br/>or collaborator @pi?"}
+  S -->|no| A{"allowlisted label, collaborator @pi,<br/>or collaborator-authored PR?"}
   A -->|no| D204b["204 — drop"]
   A -->|yes| EN{"enqueue to Valkey"}
   EN -->|ok| A202["202 — queued<br/>(duplicate delivery = no-op, deduped by GUID)"]
   EN -->|"Valkey down"| E503["503 — GitHub redelivers,<br/>deduped by GUID"]
 ```
 
-## Should you use this instead of the Claude Code GitHub Action?
+## How it compares
 
-For GitHub automation, often no — and you should know that up front.
+**vs the Claude Code GitHub Action.** For GitHub automation, often reach for the action —
 [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action) (MIT, ~8.4k stars) is
 GA and does label-triggered issue automation for 10% of the effort. pi-dispatch is for a narrower case:
 **you run pi, on your own hardware, and you want a real queue, a container boundary, and — the part the
 action can't do — to run flows against local folders**, not just GitHub repos, without hosted-runner
 minutes.
 
+**vs Claude Code routines and `/loop`.** A routine runs a recurring agent task on a cron schedule (managed,
+in the cloud); `/loop` repeats a prompt on an interval inside your session. For generic recurring work
+they're simpler — nothing to host — and often the right call. pi-dispatch's cron trigger is the same idea
+with a different centre of gravity: the run happens in **a container image you build**, on **your**
+hardware, under **your** queue and spend caps. That is the edge when the task needs an environment a hosted
+routine cannot give it — a project's exact toolchain and system libraries, or the baked-in **Playwright +
+Chromium** that lets a scheduled flow build a frontend, screenshot it, and iterate until it renders right,
+then attach the before/after to a PR. Rule of thumb: if the recurring task is *"run a prompt,"* use a
+routine; if it is *"run this project's real build / test / visual loop on a schedule, in an image I
+control,"* that is this.
+
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitHub webhook path
-(receiver → queue → clone → PR), and scheduled (cron) triggers for local folders are built and work; the
-worker runs in a terminal or as an OS service on Linux, macOS or Windows (see **Run as a service**). The
-admin surface ships as a pi extension (see **Admin (pi extension)**). The design is specified in
-[`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables
-and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
+The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitHub path (receiver → queue →
+clone → PR for both issues and pull requests), and scheduled (cron) triggers for local folders are built
+and work; the worker runs in a terminal or as an OS service on Linux, macOS or Windows (see **Run as a
+service**). The admin surface ships as a pi extension (see **Admin (pi extension)**). The design is
+specified in [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the
+non-negotiables and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 
 ## Contributing
 

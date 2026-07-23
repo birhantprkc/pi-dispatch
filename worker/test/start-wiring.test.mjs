@@ -235,7 +235,7 @@ test("chain wiring: the outbox collectChain is wired into deps as a function", {
 	assert.equal(typeof deps.collectChain, "function", "the outbox chain collector must be wired into deps.collectChain");
 });
 
-// Cron wiring. DEFAULT env => no PI_SCHEDULES_FILE => schedules=[] => reconcile is skipped, so these
+// Cron wiring. DEFAULT env => no PI_TRIGGERS_FILE => schedules=[] => reconcile is skipped, so these
 // assert the wiring that runs even with cron disabled: no live Valkey required.
 test("cron wiring: a stalled listener is registered and schedules_installed precedes worker_started", { skip }, async () => {
 	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 9, source: "gh" });

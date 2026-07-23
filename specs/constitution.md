@@ -140,15 +140,23 @@ that always fires is one nobody reads.
 
 ## CONST-TRIGGER-AUTHOR-GATE
 
-- **Statement**: Only an allowlisted label, or a comment from `author_association ∈ {OWNER, MEMBER,
-  COLLABORATOR}`, shall start a job.
+- **Statement**: Only an allowlisted label, a comment from `author_association ∈ {OWNER, MEMBER,
+  COLLABORATOR}`, or a `pull_request` event whose approval gate is satisfied, shall start a job. For a
+  `pull_request`: **labeling** (`action: labeled`) is gated by the label allowlist — a collaborator-applied
+  label is the approval, exactly as for an issue; **auto actions** (`opened`, `synchronize`, `reopened`)
+  are gated by the PR `author_association ∈ {OWNER, MEMBER, COLLABORATOR}`, so a fork or external PR never
+  auto-fires and must be triggered by a collaborator's label or comment.
 - **Why**: Only collaborators can apply labels — therefore **the label is the human approval step**, not
   a routing hint. A stranger's issue sits until a maintainer labels it, and that pause is the design, not
-  latency to be optimised away. Together with `CONST-HMAC-OVER-RAW-BODY` this is the entire "who can
-  spend our money and run our agent" gate.
+  latency to be optimised away. The PR auto-action author gate is the same principle: an *ungated*
+  auto-trigger on `pull_request.opened` is an unbounded paid agent run started by whoever opens a fork PR —
+  the exact spend-and-run vector this gate exists to close — so it is hard-coded in the filter, never a
+  config toggle. Together with `CONST-HMAC-OVER-RAW-BODY` this is the entire "who can spend our money and
+  run our agent" gate.
 - **Traces to**: `REQ-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`
 - **Acceptance**: Given `@pi fix this` from `author_association: NONE`, the receiver returns 204 and
-  enqueues nothing.
+  enqueues nothing. Given a `pull_request.opened` whose PR `author_association` is `NONE` (a fork PR), the
+  receiver returns 204 and enqueues nothing; given the same from a `COLLABORATOR`, exactly one job runs.
 
 ## CONST-HMAC-OVER-RAW-BODY
 

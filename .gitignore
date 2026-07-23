@@ -29,10 +29,10 @@ coverage/
 .env.*
 !.env.example
 
-# Cron schedule list. Holds host paths and per-schedule tasks; the committed
-# schedules.example.json is the template.
-schedules.json
-!schedules.example.json
+# Unified trigger list. Holds host paths and per-trigger tasks; the committed
+# triggers.example.json is the template, and deploy/triggers.json is the deployed default.
+/triggers.json
+!triggers.example.json
 
 # Python — bytecode and tool caches from the skill scripts under .claude/skills/
 __pycache__/

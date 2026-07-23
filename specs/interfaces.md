@@ -310,8 +310,9 @@ Evidence convention as in `constitution.md`.
 - **Contract**: `/job` mounted **read-only**. `/workspace` is writable; a **local** job additionally
   mounts `/outbox` (writable, `INT-OUTBOX-CONTRACT`); a **github** job does not.
   ```
-  /job/prompt.md          task text (issue payload, or the operator-supplied task)
-  /job/event.json         raw webhook payload — ABSENT for local-folder jobs
+  /job/prompt.md          task text (issue/PR payload, or the operator-supplied task)
+  /job/event.json         webhook payload subset — an `issue` OR a `pull_request` body per the target
+                          discriminator; ABSENT for local-folder jobs
   /job/pi/APPEND_SYSTEM.md      project persona   ─┐ materialised by the worker from the
   /job/pi/skills/<name>/SKILL.md project skills    ├─ project's .pi/ at the DEFAULT-BRANCH SHA,
   /job/pi/extensions/...        project extensions ┘  via `git show`, never `fs.readFile`
@@ -470,51 +471,77 @@ Evidence convention as in `constitution.md`.
 **GitHub → receiver.**
 
 - **Contract**:
+  - Events consumed: `issues`, `issue_comment`, `pull_request`. Everything else drops as `unhandled-event`.
   - Headers consumed: `X-Hub-Signature-256`, `X-GitHub-Event`, `X-GitHub-Delivery`
   - Body fields consumed: `action`, `issue.number`, `issue.title`, `issue.body`, `issue.labels[].name`,
-    `comment.body`, `comment.author_association`, `sender.id`, `repository.full_name`
-  - `issue.labels[].name` is consumed as a **set**, evaluated by the per-flow `{any, all, none}` trigger
-    predicate (`REQ-TRIGGER-AUTHOR-GATE`) — this changes *how* the field is used, not which fields are
-    read; it is no new field.
+    `issue.pull_request` (presence marker only — an `issue_comment` on a PR carries it), `comment.body`,
+    `comment.author_association`, `sender.id`, `repository.full_name`, and for a `pull_request` event:
+    `pull_request.number`, `pull_request.title`, `pull_request.body`, `pull_request.author_association`,
+    `pull_request.labels[].name`, `pull_request.head.ref`, `pull_request.head.sha`,
+    `pull_request.head.repo.full_name`, `pull_request.base.ref`
+  - `issue.labels[].name` and `pull_request.labels[].name` are consumed as a **set**, evaluated by the
+    `{any, all, none}` trigger predicate (`REQ-TRIGGER-AUTHOR-GATE`) — this changes *how* the field is
+    used, not which fields are read.
+  - **`pull_request.head.*` and `.base.*` are DATA only.** They are attacker-controlled (the head may be a
+    fork) and are carried into `/job/event.json` for the flow's own `gh` use; they are **never** used as a
+    clone ref. The worker still clones the base repo's default-branch SHA (`INT-CONTAINER-JOB-INPUTS`).
   - **Everything else is ignored.**
 - **Why**: Naming the subset **is** the contract. Because everything else is ignored by construction, an
   upstream schema addition cannot change our behaviour — and a reviewer can see the entire attack
   surface as one list, instead of inferring it from destructuring scattered across a handler. Every
   field here is attacker-controlled except the headers and `sender.id`, and the headers are only
-  trustworthy *after* `CONST-HMAC-OVER-RAW-BODY` has run.
-- **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `REQ-TRIGGER-AUTHOR-GATE`, `REQ-DEDUP-BY-DELIVERY-GUID`
-- **Acceptance**: Given a payload with unknown extra fields, behaviour is unchanged.
+  trustworthy *after* `CONST-HMAC-OVER-RAW-BODY` has run. `pull_request.author_association` is
+  attacker-*claimed* but GitHub-*computed*, and it gates only auto actions — a stranger cannot forge
+  themselves into `COLLABORATOR` because GitHub, not the payload author, sets it.
+- **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `REQ-TRIGGER-AUTHOR-GATE`, `REQ-DEDUP-BY-DELIVERY-GUID`,
+  `INT-CONTAINER-JOB-INPUTS`
+- **Acceptance**: Given a payload with unknown extra fields, behaviour is unchanged. Given a
+  `pull_request` payload, no `head.sha`/`head.ref` value is ever passed to a clone or fetch — the fetch
+  pins the base default-branch SHA.
 
-## INT-SCHEDULES-FILE-CONTRACT
+## INT-TRIGGERS-FILE-CONTRACT
 
-**operator → worker.**
+**operator → worker + receiver.** One unified file, read by both services; each validates the WHOLE file
+and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`, `pull_request`).
 
 - **Contract**:
   ```
-  schedules.json  (path via PI_SCHEDULES_FILE; absolute; unset = cron disabled)
-  { "schedules": [
-    { "id": "<[A-Za-z0-9._-]+, no ':' , unique>",
-      "kind": "local",                     // only "local"; "github" rejected at load
-      "cron": "<5 or 6 space-separated fields>",
-      "folder": "<absolute HOST path, must exist>",
-      "flow": "<flow name>",
-      "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
-      "provider": "<optional passthrough>", "model": "<optional passthrough>", "maxTurns": <optional passthrough> } ] }
+  triggers.json  (path via PI_TRIGGERS_FILE; absolute; unset = cron disabled for the worker, but the
+                  receiver requires it)
+  { "triggers": [
+    { "on": { "type": "cron", "id": "<[A-Za-z0-9._-]+, no ':' , unique>",
+              "pattern": "<5 or 6 space-separated fields>" },
+      "run": { "kind": "local", "folder": "<absolute HOST path, must exist>", "flow": "<flow name>",
+               "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
+               "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional> } },
+    { "on": { "type": "label", "any": [...], "all": [...], "none": [...] },
+      "run": { "kind": "github", "flow": "<flow name>" } },
+    { "on": { "type": "comment", "phrase": "<trigger phrase>" },       // at most one
+      "run": { "kind": "github", "flow": "<default flow>" } },
+    { "on": { "type": "pull_request", "action": ["labeled"|"opened"|"synchronize"|"reopened", ...],
+              "any": [...], "all": [...], "none": [...] },
+      "run": { "kind": "github", "flow": "<flow name>" } } ] }
   ```
-- **Why**: The operator's schedule set is a host file — diffable, reviewable, and git-trackable — rather
-  than API state, so a schedule change is a reviewed edit. `id` must be `:`-free because the stall guard
-  parses BullMQ's deterministic `repeat:<id>:<millis>` job id by splitting on `:`; a colon in the id would
-  corrupt that parse. `task` is operator-authored natural language and is therefore **DATA**
-  (`CONST-ISSUE-TEXT-IS-DATA`): it lands in `/job/prompt.md` as the user prompt, never in a system prompt
-  or persona. `provider`, `model`, and `maxTurns` are **pure passthrough**: when an entry omits one it is
-  **absent** from the emitted job data — the loader bakes no config default — so at job start it falls
-  through to the overlay, then env, per `INT-CONFIG-OVERLAY-CONTRACT`, exactly as an interactive local
-  job's omitted field does.
-- **Traces to**: `DES-CRON-VIA-BULLMQ-SCHEDULER`, `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`
-- **Acceptance**: Given an entry that is malformed, has `kind:"github"`, a duplicate `id`, a `:` in its
-  `id`, or a `folder` that does not exist, when the config loads, then load throws a
-  `piDispatchConfig`-tagged error. Given a valid `local` entry, when it fires, then the emitted job's
-  `data` byte-matches the shape produced by the interactive local (`enqueueLocalJob`) path.
+- **The on × run diagonal is the trust boundary, enforced fail-loud at load**: `cron ⟹ run.kind:"local"`;
+  every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind:"github"`. Off-diagonal throws a
+  `piDispatchConfig` error — a `cron` trigger has no webhook delivery, issue/PR number, title, or body to
+  supply a github run, and a webhook trigger is adversarial input that always produces a github job.
+- **Why**: The operator's trigger set is one host file — diffable, reviewable, git-trackable — rather than
+  two files in two shapes across two services. The schema unifies the *view*; evaluation still splits by
+  owner (a `label` is never scheduled; a `cron` never receives a webhook). `on.id` (cron only) must be
+  `:`-free because the stall guard parses BullMQ's `repeat:<id>:<millis>` job id by splitting on `:`.
+  `run.task` is operator-authored natural language and therefore **DATA** (`CONST-ISSUE-TEXT-IS-DATA`): it
+  lands in `/job/prompt.md`, never in a system prompt. `provider`/`model`/`maxTurns` are **pure
+  passthrough**: omitted → absent from the emitted job data, resolved at job start via the overlay then env
+  (`INT-CONFIG-OVERLAY-CONTRACT`). A `labeled` PR rule (like a `label` rule) requires a positive selector;
+  at most one `comment` trigger may be configured.
+- **Traces to**: `DES-TRIGGERS-UNIFIED-FILE`, `DES-CRON-VIA-BULLMQ-SCHEDULER`, `REQ-TRIGGER-AUTHOR-GATE`,
+  `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`
+- **Acceptance**: Given an off-diagonal entry (`cron`→`github`, or any webhook type→`local`), a duplicate
+  cron `id`, a `:` in a cron `id`, a cron `run.folder` that does not exist, a `labeled` PR/label rule with
+  no positive selector, or a second `comment` trigger, when the config loads, then load throws a
+  `piDispatchConfig`-tagged error in both services. Given a valid `cron` entry, when it fires, then the
+  emitted job's `data` byte-matches the interactive local (`enqueueLocalJob`) shape.
 
 ## INT-RUN-HISTORY-FILE-CONTRACT
 
@@ -683,6 +710,7 @@ Evidence convention as in `constitution.md`.
 
 | Date | Change |
 |---|---|
+| 2026-07-22 | Unified triggers (issue #20 + `pull_request` triggers): replaced INT-SCHEDULES-FILE-CONTRACT with **INT-TRIGGERS-FILE-CONTRACT** — one `triggers.json` of `{ on, run }` entries via `PI_TRIGGERS_FILE`, read by both worker (`on.type:cron`) and receiver (`label`/`comment`/`pull_request`), with the `on × run` diagonal enforced fail-loud at load. Expanded INT-WEBHOOK-PAYLOAD-SUBSET to consume the `pull_request` event and its fields (`number`/`title`/`body`/`author_association`/`labels[].name`/`head.{ref,sha,repo.full_name}`/`base.ref`) plus `issue.pull_request` as a presence marker — `head`/`base` are attacker-controlled DATA, never a clone ref. Amended INT-CONTAINER-JOB-INPUTS: `/job/event.json` now carries an `issue` OR a `pull_request` body per the job-data `target` discriminator. See `DES-TRIGGERS-UNIFIED-FILE`, `DES-PR-TRIGGER-ROUTES-TO-FLOW`. |
 | 2026-07-22 | Corrected INT-CONTAINER-RUNTIME-CONTRACT's mount-mechanism sentence: the `/job:ro`, `/workspace:rw`, and local-only `/outbox:rw` mounts are host bind mounts (`-v host:container`), not the superseded named-volume + `volume-subpath` mechanism. Aligns the INT with `DES-WORKER-ON-HOST` and the shipped `worker/src/docker-run.mjs`. Also corrected INT-RUN-HISTORY-FILE-CONTRACT's `chainRefused` annotation from `<bool>` to `<int>` (a count of refused `/outbox` requests on the parent; `0` = none), matching the shipped `buildRecord`, which stores the collector's running `refused` count verbatim. |
 | 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |
 | 2026-07-22 | Added INT-OUTBOX-CONTRACT (container→worker `/outbox` request files: `request-<n>.json` byte-capped at 4 KiB, `folder`-ignored same-folder-only, validation order count→size→regular-file→parse→charset→host-computed depth→`ai-trigger` gate→enqueue, retry-idempotent child ids, completed-only collection, no mount for github parents, `task` as DATA never in the run record). Extended INT-CONTAINER-JOB-INPUTS and INT-CONTAINER-RUNTIME-CONTRACT with the writable `/outbox` mount (local jobs only; absent for github). Appended `parentJobId`/`chainDepth`/`chainRefused` (additive, nullable, no-spread) to INT-RUN-HISTORY-FILE-CONTRACT's record — the `reason` enum untouched, since a chain refusal is pre-enqueue of the child. |

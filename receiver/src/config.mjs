@@ -4,12 +4,16 @@
  * where webhooks silently go unverified or untriggered.
  *
  * The security-sensitive GitHub auth block is single-sourced from `@pi-dispatch/worker/config` --
- * `loadGitHubAuth` is parsed once, in one place, so the receiver and worker cannot drift on it.
+ * `loadGitHubAuth` is parsed once, in one place, so the receiver and worker cannot drift on it. The
+ * trigger schema is likewise single-sourced from `@pi-dispatch/worker/triggers` -- both services validate
+ * the WHOLE unified triggers file and each selects the `on.type` it owns (issue #20).
  *
  * - `webhookSecret` is REQUIRED: without it the receiver cannot verify `X-Hub-Signature-256` over the
  *   raw body, and an unverified webhook is a forgeable paid-agent trigger (CONST-HMAC-OVER-RAW-BODY).
- * - `labelFlows` IS the label allowlist: each flow declares an `{any, all, none}` label rule, and only
- *   collaborators can apply labels, so the allowlist is the human approval gate (CONST-TRIGGER-AUTHOR-GATE).
+ * - `triggers` is the receiver's webhook allowlist, grouped by type: label rules (the label IS the
+ *   collaborator approval), the single comment trigger (phrase + default flow), and pull_request rules.
+ *   Only collaborators can apply labels, so the label/PR-label allowlist is the human approval gate
+ *   (CONST-TRIGGER-AUTHOR-GATE).
  * - `bind` defaults to `0.0.0.0` (public): the receiver is the trigger surface that lives outside pi
  *   (DES-TRIGGER-OUTSIDE-PI). It carries no admin/dashboard config -- the admin surface is a pi extension
  *   in the operator's session and binds no port (DES-ADMIN-VIA-PI-EXTENSION), so there is none here.
@@ -20,8 +24,9 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { configError, loadGitHubAuth, positiveInt } from "@pi-dispatch/worker/config";
+import { parseTriggers } from "@pi-dispatch/worker/triggers";
 
-const DEFAULT_FLOWS_PATH = "deploy/receiver.flows.json";
+const DEFAULT_TRIGGERS_PATH = "deploy/triggers.json";
 
 /**
  * Parse the receiver's config from `env` (default process.env). Filesystem access is injected
@@ -38,61 +43,49 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
 		valkeyUrl: env.VALKEY_URL ?? "redis://127.0.0.1:6379", // mirrors worker config: producer and consumer share one queue
 		port: positiveInt(env, "RECEIVER_PORT", 3000),
 		bind: env.RECEIVER_BIND ?? "0.0.0.0",
-		labelFlows: loadLabelFlows(env, readFile, fileExists),
-		commentTrigger: {
-			phrase: env.COMMENT_TRIGGER_PHRASE ?? "@pi",
-			defaultFlow: env.COMMENT_DEFAULT_FLOW ?? null,
-		},
+		triggers: loadTriggers(env, readFile, fileExists),
 		github: loadGitHubAuth(env, fileExists),
 	};
 }
 
 /**
- * Load and validate the flow -> `{any, all, none}` rule allowlist from the flows file. The file is the
- * reviewed, committed source of truth for which label sets trigger which flow; a missing, unparseable, or
+ * Load, validate, and group the receiver's webhook triggers from the unified triggers file. The file is
+ * the reviewed, committed source of truth for which events trigger which flow; a missing, unparseable, or
  * malformed file fails loud rather than degrading to an empty (silently trigger-nothing) allowlist.
  *
- * Each rule needs at least one positive selector (`any` or `all`): a `none`-only rule matches every
- * labeled event lacking the excluded labels, which is wider than today's single-label allowlist and would
- * weaken CONST-TRIGGER-AUTHOR-GATE. Selectors are validated as arrays of non-empty strings BEFORE the
- * positive-selector count, because `.length` is truthy on a string too -- a string selector that reached
- * the pure `matchesRule` would throw there, breaking the gate's never-throw invariant.
+ * The shared `parseTriggers` validates the WHOLE file (including the on x run diagonal and cron entries the
+ * worker owns); this loader keeps only the webhook types and groups them for the filter:
+ *   - `label`:       ordered `{ predicate, flow }` rules (first match wins in the filter).
+ *   - `comment`:     the single `{ phrase, defaultFlow }` (or null when no comment trigger is configured).
+ *   - `pullRequest`: ordered `{ actions:Set, predicate, flow }` rules.
+ *   - `knownFlows`:  every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
+ *                    unlisted flow.
  */
-function loadLabelFlows(env, readFile, fileExists) {
-	const path = env.RECEIVER_FLOWS_PATH ?? DEFAULT_FLOWS_PATH;
+function loadTriggers(env, readFile, fileExists) {
+	const path = env.PI_TRIGGERS_FILE ?? DEFAULT_TRIGGERS_PATH;
 
 	if (!fileExists(path)) {
-		throw configError(`receiver flows file not found: ${path}`);
+		throw configError(`triggers file not found: ${path}`);
 	}
 
-	let parsed;
-	try {
-		parsed = JSON.parse(readFile(path, "utf8"));
-	} catch {
-		throw configError(`receiver flows file is not valid JSON: ${path}`);
-	}
+	const parsed = parseTriggers(readFile(path, "utf8"), path); // fail-loud
 
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		throw configError(`receiver flows file must be a JSON object of flow -> {any, all, none} rules: ${path}`);
-	}
-	for (const [flowName, rule] of Object.entries(parsed)) {
-		if (flowName.trim() === "" || /^\d+$/.test(flowName)) {
-			throw configError(`receiver flows file has an empty or integer-like flow name ${JSON.stringify(flowName)}: ${path}`);
-		}
-		if (typeof rule !== "object" || rule === null || Array.isArray(rule)) {
-			throw configError(`receiver flows file flow ${JSON.stringify(flowName)} must map to an {any, all, none} rule object: ${path}`);
-		}
-		for (const key of ["any", "all", "none"]) {
-			const selector = rule[key];
-			if (selector === undefined) continue;
-			if (!Array.isArray(selector) || selector.some((s) => typeof s !== "string" || s.trim() === "")) {
-				throw configError(`receiver flows file flow ${JSON.stringify(flowName)} has a ${key} that is not an array of non-empty strings: ${path}`);
-			}
-		}
-		if ((rule.any?.length ?? 0) + (rule.all?.length ?? 0) === 0) {
-			throw configError(`receiver flows file flow ${JSON.stringify(flowName)} needs at least one positive selector (any or all): ${path}`);
+	const label = [];
+	let comment = null;
+	const pullRequest = [];
+	const knownFlows = new Set();
+
+	for (const { on, run } of parsed) {
+		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it
+		knownFlows.add(run.flow);
+		if (on.type === "label") {
+			label.push({ predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
+		} else if (on.type === "comment") {
+			comment = { phrase: on.phrase, defaultFlow: run.flow }; // parseTriggers guarantees at most one
+		} else if (on.type === "pull_request") {
+			pullRequest.push({ actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
 		}
 	}
 
-	return parsed;
+	return { label, comment, pullRequest, knownFlows };
 }

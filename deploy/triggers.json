@@ -1,0 +1,6 @@
+{
+  "triggers": [
+    { "on": { "type": "label", "any": ["pi:frontend"] }, "run": { "kind": "github", "flow": "frontend-fix" } },
+    { "on": { "type": "label", "any": ["pi:backend"] }, "run": { "kind": "github", "flow": "backend-fix" } }
+  ]
+}

@@ -146,7 +146,7 @@ test("shutdown closes each extraCloser after the worker drains", { skip }, async
 
 // The full BullMQ job object the processor hands to recordRun -- id/attemptsMade/name/data are the
 // fields buildRecord (start.mjs) reads, so recordRun must receive `job`, not `job.data`.
-const fakeJob = () => ({ id: "j1", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 1, flow: "fix" } });
+const fakeJob = () => ({ id: "j1", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", flow: "fix", target: { type: "issue", number: 1 } } });
 const isoRoundtrips = (s) => typeof s === "string" && new Date(s).toISOString() === s;
 
 test("recordRun fires once on the SUCCESS (return) path with { job, result, startedAt, endedAt }", { skip }, async () => {
@@ -307,7 +307,7 @@ const secretJob = (id = "j1") => ({
 	id,
 	attemptsMade: 0,
 	name: "github",
-	data: { kind: "github", repo: "o/r", issueNumber: 1, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+	data: { kind: "github", repo: "o/r", flow: "fix", target: { type: "issue", number: 1, title: "SECRET_T", body: "SECRET_B" } },
 });
 
 // A processor wired to the real recordRun. `runContainer`/`redis` are overridable so the infra-exit

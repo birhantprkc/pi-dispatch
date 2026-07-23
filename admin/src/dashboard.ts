@@ -21,7 +21,7 @@
 import { dayKey, weekKey, monthKey, windowState } from "@pi-dispatch/worker/budget";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue } from "@pi-dispatch/worker/queue";
-import { listRuns, readSettingsView, mapSchedulers, readFlows } from "./read-model.mjs";
+import { listRuns, readSettingsView, mapSchedulers, readTriggers } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
 import { box, meter, clip } from "./panel.mjs";
@@ -65,7 +65,7 @@ export function createDashboardDeps(paths: any) {
         schedulers: mapSchedulers(schedulerList, Date.now()),
         runs: listRuns({ logsDir: paths.logsDir, limit: RUNS_ON_DASHBOARD }),
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
-        flows: readFlows({ flowsPath: paths.flowsPath }),
+        triggers: readTriggers({ triggersPath: paths.triggersPath }),
         // ONLY the id off the active Job -- a Job's `.data` holds issue title/body/username (PII), so it
         // never enters the snapshot (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT).
         activeJobId: activeList?.[0]?.id ?? null,
@@ -346,7 +346,7 @@ function renderPanel(snapshot: any, width: number, state: any): string[] {
         ...budgetMeters(snapshot.budget, snapshot.settings, framed ? inner : 24),
       ],
     },
-    { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, flows: snapshot.flows })) },
+    { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, triggers: snapshot.triggers })) },
     { title: "RUNS", lines: renderRunList(buildRows(snapshot), selected, framed ? inner : 24) },
     { title: "SETTINGS", lines: toLines(renderSettingsView(snapshot.settings)) },
   ];
