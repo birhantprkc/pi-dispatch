@@ -22,7 +22,8 @@
     "./get-token": "./src/get-token.mjs",
     "./runtime-settings": "./src/runtime-settings.mjs",
     "./run-history": "./src/run-history.mjs",
-    "./budget": "./src/budget.mjs"
+    "./budget": "./src/budget.mjs",
+    "./scheduler-stall-guard": "./src/scheduler-stall-guard.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

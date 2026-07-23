@@ -135,6 +135,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     captureJobLogs: true,
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
+    schedulerStallMax: 2,
   });
 });
 

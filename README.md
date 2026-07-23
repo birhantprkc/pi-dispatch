@@ -161,7 +161,7 @@ editable in place**: `Enter` on a trigger shows its trust model, `e` edits its f
 adds one (guided, kind-first), and `s` edits a limit — every write is operator-typed, validated, atomic, and
 **reloaded live** by the worker/receiver (no restart). `Enter` on a run opens its full PII-free record:
 
-![The RUN_DETAIL drill-in — a framed key/value dump of one run's record: target, flow, outcome, turns, tokens, cost, exit code, timings](docs/images/dispatch-run-detail.svg)
+![The RUN_DETAIL drill-in — a colored post-mortem of one run's PII-free record: outcome, target, timing with duration, turns/exit/budget slot, tokens and cost, and a chain line naming spawned children](docs/images/dispatch-run-detail.svg)
 
 It adds `/dispatch` commands that run **locally, with no model involvement**:
 
@@ -177,10 +177,21 @@ It adds `/dispatch` commands that run **locally, with no model involvement**:
 and `logs` read the **same** `logs/<jobId>.json` / `.log` files as **Run history** below. The extension
 reads only queue counts, run records, and the settings overlay — none of which carry credentials.
 
-The model-callable tools are **reads, `pause`/`resume`, and `dispatch_run`** — every settings write stays
-an operator-typed command, never a model tool. `dispatch_run` is a **third** model-callable tool and,
-unlike the others, it enqueues a **PAID** agent run that edits a folder in place with **no undo** — it is
-**not money-safe**. It is bounded in blast-radius, not prevented, by **six** independent limits: the
+### Operating pi-dispatch from your AI
+
+The extension is AI-operable, so your assistant can drive it — but **every change asks you to confirm
+first**. The model-callable tools are: reads (`status`, `runs`, `triggers`); on/off (`pause`/`resume`, no
+confirm — reversible and money-safe); the gated `dispatch_run` enqueue; and the **confirm-gated writes**
+`dispatch_set` (change a limit) and `dispatch_trigger_add`/`_edit`/`_delete`. A write tool applies its
+change **only after you approve a dialog showing the exact before→after**, and **refuses — writing nothing —
+when no interactive operator is present** (so a prompt-injected session can't raise your cap or add a paid
+trigger; the model emits the call, only your keypress approves it). The bundled `operate-pi-dispatch` skill
+tells the model how to use those gates: state the change plainly, and accept a decline. `CONST-BUDGET-BEFORE-TOKENS`
+and `CONST-TRIGGER-AUTHOR-GATE` are unchanged — the confirm is the human approval.
+
+`dispatch_run` is the one model-callable tool that is **not money-safe**: unlike the others, it enqueues a
+**PAID** agent run that edits a folder in place with **no undo** — and unlike the confirm-gated writes, it
+has no operator confirm. It is bounded in blast-radius, not prevented, by **six** independent limits: the
 folder allowlist `PI_DISPATCH_RUN_ROOTS` (realpath + containment); the committed per-flow
 `ai-trigger: allow` opt-in read at HEAD (default **deny**); the dirty-tree refusal (no force option); no
 spend-knob parameters on the tool; a per-hour rate limit; and the daily cap. Do not read it as money-safe

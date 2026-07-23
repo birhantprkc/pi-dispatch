@@ -55,6 +55,9 @@ export function resolvePaths(env = process.env) {
       .map((s) => s.trim())
       .filter(Boolean),
     dispatchRunPerHour: parseNonNegInt(env.PI_DISPATCH_RUN_PER_HOUR, 3),
+    // The per-scheduler stall threshold, mirrored from the worker's PI_SCHEDULER_STALL_MAX (default 2) so the
+    // cron drill-in can show `stalls n/threshold`. Read directly from env for the same reason as above.
+    schedulerStallMax: parseNonNegInt(env.PI_SCHEDULER_STALL_MAX, 2),
   };
 }
 
@@ -277,10 +280,11 @@ export function writeSettings({ settingsFile, mutate, fs = nodeFs }) {
  * result is NEVER written, so the worker/receiver loaders can always parse the file), and written
  * ATOMICALLY (tmp + rename), so a live-reload watcher never observes a half-written file.
  *
- * Operator-typed only: this is reached solely from `/dispatch trigger …` command handlers, never from an
- * LLM tool, so extending write to triggers keeps CONST-TRIGGER-AUTHOR-GATE intact. A missing or unparseable
- * existing file starts from an empty set; the validated write repairs it. Returns `{ ok: true }` or
- * `{ invalid }` with the parser's reason.
+ * Human-approved writes only: reached from the operator-typed `/dispatch trigger …` handlers AND from the
+ * `dispatch_trigger_*` LLM tools, but the tools route through `confirmedWrite`, which requires an operator to
+ * approve a confirm dialog before this runs. The human keypress is the approval, so CONST-TRIGGER-AUTHOR-GATE's
+ * principle holds either way. A missing or unparseable existing file starts from an empty set; the validated
+ * write repairs it. Returns `{ ok: true }` or `{ invalid }` with the parser's reason.
  */
 export function writeTriggers({ triggersPath, mutate, fs = nodeFs }) {
   let current = [];

@@ -317,9 +317,12 @@ test("Enter on a run opens its detail dump, and Esc backs out to the list withou
   await flush();
   const detail = comp.render(80).join("\n");
   assert.match(detail, /run j1/, "the detail view titles on the selected run");
-  assert.match(detail, /attempt: -/, "a detail-only field renders, absent as '-'");
-  assert.match(detail, /tokens: 5000/, "the drill-in surfaces total tokens");
-  assert.match(detail, /cost: \$0\.0523/, "the drill-in surfaces cost as $-prefixed USD");
+  assert.match(detail, /completed/, "the grouped post-mortem shows the colored outcome");
+  assert.match(detail, /timing/, "the post-mortem groups the timing");
+  assert.match(detail, /chain[\s\S]*root/, "the chain line marks a root run");
+  assert.match(detail, /tokens\s+5000/, "the drill-in surfaces total tokens");
+  assert.match(detail, /\$0\.0523/, "the drill-in surfaces cost as $-prefixed USD");
+  assert.match(detail, /POST-MORTEM/, "the post-mortem divider is present");
 
   comp.handleInput("\x1b");
   await flush();
@@ -327,6 +330,29 @@ test("Enter on a run opens its detail dump, and Esc backs out to the list withou
   await comp.dispose();
   assert.match(back, /p pause/, "Esc returns to the interactive list");
   assert.equal(closed, 0, "Esc from a sub-view never closes the overlay");
+});
+
+test("Enter on a cron trigger opens a detail with next/health/stalls from the scheduler", async () => {
+  const snap = {
+    queue: { pausedState: false, counts: { waiting: 0, active: 0, paused: 0, delayed: 0, failed: 0 }, workers: 1 },
+    budget: { day: 0, week: 0, month: 0 },
+    settings: { path: "/s", overlay: {} },
+    triggers: { triggers: [{ type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv", flow: "tidy" }] },
+    schedulers: [{ key: "nightly", pattern: "0 3 * * *", next: Date.UTC(2030, 0, 1, 3, 0, 0), overdueMs: null }],
+    schedulerStalls: { nightly: "1" },
+    schedulerStallMax: 2,
+    runs: [],
+  };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  comp.handleInput("\r"); // row 0 is the cron trigger (triggers lead the rows list)
+  await flush();
+  const d = comp.render(80).join("\n");
+  await comp.dispose();
+  assert.match(d, /trigger · cron/, "titles on the cron trigger");
+  assert.match(d, /healthy/, "shows a health marker when the scheduler is not overdue");
+  assert.match(d, /2030-01-01 03:00/, "formats the scheduler's real next-fire timestamp");
+  assert.match(d, /stalls 1\/2/, "surfaces the stall count against the threshold");
 });
 
 test("Enter on the ACTIVE row tails its live log inside the overlay", async () => {

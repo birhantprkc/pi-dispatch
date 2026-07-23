@@ -20,16 +20,22 @@
  * (they may enter later model context, which is accepted per REQ); raw `.log`
  * bytes go ONLY to the overlay viewer, never to a message.
  *
- * It also registers five LLM-callable tools -- `dispatch_status`, `dispatch_runs`
- * (reads), `dispatch_pause`/`dispatch_resume` (durable-but-reversible controls), and
- * `dispatch_run` (a gated, PAID enqueue) -- with no settings-write tool and no log
- * tool, and a live dashboard overlay on the bare `/dispatch` command.
+ * It also registers LLM-callable tools: reads (`dispatch_status`, `dispatch_runs`,
+ * `dispatch_triggers`), the durable-but-reversible on/off controls (`dispatch_pause`/
+ * `dispatch_resume`), the gated PAID enqueue (`dispatch_run`), and the confirm-gated
+ * writes (`dispatch_set`, `dispatch_trigger_add`/`_edit`/`_delete`) -- each of which
+ * refuses unless a human operator approves a confirmation dialog showing the concrete
+ * change. There is still no log tool (raw `.log` bytes never enter model context), and
+ * a live dashboard overlay renders on the bare `/dispatch` command. The extension also
+ * ships an `operate-pi-dispatch` skill, advertised via `resources_discover`, that tells
+ * the model how to use those human-in-the-loop write gates.
  *
  * Supported pi version: 0.80.7. The factory registers nothing unless every API
  * member it consumes is present; on a miss it names the member and the
  * supported version on stderr and returns.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import {
   resolvePaths,
@@ -54,7 +60,7 @@ import { matchesKey } from "./keys.mjs";
 
 // The single source of truth for the ExtensionAPI surface this extension
 // consumes. It grows only when a task actually uses a new member.
-export const USED_API = ["registerCommand", "registerTool", "sendMessage"] as const;
+export const USED_API = ["registerCommand", "registerTool", "sendMessage", "on"] as const;
 
 export const SUPPORTED_PI_VERSION = "0.80.7";
 
@@ -99,6 +105,18 @@ export default function admin(pi: ExtensionAPI): void {
   });
 
   registerTools(pi);
+  registerSkill(pi);
+}
+
+/**
+ * Advertise the bundled `operate-pi-dispatch` skill to pi via the `resources_discover` event, so it loads
+ * exactly when this extension does (no separate install step). The skill does not grant capability -- the
+ * tools do that -- it recommends how to use the human confirm gates on the write tools. pi's resource loader
+ * honours `skillPaths` from this event; the path is the extension-relative `admin/skills` directory.
+ */
+function registerSkill(pi: ExtensionAPI): void {
+  const skillPaths = [fileURLToPath(new URL("../skills", import.meta.url))];
+  pi.on("resources_discover", () => ({ skillPaths }));
 }
 
 /** A one-shot text tool result. Failure is signalled by THROWing from `execute`, never by this shape. */
@@ -107,16 +125,25 @@ function toolText(text: string): { content: { type: "text"; text: string }[]; de
 }
 
 /**
- * Register the five LLM-callable tools: two reads (`dispatch_status`, `dispatch_runs`), the two
- * durable-but-reversible controls (`dispatch_pause`, `dispatch_resume`), and `dispatch_run` -- the one
- * gated, PAID enqueue. There is deliberately NO settings-write tool and NO log tool -- a settings write is
- * an operator-typed command only, and raw `.log` bytes never enter model context (DES-ADMIN-VIA-PI-EXTENSION
- * injection boundary; REQ acceptance). `dispatch_run` takes no spend-knob params (model/maxTurns/dailyCap/
- * concurrency resolve worker-side) and is bounded producer-side by the folder allowlist, the committed
- * per-flow ai-trigger gate read at a pre-agent SHA, and a per-hour rate limit; the daily cap stays the
- * worker's. Each read reuses the self-closing read-model wrappers: a tool call is a one-shot, so a per-call
- * connection is correct here where a per-tick one on the dashboard would not be. A control or enqueue that
- * cannot reach the queue THROWs, which pi reports to the model as an error rather than a false success.
+ * Register the LLM-callable tools. Reads: `dispatch_status`, `dispatch_runs`, `dispatch_triggers`. On/off:
+ * `dispatch_pause`/`dispatch_resume` (durable, reversible, money-safe -- no confirm). The gated PAID enqueue:
+ * `dispatch_run`. Confirm-gated writes: `dispatch_set` (a limit/setting) and `dispatch_trigger_add`/`_edit`/
+ * `_delete`. There is still NO log tool -- raw `.log` bytes never enter model context (DES-ADMIN-VIA-PI-EXTENSION
+ * injection boundary; REQ acceptance).
+ *
+ * The write tools do NOT weaken the money/trigger gates: each routes through `confirmedWrite`, which refuses
+ * unless a human operator is present (`ctx.hasUI`) and approves a `ctx.ui.confirm` dialog showing the concrete
+ * before->after. The model emits only the tool CALL; the operator answers the CONFIRM, so a prompt-injected
+ * session cannot raise the cap or add a paid trigger without a human keypress it cannot forge (the same human
+ * approval the operator-typed `/dispatch set` and the overlay CRUD already require). Without an interactive UI
+ * (print/headless) the write is refused, never silently applied.
+ *
+ * `dispatch_run` takes no spend-knob params (model/maxTurns/dailyCap/concurrency resolve worker-side) and is
+ * bounded producer-side by the folder allowlist, the committed per-flow ai-trigger gate read at a pre-agent
+ * SHA, and a per-hour rate limit; the daily cap stays the worker's. Each read reuses the self-closing
+ * read-model wrappers: a tool call is a one-shot, so a per-call connection is correct here where a per-tick
+ * one on the dashboard would not be. A control, write, or enqueue that cannot reach the queue/file THROWs,
+ * which pi reports to the model as an error rather than a false success.
  */
 function registerTools(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -210,6 +237,208 @@ function registerTools(pi: ExtensionAPI): void {
       return toolText(JSON.stringify({ jobId: res.jobId, folder: params.folder, flow: params.flow }));
     },
   });
+
+  pi.registerTool({
+    name: "dispatch_triggers",
+    label: "pi-dispatch triggers",
+    description:
+      "Read-only. Lists the configured triggers as `{ index, ...trigger }` entries. Use the `index` to target " +
+      "a specific trigger with dispatch_trigger_edit or dispatch_trigger_delete.",
+    parameters: Type.Object({}),
+    async execute() {
+      const paths = resolvePaths(process.env);
+      const t = readTriggers({ triggersPath: paths.triggersPath });
+      const data = Array.isArray(t?.triggers)
+        ? t.triggers.map((tr: any, index: number) => ({ index, ...tr }))
+        : t;
+      return toolText(JSON.stringify(data));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_set",
+    label: "pi-dispatch set limit",
+    description:
+      "Changes a pi-dispatch runtime setting/limit and applies it live. The operator MUST approve a confirm " +
+      "dialog showing the exact before->after; with no interactive operator the change is refused, never " +
+      "applied. Omit `value` (or pass empty) to unset a key back to its default. Valid keys: " +
+      KNOWN_KEYS.join(", ") + ".",
+    executionMode: "sequential",
+    parameters: Type.Object({ key: Type.String(), value: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!KNOWN_KEYS.includes(params.key)) {
+        throw new Error(`unknown key '${params.key}'. valid keys: ${KNOWN_KEYS.join(", ")}`);
+      }
+      const paths = resolvePaths(process.env);
+      const view = readSettingsView({ settingsFile: paths.settingsFile });
+      const oldVal = view?.overlay?.[params.key];
+      const unset = params.value === undefined || params.value.trim() === "";
+      const newVal = unset ? undefined : coerceSettingValue(params.key, params.value.trim());
+      const result = await confirmedWrite(
+        ctx,
+        {
+          title: unset ? `Unset ${params.key}` : `Set ${params.key}`,
+          message: `${params.key}: ${oldVal ?? "(unset)"} -> ${unset ? "(unset)" : newVal}`,
+        },
+        () => {
+          const res = unset
+            ? writeSettings({ settingsFile: paths.settingsFile, mutate: (o) => { delete o[params.key]; return o; } })
+            : writeSettings({ settingsFile: paths.settingsFile, mutate: (o) => ({ ...o, [params.key]: newVal }) });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, key: params.key, value: unset ? null : newVal, rebuiltFrom: res.rebuiltFrom ?? null };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_trigger_add",
+    label: "pi-dispatch add trigger",
+    description:
+      "Adds a trigger to triggers.json and applies it live. The operator MUST approve a confirm dialog showing " +
+      "the entry; with no interactive operator it is refused. `kind` is cron|label|comment|pull_request. cron " +
+      "needs id/pattern/folder/flow/task; label needs labels[]+flow; comment needs phrase+flow; pull_request " +
+      "needs action[] (+ optional labels[]) + flow.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      kind: Type.String(),
+      flow: Type.String(),
+      id: Type.Optional(Type.String()),
+      pattern: Type.Optional(Type.String()),
+      folder: Type.Optional(Type.String()),
+      task: Type.Optional(Type.String()),
+      phrase: Type.Optional(Type.String()),
+      labels: Type.Optional(Type.Array(Type.String())),
+      action: Type.Optional(Type.Array(Type.String())),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const entry = buildTriggerEntry(params.kind, params);
+      if (!entry) throw new Error(`unknown trigger kind '${params.kind}' (cron|label|comment|pull_request)`);
+      const result = await confirmedWrite(
+        ctx,
+        { title: `Add ${params.kind} trigger`, message: `Add to triggers.json:\n${JSON.stringify(entry)}` },
+        () => {
+          const res = writeTriggers({ triggersPath: resolvePaths(process.env).triggersPath, mutate: (list: any[]) => [...list, entry] });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, added: entry };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_trigger_edit",
+    label: "pi-dispatch edit trigger",
+    description:
+      "Changes which flow a trigger runs (by array index from dispatch_triggers) and applies it live. The " +
+      "operator MUST approve a confirm dialog showing flow before->after; with no interactive operator it is refused.",
+    executionMode: "sequential",
+    parameters: Type.Object({ index: Type.Integer({ minimum: 0 }), flow: Type.String() }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const paths = resolvePaths(process.env);
+      const list = triggerList(paths);
+      const cur = list[params.index];
+      if (!cur) throw new Error(`no trigger at index ${params.index} (have ${list.length})`);
+      const flow = params.flow.trim();
+      if (!flow) throw new Error("flow must be non-empty");
+      const result = await confirmedWrite(
+        ctx,
+        { title: `Edit trigger #${params.index + 1}`, message: `trigger #${params.index + 1} (${cur.type}) flow: ${cur.flow ?? "-"} -> ${flow}` },
+        () => {
+          const res = writeTriggers({
+            triggersPath: paths.triggersPath,
+            mutate: (raw: any[]) => raw.map((tr, i) => (i === params.index ? { ...tr, run: { ...tr.run, flow } } : tr)),
+          });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, index: params.index, flow };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_trigger_delete",
+    label: "pi-dispatch delete trigger",
+    description:
+      "Removes a trigger from triggers.json (by array index from dispatch_triggers) and applies it live. The " +
+      "operator MUST approve a confirm dialog showing the entry; with no interactive operator it is refused.",
+    executionMode: "sequential",
+    parameters: Type.Object({ index: Type.Integer({ minimum: 0 }) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const paths = resolvePaths(process.env);
+      const list = triggerList(paths);
+      const cur = list[params.index];
+      if (!cur) throw new Error(`no trigger at index ${params.index} (have ${list.length})`);
+      const result = await confirmedWrite(
+        ctx,
+        { title: `Delete trigger #${params.index + 1}`, message: `Remove trigger #${params.index + 1}: ${cur.type} -> ${cur.flow ?? "-"}` },
+        () => {
+          const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (raw: any[]) => raw.filter((_, i) => i !== params.index) });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, deletedIndex: params.index };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+}
+
+/**
+ * The single human-in-the-loop gate for every write tool. It is what lets a model-callable tool touch the
+ * cap or the triggers file without breaking CONST-BUDGET-BEFORE-TOKENS / CONST-TRIGGER-AUTHOR-GATE: the model
+ * emits the CALL, but the mutation runs only after the OPERATOR approves a `ctx.ui.confirm` dialog that shows
+ * the concrete change. Fail-closed: with no confirm-capable UI (print/headless, `ctx.hasUI` false) it THROWs
+ * rather than apply -- no operator, no write. An explicit decline is a determinate, non-error outcome
+ * (`{ applied:false }`) -- the caller must not loop-retry it.
+ */
+async function confirmedWrite(
+  ctx: any,
+  prompt: { title: string; message: string },
+  doWrite: () => any,
+): Promise<any> {
+  if (!ctx?.hasUI || typeof ctx?.ui?.confirm !== "function") {
+    throw new Error(
+      "refused: this change needs an interactive operator to confirm it, and no confirm-capable UI is available (e.g. print/headless mode).",
+    );
+  }
+  const ok = await ctx.ui.confirm(prompt.title, prompt.message);
+  if (!ok) return { applied: false, reason: "operator declined" };
+  return doWrite();
+}
+
+/** The current triggers as a display list (empty on a missing/invalid file), for index resolution + confirm text. */
+function triggerList(paths: any): any[] {
+  const t = readTriggers({ triggersPath: paths.triggersPath });
+  return Array.isArray(t?.triggers) ? t.triggers : [];
+}
+
+/**
+ * Build one `{ on, run }` trigger entry from a kind + fields. The single source of truth for the on x run
+ * diagonal (cron -> local, every webhook kind -> github): the impossible combination is absent by
+ * construction, mirroring the worker's load-time diagonal. Shared by the add-trigger dialog and the
+ * `dispatch_trigger_add` tool, so both produce identical shapes. `labels`/`action` accept either an array
+ * (tool params) or a space-separated string (dialog input) via `asWords`. Returns null for an unknown kind.
+ */
+function buildTriggerEntry(kind: string, f: any): any {
+  if (kind === "cron") return { on: { type: "cron", id: f.id, pattern: f.pattern }, run: { kind: "local", folder: f.folder, flow: f.flow, task: f.task } };
+  if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: { kind: "github", flow: f.flow } };
+  if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: { kind: "github", flow: f.flow } };
+  if (kind === "pull_request") {
+    const on: any = { type: "pull_request", action: asWords(f.action) };
+    const any = asWords(f.labels ?? f.any);
+    if (any.length > 0) on.any = any;
+    return { on, run: { kind: "github", flow: f.flow } };
+  }
+  return null;
+}
+
+/** Normalise a labels/action field to a trimmed non-empty string list, accepting an array or a string. */
+function asWords(x: any): string[] {
+  if (Array.isArray(x)) return x.map((s) => String(s).trim()).filter(Boolean);
+  return splitWords(x);
 }
 
 async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void> {
@@ -395,29 +624,27 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
     if (flow === undefined) return;
     const task = await ui.input("task (prompt text)", "run the flow");
     if (task === undefined) return;
-    entry = { on: { type: "cron", id, pattern }, run: { kind: "local", folder, flow, task } };
+    entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task });
   } else if (kind === "label") {
-    const any = await ui.input("label(s) — space-separated (any-of)", "pi:fix");
-    if (any === undefined) return;
+    const labels = await ui.input("label(s) — space-separated (any-of)", "pi:fix");
+    if (labels === undefined) return;
     const flow = await ui.input("flow", "fix");
     if (flow === undefined) return;
-    entry = { on: { type: "label", any: splitWords(any) }, run: { kind: "github", flow } };
+    entry = buildTriggerEntry("label", { labels, flow });
   } else if (kind === "comment") {
     const phrase = await ui.input("trigger phrase", "@pi");
     if (phrase === undefined) return;
     const flow = await ui.input("default flow", "fix");
     if (flow === undefined) return;
-    entry = { on: { type: "comment", phrase }, run: { kind: "github", flow } };
+    entry = buildTriggerEntry("comment", { phrase, flow });
   } else {
     const action = await ui.input("PR actions — space-separated (labeled opened synchronize reopened)", "labeled");
     if (action === undefined) return;
-    const any = await ui.input("label(s) for 'labeled' — space-separated (blank for auto actions)", "pi:review");
-    if (any === undefined) return;
+    const labels = await ui.input("label(s) for 'labeled' — space-separated (blank for auto actions)", "pi:review");
+    if (labels === undefined) return;
     const flow = await ui.input("flow", "review");
     if (flow === undefined) return;
-    const on: any = { type: "pull_request", action: splitWords(action) };
-    if (splitWords(any).length > 0) on.any = splitWords(any);
-    entry = { on, run: { kind: "github", flow } };
+    entry = buildTriggerEntry("pull_request", { action, labels, flow });
   }
   const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (list: any[]) => [...list, entry] });
   notify?.(res.ok ? `trigger added (live) — ${kind} → ${entry.run.flow}` : `add rejected: ${res.invalid}`, res.ok ? "info" : "error");

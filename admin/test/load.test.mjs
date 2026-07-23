@@ -68,6 +68,7 @@ test("(d) capability probe is all-or-nothing", async () => {
     sendMessage: () => {},
     registerCommand: (name, def) => calls.push([name, def]),
     registerTool: () => {},
+    on: () => {},
   };
   factory(pi);
   assert.equal(calls.length, 1, "exactly one command registration");

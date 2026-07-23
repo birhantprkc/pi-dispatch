@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -11,7 +11,24 @@ import { fileURLToPath } from "node:url";
 const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url);
-const { handleDashboardAction } = await jiti.import(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+const indexMod = await jiti.import(fileURLToPath(new URL("../src/index.ts", import.meta.url)));
+const { handleDashboardAction } = indexMod;
+
+/** Load the extension against a recording `pi` and return the registered tools by name. */
+function registeredTools() {
+  const tools = [];
+  const pi = new Proxy({}, { get: (_t, k) => (k === "registerTool" ? (t) => tools.push(t) : () => {}) });
+  indexMod.default(pi);
+  return tools;
+}
+const toolByName = (name) => registeredTools().find((t) => t.name === name);
+/** A ctx whose `confirm` records the (title, message) it is shown and returns a canned answer. */
+function toolCtx({ hasUI = true, answer = true } = {}) {
+  const shown = [];
+  const ui = { confirm: async (title, message) => { shown.push({ title, message }); return answer; } };
+  return { ctx: { hasUI, ui: hasUI ? ui : {} }, shown };
+}
+const textOf = (res) => JSON.parse(res.content[0].text);
 
 /** A mock ctx.ui: `select`/`input`/`confirm` return canned answers in order; `notify` records. */
 function mockUi({ select = [], input = [], confirm = [] } = {}) {
@@ -101,4 +118,98 @@ test("a build without the dialog primitives degrades to a notice, no write", asy
   await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui: { notify: (m, t) => notes.push({ m, t }) } });
   assert.equal(read(path).triggers.length, 0);
   assert.ok(notes.some((n) => /newer pi/.test(n.m)), "the missing-dialog notice is shown");
+});
+
+/**
+ * The model-callable WRITE tools are the confirm gate in code: the model emits the call, a human answers the
+ * confirm. These prove the three arms of `confirmedWrite` at the tool boundary -- no UI refuses (throws), a
+ * decline applies nothing, an approval writes -- plus that the confirm shows the concrete change, plus the
+ * out-of-range guard. Each tool reads its paths from process.env, so the temp files are wired through it.
+ */
+function withSettings(initial) {
+  const settingsFile = join(mkdtempSync(join(tmpdir(), "pi-set-")), "settings.json");
+  writeFileSync(settingsFile, JSON.stringify(initial));
+  process.env.PI_SETTINGS_FILE = settingsFile;
+  return settingsFile;
+}
+
+test("dispatch_set: refuses (throws) with no interactive operator and writes nothing", async () => {
+  const settingsFile = withSettings({ dailyCap: 25 });
+  const { ctx } = toolCtx({ hasUI: false });
+  await assert.rejects(
+    () => toolByName("dispatch_set").execute("id", { key: "dailyCap", value: "99" }, undefined, undefined, ctx),
+    /refused|interactive operator/,
+  );
+  assert.equal(read(settingsFile).dailyCap, 25, "no write without a confirm-capable UI");
+});
+
+test("dispatch_set: a declined confirm applies nothing, and the confirm shows before->after", async () => {
+  const settingsFile = withSettings({ dailyCap: 25 });
+  const { ctx, shown } = toolCtx({ answer: false });
+  const out = textOf(await toolByName("dispatch_set").execute("id", { key: "dailyCap", value: "99" }, undefined, undefined, ctx));
+  assert.equal(out.applied, false);
+  assert.equal(read(settingsFile).dailyCap, 25, "a decline leaves the value untouched");
+  assert.match(shown[0].message, /dailyCap: 25 -> 99/, "the operator saw the concrete change");
+});
+
+test("dispatch_set: an approved confirm writes the coerced value", async () => {
+  const settingsFile = withSettings({ dailyCap: 25 });
+  const { ctx } = toolCtx({ answer: true });
+  const out = textOf(await toolByName("dispatch_set").execute("id", { key: "dailyCap", value: "30" }, undefined, undefined, ctx));
+  assert.equal(out.applied, true);
+  assert.equal(read(settingsFile).dailyCap, 30, "written as a coerced JSON number");
+});
+
+test("dispatch_set: an unknown key throws before any confirm", async () => {
+  withSettings({ dailyCap: 25 });
+  const { ctx } = toolCtx({ answer: true });
+  await assert.rejects(
+    () => toolByName("dispatch_set").execute("id", { key: "dailycap", value: "5" }, undefined, undefined, ctx),
+    /unknown key/,
+  );
+});
+
+test("dispatch_trigger_add: an approved confirm appends a validated entry", async () => {
+  const path = tmpTriggers({ triggers: [] });
+  process.env.PI_TRIGGERS_FILE = path;
+  const { ctx, shown } = toolCtx({ answer: true });
+  const out = textOf(await toolByName("dispatch_trigger_add").execute("id", { kind: "label", flow: "frontend-fix", labels: ["pi:fix"] }, undefined, undefined, ctx));
+  assert.equal(out.applied, true);
+  const w = read(path);
+  assert.equal(w.triggers[0].on.type, "label");
+  assert.deepEqual(w.triggers[0].on.any, ["pi:fix"]);
+  assert.equal(w.triggers[0].run.flow, "frontend-fix");
+  assert.match(shown[0].message, /triggers\.json/, "the confirm shows the entry being added");
+});
+
+test("dispatch_trigger_edit: an approved confirm changes the flow and shows old->new", async () => {
+  const path = tmpTriggers({ triggers: [{ on: { type: "label", any: ["a"] }, run: { kind: "github", flow: "old" } }] });
+  process.env.PI_TRIGGERS_FILE = path;
+  const { ctx, shown } = toolCtx({ answer: true });
+  await toolByName("dispatch_trigger_edit").execute("id", { index: 0, flow: "new" }, undefined, undefined, ctx);
+  assert.equal(read(path).triggers[0].run.flow, "new");
+  assert.match(shown[0].message, /old -> new/);
+});
+
+test("dispatch_trigger_delete: out-of-range index throws and writes nothing", async () => {
+  const path = tmpTriggers({ triggers: [{ on: { type: "label", any: ["a"] }, run: { kind: "github", flow: "f" } }] });
+  process.env.PI_TRIGGERS_FILE = path;
+  const { ctx } = toolCtx({ answer: true });
+  await assert.rejects(
+    () => toolByName("dispatch_trigger_delete").execute("id", { index: 9 }, undefined, undefined, ctx),
+    /no trigger at index/,
+  );
+  assert.equal(read(path).triggers.length, 1);
+});
+
+test("the extension advertises the operate-pi-dispatch skill via resources_discover", () => {
+  let handler;
+  const pi = new Proxy({}, {
+    get: (_t, k) => (k === "on" ? (evt, h) => { if (evt === "resources_discover") handler = h; } : () => {}),
+  });
+  indexMod.default(pi);
+  assert.equal(typeof handler, "function", "registered a resources_discover handler");
+  const res = handler({ type: "resources_discover", cwd: "/", reason: "startup" }, {});
+  assert.ok(Array.isArray(res.skillPaths) && res.skillPaths.length === 1, "advertises one skill dir");
+  assert.ok(existsSync(join(res.skillPaths[0], "operate-pi-dispatch", "SKILL.md")), "the dir holds the skill");
 });
