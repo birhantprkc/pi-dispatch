@@ -76,9 +76,9 @@ export async function startWorker(
 	const config = loadConfig(env);
 	const log = (event, fields = {}) => process.stdout.write(`${JSON.stringify({ event, ...fields })}\n`);
 
-	// DES-CRON-VIA-BULLMQ-SCHEDULER: load and validate the schedule file with the operator present and
+	// DES-CRON-VIA-BULLMQ-SCHEDULER: load and validate the triggers file with the operator present and
 	// before any Valkey contact, so a misconfigured schedule refuses startup loudly (configError) rather
-	// than upserting a broken scheduler. [] means cron disabled (no PI_SCHEDULES_FILE).
+	// than upserting a broken scheduler. [] means cron disabled (no PI_TRIGGERS_FILE, or no cron triggers).
 	const schedules = loadSchedules(config);
 
 	let gh = null;
@@ -175,7 +175,7 @@ export async function startWorker(
 				if (job?.kind === "github" && gh) {
 					try {
 						const token = await gh.mintToken(job.repo);
-						await host.postStatusComment(job.repo, job.issueNumber, text, token);
+						await host.postStatusComment(job.repo, job.target.number, text, token);
 					} catch (err) {
 						log("comment_failed", { jobId: job?.id, reason: err?.message });
 					}

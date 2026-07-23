@@ -38,6 +38,7 @@ function respond(res, status, obj) {
  * and the enqueued job are allowed to see.
  */
 export function parseSubset(payload) {
+	const pr = payload.pull_request;
 	return {
 		action: payload.action,
 		sender: { id: payload.sender?.id },
@@ -46,8 +47,25 @@ export function parseSubset(payload) {
 			title: payload.issue?.title,
 			body: payload.issue?.body,
 			labels: Array.isArray(payload.issue?.labels) ? payload.issue.labels.map((l) => ({ name: l?.name })) : [],
+			// Presence marker only: an issue_comment on a PR carries issue.pull_request, so the comment path
+			// routes it as a pull_request target. A boolean keeps a URL/login out of the subset.
+			pull_request: payload.issue?.pull_request != null,
 		},
 		comment: { body: payload.comment?.body, author_association: payload.comment?.author_association },
+		// pull_request event fields (labeled/opened/synchronize/reopened). head/base are attacker-controlled
+		// fork DATA -- projected for the flow's event.json, NEVER used as a clone ref (the worker clones the
+		// base default-branch SHA). Absent for non-PR events.
+		pull_request: pr
+			? {
+					number: pr.number,
+					title: pr.title,
+					body: pr.body,
+					author_association: pr.author_association,
+					labels: Array.isArray(pr.labels) ? pr.labels.map((l) => ({ name: l?.name })) : [],
+					head: { ref: pr.head?.ref, sha: pr.head?.sha, repo: { full_name: pr.head?.repo?.full_name } },
+					base: { ref: pr.base?.ref },
+				}
+			: undefined,
 		repository: { full_name: payload.repository?.full_name },
 	};
 }
@@ -80,7 +98,7 @@ export function makeReceiver({ queue, selfId, cfg, log }) {
 			return respond(res, 503, { error: "enqueue-failed" }); // GitHub redelivers; dedup by GUID coalesces
 		}
 
-		log?.({ event: "enqueued", delivery, repo: result.job.repo, issue: result.job.issueNumber, flow: result.job.flow });
+		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.target.type}#${result.job.target.number}`, flow: result.job.flow });
 		return respond(res, 202, { status: "queued" });
 	});
 }

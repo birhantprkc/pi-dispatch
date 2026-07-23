@@ -23,8 +23,12 @@ const SECRET = "test-webhook-secret";
 const SELF_ID = 999;
 const cfg = {
 	webhookSecret: SECRET,
-	labelFlows: { "frontend-fix": { any: ["pi:frontend"] } },
-	commentTrigger: { phrase: "@pi", defaultFlow: null },
+	triggers: {
+		label: [{ predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+		comment: { phrase: "@pi", defaultFlow: null },
+		pullRequest: [],
+		knownFlows: new Set(["frontend-fix"]),
+	},
 };
 
 /** GitHub's `X-Hub-Signature-256` shape, computed the same way GitHub computes it. */

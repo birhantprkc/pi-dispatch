@@ -51,19 +51,24 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  * for the github kind. No `sha` field: the commit is resolved fresh in prepare (C1), so baking a
  * possibly-stale sha here would only race the branch head.
  *
+ * `target` is the discriminated subject of the job -- `{ type:"issue"|"pull_request", number, title,
+ * body, ... }` -- built by the receiver's filter from the INT-WEBHOOK-PAYLOAD-SUBSET fields. Its `number`
+ * keys the semantic dedup window; GitHub issues and PRs share one per-repo number sequence, so the key is
+ * collision-free without encoding the type.
+ *
  * Two dedup layers, ADDITIVE and independent:
  *   - `jobId` (the delivery GUID) is exact-per-delivery: a redelivered webhook resolves to the same
  *     id and BullMQ's `EXISTS jobId` rejects it -- REQ-DEDUP-BY-DELIVERY-GUID.
- *   - `deduplication` keys on `repo#issue:flow` for SEMANTIC_WINDOW_MS: distinct GUIDs from rapid
- *     re-labels of the same issue coalesce to one active job. It coexists with jobId; it does not
+ *   - `deduplication` keys on `repo#number:flow` for SEMANTIC_WINDOW_MS: distinct GUIDs from rapid
+ *     re-labels or repeated PR pushes coalesce to one active job. It coexists with jobId; it does not
  *     replace it.
  */
-export async function enqueueGitHubJob(queue, { repo, issueNumber, flow, title, body, trigger, provider, model, maxTurns }) {
+export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns }) {
 	const jobId = deliveryJobId(trigger.deliveryId);
-	const data = { kind: "github", repo, issueNumber, flow, title, body, trigger, provider, model, maxTurns };
+	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns };
 	await queue.add("github", data, {
 		jobId,
-		deduplication: { id: `${repo}#${issueNumber}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
+		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
 		attempts: 2,
 		backoff: { type: "exponential", delay: 60_000 },
 		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above

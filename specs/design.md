@@ -250,10 +250,11 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     one under load, so the admin extension should surface `next` drift rather than let it look healthy.
   - **Deterministic `jobId`** — `repeat:<schedulerId>:<nextMillis>` — so scheduler jobs get
     `REQ-DEDUP-BY-DELIVERY-GUID`-equivalent dedup for free, with no GUID to supply.
-  - **Local-only this slice.** A `kind:"github"` schedule is rejected at load. A scheduled GitHub job has
-    no webhook delivery, issue number, title, or body to supply, and post-integration the github path would
-    perform a real host clone and per-job token mint before failing every tick — spend and side effects for
-    a trigger that cannot complete. GitHub scheduling is deferred to a later slice.
+  - **Local-only this slice.** The on × run diagonal rejects a `cron → github` trigger at load
+    (`INT-TRIGGERS-FILE-CONTRACT`, `DES-TRIGGERS-UNIFIED-FILE`). A scheduled GitHub job has no webhook
+    delivery, issue/PR number, title, or body to supply, and post-integration the github path would perform
+    a real host clone and per-job token mint before failing every tick — spend and side effects for a
+    trigger that cannot complete. GitHub scheduling is deferred to a later slice.
   - **Two distinct enqueue paths, not duplication.** The interactive `enqueueLocalJob` sets `attempts: 2`
     with backoff; the scheduled path (`upsertJobScheduler`) passes retention-only opts with a single
     attempt. For an unattended recurring trigger the **cadence is the retry**, so a failing tick must not
@@ -280,6 +281,48 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   precisely the trigger that runs while nobody is watching.
 - **Traces to**: `CONST-RETRY-INFRA-ONLY`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-RUNNER-TURN-BUDGET`,
   `REQ-QUEUE-BURST-NO-DROP`
+
+## DES-TRIGGERS-UNIFIED-FILE
+
+- **Decision**: One `triggers.json` of `{ on, run }` entries is the single source of standing triggers for
+  **both** services. A shared validator (`worker/src/triggers.mjs`, exported as
+  `@pi-dispatch/worker/triggers`) parses and validates the whole file; the worker selects `on.type:"cron"`
+  and the receiver selects `on.type ∈ {label, comment, pull_request}`. Both validate everything; each
+  evaluates only its own subset. This replaces the two prior files (`PI_SCHEDULES_FILE` and
+  `receiver.flows.json`) with **no compatibility shim** — a clean cutover.
+- **Why**: The schema unifies the operator's *view* of triggers; it does **not** merge the engines. The
+  `receiver`/`worker`, adversarial/trusted boundary is untouched: a `label` `on` is never scheduled (no
+  delivery GUID to dedup on, no fresh collaborator approval), and a `cron` `on` never receives a webhook.
+  The `on × run` matrix is near-diagonal (`cron ↔ local`, webhook ↔ `github`) and that diagonal **is** the
+  trust boundary, encoded as a fail-loud validation rule (`INT-TRIGGERS-FILE-CONTRACT`). One validator, run
+  by both, means a malformed file fails both services identically — the two cannot drift. The shared module
+  lives in the worker package because `receiver` and `admin` already depend on `@pi-dispatch/worker`; the
+  dependency is one-way, so no cycle.
+- **Rejected**: a compat union accepting both old shapes (the repo bans backwards-compat shims,
+  `.claude/rules/legacy-removal.md`) · two independent validators (they drift) · a third shared package
+  (unnecessary — the one-way worker dependency already exists).
+- **Traces to**: `INT-TRIGGERS-FILE-CONTRACT`, `REQ-CRON-SCHEDULED-JOBS`, `REQ-TRIGGER-AUTHOR-GATE`
+
+## DES-PR-TRIGGER-ROUTES-TO-FLOW
+
+- **Decision**: A `pull_request` trigger **routes the event to the configured flow**; the harness does not
+  implement review-vs-push behaviour and does not change the clone ref. The worker still clones the base
+  repo's default-branch SHA (fork-safe, `INT-CONTAINER-JOB-INPUTS`), delivers the PR context — number,
+  head/base refs — as DATA in `/job/event.json`, and the flow (a repo skill) decides what to do with the PR
+  via `gh` (review, comment, or push to the PR head branch).
+- **Why**: pi is the agent; this repo is the trigger, the queue, and the box (`no-reimplementing-pi`,
+  `library-first.md`). Encoding "fix the PR" vs "review the PR" in the harness would rebuild pi badly and
+  fork the prompt per intent; naming the flow and handing it the PR context keeps the harness thin and lets
+  the same machinery serve any PR workflow. Keeping the clone ref at the base default-branch SHA preserves
+  the fork-safety property the isolation design already relies on — attacker-controlled head bytes are never
+  executed by the host or baked into the system prompt. The job-data carries a discriminated
+  `target: { type: "issue" | "pull_request", number, title, body, head?, base? }` rather than a compat union
+  of flat fields.
+- **Rejected**: cloning the PR head ref in the worker (executes fork code on the host clone path, and a
+  base-scoped token cannot push to a fork branch anyway) · harness-side review/push logic (reimplements pi) ·
+  auto-firing on any PR open (unbounded paid runs from fork PRs — `CONST-TRIGGER-AUTHOR-GATE`).
+- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `INT-WEBHOOK-PAYLOAD-SUBSET`, `INT-CONTAINER-JOB-INPUTS`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`
 
 ## DES-CLI-TRIGGER-FOR-LOCAL
 

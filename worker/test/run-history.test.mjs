@@ -205,7 +205,7 @@ test("parseExitTokens never throws across the same corpus that stresses parseExi
 test("buildRecord stores a completed run's tokens object as an explicit field", () => {
 	const tokens = { input: 1000, output: 200, total: 1200, cost: 0.05 };
 	const record = buildRecord({
-		job: { id: "gh-t", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 1 } },
+		job: { id: "gh-t", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", target: { type: "issue", number: 1 } } },
 		result: { outcome: "completed", turns: 4, tokens },
 		startedAt: "2026-07-18T00:00:00.000Z",
 		endedAt: "2026-07-18T00:01:00.000Z",
@@ -219,7 +219,7 @@ test("buildRecord for a github job keeps id-only fields and admits no PII", () =
 		id: "gh-x",
 		attemptsMade: 0,
 		name: "github",
-		data: { kind: "github", repo: "o/r", issueNumber: 5, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+		data: { kind: "github", repo: "o/r", flow: "fix", target: { type: "issue", number: 5, title: "SECRET_T", body: "SECRET_B" } },
 	};
 	const record = buildRecord({
 		job,
@@ -265,7 +265,7 @@ test("buildRecord for a local job keeps only the folder basename and no task tex
 });
 
 test("buildRecord throw-path maps a present error and no result to a failed outcome", () => {
-	const job = { id: "gh-y", attemptsMade: 1, name: "github", data: { kind: "github", repo: "o/r", issueNumber: 9 } };
+	const job = { id: "gh-y", attemptsMade: 1, name: "github", data: { kind: "github", repo: "o/r", target: { type: "issue", number: 9 } } };
 	const record = buildRecord({
 		job,
 		error: { reason: "error" },
@@ -287,7 +287,7 @@ test("buildRecord throw-path admits no PII for either job kind", () => {
 			id: "gh-err",
 			attemptsMade: 1,
 			name: "github",
-			data: { kind: "github", repo: "o/r", issueNumber: 9, flow: "fix", title: "SECRET_T", body: "SECRET_B" },
+			data: { kind: "github", repo: "o/r", flow: "fix", target: { type: "issue", number: 9, title: "SECRET_T", body: "SECRET_B" } },
 		},
 		error: { reason: "error" },
 		startedAt,
@@ -317,7 +317,7 @@ test("buildRecord throw-path admits no PII for either job kind", () => {
 });
 
 test("buildRecord: the chain fields default null on a non-chain record and chainEnqueued is never stored", () => {
-	const job = { id: "gh-x", name: "github", data: { kind: "github", repo: "o/r", issueNumber: 5 } };
+	const job = { id: "gh-x", name: "github", data: { kind: "github", repo: "o/r", target: { type: "issue", number: 5 } } };
 	const record = buildRecord({
 		job,
 		result: { outcome: "completed" },

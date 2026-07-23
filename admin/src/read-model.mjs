@@ -1,7 +1,7 @@
 /**
  * The admin extension's whole data-access surface: reads the queue, the budget counter, the durable
  * run-history files (INT-RUN-HISTORY-FILE-CONTRACT, admin is the named consumer), the settings overlay
- * (INT-CONFIG-OVERLAY-CONTRACT), and the receiver's label->flow allowlist.
+ * (INT-CONFIG-OVERLAY-CONTRACT), and the unified `triggers.json` for display.
  *
  * Every function takes injected dependencies (`fs`, `makeQueueFn`, `redisFn`, ...) with real defaults, so
  * the tests run fully offline against fakes and production uses the worker's own helpers unchanged. The
@@ -42,7 +42,7 @@ export function resolvePaths(env = process.env) {
     valkeyUrl: env.VALKEY_URL ?? "redis://127.0.0.1:6379",
     logsDir: env.PI_LOGS_DIR || defaultLogsDir(),
     settingsFile: settingsFilePath(env),
-    flowsPath: env.RECEIVER_FLOWS_PATH ?? "deploy/receiver.flows.json",
+    triggersPath: env.PI_TRIGGERS_FILE ?? "deploy/triggers.json",
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
     // The two dispatch_run bounds the extension enforces producer-side, read DIRECTLY from env (never
     // loadConfig, which throws on unrelated GitHub-auth problems). `delimitedList`/`nonNegativeInt` are
@@ -416,16 +416,20 @@ export function readSettingsView({ settingsFile, fs = nodeFs }) {
 }
 
 /**
- * Read the receiver's committed per-flow `{any, all, none}` trigger rules for display. Unlike the
- * receiver's fail-loud loader (boot semantics), a viewer degrades: an absent file is `{ missing: true }`,
- * malformed content is `{ invalid }`, and each rule normalizes into `{ rules: { <flow>: {any, all, none} } }`
- * with missing selectors defaulting to `[]` and non-string members dropped. A value that is not an object
- * is skipped, not fatal.
+ * Read the unified committed `triggers.json` for display (OQ-008). Unlike the worker/receiver fail-loud
+ * `parseTriggers` (boot semantics), a viewer degrades: an absent file is `{ missing: true }`, JSON or
+ * shape errors are `{ invalid }`, and each entry normalizes into `{ triggers: [ { type, ... } ] }`
+ * discriminated on `on.type` (cron | label | comment | pull_request). Missing selectors default to `[]`
+ * and non-string members are dropped; an entry that is not a usable `{ on, run }` object is skipped, not
+ * fatal.
+ *
+ * Custom: fail-soft display normalizer, not the shared fail-loud `parseTriggers`; a viewer degrades and
+ * shows what it can rather than throwing on one bad entry.
  */
-export function readFlows({ flowsPath, fs = nodeFs }) {
+export function readTriggers({ triggersPath, fs = nodeFs }) {
   let text;
   try {
-    text = fs.readFileSync(flowsPath, "utf8");
+    text = fs.readFileSync(triggersPath, "utf8");
   } catch {
     return { missing: true };
   }
@@ -433,21 +437,52 @@ export function readFlows({ flowsPath, fs = nodeFs }) {
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { invalid: "flows file is not valid JSON" };
+    return { invalid: "triggers file is not valid JSON" };
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { invalid: "flows file must be a flow -> rule object" };
+  const entries = parsed?.triggers;
+  if (!Array.isArray(entries)) {
+    return { invalid: 'triggers file must have a "triggers" array' };
   }
-  const rules = {};
-  for (const [flowName, rule] of Object.entries(parsed)) {
-    if (rule === null || typeof rule !== "object" || Array.isArray(rule)) continue;
-    rules[flowName] = {
-      any: normalizeSelector(rule.any),
-      all: normalizeSelector(rule.all),
-      none: normalizeSelector(rule.none),
-    };
+  const triggers = [];
+  for (const entry of entries) {
+    const display = normalizeTriggerForDisplay(entry);
+    if (display) triggers.push(display);
   }
-  return { rules };
+  return { triggers };
+}
+
+/** Normalize one `{ on, run }` entry into its display record, or `null` when it is not usable. */
+function normalizeTriggerForDisplay(entry) {
+  if (entry === null || typeof entry !== "object") return null;
+  const on = entry.on;
+  if (on === null || typeof on !== "object") return null;
+  const run = entry.run !== null && typeof entry.run === "object" ? entry.run : {};
+  const flow = typeof run.flow === "string" ? run.flow : null;
+  switch (on.type) {
+    case "cron":
+      return {
+        type: "cron",
+        id: typeof on.id === "string" ? on.id : null,
+        pattern: typeof on.pattern === "string" ? on.pattern : null,
+        folder: typeof run.folder === "string" ? run.folder : null,
+        flow,
+      };
+    case "label":
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow };
+    case "comment":
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow };
+    case "pull_request":
+      return {
+        type: "pull_request",
+        action: normalizeSelector(on.action),
+        any: normalizeSelector(on.any),
+        all: normalizeSelector(on.all),
+        none: normalizeSelector(on.none),
+        flow,
+      };
+    default:
+      return null;
+  }
 }
 
 // Custom: fail-soft display normalizer, not the receiver's fail-loud validator; a viewer degrades, never throws.

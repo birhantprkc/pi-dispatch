@@ -140,12 +140,13 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
 - **Question**: Should the admin extension edit triggers — toggling a cron schedule, remapping a
   label→flow — and via what mechanism that survives a worker or receiver restart?
 - **Why it matters**: A Redis-side scheduler toggle is overwritten by the worker's boot reconcile
-  (`REQ-CRON-SCHEDULED-JOBS` acceptance: startup removes schedulers absent from the schedules file), so a
-  runtime edit that silently reverts at the next boot is worse than no edit at all. The label→flow mapping
-  lives in `receiver.flows.json`, loaded fail-loud at receiver boot, so an edit there needs a receiver
-  restart. Two sources of truth — a live toggle and a file the boot reconcile trusts — is the failure mode.
-- **How to answer**: Either make the files the write target (the extension edits `schedules.json` /
-  `receiver.flows.json` and gains a reload story), or ratify trigger editing as display-only.
+  (`REQ-CRON-SCHEDULED-JOBS` acceptance: startup removes schedulers absent from the triggers file), so a
+  runtime edit that silently reverts at the next boot is worse than no edit at all. The label→flow and
+  pull_request mappings live in the unified `triggers.json`, loaded fail-loud at receiver boot, so an edit
+  there needs a receiver restart. Two sources of truth — a live toggle and a file the boot reconcile
+  trusts — is the failure mode.
+- **How to answer**: Either make the file the write target (the extension edits `triggers.json` and gains
+  a reload story), or ratify trigger editing as display-only.
 - **Blocks**: Nothing this slice — the admin extension ships triggers **display-only**.
 
 ## OQ-009 — Chaining from a GitHub-job parent (and cross-folder chaining) is deferred

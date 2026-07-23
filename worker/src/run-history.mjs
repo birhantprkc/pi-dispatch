@@ -139,12 +139,12 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 }
 
 /**
- * A stable, non-PII target label. GitHub jobs read `repo#issue`; local jobs read `local:<basename>` --
- * basename only, so the full folder path (which on Windows carries the OS account name) never lands in
- * the record.
+ * A stable, non-PII target label. GitHub jobs read `repo#number` (issue or PR number); local jobs read
+ * `local:<basename>` -- basename only, so the full folder path (which on Windows carries the OS account
+ * name) never lands in the record.
  */
 function targetFor(kind, data) {
-	if (kind === "github") return `${data.repo}#${data.issueNumber}`;
+	if (kind === "github") return `${data.repo}#${data.target?.number}`;
 	if (kind === "local") return `local:${basename(data.folder ?? "")}`;
 	return null;
 }

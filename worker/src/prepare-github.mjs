@@ -158,7 +158,7 @@ export async function prepareGithubWorkspace(
 		// Issue text is DATA: it enters the USER prompt (buildGithubPrompt), never a system prompt.
 		writeFile(
 			join(jobDir, "prompt.md"),
-			buildGithubPrompt({ flow: job.flow, title: job.title, body: job.body, issueNumber: job.issueNumber }),
+			buildGithubPrompt({ flow: job.flow, target: job.target }),
 			{ mode: 0o444 },
 		);
 
@@ -168,7 +168,7 @@ export async function prepareGithubWorkspace(
 			action: job.trigger?.action,
 			delivery: job.trigger?.deliveryId,
 			repository: { full_name: job.repo },
-			issue: { number: job.issueNumber, title: job.title, body: job.body },
+			...(job.target?.type === "pull_request" ? { pull_request: prEventBody(job.target) } : { issue: { number: job.target?.number, title: job.target?.title, body: job.target?.body } }),
 			sender: { id: job.trigger?.sender?.id, login: job.trigger?.sender?.login },
 		};
 		writeFile(join(jobDir, "event.json"), JSON.stringify(subset, null, 2), { mode: 0o444 });
@@ -178,6 +178,18 @@ export async function prepareGithubWorkspace(
 		// The askpass machinery must not outlive the prepare, and must never be agent-reachable.
 		rmSync(askpass.dir, { recursive: true, force: true });
 	}
+}
+
+/**
+ * The `pull_request` body for event.json, from the job's PR target. `head`/`base` are attacker-controlled
+ * fork DATA carried for the flow's own `gh` use; they are surfaced here, never used as a clone ref. Absent
+ * when the target lacks them (a comment-triggered PR job resolves them from the number via `gh`).
+ */
+function prEventBody(target) {
+	const body = { number: target.number, title: target.title, body: target.body };
+	if (target.head) body.head = target.head;
+	if (target.base) body.base = target.base;
+	return body;
 }
 
 /**

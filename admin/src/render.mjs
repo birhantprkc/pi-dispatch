@@ -124,22 +124,41 @@ export function renderSchedulers(schedulers) {
 }
 
 /**
- * Render triggers display-only (OQ-008): the schedulers block, then the committed per-flow
- * `{any, all, none}` trigger rules.
+ * Render triggers display-only (OQ-008): the schedulers block, then the committed unified `triggers.json`
+ * as a discriminated list -- cron, label, comment, and pull_request entries each on their own line.
  */
-export function renderTriggers({ schedulers, flows } = {}) {
+export function renderTriggers({ schedulers, triggers } = {}) {
   const out = [renderSchedulers(schedulers), "", "Triggers:"];
-  if (flows && flows.missing) {
-    out.push("  (flows file not found)");
-  } else if (flows && flows.invalid) {
-    out.push(`  (flows file invalid: ${flows.invalid})`);
+  if (triggers && triggers.missing) {
+    out.push("  (triggers file not found)");
+  } else if (triggers && triggers.invalid) {
+    out.push(`  (triggers file invalid: ${triggers.invalid})`);
   } else {
-    const rules = (flows && flows.rules) ?? {};
-    const flowNames = Object.keys(rules);
-    if (flowNames.length === 0) out.push("  (no rules)");
-    else for (const flowName of flowNames) out.push(`  ${flowName}: ${ruleClauses(rules[flowName])}`);
+    const list = (triggers && triggers.triggers) ?? [];
+    if (list.length === 0) out.push("  (no triggers)");
+    else for (const t of list) out.push(`  ${triggerLine(t)}`);
   }
   return out.join("\n");
+}
+
+/** One trigger's display line, discriminated on `type`. A null field reads as "-". */
+function triggerLine(t) {
+  const flow = t?.flow ?? "-";
+  switch (t?.type) {
+    case "cron":
+      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}`;
+    case "label":
+      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}`;
+    case "comment":
+      return `comment  "${t.phrase ?? "-"}" → ${flow}`;
+    case "pull_request": {
+      const clauses = ruleClauses(t);
+      const action = `action[${(t.action ?? []).join(",")}]`;
+      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}`;
+    }
+    default:
+      return "(unknown trigger)";
+  }
 }
 
 function ruleClauses(rule) {
