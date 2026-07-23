@@ -1,6 +1,6 @@
 {
   "name": "@edgehero/pi-dispatch-admin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Operator console (a pi extension) + skill for the pi-dispatch self-hosted agent service: a /dispatch TUI for queue, spend, run history, triggers, and scheduled pause windows. Runs against a live pi-dispatch deployment.",
   "keywords": [
     "pi-package",
@@ -30,7 +30,7 @@
     "skills": [
       "./skills"
     ],
-    "image": "https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/dispatch-dashboard.svg"
+    "image": "https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png"
   },
   "scripts": {
     "build": "node build.mjs",

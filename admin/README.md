@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+</p>
+
 # @edgehero/pi-dispatch-admin
 
 The **operator console** for [**pi-dispatch**](https://github.com/edgehero/pi-dispatch) — a
