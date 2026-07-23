@@ -8,8 +8,12 @@ const SECRET = "test-webhook-secret";
 const SELF_ID = 999;
 const cfg = {
 	webhookSecret: SECRET,
-	labelFlows: { "frontend-fix": { any: ["pi:frontend"] } },
-	commentTrigger: { phrase: "@pi", defaultFlow: null },
+	triggers: {
+		label: [{ predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+		comment: { phrase: "@pi", defaultFlow: null },
+		pullRequest: [{ actions: new Set(["opened", "synchronize"]), predicate: {}, flow: "review" }],
+		knownFlows: new Set(["frontend-fix", "review"]),
+	},
 };
 
 /** GitHub's `X-Hub-Signature-256` shape, computed the same way GitHub computes it. */
@@ -101,8 +105,70 @@ test("signed issues.labeled (pi:frontend) enqueues one github job and responds 2
 	assert.equal(calls[0].name, "github");
 	assert.equal(calls[0].data.kind, "github");
 	assert.equal(calls[0].data.flow, "frontend-fix");
+	assert.equal(calls[0].data.target.type, "issue");
+	assert.equal(calls[0].data.target.number, 42);
 	assert.equal(calls[0].opts.jobId, "gh-" + delivery);
 	assert.equal(res.statusCode, 202);
+});
+
+test("signed pull_request.opened by a collaborator enqueues a pull_request job and responds 202", async () => {
+	const delivery = "d-propen";
+	const payload = {
+		action: "opened",
+		sender: { id: 1 },
+		repository: { full_name: "octo/repo" },
+		pull_request: {
+			number: 12,
+			title: "PR T",
+			body: "PR B",
+			author_association: "COLLABORATOR",
+			labels: [],
+			head: { ref: "feat", sha: "abc", repo: { full_name: "octo/repo" } },
+			base: { ref: "main" },
+		},
+	};
+	const raw = JSON.stringify(payload);
+
+	const { calls, queue } = recordingQueue();
+	const handler = makeReceiver({ queue, selfId: SELF_ID, cfg, log: () => {} });
+	const req = mockReq({ headers: headersFor("pull_request", delivery, raw) });
+	const res = mockRes();
+	await drive(handler, req, res, raw);
+
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].data.flow, "review");
+	assert.equal(calls[0].data.target.type, "pull_request");
+	assert.equal(calls[0].data.target.number, 12);
+	assert.equal(calls[0].data.target.head.ref, "feat");
+	assert.equal(res.statusCode, 202);
+});
+
+test("signed pull_request.opened from a fork author (NONE) is dropped 204, nothing enqueued", async () => {
+	const delivery = "d-prfork";
+	const payload = {
+		action: "opened",
+		sender: { id: 1 },
+		repository: { full_name: "octo/repo" },
+		pull_request: {
+			number: 13,
+			title: "PR T",
+			body: "PR B",
+			author_association: "NONE",
+			labels: [],
+			head: { ref: "feat", sha: "abc", repo: { full_name: "attacker/repo" } },
+			base: { ref: "main" },
+		},
+	};
+	const raw = JSON.stringify(payload);
+
+	const { calls, queue } = recordingQueue();
+	const handler = makeReceiver({ queue, selfId: SELF_ID, cfg, log: () => {} });
+	const req = mockReq({ headers: headersFor("pull_request", delivery, raw) });
+	const res = mockRes();
+	await drive(handler, req, res, raw);
+
+	assert.equal(calls.length, 0, "a fork PR must not auto-fire a paid job");
+	assert.equal(res.statusCode, 204);
 });
 
 test("self-comment (sender.id === selfId) is dropped 204, nothing enqueued", async () => {

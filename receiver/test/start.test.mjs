@@ -5,14 +5,14 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { startReceiver } from "../src/start.mjs";
 
-// The committed flows file, addressed absolutely so loadReceiverConfig's real fs reads succeed
-// regardless of the test runner's cwd. Every side-effecting collaborator (gh, Valkey, socket) is
+// The committed unified triggers file, addressed absolutely so loadReceiverConfig's real fs reads
+// succeed regardless of the test runner's cwd. Every side-effecting collaborator (gh, Valkey, socket) is
 // injected, so this suite touches none of them.
-const FLOWS_PATH = fileURLToPath(new URL("../../deploy/receiver.flows.json", import.meta.url));
+const TRIGGERS_PATH = fileURLToPath(new URL("../../deploy/triggers.json", import.meta.url));
 const SECRET = "shh";
 
 function baseEnv(overrides = {}) {
-	return { WEBHOOK_SECRET: SECRET, RECEIVER_FLOWS_PATH: FLOWS_PATH, ...overrides };
+	return { WEBHOOK_SECRET: SECRET, PI_TRIGGERS_FILE: TRIGGERS_PATH, ...overrides };
 }
 
 const okAuth = async () => ({ selfId: 12345, source: "gh" });
@@ -134,7 +134,7 @@ test("the makeReceiver handler is wired to createServer and a signed delivery en
 	await startReceiver(baseEnv(), { makeAuth: okAuth, makeQueueFn: () => queue, createServer });
 	assert.equal(typeof captured.handler, "function", "the makeReceiver handler was passed to createServer");
 
-	// Drive a real signed issues.labeled through the wired handler; the flows file maps pi:frontend.
+	// Drive a real signed issues.labeled through the wired handler; the triggers file maps pi:frontend.
 	const payload = {
 		action: "labeled",
 		sender: { id: 1 },

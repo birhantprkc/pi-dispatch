@@ -17,6 +17,7 @@
     "./queue": "./src/queue.mjs",
     "./connection": "./src/connection.mjs",
     "./job-id": "./src/job-id.mjs",
+    "./triggers": "./src/triggers.mjs",
     "./identity": "./src/identity.mjs",
     "./get-token": "./src/get-token.mjs",
     "./runtime-settings": "./src/runtime-settings.mjs",

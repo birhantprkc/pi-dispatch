@@ -40,7 +40,7 @@ import {
   readRun,
   readLogTail,
   readSettingsView,
-  readFlows,
+  readTriggers,
   listRunIds,
   setQueuePaused,
   writeSettings,
@@ -245,8 +245,8 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
     }
     case "triggers": {
       const schedulers = await readSchedulers({ url: paths.valkeyUrl });
-      const flows = readFlows({ flowsPath: paths.flowsPath });
-      send(pi, renderTriggers({ schedulers, flows }));
+      const triggers = readTriggers({ triggersPath: paths.triggersPath });
+      send(pi, renderTriggers({ schedulers, triggers }));
       return;
     }
     case "settings": {

@@ -13,7 +13,7 @@ import {
   readRun,
   readLogTail,
   readSettingsView,
-  readFlows,
+  readTriggers,
   listRunIds,
   setQueuePaused,
   writeSettings,
@@ -58,7 +58,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     VALKEY_URL: "redis://h:1",
     PI_LOGS_DIR: "/l",
     PI_SETTINGS_FILE: "/s.json",
-    RECEIVER_FLOWS_PATH: "/f.json",
+    PI_TRIGGERS_FILE: "/f.json",
     PI_CAPTURE_JOB_LOGS: "1",
     PI_DISPATCH_RUN_ROOTS: "/root-a",
     PI_DISPATCH_RUN_PER_HOUR: "5",
@@ -67,7 +67,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     valkeyUrl: "redis://h:1",
     logsDir: "/l",
     settingsFile: "/s.json",
-    flowsPath: "/f.json",
+    triggersPath: "/f.json",
     captureJobLogs: true,
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
@@ -77,7 +77,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
 test("resolvePaths falls back to defaults on empty env (no worker config required)", () => {
   const p = resolvePaths({});
   assert.equal(p.valkeyUrl, "redis://127.0.0.1:6379");
-  assert.equal(p.flowsPath, "deploy/receiver.flows.json");
+  assert.equal(p.triggersPath, "deploy/triggers.json");
   assert.equal(p.captureJobLogs, false);
   assert.ok(typeof p.logsDir === "string" && p.logsDir.length > 0);
   assert.ok(typeof p.settingsFile === "string" && p.settingsFile.length > 0);
@@ -267,36 +267,55 @@ test("readSchedulers returns { unreachable } on a connection error", async () =>
   assert.match(res.unreachable, /down/);
 });
 
-test("readFlows returns the normalized per-flow rules", () => {
+test("readTriggers normalizes each on.type into its discriminated display record", () => {
   const files = {
-    "receiver.flows.json": JSON.stringify({
-      "frontend-fix": { any: ["pi:frontend"] },
-      "backend-fix": { any: ["pi:backend"], none: ["wontfix"] },
+    "triggers.json": JSON.stringify({
+      triggers: [
+        { on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/p", flow: "tidy", task: "t" } },
+        { on: { type: "label", any: ["pi:frontend"], none: ["wontfix"] }, run: { kind: "github", flow: "frontend-fix" } },
+        { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } },
+        { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"] }, run: { kind: "github", flow: "review" } },
+      ],
     }),
   };
-  const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
-  assert.deepEqual(res.rules, {
-    "frontend-fix": { any: ["pi:frontend"], all: [], none: [] },
-    "backend-fix": { any: ["pi:backend"], all: [], none: ["wontfix"] },
-  });
+  const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
+  assert.deepEqual(res.triggers, [
+    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy" },
+    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix" },
+    { type: "comment", phrase: "@pi", flow: "fix" },
+    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review" },
+  ]);
 });
 
-test("readFlows skips a rule whose value is not an object (viewer degrades)", () => {
+test("readTriggers skips an entry that is not a usable { on, run } object (viewer degrades)", () => {
   const files = {
-    "receiver.flows.json": JSON.stringify({ "frontend-fix": { any: ["pi:frontend"] }, "backend-fix": "backend-fix" }),
+    "triggers.json": JSON.stringify({
+      triggers: [
+        { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix" } },
+        "not-an-object",
+        { on: { type: "unknown" }, run: { kind: "github", flow: "x" } },
+        { run: { kind: "github", flow: "no-on" } },
+      ],
+    }),
   };
-  const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
-  assert.deepEqual(res.rules, { "frontend-fix": { any: ["pi:frontend"], all: [], none: [] } });
+  const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
+  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix" }]);
 });
 
-test("readFlows returns { invalid } when the file is a JSON array", () => {
-  const files = { "receiver.flows.json": JSON.stringify(["frontend-fix"]) };
-  const res = readFlows({ flowsPath: "/x/receiver.flows.json", fs: fakeFs(files) });
-  assert.ok(res.invalid, "a top-level array is invalid, not a rule object");
+test("readTriggers returns { invalid } when there is no triggers array", () => {
+  const files = { "triggers.json": JSON.stringify({ schedules: [] }) };
+  const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
+  assert.ok(res.invalid, 'a file without a "triggers" array is invalid');
 });
 
-test("readFlows returns { missing:true } when the file is absent (viewer degrades)", () => {
-  assert.deepEqual(readFlows({ flowsPath: "/x/none.json", fs: fakeFs({}) }), { missing: true });
+test("readTriggers returns { invalid } when the file is not valid JSON", () => {
+  const files = { "triggers.json": "{ not valid json" };
+  const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
+  assert.ok(res.invalid);
+});
+
+test("readTriggers returns { missing:true } when the file is absent (viewer degrades)", () => {
+  assert.deepEqual(readTriggers({ triggersPath: "/x/none.json", fs: fakeFs({}) }), { missing: true });
 });
 
 test("readSettingsView returns the validated overlay via the worker's own reader", () => {

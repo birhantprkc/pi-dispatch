@@ -11,11 +11,17 @@ const SHA = "a".repeat(40);
 const JOB = {
 	kind: "github",
 	repo: "owner/name",
-	issueNumber: 7,
 	flow: "frontend-fix",
-	title: "Fix the header spacing",
-	body: "The header is cramped. Please @owner fix it.",
+	target: { type: "issue", number: 7, title: "Fix the header spacing", body: "The header is cramped. Please @owner fix it." },
 	trigger: { event: "issues", action: "labeled", deliveryId: "guid-123", sender: { id: 42, login: "octocat" } },
+};
+
+const PR_JOB = {
+	kind: "github",
+	repo: "owner/name",
+	flow: "review",
+	target: { type: "pull_request", number: 12, title: "Add caching", body: "@owner please review", head: { ref: "feat/cache", sha: "b".repeat(40), repo: "fork/name" }, base: { ref: "main" } },
+	trigger: { event: "pull_request", action: "opened", deliveryId: "guid-pr", sender: { id: 99, login: "contributor" } },
 };
 
 /**
@@ -232,8 +238,8 @@ test("event.json holds exactly the payload subset -- no header, signature, or to
 		action: "labeled",
 		delivery: "guid-123",
 		repository: { full_name: "owner/name" },
-		issue: { number: 7, title: JOB.title, body: JOB.body },
 		sender: { id: 42, login: "octocat" },
+		issue: { number: 7, title: JOB.target.title, body: JOB.target.body },
 	});
 
 	const serialized = JSON.stringify(event).toLowerCase();
@@ -261,5 +267,43 @@ test("happy path returns { workspace, jobDir, sha, materialised }", async () => 
 	// prompt.md is the user prompt; it names the flow and quotes the issue body as data.
 	const prompt = readFileSync(join(h.jobDir, "prompt.md"), "utf8");
 	assert.ok(prompt.includes('Use the "frontend-fix" skill'));
-	assert.ok(prompt.includes(JOB.body));
+	assert.ok(prompt.includes(JOB.target.body));
+});
+
+// -- 11: a PR-triggered job clones the BASE default branch and carries PR context as event.json data --
+
+test("a PR job clones the base default-branch SHA (never the PR head) and writes a pull_request event.json", async () => {
+	const git = fakeGit();
+	const h = harness({ git });
+	const result = await prepareGithubWorkspace(PR_JOB, TOKEN, h.deps);
+
+	// The clone ref is the fresh default-branch SHA -- NEVER the attacker-controlled PR head sha.
+	assert.equal(result.sha, SHA);
+	assert.notEqual(result.sha, PR_JOB.target.head.sha, "a PR job must never clone the head sha");
+	const fetch = callFor(git, "fetch");
+	assert.ok(fetch.args.includes(SHA), "fetch pins the base default-branch SHA");
+	assert.ok(!fetch.args.includes(PR_JOB.target.head.sha), "fetch must not pin the PR head sha");
+
+	// event.json carries a pull_request body with head/base as DATA; no issue body.
+	const event = JSON.parse(readFileSync(join(h.jobDir, "event.json"), "utf8"));
+	assert.deepEqual(event, {
+		event: "pull_request",
+		action: "opened",
+		delivery: "guid-pr",
+		repository: { full_name: "owner/name" },
+		sender: { id: 99, login: "contributor" },
+		pull_request: {
+			number: 12,
+			title: PR_JOB.target.title,
+			body: PR_JOB.target.body,
+			head: { ref: "feat/cache", sha: "b".repeat(40), repo: "fork/name" },
+			base: { ref: "main" },
+		},
+	});
+	assert.equal("issue" in event, false, "a PR job's event.json carries no issue body");
+
+	// prompt.md is the PR prompt: names the flow, routes to it, mints no pi/issue-<n> branch.
+	const prompt = readFileSync(join(h.jobDir, "prompt.md"), "utf8");
+	assert.ok(prompt.includes('Use the "review" skill'));
+	assert.ok(!prompt.includes("pi/issue-"), "a PR job must not mint an issue branch");
 });

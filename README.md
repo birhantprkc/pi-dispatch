@@ -214,28 +214,30 @@ mounted into the job container, and are gitignored. A boot-time sweep prunes any
 ## Scheduling recurring jobs
 
 A cron schedule is a trigger, not a new job kind: each entry runs a local folder through a flow on a cron
-pattern. Cron is **off by default** — the worker reads schedules only when `PI_SCHEDULES_FILE` points at a
-file.
+pattern. Cron entries live in the unified **`triggers.json`** alongside the GitHub triggers, and cron is
+**off by default** for the worker — it fires cron entries only when `PI_TRIGGERS_FILE` points at the file.
 
 ```bash
 # 1. Copy the template and edit it
-cp schedules.example.json schedules.json   # then edit "folder" to a REAL absolute path
+cp triggers.example.json triggers.json   # then edit the cron entry's "folder" to a REAL absolute path
 
-# 2. Point the worker at it (absolute path), and restart the worker
-#    In .env:  PI_SCHEDULES_FILE=/absolute/path/to/schedules.json
+# 2. Point the services at it (absolute path), and restart the worker
+#    In .env:  PI_TRIGGERS_FILE=/absolute/path/to/triggers.json
 npx pi-dispatch worker
 ```
 
-Each entry sets `id`, `cron` (5 or 6 fields), `folder`, `flow`, and `task`; `provider`, `model`, and
-`maxTurns` are optional and fall back to the worker's defaults. A schedule's `folder` is a **host path** —
-the worker runs on the host ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job
-container, so it must be readable by the worker's user.
+Every trigger is an `{ on, run }` pair. A cron trigger is
+`{ "on": { "type": "cron", "id", "pattern" }, "run": { "kind": "local", "folder", "flow", "task" } }`,
+where `pattern` is a 5- or 6-field cron expression; `provider`, `model`, and `maxTurns` are optional on
+`run` and fall back to the worker's defaults. A cron `folder` is a **host path** — the worker runs on the
+host ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must
+be readable by the worker's user.
 
-- **Local schedules only this slice.** `kind` must be `"local"`; the loader rejects `kind:"github"` at
-  startup — a schedule has no webhook delivery, issue number, or body to work.
-- **Editing `folder` is mandatory.** Copying `schedules.example.json` verbatim makes the worker **refuse
-  to start** with `configError: folder does not exist` until `folder` names a real path. This is
-  fail-loud on purpose: a broken schedule never silently fails to fire.
+- **A cron trigger runs locally.** `run.kind` must be `"local"`; the loader rejects a cron trigger with
+  `run.kind:"github"` at startup — a cron trigger has no webhook delivery, issue number, or body to work.
+- **Editing `folder` is mandatory.** Copying `triggers.example.json` verbatim makes the worker **refuse
+  to start** with `configError: folder does not exist` until a cron trigger's `folder` names a real path.
+  This is fail-loud on purpose: a broken trigger never silently fails to fire.
 
 ## Advanced: GitHub automation
 
@@ -244,6 +246,11 @@ opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECR
 authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
 **PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
 for multi-tenant.
+
+Which labels, which comment phrase, and which pull_request actions fire a flow are configured in the same
+unified **`triggers.json`** as the cron entries above — each a `{ on, run }` pair whose `on.type` is
+`label`, `comment`, or `pull_request` and whose `run` is `{ "kind": "github", "flow" }`. The receiver
+**requires** `PI_TRIGGERS_FILE` to point at that file.
 
 ```mermaid
 flowchart LR
@@ -261,6 +268,9 @@ flowchart LR
 ```
 
 - Only a collaborator's label or `@pi` comment starts a job (the label *is* the approval step).
+- Beyond labeled issues, pi-dispatch also handles **pull requests**: label a PR, comment on a PR, or fire
+  automatically when a PR is opened or updated — the auto (`opened`/`synchronize`/`reopened`) path is
+  gated on the PR author being a collaborator.
 - The agent gets a **repo-scoped, short-lived token** — and, honestly: that token *can* merge, because
   GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
   default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has

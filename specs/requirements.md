@@ -142,22 +142,30 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 
 ## REQ-TRIGGER-AUTHOR-GATE
 
-- **Statement**: The receiver shall enqueue only for allowlisted labels, or comments whose
-  `author_association ∈ {OWNER, MEMBER, COLLABORATOR}` matching the trigger phrase. Events sent by our
-  own App identity shall be ignored. The label allowlist is a per-flow `{any, all, none}` predicate over
-  the issue's label set: `any` is an OR requirement, `all` a stricter AND requirement, and `none` is
-  **suppress-only** — it can never cause a trigger, only prevent one. A rule shall carry at least one
-  positive selector (a non-empty `any` or `all`); the whole predicate stays equal-or-stricter than a
-  single-label OR and collaborator-gated, since only collaborators can apply labels.
+- **Statement**: The receiver shall enqueue only for: allowlisted issue labels; comments whose
+  `author_association ∈ {OWNER, MEMBER, COLLABORATOR}` matching the trigger phrase; and `pull_request`
+  events whose approval gate is satisfied. Events sent by our own App identity shall be ignored. The label
+  allowlist is a `{any, all, none}` predicate over the label set: `any` is an OR requirement, `all` a
+  stricter AND requirement, and `none` is **suppress-only** — it can never cause a trigger, only prevent
+  one. A label rule (and a `labeled` PR rule) shall carry at least one positive selector (a non-empty
+  `any` or `all`). For a `pull_request`: `action: labeled` is gated by the label predicate (a
+  collaborator-applied label is the approval); `action ∈ {opened, synchronize, reopened}` is gated by the
+  PR `author_association ∈ {OWNER, MEMBER, COLLABORATOR}` — a gate hard-coded in the filter, never
+  config-optional. A comment carrying `issue.pull_request` is a PR-context comment and enqueues a
+  pull_request target.
 - **Why**: The enforcement of `CONST-TRIGGER-AUTHOR-GATE`. The bot-loop guard matters independently: our
-  own job comments on the issue, which is an `issue_comment.created` event, which without the guard
-  triggers another job — an unbounded paid recursion. The positive-selector requirement is what keeps a
-  `none`-only rule — which would match every labeled event lacking the excluded labels, wider than
-  today — from ever loading.
+  own job comments on the issue — or pushes to a PR head branch, which fires `pull_request.synchronize` —
+  an event that without the guard triggers another job, an unbounded paid recursion. The positive-selector
+  requirement is what keeps a `none`-only rule — which would match every labeled event lacking the excluded
+  labels, wider than a single-label OR — from ever loading. The PR auto-action author gate is
+  load-bearing money control: without it, any fork PR opened by a stranger launches a paid agent run.
 - **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`
 - **Acceptance**: Given `@pi fix this` with `author_association: NONE`, 204 and zero jobs. Given a
   comment from our own App id, 204 and zero jobs. Given a flow rule with no positive selector (`none`
-  only, or empty), config load fails and the receiver does not boot.
+  only, or empty), config load fails and the receiver does not boot. Given a `pull_request.opened` whose
+  PR `author_association` is not a collaborator, 204 and zero jobs; given the same from a `COLLABORATOR`,
+  exactly one job. Given a `pull_request.synchronize` whose `sender.id` is our own identity, 204 and zero
+  jobs (the bot-loop guard).
 
 ## REQ-JOB-TIMEOUT-30M
 

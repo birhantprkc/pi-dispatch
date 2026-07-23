@@ -85,7 +85,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		dailyTokenCap: optionalBoundedInt(env, "PI_DAILY_TOKEN_CAP", 1), // issue #25; null = daily token counter disabled (check-AFTER, host-side)
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
-		schedulesFile: env.PI_SCHEDULES_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: schedule list is a host file; null = cron disabled
+		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")
 		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
 		logsDir: env.PI_LOGS_DIR || defaultLogsDir(), // || (not ??) so an empty string falls back to the default
 		settingsFile: env.PI_SETTINGS_FILE || defaultSettingsFile(), // || (not ??) so an empty string falls back; INT-CONFIG-OVERLAY-CONTRACT

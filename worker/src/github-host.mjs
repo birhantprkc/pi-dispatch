@@ -10,9 +10,9 @@
  * the job run: only a real 404 (the repo has no protection object) is the determinate unprotected
  * state that drives the policy refusal; any other error is retryable and never a silent `false`.
  *
- * REQ-JOB-STATUS-COMMENTS: `postStatusComment` reports outcome to the issue. It is content-agnostic
- * -- the no-trigger-phrase guard belongs to the caller -- and never logs the comment body or any
- * issue-derived content (no-pii-in-logs); a job is identified by `repo#issueNumber` alone.
+ * REQ-JOB-STATUS-COMMENTS: `postStatusComment` reports outcome to the issue or PR. It is content-
+ * agnostic -- the no-trigger-phrase guard belongs to the caller -- and never logs the comment body or
+ * any issue/PR-derived content (no-pii-in-logs); a job is identified by `repo#number` alone.
  *
  * CONST-TOKEN-SCOPED-PER-JOB: the token is minted per job and passed to every method. Each method
  * constructs a FRESH Octokit through the injected `octokitFor(token)`; no client is cached or reused
@@ -86,16 +86,17 @@ export function makeGitHubHost({ octokitFor = (token) => new Octokit({ auth: tok
 	}
 
 	/**
-	 * Post `text` as an issue comment. Content-agnostic: `text` is passed through as `body` verbatim,
-	 * never inspected, filtered, or logged.
+	 * Post `text` as an issue comment. `number` is an issue OR a pull request number -- a PR shares the
+	 * `/issues/{n}/comments` endpoint, so posting to a PR number comments on the PR conversation.
+	 * Content-agnostic: `text` is passed through as `body` verbatim, never inspected, filtered, or logged.
 	 */
-	async function postStatusComment(repo, issueNumber, text, token) {
+	async function postStatusComment(repo, number, text, token) {
 		const [owner, name] = splitRepo(repo);
 		const octokit = octokitFor(token);
 		await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
 			owner,
 			repo: name,
-			issue_number: issueNumber,
+			issue_number: number,
 			body: text,
 		});
 	}
