@@ -345,7 +345,7 @@ test("readTriggers normalizes each on.type into its discriminated display record
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
   assert.deepEqual(res.triggers, [
-    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy" },
+    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null },
     { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix" },
     { type: "comment", phrase: "@pi", flow: "fix" },
     { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review" },

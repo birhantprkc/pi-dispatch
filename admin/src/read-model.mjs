@@ -504,6 +504,9 @@ function normalizeTriggerForDisplay(entry) {
         pattern: typeof on.pattern === "string" ? on.pattern : null,
         folder: typeof run.folder === "string" ? run.folder : null,
         flow,
+        // Optional per-cron model override (passthrough into job.data); null when the entry resolves the
+        // deployment default. Surfaced so the drill-in shows which schedules pin their own model.
+        model: typeof run.model === "string" ? run.model : null,
       };
     case "label":
       return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow };

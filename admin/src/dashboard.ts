@@ -685,7 +685,8 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
       const drift = sched.overdueMs ? formatDuration(sched.overdueMs) : "0s";
       out.push(kv("health", `drift ${drift} · stalls ${sched.stalls}/${sched.stallMax}`, sched.overdueMs ? "warning" : "success"));
     }
-    out.push(kv("produces", `local · ${t.folder ?? "-"} · flow ${t.flow ?? "-"}`, "success"));
+    const model = t.model ? ` · model ${t.model}` : " · model default";
+    out.push(kv("produces", `local · ${t.folder ?? "-"} · flow ${t.flow ?? "-"}${model}`, "success"));
   } else if (t.type === "label" || t.type === "pull_request") {
     if (t.type === "pull_request") out.push(kv("actions", (t.action ?? []).join(", ") || "-"));
     out.push(kv("any of", (t.any ?? []).join(" · ") || "-", "success"));

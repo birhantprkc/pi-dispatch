@@ -73,12 +73,24 @@ test("addTrigger: kind-first dialogs write a validated label trigger (live-reloa
 
 test("addTrigger: a cron entry pairs with local by construction (the diagonal is not offered)", async () => {
   const path = tmpTriggers({ triggers: [] });
-  const ui = mockUi({ select: ["cron"], input: ["nightly", "0 3 * * *", "/srv/site", "tidy", "run tidy"] });
+  // The cron form prompts id/pattern/folder/flow/task, then the optional model/provider/maxTurns (blank here).
+  const ui = mockUi({ select: ["cron"], input: ["nightly", "0 3 * * *", "/srv/site", "tidy", "run tidy", "", "", ""] });
   await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui });
   const t = read(path).triggers[0];
   assert.equal(t.on.type, "cron");
   assert.equal(t.run.kind, "local"); // never github — the form only builds the diagonal partner
   assert.equal(t.run.folder, "/srv/site");
+  assert.ok(!("model" in t.run), "a blank model override is omitted, resolving the deployment default");
+});
+
+test("addTrigger: a cron entry can pin its own model/provider/maxTurns", async () => {
+  const path = tmpTriggers({ triggers: [] });
+  const ui = mockUi({ select: ["cron"], input: ["nightly", "0 3 * * *", "/srv/site", "tidy", "run tidy", "claude-sonnet-5", "anthropic", "20"] });
+  await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui });
+  const t = read(path).triggers[0];
+  assert.equal(t.run.model, "claude-sonnet-5");
+  assert.equal(t.run.provider, "anthropic");
+  assert.equal(t.run.maxTurns, 20, "maxTurns is coerced to a number");
 });
 
 test("editTrigger: updates the flow in place", async () => {
@@ -180,6 +192,22 @@ test("dispatch_trigger_add: an approved confirm appends a validated entry", asyn
   assert.deepEqual(w.triggers[0].on.any, ["pi:fix"]);
   assert.equal(w.triggers[0].run.flow, "frontend-fix");
   assert.match(shown[0].message, /triggers\.json/, "the confirm shows the entry being added");
+});
+
+test("dispatch_trigger_add: a cron entry carries an approved model/maxTurns override", async () => {
+  const path = tmpTriggers({ triggers: [] });
+  process.env.PI_TRIGGERS_FILE = path;
+  const { ctx } = toolCtx({ answer: true });
+  const out = textOf(await toolByName("dispatch_trigger_add").execute(
+    "id",
+    { kind: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv", flow: "tidy", task: "run", model: "claude-opus-4-8", maxTurns: 40 },
+    undefined, undefined, ctx,
+  ));
+  assert.equal(out.applied, true);
+  const t = read(path).triggers[0];
+  assert.equal(t.run.model, "claude-opus-4-8");
+  assert.equal(t.run.maxTurns, 40);
+  assert.equal(t.on.type, "cron");
 });
 
 test("dispatch_trigger_edit: an approved confirm changes the flow and shows old->new", async () => {

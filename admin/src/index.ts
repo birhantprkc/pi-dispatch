@@ -298,8 +298,10 @@ function registerTools(pi: ExtensionAPI): void {
     description:
       "Adds a trigger to triggers.json and applies it live. The operator MUST approve a confirm dialog showing " +
       "the entry; with no interactive operator it is refused. `kind` is cron|label|comment|pull_request. cron " +
-      "needs id/pattern/folder/flow/task; label needs labels[]+flow; comment needs phrase+flow; pull_request " +
-      "needs action[] (+ optional labels[]) + flow.",
+      "needs id/pattern/folder/flow/task and may set optional model/provider/maxTurns (the flow's default model " +
+      "for that schedule; omit to use the deployment default); label needs labels[]+flow; comment needs " +
+      "phrase+flow; pull_request needs action[] (+ optional labels[]) + flow. Only cron carries model/provider/" +
+      "maxTurns — github triggers run under the deployment default.",
     executionMode: "sequential",
     parameters: Type.Object({
       kind: Type.String(),
@@ -311,6 +313,9 @@ function registerTools(pi: ExtensionAPI): void {
       phrase: Type.Optional(Type.String()),
       labels: Type.Optional(Type.Array(Type.String())),
       action: Type.Optional(Type.Array(Type.String())),
+      model: Type.Optional(Type.String()),
+      provider: Type.Optional(Type.String()),
+      maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const entry = buildTriggerEntry(params.kind, params);
@@ -423,7 +428,20 @@ function triggerList(paths: any): any[] {
  * (tool params) or a space-separated string (dialog input) via `asWords`. Returns null for an unknown kind.
  */
 function buildTriggerEntry(kind: string, f: any): any {
-  if (kind === "cron") return { on: { type: "cron", id: f.id, pattern: f.pattern }, run: { kind: "local", folder: f.folder, flow: f.flow, task: f.task } };
+  if (kind === "cron") {
+    // Optional per-entry provider/model/maxTurns pass through to job.data (highest precedence); omitted when
+    // blank so the value still resolves against the settings overlay/env at job start (triggers.mjs:127-131).
+    // undefined keys drop out of the written JSON. Only the local/cron path carries these — github triggers
+    // run under the global overlay/env model, which the loader enforces.
+    const run: any = { kind: "local", folder: f.folder, flow: f.flow, task: f.task };
+    const model = optStr(f.model);
+    const provider = optStr(f.provider);
+    const maxTurns = optInt(f.maxTurns);
+    if (model) run.model = model;
+    if (provider) run.provider = provider;
+    if (maxTurns !== undefined) run.maxTurns = maxTurns;
+    return { on: { type: "cron", id: f.id, pattern: f.pattern }, run };
+  }
   if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: { kind: "github", flow: f.flow } };
   if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: { kind: "github", flow: f.flow } };
   if (kind === "pull_request") {
@@ -439,6 +457,19 @@ function buildTriggerEntry(kind: string, f: any): any {
 function asWords(x: any): string[] {
   if (Array.isArray(x)) return x.map((s) => String(s).trim()).filter(Boolean);
   return splitWords(x);
+}
+
+/** A trimmed non-empty string, or undefined (so a blank optional field drops out of the written JSON). */
+function optStr(x: any): string | undefined {
+  const s = String(x ?? "").trim();
+  return s === "" ? undefined : s;
+}
+
+/** A finite number from a string/number, or undefined when blank/absent/non-numeric. */
+function optInt(x: any): number | undefined {
+  if (x === undefined || x === null || String(x).trim() === "") return undefined;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void> {
@@ -624,7 +655,14 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
     if (flow === undefined) return;
     const task = await ui.input("task (prompt text)", "run the flow");
     if (task === undefined) return;
-    entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task });
+    // Optional per-cron overrides — blank keeps the global overlay/env value at job start.
+    const model = await ui.input("model (blank = default)", "");
+    if (model === undefined) return;
+    const provider = await ui.input("provider (blank = default)", "");
+    if (provider === undefined) return;
+    const maxTurns = await ui.input("maxTurns (blank = default)", "");
+    if (maxTurns === undefined) return;
+    entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task, model, provider, maxTurns });
   } else if (kind === "label") {
     const labels = await ui.input("label(s) — space-separated (any-of)", "pi:fix");
     if (labels === undefined) return;
