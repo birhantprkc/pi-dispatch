@@ -36,6 +36,17 @@ const TAIL_VIEWPORT = 20;
 // panel.mjs floors a box to this width; below it (or a missing/non-finite width) the panel degrades to
 // unframed plain lines rather than a ragged or over-width frame.
 const MIN_WIDTH = 8;
+// Drill-in views (TRIGGER_DETAIL, RUN_DETAIL) are small; they frame to a compact width and center within
+// the wider overlay rather than stretching a handful of key/value lines across the full LIST width.
+const DRILL_WIDTH = 70;
+
+/** Left-pad each line to center a `blockWidth`-wide frame within the `overlayWidth` overlay. */
+function centerBlock(lines: string[], overlayWidth: number, blockWidth: number): string[] {
+  const pad = Math.max(0, Math.floor((overlayWidth - blockWidth) / 2));
+  if (pad === 0) return lines;
+  const prefix = " ".repeat(pad);
+  return lines.map((l) => prefix + l);
+}
 
 /**
  * Build the read/act/close deps for a live dashboard from resolved paths: ONE failFast queue and ONE
@@ -360,16 +371,19 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
   if (view === "TRIGGER_DETAIL") {
     const t = detailTrigger?.record;
     const detailTitle = `trigger · ${t?.type ?? "?"}`;
-    const lines = renderTriggerDetail(t, framed ? inner : 24, styler);
+    const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
+    const lines = renderTriggerDetail(t, framed ? dw - 4 : 24, styler);
     if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "e edit · x delete · esc back"];
-    return frame(styler, { title: detailTitle, width, lines, footer: triggerDetailHints(inner, styler) });
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: triggerDetailHints(dw - 4, styler) });
+    return centerBlock(boxed, Math.trunc(width), dw);
   }
 
   if (view === "RUN_DETAIL") {
     const detailTitle = `run ${detailRun?.jobId ?? "-"}`;
     const detailLines = renderRunDetail(detailRun);
     if (!framed) return [detailTitle, "", ...detailLines, "", "Esc back"];
-    return box({ title: detailTitle, footer: "Esc back", width, sections: [{ lines: detailLines }] });
+    const dw = Math.min(Math.trunc(width), DRILL_WIDTH);
+    return centerBlock(box({ title: detailTitle, footer: "Esc back", width: dw, sections: [{ lines: detailLines }] }), Math.trunc(width), dw);
   }
 
   if (view === "LIVE_TAIL") {
