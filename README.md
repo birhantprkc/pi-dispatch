@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/banner.png" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+</p>
+
 # pi-dispatch
 
 **Run the [pi](https://github.com/earendil-works/pi) coding agent as a service — triggered on demand, on a
