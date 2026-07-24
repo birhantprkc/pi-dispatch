@@ -267,6 +267,30 @@ Copying `triggers.example.json` verbatim makes the worker **refuse to start** wi
 `configError: folder does not exist` until a cron trigger's `folder` names a real path — fail-loud on
 purpose, so a broken trigger never silently fails to fire.
 
+## Quiet hours — scoped pause windows
+
+Pause a **specific folder or repo's** runs *between certain times* — recurring daily, optionally restricted to
+certain weekdays or a date range, in a timezone of your choice — and resume automatically. Unlike
+`pi-dispatch pause` (which stops the **whole** queue, untimed), a pause window is per-scope and scheduled, and
+a paused job is **deferred, not dropped**: it waits in the queue and runs once the window ends. The check
+happens **before** the budget reservation, so a deferred job spends nothing and counts nothing against the cap.
+
+Copy `pause-windows.example.json` and point `PI_PAUSE_WINDOWS_FILE` at it (unset = off); the worker validates
+it at boot and live-reloads edits:
+
+```json
+{ "windows": [
+  { "scope": "acme/web",  "from": "22:00", "to": "06:00", "tz": "Europe/Amsterdam",
+    "days": ["mon","tue","wed","thu","fri"] },
+  { "scope": "/srv/site", "from": "09:00", "to": "17:00", "dateFrom": "2026-08-10", "dateTo": "2026-08-14" }
+] }
+```
+
+`scope` is a repo `"owner/name"`, a local folder path, or `"*"` for all; `from > to` is an overnight window;
+`days`/`dateFrom`/`dateTo` gate the day the window starts. Manage windows by editing the file, in the panel
+(`/dispatch` → `w`), or through the confirm-gated `dispatch_pause_add`/`_delete` tools. Full field reference
+and more examples: **[`docs/pause-windows.md`](docs/pause-windows.md)**.
+
 ## GitHub automation
 
 pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
