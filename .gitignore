@@ -34,6 +34,11 @@ coverage/
 /triggers.json
 !triggers.example.json
 
+# Scoped pause windows ("quiet hours"). pause-windows.example.json is the template;
+# deploy/pause-windows.json is the deployed default (empty). See docs/pause-windows.md.
+/pause-windows.json
+!pause-windows.example.json
+
 # Python — bytecode and tool caches from the skill scripts under .claude/skills/
 __pycache__/
 *.py[cod]
