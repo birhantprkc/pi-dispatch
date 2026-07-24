@@ -8,6 +8,9 @@ import { gitDirty } from "./git-dirty.mjs";
 
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
+  pi-dispatch init         scaffold .env + triggers.json + pause-windows.json in this folder
+  pi-dispatch doctor       preflight Docker, Valkey, the job image, and your provider key
+
   pi-dispatch run <folder> --task "<what to do>" [--flow <name>]
                            [--provider <p>] [--model <m>] [--max-turns <n>] [--force]
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
@@ -19,6 +22,16 @@ Config comes from the environment (see .env.example); flags override it per run.
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
 	const cmd = argv[0];
+
+	if (cmd === "init") {
+		const { runInit } = await import("./init.mjs");
+		return runInit(process.cwd());
+	}
+
+	if (cmd === "doctor") {
+		const { runDoctor } = await import("./doctor.mjs");
+		return runDoctor(env);
+	}
 
 	if (cmd === "worker") {
 		const { startWorker } = await import("./start.mjs");
