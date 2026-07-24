@@ -197,7 +197,9 @@ The admin surface — the dashboard and command transcript shown at the top of t
 extension** in [`admin/`](admin/) that loads into *your own* interactive pi session — no daemon, no web
 app, **no network port at all**.
 
-**Install it through pi** — the published package, then open the panel:
+**Install it through pi** — the published package (the extension **and** the `operate-pi-dispatch` skill, so
+your AI can drive the deployment too — see [Operating pi-dispatch from your AI](#operating-pi-dispatch-from-your-ai)),
+then open the panel:
 
 ```bash
 pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
@@ -235,15 +237,24 @@ reads only queue counts, run records, and the settings overlay — none of which
 
 ### Operating pi-dispatch from your AI
 
-The extension is AI-operable, so your assistant can drive it — but **every change asks you to confirm
-first**. The model-callable tools are: reads (`status`, `runs`, `triggers`); on/off (`pause`/`resume`, no
-confirm — reversible and money-safe); the gated `dispatch_run` enqueue; and the **confirm-gated writes**
-`dispatch_set` (change a limit) and `dispatch_trigger_add`/`_edit`/`_delete`. A write tool applies its
-change **only after you approve a dialog showing the exact before→after**, and **refuses — writing nothing —
-when no interactive operator is present** (so a prompt-injected session can't raise your cap or add a paid
-trigger; the model emits the call, only your keypress approves it). The bundled `operate-pi-dispatch` skill
-tells the model how to use those gates: state the change plainly, and accept a decline. `CONST-BUDGET-BEFORE-TOKENS`
-and `CONST-TRIGGER-AUTHOR-GATE` are unchanged — the confirm is the human approval.
+Installing `@edgehero/pi-dispatch-admin` gives your AI more than the panel: the package **also ships the
+`operate-pi-dispatch` skill** (via its `pi.skills` manifest), so once it's installed your assistant knows this
+deployment's tools and how to use their gates — **you can just ask, in plain language**: *"raise the daily cap
+to 30", "add a nightly `tidy` trigger for `/srv/site`", "quiet-hours for `acme/web` 22:00–06:00 Amsterdam"*.
+Everything the panel does is model-callable, so **setting it up can be driven entirely by the AI** — with your
+confirmation on every change that costs money or config:
+
+- **Read** (no confirm): `dispatch_status`, `dispatch_runs`, `dispatch_triggers`, `dispatch_pauses`.
+- **Turn on/off** (no confirm — reversible, money-safe): `dispatch_pause` / `dispatch_resume`.
+- **Change config — each behind a confirm you approve**: `dispatch_set` (a limit/setting), the triggers
+  `dispatch_trigger_add` / `_edit` / `_delete`, and the quiet-hours `dispatch_pause_add` / `_edit` / `_delete`.
+- **Start a paid run**: `dispatch_run` (gated — see below).
+
+A confirm-gated write applies its change **only after you approve a dialog showing the exact before→after**,
+and **refuses — writing nothing — when no interactive operator is present** (so a prompt-injected session
+can't raise your cap or add a paid trigger; the model emits the call, only your keypress approves it). The
+`operate-pi-dispatch` skill tells the model how to use those gates: state the change plainly, and accept a
+decline. `CONST-BUDGET-BEFORE-TOKENS` and `CONST-TRIGGER-AUTHOR-GATE` are unchanged — the confirm is the human approval.
 
 `dispatch_run` is the one model-callable tool that is **not money-safe**: unlike the others, it enqueues a
 **PAID** agent run that edits a folder in place with **no undo** — and unlike the confirm-gated writes, it
