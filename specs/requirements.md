@@ -495,6 +495,40 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 
 ---
 
+## REQ-GLOBAL-PI-OVERLAY
+
+- **Statement**: An operator shall be able to reuse their existing host `pi` setup in every job. A single
+  **global overlay dir** (`PI_GLOBAL_PI_DIR`) is bind-mounted `/opt/pi-global:ro` into each container (both
+  job kinds) and layered **UNDER** each repo's own `.pi/`: custom models (`models.json`) become resolvable,
+  global skills (`skills/`) and a global persona (`APPEND_SYSTEM.md`) apply to every job. **Repo wins on
+  conflict** — the repo skill path is listed first (pi is first-path-wins) and the repo persona is appended
+  last; the baked `HARD_RULES.md` floor stays first and unremovable. The overlay is **credential-free by
+  construction**: `pi-dispatch import-pi` stages the safe subset of `~/.pi/agent` (honoring
+  `PI_CODING_AGENT_DIR`), **refusing** a `models.json` with a literal key and **never** copying `auth.json`
+  or `settings.json`; `pi-dispatch doctor` re-verifies. Overlay **extensions are fail-closed**: copied only
+  under `import-pi --with-extensions` (the admin extension hard-blocked), and loaded only when the operator
+  arms `PI_GLOBAL_ALLOW_EXTENSIONS=1`. A custom provider's key reaches the container through the explicit
+  `PI_FORWARD_ENV` name allowlist, never a host pass-through.
+- **Scope**: The container mount + env contract and the runner's resource loader; a new host-side CLI
+  (`import-pi`) and `doctor` checks. Works with the **pulled** prebuilt image — a runtime mount, not a
+  rebuild. Distinct from the per-repo `.pi/` (trusted-by-merge, materialized from a git SHA) and from the
+  admin-editable runtime settings overlay (which still may never carry persona).
+- **Why**: Anyone who already runs pi has a configured `~/.pi/agent`; re-expressing it per-repo is friction
+  the missing-layer pitch should remove. The overlay is **operator deploy-time config — the same trust class
+  as baking the image** — so it may carry a persona layer, but it is mounted `:ro` into an adversarial-input
+  container, so it must hold no secret (`CONST-TOKEN-SCOPED-PER-JOB`) and extensions (arbitrary code, open
+  egress) stay opt-in and armed separately.
+- **Traces to**: `DES-OPERATOR-GLOBAL-OVERLAY`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SDK-SESSION-OPTIONS`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `DES-PERSONA-VIA-APPEND-SYSTEM-MD`
+- **Acceptance**: Given a configured overlay, a global skill is available to a job and a repo skill of the
+  same name overrides it; the assembled prompt shows guardrails before the global persona before the repo
+  persona; given a custom model in the overlay `models.json`, the runner resolves it; given `import-pi`
+  against a `models.json` with a literal key, it refuses and writes nothing; given `auth.json` in the
+  overlay, `doctor` fails; given overlay extensions with `PI_GLOBAL_ALLOW_EXTENSIONS` unset, they do not
+  load; given `import-pi --with-extensions` over the admin extension, it is not copied.
+
+---
+
 ## Notes (not requirements)
 
 **Capacity and cost.** ~1.5–2.5 GB RAM per job (pi + dev server + headless Chromium) and roughly

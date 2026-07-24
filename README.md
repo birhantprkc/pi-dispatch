@@ -84,6 +84,25 @@ A container boundary, spend bounded *before* a container starts, nothing dropped
 enforces. Read [`SECURITY.md`](SECURITY.md) before you rely on it: it states plainly what is and is not
 defended.
 
+## Reuse your existing pi setup
+
+Already run `pi`? Give every job your host setup — custom models, global skills, a global persona — **layered
+under each repo's own `.pi/`** (the repo still wins). Works with the pulled image; it's a read-only mount, not
+a rebuild.
+
+```bash
+pi-dispatch import-pi          # stage a credential-free copy of ~/.pi/agent into ./pi-global
+# then set PI_GLOBAL_PI_DIR=/abs/path/to/pi-global in .env, and:
+pi-dispatch doctor             # verifies the overlay carries no credential
+```
+
+The overlay is mounted `/opt/pi-global:ro` into every container. Skills merge with the repo's (a repo skill
+of the same name overrides the global one); the prompt layers `guardrails → global persona → repo persona`,
+the safety floor always first and unremovable. `import-pi` **refuses** a `models.json` with a literal key and
+**never** copies `auth.json` — your credential stays in the environment. Extensions are opt-in and armed
+separately (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS=1`) because they run code against adversarial
+input; the admin extension is hard-blocked. Full reference: [`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
+
 ## Run as a service
 
 `pi-dispatch worker` is a long-running process — run it in a terminal, or hand it to your OS's service

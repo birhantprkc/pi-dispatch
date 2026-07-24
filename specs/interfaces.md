@@ -28,14 +28,18 @@ Evidence convention as in `constitution.md`.
 
   ```typescript
   const authStorage   = AuthStorage.create(`${agentDir}/auth.json`);
-  const modelRegistry = ModelRegistry.create(authStorage, `${agentDir}/models.json`);
+  // Prefer the operator overlay's models.json when the :ro overlay is mounted (REQ-GLOBAL-PI-OVERLAY) —
+  // how a CUSTOM provider/model becomes resolvable. Definitions only; the key still flows env -> auth.json.
+  const modelsPath = existsSync("/opt/pi-global/models.json") ? "/opt/pi-global/models.json" : `${agentDir}/models.json`;
+  const modelRegistry = ModelRegistry.create(authStorage, modelsPath);
   const model = modelRegistry.find(process.env.PI_PROVIDER, process.env.PI_MODEL);  // NOT getModel
   if (!model) throw configError(`unknown model`);   // configError tags exit 2 — see below
   if (!modelRegistry.hasConfiguredAuth(model)) throw configError(`no configured auth`);
 
   // Guardrails read EXPLICITLY from a path we own — never via discovery. See (e).
-  const guardrails    = readFileSync("/opt/pi-dispatch/HARD_RULES.md", "utf8");
-  const projectPersona = readIfExists("/job/pi/APPEND_SYSTEM.md");   // :ro, default-branch SHA
+  const guardrails     = readFileSync("/opt/pi-dispatch/HARD_RULES.md", "utf8");
+  const globalPersona  = readIfExists("/opt/pi-global/APPEND_SYSTEM.md"); // operator overlay, :ro (REQ-GLOBAL-PI-OVERLAY)
+  const projectPersona = readIfExists("/job/pi/APPEND_SYSTEM.md");        // :ro, default-branch SHA
 
   const resourceLoader = new DefaultResourceLoader({
     cwd: "/workspace",
@@ -43,9 +47,14 @@ Evidence convention as in `constitution.md`.
     noContextFiles: true,                              // CONST-NO-CONTEXT-FILES-MANDATORY
     noSkills: true,                                    // exclude cwd/package discovery …
     noExtensions: true,                                // … we supply ours explicitly instead
-    additionalSkillPaths:     ["/job/pi/skills"],      // native pi skills, :ro, default-branch
-    additionalExtensionPaths: ["/job/pi/extensions"],
-    appendSystemPromptOverride: () => [guardrails, projectPersona].filter(Boolean),
+    // Repo path FIRST so a repo skill overrides a global one of the same name (pi is first-path-wins).
+    additionalSkillPaths:     ["/job/pi/skills", ...(existsSync("/opt/pi-global/skills") ? ["/opt/pi-global/skills"] : [])],
+    // Overlay extensions are fail-closed: only when PI_GLOBAL_ALLOW_EXTENSIONS=1 AND the dir is present.
+    additionalExtensionPaths: ["/job/pi/extensions", ...(allowGlobalExtensions && existsSync("/opt/pi-global/extensions") ? ["/opt/pi-global/extensions"] : [])],
+    // Floor first (unremovable), then operator-global, then repo (most specific). Deploy-time overlay
+    // persona is the SAME trust class as baking (DES-OPERATOR-GLOBAL-OVERLAY), distinct from the
+    // admin-editable runtime settings overlay, which still may never carry persona.
+    appendSystemPromptOverride: () => [guardrails, globalPersona, projectPersona].filter(Boolean),
   });
   await resourceLoader.reload();        // MANDATORY — createAgentSession will NOT do this for you
   // NOTE: reload() is NOT called with `resolveProjectTrust`. Project trust is never granted.
@@ -369,8 +378,11 @@ Evidence convention as in `constitution.md`.
     (see below); `GITHUB_TOKEN` (scoped, short-lived — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
     otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
-    (if not `$HOME/.pi/agent`). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is NOT forwarded** — the daily
-    token counter is enforced host-side, and the container stays queue/budget-blind (`no-broad-env-into-container`).
+    (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=1` (forwarded ONLY when the operator armed overlay
+    extensions — fail-closed; `REQ-GLOBAL-PI-OVERLAY`); and each name in `PI_FORWARD_ENV` (an explicit operator
+    allowlist of extra host vars — e.g. a custom provider's key — forwarded by exact `-e NAME=VALUE`, never a
+    pass-through, so it satisfies `no-broad-env-into-container`). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
+    NOT forwarded** — the daily token counter is enforced host-side, and the container stays queue/budget-blind.
   - Env **baked into the image**, because they are facts about the image and not choices a job makes:
     `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,
     `PLAYWRIGHT_MCP_SANDBOX=false`. **`PLAYWRIGHT_MCP_BROWSER` is load-bearing**: `playwright-cli`
@@ -388,10 +400,15 @@ Evidence convention as in `constitution.md`.
     hand-maintained copy is exactly the reinvention `no-reimplementing-pi` forbids. For `anthropic` the
     call returns `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` — **the array order *is* the
     precedence**, which is precisely the trap this rule exists for.
-  - Mounts: `/job:ro`, `/workspace:rw`, and — **local jobs only** — `/outbox:rw` — delivered by host bind
-    mounts (`-v <hostPath>:<containerPath>`, per `DES-WORKER-ON-HOST` and `worker/src/docker-run.mjs`): the
-    worker runs on the host and binds the per-job inputs dir, the workspace folder, and the outbox dir
-    directly. No credential is ever written to `/outbox` (same rule as `/workspace`).
+  - Mounts: `/job:ro`, `/workspace:rw`, — **local jobs only** — `/outbox:rw`, and — **only when
+    `PI_GLOBAL_PI_DIR` is configured** — `/opt/pi-global:ro` — delivered by host bind mounts
+    (`-v <hostPath>:<containerPath>`, per `DES-WORKER-ON-HOST` and `worker/src/docker-run.mjs`): the worker
+    runs on the host and binds the per-job inputs dir, the workspace folder, the outbox dir, and the operator's
+    global pi overlay directly. `/opt/pi-global` is the operator's own `~/.pi/agent` subset — custom models, global
+    skills, a global persona — layered UNDER each repo's `.pi/` (`REQ-GLOBAL-PI-OVERLAY`, `DES-OPERATOR-GLOBAL-OVERLAY`);
+    it is `:ro` and **credential-free by construction** (`import-pi` refuses a literal-key `models.json` and never
+    copies `auth.json`; `CONST-TOKEN-SCOPED-PER-JOB`). No credential is ever written to `/outbox` or `/opt/pi-global`
+    (same rule as `/workspace`).
   - No TTY (`-it` absent)
   - **The agent dir must be writable by the non-root runtime user.** pi lazily creates
     `~/.pi/agent/` (mode `0700`) and `auth.json` (mode `0600`, contents `{}`) on the **first credential

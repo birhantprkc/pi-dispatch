@@ -30,6 +30,9 @@ export function makeRunContainer({
 	onOutput = (c) => process.stdout.write(c),
 	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null }) }),
 	spawnFn = spawn,
+	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
+	allowGlobalExtensions = false,
+	forwardEnv = [],
 }) {
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
@@ -46,6 +49,8 @@ export function makeRunContainer({
 			jobId: name,
 			githubToken: token ?? undefined,
 			hostEnv,
+			allowGlobalExtensions, // arms overlay extensions in the runner (fail-closed)
+			forwardEnv, // extra host var names to forward (e.g. a custom provider's key)
 		});
 
 		const args = buildDockerRunArgs({
@@ -54,6 +59,7 @@ export function makeRunContainer({
 			jobDir: prepared.jobDir,
 			workspace: prepared.workspace,
 			outboxDir: prepared.outboxDir, // undefined for github jobs -> docker-run's guard skips the /outbox mount
+			globalPiDir, // undefined/null -> docker-run's guard skips the /opt/pi-global mount
 			name,
 		});
 

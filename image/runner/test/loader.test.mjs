@@ -203,3 +203,50 @@ test("guardrails precede outbox precede persona when all three are present", { s
 		"the outbox protocol must precede the project persona",
 	);
 });
+
+// --- REQ-GLOBAL-PI-OVERLAY: the operator global overlay, layered UNDER the per-repo .pi/ ---
+const GLOBAL_PERSONA_SENTINEL = "GLOBAL-PERSONA-SENTINEL-d15e";
+const GLOBAL_SKILL_SENTINEL = "GLOBAL-ONLY-SKILL-SENTINEL-e26f";
+const GLOBAL_BUGFIX_SENTINEL = "GLOBAL-BUGFIX-SENTINEL-f37a"; // a global "bug-fix" the repo's must shadow
+
+/** A /opt/pi-global overlay: a global-only skill, a colliding "bug-fix" skill, and a global persona. */
+function globalOverlay() {
+	const dir = mkdtempSync(join(tmpdir(), "pi-global-"));
+	mkdirSync(join(dir, "skills", "global-only"), { recursive: true });
+	writeFileSync(join(dir, "skills", "global-only", "SKILL.md"), `---\nname: global-only\ndescription: ${GLOBAL_SKILL_SENTINEL} a house rule\n---\n\nApply everywhere.\n`);
+	mkdirSync(join(dir, "skills", "bug-fix"), { recursive: true });
+	writeFileSync(join(dir, "skills", "bug-fix", "SKILL.md"), `---\nname: bug-fix\ndescription: ${GLOBAL_BUGFIX_SENTINEL} the GLOBAL bug-fix\n---\n\nGlobal steps.\n`);
+	writeFileSync(join(dir, "APPEND_SYSTEM.md"), `# House persona\n${GLOBAL_PERSONA_SENTINEL}\nHouse style.\n`);
+	return dir;
+}
+
+test("a global overlay skill loads, and a repo skill of the same name overrides it (repo first)", { skip }, async () => {
+	const { loader } = await load({ globalPiDir: globalOverlay() });
+	const { skills } = loader.getSkills();
+	assert.ok(skills.find((s) => s.name === "global-only")?.description.includes(GLOBAL_SKILL_SENTINEL), "a global-only skill must load");
+	const bugFix = skills.find((s) => s.name === "bug-fix");
+	assert.ok(bugFix.description.includes(SKILL_SENTINEL), "the REPO bug-fix must win the name collision (repo path is first)");
+	assert.ok(!bugFix.description.includes(GLOBAL_BUGFIX_SENTINEL), "the global bug-fix must be shadowed, not merged");
+});
+
+test("the global persona layers between the guardrails floor and the repo persona", { skip }, async () => {
+	const { loader } = await load({ globalPiDir: globalOverlay() });
+	const appended = loader.getAppendSystemPrompt().join("\n\n");
+	assert.ok(appended.includes(GLOBAL_PERSONA_SENTINEL), "the global persona must reach the prompt");
+	assert.ok(
+		appended.indexOf(GUARDRAIL_SENTINEL) < appended.indexOf(GLOBAL_PERSONA_SENTINEL),
+		"the immutable floor must precede the global persona",
+	);
+	assert.ok(
+		appended.indexOf(GLOBAL_PERSONA_SENTINEL) < appended.indexOf(PERSONA_SENTINEL),
+		"the global persona must precede the repo persona (repo is most specific)",
+	);
+});
+
+test("no overlay mounted -> the loader behaves exactly as before (guardrails + repo persona only)", { skip }, async () => {
+	// globalPiDir points at a path that does not exist -> existsSync gates every overlay read to a no-op.
+	const { loader } = await load({ globalPiDir: join(tmpdir(), "pi-global-absent-xyz") });
+	const appended = loader.getAppendSystemPrompt().join("\n\n");
+	assert.ok(appended.includes(GUARDRAIL_SENTINEL) && appended.includes(PERSONA_SENTINEL));
+	assert.ok(!appended.includes(GLOBAL_PERSONA_SENTINEL), "an absent overlay contributes nothing");
+});

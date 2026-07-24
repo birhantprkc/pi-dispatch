@@ -29,7 +29,7 @@ export function providerKeyVars(provider, hostEnv) {
  * Throws if the provider is not configured -- a deterministic misconfiguration the caller maps to
  * a pre-spend refusal, never a launched-then-failed container.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv, allowGlobalExtensions = false, forwardEnv = [] }) {
 	const keyVars = providerKeyVars(provider, hostEnv);
 	if (!keyVars || keyVars.length === 0) {
 		const error = new Error(`provider ${provider} has no configured credential in the worker environment`);
@@ -50,12 +50,23 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
 		PLAYWRIGHT_MCP_BROWSER: "chromium",
 		PLAYWRIGHT_MCP_SANDBOX: "false",
+		// Arms loading of the global overlay's extensions in the runner (REQ-GLOBAL-PI-OVERLAY). Fail-closed:
+		// only set when the operator opted in, so an unset value keeps overlay extensions dormant.
+		PI_GLOBAL_ALLOW_EXTENSIONS: allowGlobalExtensions ? "1" : undefined,
 	};
 
 	// The provider credential(s), by their real names, copied from the host by EXACT name. Passing
 	// the value under pi's expected variable name is what lets pi's own auth resolution find it.
 	for (const name of keyVars) {
 		env[name] = hostEnv[name];
+	}
+
+	// Operator-declared extra vars (PI_FORWARD_ENV), forwarded by EXACT name -- the allowlist
+	// no-broad-env-into-container prescribes, not a host pass-through. This is how a CUSTOM provider's
+	// key (one pi's findEnvKeys table does not know) reaches the container. A name whose value is unset
+	// on the host is skipped, never forwarded as empty.
+	for (const name of forwardEnv) {
+		if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
 	}
 
 	// GitHub-backed jobs only. Local-folder jobs have no token (CONST-TOKEN-SCOPED-PER-JOB is

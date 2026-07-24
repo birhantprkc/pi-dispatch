@@ -13,6 +13,13 @@ export const OUTBOX_MOUNT = "/outbox";
 /** Read-only mount the worker materialises the project's .pi/ into, from the default-branch SHA. */
 export const JOB_PI_DIR = "/job/pi";
 
+/**
+ * Read-only mount of the operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY): custom models, global
+ * skills, and a global persona from the operator's own ~/.pi/agent, present only when configured. It is
+ * operator deploy-time config -- the same trust class as the baked floor -- layered UNDER each repo's .pi/.
+ */
+export const GLOBAL_PI_DIR = "/opt/pi-global";
+
 export const WORKSPACE = "/workspace";
 
 function readIfExists(path) {
@@ -47,12 +54,20 @@ export function buildResourceLoader({
 	cwd = WORKSPACE,
 	guardrailsPath = GUARDRAILS_PATH,
 	jobPiDir = JOB_PI_DIR,
+	globalPiDir = GLOBAL_PI_DIR,
 	outboxMount = OUTBOX_MOUNT,
 	outboxProtocolPath = OUTBOX_PROTOCOL_PATH,
+	allowGlobalExtensions = false,
 	settingsManager,
 } = {}) {
 	const guardrails = readFileSync(guardrailsPath, "utf8");
 	const projectPersona = readIfExists(`${jobPiDir}/APPEND_SYSTEM.md`);
+	// The operator's global overlay (REQ-GLOBAL-PI-OVERLAY), present only when the /opt/pi-global mount
+	// exists. Persona layers BETWEEN the immutable floor and the repo persona; skills layer UNDER the
+	// repo's (repo path first => repo wins a name collision, since pi's loadSkills is first-path-wins).
+	const globalPersona = readIfExists(`${globalPiDir}/APPEND_SYSTEM.md`);
+	const globalSkills = `${globalPiDir}/skills`;
+	const globalExtensions = `${globalPiDir}/extensions`;
 	// Only a local job carries an /outbox mount; a github job has none, so its prompt never
 	// pays for the protocol. Evaluated ONCE here at loader build, not per message, so the
 	// assembled prompt is byte-identical across turns (CONST-PERSONA-IN-CACHED-PREFIX).
@@ -65,9 +80,16 @@ export function buildResourceLoader({
 		noContextFiles: true,
 		noSkills: true,
 		noExtensions: true,
-		additionalSkillPaths: [`${jobPiDir}/skills`],
-		additionalExtensionPaths: [`${jobPiDir}/extensions`],
-		appendSystemPromptOverride: () => [guardrails, outboxProtocol, projectPersona].filter(Boolean),
+		// Repo path FIRST so a repo skill overrides a global one of the same name (first-path-wins).
+		additionalSkillPaths: [`${jobPiDir}/skills`, ...(existsSync(globalSkills) ? [globalSkills] : [])],
+		// Global overlay extensions are fail-closed: loaded ONLY when the operator armed them
+		// (PI_GLOBAL_ALLOW_EXTENSIONS=1) AND the dir is present. They run code against adversarial input
+		// with open egress, so arming is a second, explicit decision beyond mounting the overlay.
+		additionalExtensionPaths: [
+			`${jobPiDir}/extensions`,
+			...(allowGlobalExtensions && existsSync(globalExtensions) ? [globalExtensions] : []),
+		],
+		appendSystemPromptOverride: () => [guardrails, outboxProtocol, globalPersona, projectPersona].filter(Boolean),
 	});
 }
 

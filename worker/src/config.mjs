@@ -62,6 +62,25 @@ function delimitedList(raw) {
 		.filter((s) => s.length > 0);
 }
 
+// A comma-separated list of NAMES (env var names cannot contain commas, so unlike a path list this
+// splits on ",", not the OS path delimiter). Used by PI_FORWARD_ENV.
+function commaList(raw) {
+	return (raw ?? "")
+		.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+}
+
+// The operator's global pi overlay dir (REQ-GLOBAL-PI-OVERLAY). Unset/empty = feature off. When set it
+// must EXIST at boot -- a typo pointing at nothing would silently drop the operator's whole setup on
+// every job, so fail loud like every other config error rather than degrade to nothing.
+function resolveGlobalPiDir(env, fileExists) {
+	const dir = env.PI_GLOBAL_PI_DIR;
+	if (dir === undefined || dir === "") return null;
+	if (!fileExists(dir)) throw configError(`PI_GLOBAL_PI_DIR does not exist: ${dir}`);
+	return dir;
+}
+
 /**
  * Parse the worker's config from `env` (default process.env). All defaults are conservative:
  * spend controls (`PI_DAILY_CAP`, `PI_MAX_TURNS`) exist to bound money, so they default low, and a
@@ -84,6 +103,9 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		maxTokens: optionalBoundedInt(env, "PI_MAX_TOKENS", 1), // issue #25; null = per-job token budget disabled (lagging in-run backstop)
 		dailyTokenCap: optionalBoundedInt(env, "PI_DAILY_TOKEN_CAP", 1), // issue #25; null = daily token counter disabled (check-AFTER, host-side)
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
+		globalPiDir: resolveGlobalPiDir(env, fileExists), // REQ-GLOBAL-PI-OVERLAY: operator's ~/.pi/agent subset, :ro-mounted; null = off
+		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1", // fail-closed: overlay extensions load only when armed
+		forwardEnv: commaList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")
 		pauseWindowsFile: env.PI_PAUSE_WINDOWS_FILE ?? null, // REQ-SCOPED-PAUSE-WINDOWS: per-folder/repo timed pause; null = no scoped pauses

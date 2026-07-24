@@ -69,6 +69,28 @@ test("dispatchRunRoots defaults to [] and empty/whitespace yields [] (fail-close
 	assert.deepEqual(loadConfig({ PI_DISPATCH_RUN_ROOTS: `   ${delimiter}  ` }).dispatchRunRoots, []);
 });
 
+test("globalPiDir: unset is null; set-but-missing fails loud; set-and-existing returns the path", () => {
+	assert.equal(loadConfig({}).globalPiDir, null);
+	assert.throws(
+		() => loadConfig({ PI_GLOBAL_PI_DIR: "/no/such/dir" }, { fileExists: () => false }),
+		(e) => e.piDispatchConfig === true,
+		"a PI_GLOBAL_PI_DIR that does not exist must refuse boot, not silently drop the operator's setup",
+	);
+	assert.equal(loadConfig({ PI_GLOBAL_PI_DIR: "/opt/pi-global" }, { fileExists: () => true }).globalPiDir, "/opt/pi-global");
+});
+
+test("allowGlobalExtensions is fail-closed: only the exact string '1' arms it", () => {
+	assert.equal(loadConfig({}).allowGlobalExtensions, false);
+	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "1" }).allowGlobalExtensions, true);
+	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "true" }).allowGlobalExtensions, false);
+	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "0" }).allowGlobalExtensions, false);
+});
+
+test("forwardEnv is a comma list of names -- trimmed, empties dropped, default []", () => {
+	assert.deepEqual(loadConfig({}).forwardEnv, []);
+	assert.deepEqual(loadConfig({ PI_FORWARD_ENV: "MY_KEY, OTHER ,,THIRD" }).forwardEnv, ["MY_KEY", "OTHER", "THIRD"]);
+});
+
 test("run-history env overrides logsDir, captureJobLogs, and logRetentionDays", () => {
 	const c = loadConfig({ PI_LOGS_DIR: "/x", PI_CAPTURE_JOB_LOGS: "1", PI_LOG_RETENTION_DAYS: "7" });
 	assert.equal(c.logsDir, "/x");

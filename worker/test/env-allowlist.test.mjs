@@ -86,3 +86,18 @@ test("an unconfigured provider throws a config-tagged error (=> pre-spend refusa
 		(e) => e.piDispatchConfig === true,
 	);
 });
+
+test("PI_GLOBAL_ALLOW_EXTENSIONS is forwarded only when armed (fail-closed)", { skip }, () => {
+	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
+	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: true }).PI_GLOBAL_ALLOW_EXTENSIONS, "1");
+	assert.equal(buildContainerEnv(base).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "unset by default -> overlay extensions stay dormant");
+});
+
+test("PI_FORWARD_ENV forwards ONLY the named vars that are present, never a pass-through", { skip }, () => {
+	const host = { ...HOST, MY_PROVIDER_KEY: "sk-custom", UNLISTED: "nope" };
+	const env = buildContainerEnv({ provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: host, forwardEnv: ["MY_PROVIDER_KEY", "ABSENT_VAR"] });
+	assert.equal(env.MY_PROVIDER_KEY, "sk-custom", "a listed, present var is forwarded (a custom provider's key)");
+	assert.equal(env.ABSENT_VAR, undefined, "a listed but unset var is skipped, never forwarded as empty");
+	assert.equal(env.UNLISTED, undefined, "an unlisted host var is never forwarded");
+	assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined, "the stray host secret still does not ride along");
+});

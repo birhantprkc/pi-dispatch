@@ -226,7 +226,14 @@ export async function startWorker(
 		pauseUntil: (job, now) => pauseUntilMs(pauseWindows.current, job, now),
 		deps: {
 			collectChain,
-			runContainer: makeRunContainer({ image: config.jobImage, hostEnv: env, openJobLog }),
+			runContainer: makeRunContainer({
+				image: config.jobImage,
+				hostEnv: env,
+				openJobLog,
+				globalPiDir: config.globalPiDir, // REQ-GLOBAL-PI-OVERLAY: :ro overlay mount when configured
+				allowGlobalExtensions: config.allowGlobalExtensions,
+				forwardEnv: config.forwardEnv,
+			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				resolveDefaultBranchSha: host.resolveDefaultBranchSha,

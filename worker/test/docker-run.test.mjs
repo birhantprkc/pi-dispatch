@@ -40,6 +40,14 @@ test("a github job (no outboxDir) emits no /outbox mount -- the request channel 
 	assert.ok(!args.some((a) => a.includes(":/outbox")), "a github job must have no /outbox mount");
 });
 
+test("the operator global overlay mounts /opt/pi-global:ro only when configured", () => {
+	const on = buildDockerRunArgs({ ...base, globalPiDir: "/srv/pi-global" });
+	assert.ok(on.includes("/srv/pi-global:/opt/pi-global:ro"), "overlay must mount at /opt/pi-global, read-only");
+	assert.ok(!on.some((a) => a.includes("/opt/pi-global") && !a.endsWith(":ro")), "the overlay mount must be :ro");
+	const off = buildDockerRunArgs({ ...base, globalPiDir: undefined });
+	assert.ok(!off.some((a) => a.includes("/opt/pi-global")), "no overlay mount when PI_GLOBAL_PI_DIR is unset");
+});
+
 test("env is an explicit -e NAME=VALUE allowlist, never a pass-through or --env-file", () => {
 	const args = buildDockerRunArgs(base);
 	assert.ok(args.includes("-e") && args.includes("ANTHROPIC_API_KEY=sk-real"));
