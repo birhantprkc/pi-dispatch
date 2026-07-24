@@ -1,0 +1,81 @@
+# Cut a GitHub Release for the WHOLE pi-dispatch tool when the ROOT package.json version changes on main.
+#
+# This is distinct from release.yml, which PUBLISHES the @edgehero/pi-dispatch-admin npm package (and tags
+# its own releases admin-v*). This workflow owns the v* tags = the product's releases. To cut one, bump
+# `version` in the root package.json in a PR; it is idempotent (skips when the tag already exists), so an
+# unrelated root package.json edit — a dependency bump, a script tweak — is a no-op.
+#
+# main is branch-protected (PR + 1 approving review), so a push here is an already-approved merge — nothing
+# here merges anything (CONST-MERGE-NEVER-AUTOMATIC). No secret is required to tag a release; the optional
+# repo secret ANTHROPIC_API_KEY enables AI-written notes, and without it the release falls back to a plain
+# commit list. Optional repo variable RELEASE_MODEL (default: claude-sonnet-5).
+
+name: repo-release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json" # the ROOT one only (a bare path does not match nested workspace package.json files)
+      - ".github/workflows/repo-release.yml"
+      - ".github/scripts/release-notes.mjs"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create tags + releases
+
+concurrency:
+  group: repo-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for the release-notes commit range
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19"
+
+      - name: Resolve version + decide release
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(node -p "require('./package.json').version")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "release=no" >> "$GITHUB_OUTPUT"; echo "release v$V already exists — skip"
+          else
+            echo "release=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release notes
+        if: steps.v.outputs.release == 'yes'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
+        run: |
+          # Range since the previous tool release (v*); the whole repo, not just one workspace.
+          PREV=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          RANGE=${PREV:+$PREV..HEAD}
+          COMMITS=$(git log $RANGE --no-merges --pretty=format:'- %s' | head -n 80)
+          if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.v.outputs.version }}" \
+               node .github/scripts/release-notes.mjs > /tmp/notes.md 2>/tmp/notes.err; then
+            echo "release notes: AI-written"
+          else
+            echo "release notes: AI unavailable ($(head -n1 /tmp/notes.err 2>/dev/null)) — using commit list"
+            { echo "### Changes"; echo; printf '%s\n' "$COMMITS"; } > /tmp/notes.md
+          fi
+
+      - name: Create GitHub Release
+        if: steps.v.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.v.outputs.version }}" \
+            --title "pi-dispatch v${{ steps.v.outputs.version }}" \
+            --notes-file /tmp/notes.md
