@@ -4,22 +4,25 @@
 
 # @edgehero/pi-dispatch-admin
 
-The **operator console** for [**pi-dispatch**](https://github.com/edgehero/pi-dispatch) — a
-[pi](https://github.com/earendil-works/pi) extension that adds a `/dispatch` command (a live TUI overlay +
-model-callable tools) for running the pi coding agent as a self-hosted service.
+**The operator console for [pi-dispatch](https://github.com/edgehero/pi-dispatch) — run the [pi](https://github.com/earendil-works/pi) coding agent as a self-hosted service, and drive the whole thing from `/dispatch`.**
 
-> This is a **companion** to a running pi-dispatch deployment. It reads that deployment's Valkey queue and
-> run-history — install it in your own pi, alongside the pi-dispatch service. On its own it will show
-> "queue unreachable".
+pi is a superb coding agent, but it has no job queue, no spend limit, and — by its own README — no permission system. **pi-dispatch** is the operational layer that adds them: every job runs in an ephemeral, container-isolated box; spend is capped *before* a single token is spent; and the same job runs whether you trigger it from the CLI, a cron schedule, or a GitHub issue. **This package is the pi extension you install to run that deployment.**
 
-## What it gives you
+> **Companion, not standalone.** It reads your pi-dispatch deployment's queue and run history — point it at yours with `VALKEY_URL`, `PI_LOGS_DIR`, and friends. On its own it just says "queue unreachable."
 
-- A `/dispatch` overlay: live queue state, day/week/month **spend meters** + a daily token counter, run
-  history with per-job token & cost, and a unified **triggers** pane (cron / label / comment / pull_request).
-- **Editable** triggers and **scheduled pause windows** ("quiet hours" per folder/repo), applied live.
-- **Confirm-gated** model tools so an agent can operate the deployment (change limits, manage triggers/pauses)
-  with **a human approving each change** — fail-closed when no operator is present.
-- The bundled `operate-pi-dispatch` **skill** documenting those human-in-the-loop gates.
+## `/dispatch` — the whole deployment in one command
+
+- **Live panel.** Queue and worker state, day/week/month **spend meters** + a daily token counter, and a run-history table with per-job token & cost.
+- **Triggers, editable in place.** cron / label / comment / pull_request, with colored drill-ins showing what fires each one, what it runs, and its trust model — added, edited, and deleted live, no restart.
+- **Scheduled pause windows.** "Quiet hours" per folder or repo: defer a scope's runs **between certain times** — recurring daily, weekday- and date-bounded, timezone-aware — and resume automatically. Deferred, never dropped, at zero budget cost.
+- **AI-operable, with a human gate.** Model-callable tools let an agent change limits and manage triggers and pause windows — but **every write pops an operator confirmation the model can't answer**, and is refused when no operator is present. The bundled `operate-pi-dispatch` skill teaches the agent to use those gates.
+- **Logs stay put.** Raw container output renders only in the overlay viewer, never into model context.
+
+## Why run pi this way
+
+- **The container is the boundary.** Every job is ephemeral, `--cap-drop=ALL`, non-root, instructions mounted read-only. That's pi's missing permission system, enforced by Docker.
+- **Spend is bounded before tokens.** A per-job turn budget plus daily/weekly/monthly caps, checked before a container even starts. A runaway costs you a refusal, not a bill.
+- **Three triggers, one job.** CLI, cron, or a GitHub issue/PR — same queue, same box, same budget. Cron is the unattended one: recurring work on your own hardware, in an image you control.
 
 ## Install
 
@@ -27,11 +30,8 @@ model-callable tools) for running the pi coding agent as a self-hosted service.
 pi install npm:@edgehero/pi-dispatch-admin
 ```
 
-Then run pi and use `/dispatch`. Point it at your deployment with `VALKEY_URL` / `PI_LOGS_DIR` /
-`PI_SETTINGS_FILE` / `PI_TRIGGERS_FILE` / `PI_PAUSE_WINDOWS_FILE` (the same values your pi-dispatch worker uses).
+Then run pi and open `/dispatch`. Set `VALKEY_URL` / `PI_LOGS_DIR` / `PI_SETTINGS_FILE` / `PI_TRIGGERS_FILE` / `PI_PAUSE_WINDOWS_FILE` to match your deployment.
 
 ## The service
 
-The queue, worker, container image, and GitHub receiver live in the main repo:
-**https://github.com/edgehero/pi-dispatch** — start there. MIT. Read
-[`SECURITY.md`](https://github.com/edgehero/pi-dispatch/blob/main/SECURITY.md) before you rely on it.
+The queue, worker, container image, and GitHub receiver live in the main repo — **start there:** **https://github.com/edgehero/pi-dispatch**. MIT, self-hosted. Read [`SECURITY.md`](https://github.com/edgehero/pi-dispatch/blob/main/SECURITY.md) before you rely on it — it states plainly what is and isn't defended.
