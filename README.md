@@ -32,15 +32,20 @@ system. **pi-dispatch is exactly that missing operational layer, and nothing els
 You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic).
 
 ```bash
-# 1. Build the job image (once)
-docker build -f image/Dockerfile -t pi-job:latest .
+# 1. Get the job image — pull the prebuilt one (fast)...
+docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest
+#    ...or bake your own toolchain into it instead (slower, fully yours):
+#    docker build -f image/Dockerfile -t pi-job:latest .
 
 # 2. Start Valkey (the durable job queue)
 docker compose -f deploy/docker-compose.yml up -d
 
-# 3. Configure
-cp .env.example .env         # then set ANTHROPIC_API_KEY (or your provider's key)
+# 3. Install, scaffold, and check your setup
 npm ci
+npx pi-dispatch init         # writes .env + triggers.json + pause-windows.json (never clobbers)
+#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
+#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
+npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the image, and your provider key
 
 # 4. Run the worker in one terminal
 npx pi-dispatch worker       # (or: npm --workspace worker start)
@@ -48,6 +53,9 @@ npx pi-dispatch worker       # (or: npm --workspace worker start)
 # 5. Queue a job from another
 npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 ```
+
+> **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
+> toolchain in (the edge cron/visual flows rely on), build `image/Dockerfile` yourself — step 1's second form.
 
 > **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
 > which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It
@@ -76,6 +84,32 @@ flowchart LR
 A container boundary, spend bounded *before* a container starts, nothing dropped — that is what this path
 enforces. Read [`SECURITY.md`](SECURITY.md) before you rely on it: it states plainly what is and is not
 defended.
+
+## Reuse your existing pi setup
+
+Already run `pi`? Give every job your host setup — custom models, global skills, a global persona — **layered
+under each repo's own `.pi/`** (the repo still wins). Works with the pulled image; it's a read-only mount, not
+a rebuild.
+
+```bash
+pi-dispatch import-pi          # stage a credential-free copy of ~/.pi/agent into ./pi-global
+# then set PI_GLOBAL_PI_DIR=/abs/path/to/pi-global in .env, and:
+pi-dispatch doctor             # verifies the overlay carries no credential
+```
+
+The overlay is mounted `/opt/pi-global:ro` into every container. Skills merge with the repo's (a repo skill
+of the same name overrides the global one); the prompt layers `guardrails → global persona → repo persona`,
+the safety floor always first and unremovable. `import-pi` **refuses** a `models.json` with a literal key and
+**never** copies `auth.json` — your credential stays in the environment. Extensions are opt-in and armed
+separately (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS=1`) because they run code against adversarial
+input; the admin extension is hard-blocked. Full reference: [`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
+
+**Already logged into pi? The key just works — by default.** When the provider key is absent from the
+worker's environment, the worker reads it **host-side** from `~/.pi/agent/auth.json` and env-injects it into
+the job — a host-side read of a host-held secret, never a file mounted into the container. Nothing to set;
+`PI_AUTH_FROM_PI=0` forces env-only if you'd rather fail loudly on a missing env key. **API-key logins only**:
+an OAuth/subscription login (`pi login`) is refused — those tokens expire and can't be refreshed in the
+container, and a subscription isn't the credential for an unattended service; use an API key with a spend limit.
 
 ## Run as a service
 
@@ -161,9 +195,20 @@ worker's **boot reaper** clears on the next start, rather than draining cleanly.
 
 The admin surface — the dashboard and command transcript shown at the top of this README — is a **pi
 extension** in [`admin/`](admin/) that loads into *your own* interactive pi session — no daemon, no web
-app, **no network port at all**. Load it with `pi -e admin/src/index.ts` from this checkout, add that path
-to the `"extensions"` array in `~/.pi/agent/settings.json`, or just run pi inside this checkout: the
-in-repo `.pi/extensions` shim auto-loads once you've trusted the project.
+app, **no network port at all**.
+
+**Install it through pi** — the published package, then open the panel:
+
+```bash
+pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
+```
+
+Two other ways to load it: from a clone, the in-repo `.pi/extensions` shim auto-loads once you've trusted
+the project; or point pi at the source with `pi -e admin/src/index.ts` (add that path to the `"extensions"`
+array in `~/.pi/agent/settings.json` to make it permanent). To operate a **live** deployment, give the pi
+session the same `VALKEY_URL`, `PI_SETTINGS_FILE`, `PI_TRIGGERS_FILE`, `PI_PAUSE_WINDOWS_FILE`, and
+`PI_LOGS_DIR` the worker uses — the panel reads and writes those same files and queue, so both act on one
+deployment.
 
 Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
 queue in place, `↑`/`↓` to move across the triggers and runs, `Enter` to drill into either. **Triggers are

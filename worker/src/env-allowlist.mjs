@@ -1,4 +1,13 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { findEnvKeys } from "@earendil-works/pi-ai/compat";
+
+function configError(message) {
+	const error = new Error(message);
+	error.piDispatchConfig = true;
+	return error;
+}
 
 /**
  * Build the EXACT environment a job container receives. Never a pass-through.
@@ -23,19 +32,81 @@ export function providerKeyVars(provider, hostEnv) {
 }
 
 /**
+ * Resolve the provider credential(s) to inject, as `{ VAR_NAME: value }`.
+ *
+ * Primary source: the worker's own environment, by pi's expected variable name(s) (`findEnvKeys`).
+ * Fallback (ON by default; `PI_AUTH_FROM_PI=0` forces env-only): when the env has none, read the credential
+ * from the host's pi `auth.json`. This is a HOST-SIDE read of a host-held secret, injected via env exactly
+ * like the env path — never a credential file mounted into the container (`CONST-TOKEN-SCOPED-PER-JOB`).
+ * API-key credentials only; an OAuth/subscription login is refused (it expires, the container cannot refresh
+ * it, and it is not the credential for an unattended service). Throws a config-tagged error (pre-spend
+ * refusal) when neither source yields a credential.
+ */
+export function resolveProviderCredential({ provider, hostEnv, authFromPi = false, agentDir, readFile = readFileSync }) {
+	const envNames = providerKeyVars(provider, hostEnv);
+	if (envNames && envNames.length > 0) {
+		return Object.fromEntries(envNames.map((name) => [name, hostEnv[name]]));
+	}
+	if (authFromPi) {
+		const { name, value } = credentialFromPiAuth(provider, agentDir ?? defaultAgentDir(hostEnv), readFile);
+		return { [name]: value };
+	}
+	throw configError(`provider ${provider} has no configured credential in the worker environment`);
+}
+
+function defaultAgentDir(hostEnv) {
+	// pi's getAgentDir() default, resolved without importing the whole pi SDK into the worker.
+	return hostEnv.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+}
+
+function credentialFromPiAuth(provider, agentDir, readFile) {
+	const path = join(agentDir, "auth.json");
+	let auth;
+	try {
+		auth = JSON.parse(readFile(path, "utf8"));
+	} catch {
+		throw configError(`no credential for provider "${provider}": not in the worker environment, and no pi login at ${path} — set the key in .env, or run \`pi login\``);
+	}
+	const cred = auth?.[provider];
+	if (!cred) throw configError(`no credential for provider "${provider}": not in the worker environment, and ${path} has no "${provider}" login — set the key in .env, or run \`pi login\``);
+	if (cred.type === "oauth") {
+		throw configError(
+			`the pi login for "${provider}" is an OAuth/subscription token, which cannot power an unattended service (it expires and the container cannot refresh it). Configure an API key — with a provider-side spend limit — instead.`,
+		);
+	}
+	if (cred.type !== "api_key" || !cred.key) throw configError(`unsupported pi credential for "${provider}" in ${path} — set an API key in .env`);
+	const name = resolveEnvName(provider, cred);
+	if (!name) {
+		throw configError(`could not determine the environment variable pi expects for provider "${provider}" — set it in the worker environment manually`);
+	}
+	return { name, value: cred.key };
+}
+
+/**
+ * The env var name pi reads this provider's key from. Discovered through pi's OWN `findEnvKeys` (the
+ * oracle) rather than a hand-maintained provider→var table that would drift: try the credential's own
+ * `env` hint plus the conventional `<PROVIDER>_API_KEY`/`_KEY`, and forward the one pi recognizes.
+ */
+function resolveEnvName(provider, cred) {
+	const upper = provider.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+	const candidates = [cred.env, `${upper}_API_KEY`, `${upper}_KEY`].filter((s) => typeof s === "string" && s.length > 0);
+	const synthetic = Object.fromEntries(candidates.map((name) => [name, cred.key]));
+	const recognized = findEnvKeys(provider, synthetic);
+	return recognized?.[0] ?? null;
+}
+
+/**
  * Assemble the container env. `hostEnv` is the worker's process.env; `job` carries the resolved
  * config and the per-job scoped token (GitHub-backed jobs only).
  *
  * Throws if the provider is not configured -- a deterministic misconfiguration the caller maps to
  * a pre-spend refusal, never a launched-then-failed container.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv }) {
-	const keyVars = providerKeyVars(provider, hostEnv);
-	if (!keyVars || keyVars.length === 0) {
-		const error = new Error(`provider ${provider} has no configured credential in the worker environment`);
-		error.piDispatchConfig = true;
-		throw error;
-	}
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv, allowGlobalExtensions = false, forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
+	// The provider credential(s), by pi's expected variable name(s) -- from the worker env, or (when
+	// PI_AUTH_FROM_PI is set and the env has none) host-side from pi's auth.json. Throws (config) if
+	// neither source yields one, which the processor turns into a pre-spend refusal.
+	const credEnv = resolveProviderCredential({ provider, hostEnv, authFromPi, agentDir, readFile });
 
 	const env = {
 		PI_PROVIDER: provider,
@@ -50,12 +121,20 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
 		PLAYWRIGHT_MCP_BROWSER: "chromium",
 		PLAYWRIGHT_MCP_SANDBOX: "false",
+		// Arms loading of the global overlay's extensions in the runner (REQ-GLOBAL-PI-OVERLAY). Fail-closed:
+		// only set when the operator opted in, so an unset value keeps overlay extensions dormant.
+		PI_GLOBAL_ALLOW_EXTENSIONS: allowGlobalExtensions ? "1" : undefined,
 	};
 
-	// The provider credential(s), by their real names, copied from the host by EXACT name. Passing
-	// the value under pi's expected variable name is what lets pi's own auth resolution find it.
-	for (const name of keyVars) {
-		env[name] = hostEnv[name];
+	// The provider credential(s), under pi's expected variable name(s), so pi's own auth resolution finds them.
+	Object.assign(env, credEnv);
+
+	// Operator-declared extra vars (PI_FORWARD_ENV), forwarded by EXACT name -- the allowlist
+	// no-broad-env-into-container prescribes, not a host pass-through. This is how a CUSTOM provider's
+	// key (one pi's findEnvKeys table does not know) reaches the container. A name whose value is unset
+	// on the host is skipped, never forwarded as empty.
+	for (const name of forwardEnv) {
+		if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
 	}
 
 	// GitHub-backed jobs only. Local-folder jobs have no token (CONST-TOKEN-SCOPED-PER-JOB is

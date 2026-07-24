@@ -74,8 +74,11 @@ that always fires is one nobody reads.
   permissions of the user and process that launched it."* … *"If you need stronger boundaries,
   containerize or sandbox Pi."*
 - **Traces to**: `INT-CONTAINER-RUNTIME-CONTRACT`, `CONST-TOKEN-SCOPED-PER-JOB`
-- **Acceptance**: Given any job, the agent has no filesystem path to the host outside the two declared
-  mounts, and the container is gone after the run.
+- **Acceptance**: Given any job, the agent has no filesystem path to the host outside the declared mounts
+  in `INT-CONTAINER-RUNTIME-CONTRACT` — `/job:ro`, `/workspace:rw`, `/outbox:rw` (local only), and
+  `/opt/pi-global:ro` (the operator global overlay, only when configured; `REQ-GLOBAL-PI-OVERLAY`) — every
+  one operator- or worker-supplied, none host-wide, and only `/workspace`/`/outbox` writable; and the
+  container is gone after the run.
 
 ## CONST-NO-CONTEXT-FILES-MANDATORY
 

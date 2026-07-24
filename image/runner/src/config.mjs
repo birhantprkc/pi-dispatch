@@ -20,6 +20,10 @@ export function parseRunnerEnv(env) {
 		model,
 		maxTurns,
 		maxTokens,
+		// REQ-GLOBAL-PI-OVERLAY: arm loading of the global overlay's extensions. Fail-closed -- anything
+		// but the exact string "1" leaves overlay extensions dormant. Not a configError: an unset flag is
+		// the normal, safe state, not a misconfiguration.
+		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1",
 		retry: {
 			maxRetries: parsePositiveInt(env, "PI_RETRY_MAX", 2),
 			baseDelayMs: parsePositiveInt(env, "PI_RETRY_BASE_MS", 2000),

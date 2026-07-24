@@ -618,7 +618,10 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   - **The overlay may never carry persona or hard rules.** It tunes task/config knobs only; the immutable
     rules stay baked. This is the `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE` boundary applied to settings:
     mutable = task/config tuning, immutable = hard rules, and the split falls on the risk, not on the
-    filesystem.
+    filesystem. This bar is on **this admin-editable runtime channel** — the one an admin-surface compromise
+    can bend. It does not constrain deploy-time operator config: the global pi overlay
+    (`DES-OPERATOR-GLOBAL-OVERLAY`) *may* carry a persona layer, because it is operator-authored `:ro` config
+    at the same trust level as baking, not a runtime-mutable knob.
   - **A file, not Redis**, so the live configuration is inspectable, hand-editable with an editor,
     survives a Valkey flush, and does not become a second opaque state store. The shared-filesystem
     assumption it relies on is true by construction: `DES-WORKER-ON-HOST` puts the worker and the admin
@@ -768,8 +771,41 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   - *Everything admin-editable including hard rules* — makes `CONST-MERGE-NEVER-AUTOMATIC` and
     `CONST-ISSUE-TEXT-IS-DATA` runtime-mutable state. They are constitutional precisely because they are
     not negotiable at runtime.
+- **Clarification (operator deploy-time overlay)**: "The admin surface may never touch the persona" governs
+  the **admin-editable runtime channel** — the settings overlay (`DES-RUNTIME-SETTINGS-FILE-OVERLAY`) — which
+  an attacker who reaches the admin surface could bend. It does **not** bar the operator from supplying a
+  persona at deploy time. The global pi overlay (`DES-OPERATOR-GLOBAL-OVERLAY`) is operator-authored,
+  `:ro`-mounted deploy-time config — the **same trust class as baking `~/.pi/agent/APPEND_SYSTEM.md` into the
+  image** — and may carry a persona layer *under* the immutable floor. Mutability, not the persona/flow label,
+  is the boundary: the baked `HARD_RULES.md` stays first and unremovable regardless.
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-MERGE-NEVER-AUTOMATIC`, `INT-CONTAINER-JOB-INPUTS`,
-  `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `DES-PANEL-SEPARATE-FROM-RECEIVER`
+  `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `DES-OPERATOR-GLOBAL-OVERLAY`, `DES-PANEL-SEPARATE-FROM-RECEIVER`
+
+## DES-OPERATOR-GLOBAL-OVERLAY
+
+- **Decision**: Reuse an operator's existing host `pi` setup across every job through a single **global
+  overlay dir** (`PI_GLOBAL_PI_DIR`), bind-mounted `/opt/pi-global:ro` into each container and layered as a
+  new trust **tier 2** between the baked floor and the per-repo `.pi/`. It supplies custom models
+  (`models.json`), global skills, and a global persona; the runner reads them (models path selection,
+  `additionalSkillPaths` with the repo path first, a global persona entry in `appendSystemPromptOverride`).
+  A host-side `pi-dispatch import-pi` stages the **credential-free** subset of `~/.pi/agent` and `doctor`
+  re-verifies it. Extensions are a separate, armed opt-in (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS`),
+  with the admin extension hard-blocked. A runtime **mount**, not a rebuild, so it works with the pulled image.
+- **Why**: Four trust tiers, each refining but never removing the one above — baked floor (immutable) →
+  operator overlay (deploy-time, operator-authored) → per-repo `.pi/` (trusted-by-merge) → adversarial input.
+  The overlay sits at the operator's own trust level, which is why it may carry a persona (unlike the
+  admin-editable settings overlay) yet must stay `:ro` and credential-free (it rides into an adversarial-input
+  container: `CONST-TOKEN-SCOPED-PER-JOB`). Skills are **first-path-wins** in pi, so listing the repo path
+  first makes repo skills override global ones — the "project refines global" semantics operators expect.
+- **Rejected**:
+  - *Copy `~/.pi` wholesale* — drags `auth.json` and MCP-credentialed extensions into the box; and pi's
+    `noSkills/noExtensions/noContextFiles` mean host-global *discovery* is off anyway, so most of it is inert.
+  - *Bake the overlay into the image* — a per-operator image defeats the pulled prebuilt image; the mount
+    delivers the same content without a rebuild.
+  - *Load overlay extensions by default* — arbitrary code against adversarial input with open egress; arming
+    it must be a second, explicit decision, and the admin extension must never be among them.
+- **Traces to**: `REQ-GLOBAL-PI-OVERLAY`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SDK-SESSION-OPTIONS`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`
 
 ## DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS
 

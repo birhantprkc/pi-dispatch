@@ -169,8 +169,22 @@ Stated openly rather than discovered later:
   provider needs. In particular `ANTHROPIC_OAUTH_TOKEN` silently takes precedence over
   `ANTHROPIC_API_KEY`, so a stray variable in the host environment can quietly redirect which credential
   a job spends.
+- **By default the worker sources the provider key from pi's `~/.pi/agent/auth.json` when the env has none.**
+  It is a host-side read env-injected into the container — never a credential file mounted in — and accepts
+  **API-key** logins only; an OAuth/subscription login is refused. The env always wins when set; set
+  `PI_AUTH_FROM_PI=0` to force env-only (fail loudly on a missing env key rather than fall back to a pi login).
+  Prefer an API key with a provider-side spend limit for an unattended service; a subscription token is
+  neither refreshable in the container nor intended for automation.
 - **Treat `.pi/` on your default branch as production code**, because it is: it goes into the agent's
   system prompt. Review changes to it with the same care as `.github/workflows/`.
+- **The global pi overlay (`PI_GLOBAL_PI_DIR`) is production code too**, and it must be credential-free. It
+  is mounted `:ro` into every job — a container that runs adversarial input — so a secret in it is a secret
+  in the box. Stage it with `pi-dispatch import-pi` (it refuses a `models.json` with a literal key and never
+  copies `auth.json`) and let `pi-dispatch doctor` re-check it; the provider key belongs in the environment,
+  never a mounted file. Overlay **extensions run arbitrary code against adversarial input with open network
+  egress** and are not scanned for secrets: keep `PI_GLOBAL_ALLOW_EXTENSIONS` unset until you have vetted
+  every one, and never place the admin extension in the overlay (it can enqueue paid jobs — a recursion
+  vector; `import-pi` blocks it).
 - **The admin surface is not a network service.** It is a pi extension in your own terminal session plus
   a `settings.json` file — it binds no port. Whoever can run pi with the extension loaded, or write
   `PI_SETTINGS_FILE`, holds operator power: the same trust as shell access on the host. Treat it that way.

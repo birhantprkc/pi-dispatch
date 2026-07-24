@@ -47,7 +47,12 @@ async function main() {
 	// ships, REQ-UPSTREAM-CONTRACT-TESTS fires on the pin bump and this is the code that changes.
 	// See OQ-005.
 	const authStorage = AuthStorage.create(`${agentDir}/auth.json`);
-	const modelRegistry = ModelRegistry.create(authStorage, `${agentDir}/models.json`);
+	// Prefer the operator's global overlay models.json (REQ-GLOBAL-PI-OVERLAY) when the :ro overlay is
+	// mounted -- this is how a CUSTOM provider/model becomes resolvable. The credential still comes from
+	// env -> auth.json; the overlay models.json is definitions only (import-pi refuses a literal key).
+	const GLOBAL_MODELS = "/opt/pi-global/models.json";
+	const modelsPath = existsSync(GLOBAL_MODELS) ? GLOBAL_MODELS : `${agentDir}/models.json`;
+	const modelRegistry = ModelRegistry.create(authStorage, modelsPath);
 
 	// Pin the model explicitly. With `model` omitted, pi picks from settings and provider defaults
 	// -- nondeterministic across images, and it silently changes cost per job.
@@ -61,7 +66,7 @@ async function main() {
 	// project's .pi/settings.json cannot override our spend controls.
 	const settingsManager = SettingsManager.inMemory({ retry: { enabled: true, ...cfg.retry } });
 
-	const resourceLoader = await buildLoadedResourceLoader({ settingsManager });
+	const resourceLoader = await buildLoadedResourceLoader({ settingsManager, allowGlobalExtensions: cfg.allowGlobalExtensions });
 
 	const { session } = await createAgentSession({
 		cwd: WORKSPACE,

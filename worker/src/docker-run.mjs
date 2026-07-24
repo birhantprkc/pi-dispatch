@@ -27,6 +27,7 @@ export const ISOLATION_FLAGS = [
  * @param jobDir     host path to the /job inputs dir (contains prompt.md and pi/); mounted /job:ro
  * @param workspace  host path to the fresh clone / local folder (mounted /workspace:rw)
  * @param outboxDir  host path to the /outbox chain-request dir (local jobs only); mounted /outbox:rw
+ * @param globalPiDir host path to the operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY); mounted /opt/pi-global:ro
  * @param name       container name (for `docker stop` at the timeout)
  * @param memory     e.g. "4g"; cpus e.g. "2"
  * @param extraFlags escape hatch for a Linux-only --user uid:gid on a bind-mounted local folder
@@ -37,6 +38,7 @@ export function buildDockerRunArgs({
 	jobDir,
 	workspace,
 	outboxDir,
+	globalPiDir,
 	name,
 	memory = "4g",
 	cpus = "2",
@@ -64,6 +66,11 @@ export function buildDockerRunArgs({
 	// (DES-WORKER-ON-HOST). github jobs pass no outboxDir, so the request channel does not exist for
 	// them -- an untrusted issue author cannot chain (INT-OUTBOX-CONTRACT).
 	if (outboxDir) args.push("-v", `${outboxDir}:/outbox`);
+
+	// The operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY): custom models, global skills, a global
+	// persona, layered UNDER each repo's own .pi/. Read-only -- it is operator-authored deploy-time config,
+	// the same trust class as the baked floor, but the agent still must not rewrite it. Both job kinds.
+	if (globalPiDir) args.push("-v", `${globalPiDir}:/opt/pi-global:ro`);
 
 	args.push(image);
 	return args;
