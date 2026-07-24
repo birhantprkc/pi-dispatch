@@ -301,3 +301,43 @@ test("managePauses: Delete removes the picked window on confirm", async () => {
   await handleDashboardAction({ action: "managePauses" }, { pauseWindowsPath: path }, { ui });
   assert.deepEqual(read(path).windows.map((w) => w.scope), ["*"], "only the picked window is removed");
 });
+
+test("dispatch_pause_edit: an approved partial edit changes one field and keeps the rest", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00", tz: "Europe/Amsterdam", days: ["mon", "tue"] }] });
+  const { ctx, shown } = toolCtx({ answer: true });
+  const out = textOf(await toolByName("dispatch_pause_edit").execute("id", { index: 0, to: "07:00" }, undefined, undefined, ctx));
+  assert.equal(out.applied, true);
+  const w = read(path).windows[0];
+  assert.equal(w.to, "07:00", "the changed field");
+  assert.equal(w.from, "22:00", "unchanged field kept");
+  assert.equal(w.tz, "Europe/Amsterdam", "unchanged field kept");
+  assert.deepEqual(w.days, ["mon", "tue"], "unchanged field kept");
+  assert.match(shown[0].message, /06:00/);
+  assert.match(shown[0].message, /07:00/);
+});
+
+test("dispatch_pause_edit: out-of-range index throws and writes nothing", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00" }] });
+  const { ctx } = toolCtx({ answer: true });
+  await assert.rejects(() => toolByName("dispatch_pause_edit").execute("id", { index: 9, to: "07:00" }, undefined, undefined, ctx), /no pause window at index/);
+  assert.equal(read(path).windows[0].to, "06:00");
+});
+
+test("dispatch_pause_edit: refuses with no interactive operator and writes nothing", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00" }] });
+  const { ctx } = toolCtx({ hasUI: false });
+  await assert.rejects(() => toolByName("dispatch_pause_edit").execute("id", { index: 0, to: "07:00" }, undefined, undefined, ctx), /refused|interactive operator/);
+  assert.equal(read(path).windows[0].to, "06:00");
+});
+
+test("managePauses: Edit re-prompts fields (blank keeps) and updates the picked window", async () => {
+  const path = tmpPauses({ windows: [{ scope: "acme/web", from: "22:00", to: "06:00", tz: "Europe/Amsterdam" }] });
+  // pick the window, then blank-keep scope/from, change `to`, blank-keep tz/days/dateFrom/dateTo.
+  const ui = mockUi({ select: ["Edit a pause window", "#1  acme/web  22:00-06:00 Europe/Amsterdam"], input: ["", "", "07:00", "", "", "", ""] });
+  await handleDashboardAction({ action: "managePauses" }, { pauseWindowsPath: path }, { ui });
+  const w = read(path).windows[0];
+  assert.equal(w.to, "07:00", "the changed field");
+  assert.equal(w.from, "22:00", "kept");
+  assert.equal(w.tz, "Europe/Amsterdam", "kept");
+  assert.ok(ui.notes.some((n) => /updated \(live\)/.test(n.m)), "a live-updated notice is shown");
+});

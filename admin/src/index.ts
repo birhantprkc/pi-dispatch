@@ -446,6 +446,56 @@ function registerTools(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "dispatch_pause_edit",
+    label: "pi-dispatch edit pause window",
+    description:
+      "Changes fields of an existing pause window (by array index from dispatch_pauses) and applies it live. " +
+      "Provide only the fields to change (scope/from/to/tz/days/dateFrom/dateTo); the rest keep their current " +
+      "value. The operator MUST approve a confirm dialog showing the before->after; refused with no interactive " +
+      "operator.",
+    executionMode: "sequential",
+    parameters: Type.Object({
+      index: Type.Integer({ minimum: 0 }),
+      scope: Type.Optional(Type.String()),
+      from: Type.Optional(Type.String()),
+      to: Type.Optional(Type.String()),
+      tz: Type.Optional(Type.String()),
+      days: Type.Optional(Type.Array(Type.String())),
+      dateFrom: Type.Optional(Type.String()),
+      dateTo: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const paths = resolvePaths(process.env);
+      const p = readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath });
+      const list = Array.isArray(p?.windows) ? p.windows : [];
+      const cur = list[params.index];
+      if (!cur) throw new Error(`no pause window at index ${params.index} (have ${list.length})`);
+      // A provided field replaces; an omitted one keeps the current value (?? treats undefined as "keep").
+      // Rebuild through the shared builder so the result is validated the same way as an add.
+      const before = buildPauseWindow(cur);
+      const merged = buildPauseWindow({
+        scope: params.scope ?? cur.scope,
+        from: params.from ?? cur.from,
+        to: params.to ?? cur.to,
+        tz: params.tz ?? cur.tz,
+        days: params.days ?? cur.days,
+        dateFrom: params.dateFrom ?? cur.dateFrom,
+        dateTo: params.dateTo ?? cur.dateTo,
+      });
+      const result = await confirmedWrite(
+        ctx,
+        { title: `Edit pause window #${params.index + 1}`, message: `pause window #${params.index + 1}:\n${JSON.stringify(before)}\n→ ${JSON.stringify(merged)}` },
+        () => {
+          const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (l: any[]) => l.map((w, i) => (i === params.index ? merged : w)) });
+          if (res.invalid) throw new Error(`rejected: ${res.invalid}`);
+          return { applied: true, index: params.index, window: merged };
+        },
+      );
+      return toolText(JSON.stringify(result));
+    },
+  });
+
+  pi.registerTool({
     name: "dispatch_trigger_delete",
     label: "pi-dispatch delete trigger",
     description:
@@ -742,11 +792,12 @@ export async function handleDashboardAction(result: any, paths: any, ctx: any): 
   }
 }
 
-/** Pause-window management: pick add or delete, then run the matching dialog. Keeps one overlay key (`w`). */
+/** Pause-window management: pick add / edit / delete, then run the matching dialog. One overlay key (`w`). */
 async function managePausesViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
-  const action = await ui.select("Pause windows", ["Add a pause window", "Delete a pause window"]);
+  const action = await ui.select("Pause windows", ["Add a pause window", "Edit a pause window", "Delete a pause window"]);
   if (!action) return;
   if (action.startsWith("Add")) return addPauseWindowViaDialogs(paths, ui, notify);
+  if (action.startsWith("Edit")) return editPauseWindowViaDialogs(paths, ui, notify);
   return deletePauseWindowViaDialogs(paths, ui, notify);
 }
 
@@ -769,6 +820,48 @@ async function addPauseWindowViaDialogs(paths: any, ui: any, notify: Notify): Pr
   const w = buildPauseWindow({ scope, from, to, tz, days, dateFrom, dateTo });
   const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (list: any[]) => [...list, w] });
   notify?.(res.ok ? `pause window added (live) — ${w.scope} ${w.from}-${w.to}` : `add rejected: ${res.invalid}`, res.ok ? "info" : "error");
+}
+
+/** Edit a pause window: select which, then re-prompt each field with its current value — a blank answer keeps
+ * it, so you only re-type what you change. Validated + live through the same `writePauseWindows`. */
+async function editPauseWindowViaDialogs(paths: any, ui: any, notify: Notify): Promise<void> {
+  const p = readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath });
+  const list: any[] = Array.isArray(p?.windows) ? p.windows : [];
+  if (list.length === 0) { notify?.("no pause windows to edit", "info"); return; }
+  const labels = list.map((w, i) => `#${i + 1}  ${w.scope}  ${w.from}-${w.to} ${w.tz}${w.days ? ` [${w.days.join(",")}]` : ""}`);
+  const picked = await ui.select("Edit which pause window", labels);
+  if (!picked) return;
+  const index = labels.indexOf(picked);
+  if (index < 0) return;
+  const cur = list[index];
+  // Each field's current value is the placeholder; a blank answer keeps it (undefined = the operator cancelled).
+  const ask = async (label: string, current: string) => ui.input(`${label} — blank keeps "${current}"`, current);
+  const keep = (v: string | undefined, current: any) => (v === undefined || v.trim() === "" ? current : v);
+  const scope = await ask("scope", cur.scope ?? "");
+  if (scope === undefined) return;
+  const from = await ask("from (HH:MM)", cur.from ?? "");
+  if (from === undefined) return;
+  const to = await ask("to (HH:MM)", cur.to ?? "");
+  if (to === undefined) return;
+  const tz = await ask("tz (IANA / UTC)", cur.tz ?? "UTC");
+  if (tz === undefined) return;
+  const days = await ask("days (space-separated)", (cur.days ?? []).join(" "));
+  if (days === undefined) return;
+  const dateFrom = await ask("dateFrom (YYYY-MM-DD)", cur.dateFrom ?? "");
+  if (dateFrom === undefined) return;
+  const dateTo = await ask("dateTo (YYYY-MM-DD)", cur.dateTo ?? "");
+  if (dateTo === undefined) return;
+  const merged = buildPauseWindow({
+    scope: keep(scope, cur.scope),
+    from: keep(from, cur.from),
+    to: keep(to, cur.to),
+    tz: keep(tz, cur.tz),
+    days: keep(days, cur.days),
+    dateFrom: keep(dateFrom, cur.dateFrom),
+    dateTo: keep(dateTo, cur.dateTo),
+  });
+  const res = writePauseWindows({ pauseWindowsPath: paths.pauseWindowsPath, mutate: (l: any[]) => l.map((w, i) => (i === index ? merged : w)) });
+  notify?.(res.ok ? `pause window #${index + 1} updated (live) — ${merged.scope} ${merged.from}-${merged.to}` : `edit rejected: ${res.invalid}`, res.ok ? "info" : "error");
 }
 
 /** Delete a pause window: select which (by a scope/time label), confirm, remove. */

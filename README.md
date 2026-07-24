@@ -288,7 +288,8 @@ it at boot and live-reloads edits:
 
 `scope` is a repo `"owner/name"`, a local folder path, or `"*"` for all; `from > to` is an overnight window;
 `days`/`dateFrom`/`dateTo` gate the day the window starts. Manage windows by editing the file, in the panel
-(`/dispatch` → `w`), or through the confirm-gated `dispatch_pause_add`/`_delete` tools. Full field reference
+(`/dispatch` → `w` → add / edit / delete), or through the confirm-gated
+`dispatch_pause_add`/`_edit`/`_delete` tools. Full field reference
 and more examples: **[`docs/pause-windows.md`](docs/pause-windows.md)**.
 
 ## GitHub automation
