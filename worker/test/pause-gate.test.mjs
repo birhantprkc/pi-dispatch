@@ -48,6 +48,7 @@ function harness({ pauseUntil, redis = fakeRedis() }) {
 		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, weeklyCap: null, monthlyCap: null, concurrency: 3, softHoldPct: null }),
 		applyConcurrency: () => {},
 		pauseUntil,
+		now: () => NOW, // fixed clock so the defer guard shares the predicate's clock (else it rots past NOW)
 		recordRun: () => {},
 		timeoutMs: 100000,
 		deps: {

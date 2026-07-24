@@ -27,7 +27,7 @@ export const JOB_TIMEOUT_MS = 30 * 60 * 1000; // REQ-JOB-TIMEOUT-30M
  * The overlay changes which values the spend caps take, never when they are checked -- reserveBudget still
  * runs inside runJob against the freshly passed caps (CONST-BUDGET-BEFORE-TOKENS).
  */
-export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, applyConcurrency = () => {}, pauseUntil = () => null, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS }) {
+export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, applyConcurrency = () => {}, pauseUntil = () => null, deps, recordRun = () => {}, timeoutMs = JOB_TIMEOUT_MS, now = () => Date.now() }) {
 	return async function processor(job, token, signal) {
 		// Scoped pause windows (REQ-SCOPED-PAUSE-WINDOWS): if this job's folder/repo is inside an active pause
 		// window, DEFER it to the window end via BullMQ's delayed set -- the job keeps its identity/dedup and
@@ -36,8 +36,11 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 		// (CONST-BUDGET-BEFORE-TOKENS). `moveToDelayed` needs the worker's `token`; the `> now + 1s` guard keeps
 		// a boundary tick from busy-deferring. A thrown `DelayedError` is how BullMQ learns the job was deferred
 		// (worker.js recognises it) rather than completed or failed.
-		const until = pauseUntil(job.data, Date.now());
-		if (until && until > Date.now() + 1000) {
+		// One clock snapshot for both the window lookup and the guard, so they cannot disagree across the
+		// call (and a test can inject a fixed clock). `now` defaults to the real wall clock in production.
+		const nowMs = now();
+		const until = pauseUntil(job.data, nowMs);
+		if (until && until > nowMs + 1000) {
 			await job.moveToDelayed(until, token);
 			throw new DelayedError();
 		}
