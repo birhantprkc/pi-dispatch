@@ -1,4 +1,6 @@
-# Publish @edgehero/pi-dispatch-admin and cut a GitHub Release when its version changes on main.
+# Publish @edgehero/pi-dispatch-admin (npm) and cut its GitHub Release when admin/package.json's version
+# changes on main. This is the EXTENSION's pipeline: it tags admin-v*. The whole TOOL's releases (v*) are cut
+# by repo-release.yml off the ROOT package.json version — the two never share a tag.
 #
 # main is branch-protected (PR + 1 approving review required), so a push here is an already-approved merge —
 # the human gate is the merge, not this workflow (consistent with CONST-MERGE-NEVER-AUTOMATIC: nothing here
@@ -63,8 +65,10 @@ jobs:
           else
             echo "publish=yes" >> "$GITHUB_OUTPUT"
           fi
-          if gh release view "v$V" >/dev/null 2>&1; then
-            echo "release=no" >> "$GITHUB_OUTPUT"; echo "release v$V already exists — skip release"
+          # The admin EXTENSION's GitHub releases are tagged admin-v* so the tool's own releases own the v*
+          # namespace (see repo-release.yml). npm publish above is unaffected — it keys off the package version.
+          if gh release view "admin-v$V" >/dev/null 2>&1; then
+            echo "release=no" >> "$GITHUB_OUTPUT"; echo "release admin-v$V already exists — skip release"
           else
             echo "release=yes" >> "$GITHUB_OUTPUT"
           fi
@@ -81,7 +85,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
         run: |
-          PREV=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          PREV=$(git tag --list 'admin-v*' --sort=-v:refname | head -n1)
           RANGE=${PREV:+$PREV..HEAD}
           COMMITS=$(git log $RANGE --no-merges --pretty=format:'- %s' -- admin/ | head -n 60)
           if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.v.outputs.version }}" \
@@ -97,6 +101,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ steps.v.outputs.version }}" \
-            --title "v${{ steps.v.outputs.version }} — pi-dispatch operator extension" \
+          gh release create "admin-v${{ steps.v.outputs.version }}" \
+            --title "@edgehero/pi-dispatch-admin v${{ steps.v.outputs.version }}" \
             --notes-file /tmp/notes.md
