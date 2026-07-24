@@ -213,8 +213,9 @@ deployment.
 Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
 queue in place, `↑`/`↓` to move across the triggers and runs, `Enter` to drill into either. **Triggers are
 editable in place**: `Enter` on a trigger shows its trust model, `e` edits its flow, `x` deletes it, `a`
-adds one (guided, kind-first), and `s` edits a limit — every write is operator-typed, validated, atomic, and
-**reloaded live** by the worker/receiver (no restart). `Enter` on a run opens its full PII-free record:
+adds one (guided, kind-first), `s` edits a limit, and `w` manages scheduled pause windows — every write is
+operator-typed, validated, atomic, and **reloaded live** by the worker/receiver (no restart). `Enter` on a
+run opens its full PII-free record:
 
 ![The RUN_DETAIL drill-in — a colored post-mortem of one run's PII-free record: outcome, target, timing with duration, turns/exit/budget slot, tokens and cost, and a chain line naming spawned children](docs/images/dispatch-run-detail.svg)
 
@@ -274,6 +275,32 @@ because that raw stream can contain issue and comment text (PII). Both files sta
 mounted into the job container, and are gitignored. A boot-time sweep prunes anything older than
 `PI_LOG_RETENTION_DAYS` (default 30; `0` keeps them forever).
 
+## Flows: the custom prompt a trigger runs
+
+A **flow** is the recipe the agent follows — a pi **skill** committed to the target repo/folder at
+`.pi/skills/<flow>/SKILL.md`. **That file *is* the custom prompt**: the frontmatter names the flow, the body is
+the standing instructions the agent runs. A trigger (or `pi-dispatch run --flow <name>`) only *names* which
+flow to run; the flow lives with the project, so different repos can define the same flow name their own way.
+
+```markdown
+<!-- .pi/skills/tidy/SKILL.md -->
+---
+name: tidy
+description: Format, fix lint, and tighten types across the repo.
+ai-trigger: allow        # opt-in required for GitHub/AI triggers; omit for CLI/cron-only flows (default deny)
+---
+
+Run the formatter and linter and fix what they report; tighten obvious type holes.
+Keep the diff minimal and open a PR titled "tidy: <what changed>". Do not change behavior.
+```
+
+Two things reach the agent: the **flow** (this SKILL.md — the standing instructions) and the **task** (the
+one-off ask for a single run). You set the task explicitly for a CLI/cron run (`--task "…"`, or the trigger's
+`task`); for a GitHub trigger the issue/comment/PR text *is* the task. Flows are read from your
+**default-branch** commit, read-only — so **commit and merge a flow before a trigger can use it**; a PR branch
+can neither add one nor alter it. `ai-trigger: allow` in the frontmatter is what lets a label/comment/PR — or
+an AI tool — run that flow at all (default **deny**).
+
 ## Triggers: cron, labels, comments, pull requests
 
 Every standing trigger — cron schedules and GitHub triggers alike — lives in one unified
@@ -293,6 +320,21 @@ cron off), the receiver requires it.
 
 The `on × run` matrix is the trust boundary, enforced fail-loud at load: a `cron` trigger must run
 `local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs `github`.
+
+### Add a trigger from the panel
+
+You can edit `triggers.json` by hand, or add one from `/dispatch` without touching the file: press **`a`** and
+answer the **kind-first** prompts. The panel writes a validated entry and both services reload it live:
+
+- **cron** → `id` · `pattern` (5–6 field cron) · `folder` (absolute host path) · `flow` · `task`, then the
+  optional `model` / `provider` / `maxTurns` (blank = the deployment default).
+- **label** → `labels` (space-separated, any-of) · `flow`. The issue text is the task.
+- **comment** → trigger `phrase` (e.g. `@pi`) · `flow`. The comment/issue text is the task.
+- **pull_request** → `action`s (`labeled opened synchronize reopened`) · `labels` (for `labeled`) · `flow`.
+
+To change an existing trigger, `Enter` on it → **`e`** edits which flow it runs, **`x`** deletes it (with a
+confirm). An AI assistant can propose the same edits via `dispatch_trigger_add`/`_edit`/`_delete`, but each
+write waits on your confirmation.
 
 ### Scheduling recurring jobs
 
@@ -332,10 +374,19 @@ it at boot and live-reloads edits:
 ```
 
 `scope` is a repo `"owner/name"`, a local folder path, or `"*"` for all; `from > to` is an overnight window;
-`days`/`dateFrom`/`dateTo` gate the day the window starts. Manage windows by editing the file, in the panel
-(`/dispatch` → `w` → add / edit / delete), or through the confirm-gated
-`dispatch_pause_add`/`_edit`/`_delete` tools. Full field reference
-and more examples: **[`docs/pause-windows.md`](docs/pause-windows.md)**.
+`days`/`dateFrom`/`dateTo` gate the day the window starts.
+
+**Manage windows from the panel:** in `/dispatch`, press **`w`** and choose *Add*, *Edit*, or *Delete* —
+validated and live, no restart.
+
+- **Add** prompts `scope → from → to → tz → days → dateFrom → dateTo`; leave an optional field blank to omit it
+  (blank `tz` = UTC, blank `days` = every day).
+- **Edit** lets you pick a window and re-type only what changes — a blank answer keeps the current value.
+- **Delete** picks a window and confirms.
+
+The **PAUSES** pane shows each window as ● paused (with a resume countdown) or ○ open. Editing the file
+directly and the confirm-gated `dispatch_pause_add`/`_edit`/`_delete` tools do the same thing. Full field
+reference and more examples: **[`docs/pause-windows.md`](docs/pause-windows.md)**.
 
 ## GitHub automation
 
