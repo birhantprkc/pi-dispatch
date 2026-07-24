@@ -92,11 +92,14 @@ windows. The `deploy/pause-windows.json` in this repo is an empty template (`{ "
 Three equivalent ways — all write the same validated file and take effect live:
 
 1. **Edit the file.** Change `pause-windows.json`; the worker hot-reloads it (keeps the last-good set on a bad edit).
-2. **In the panel.** Open `/dispatch`, press `w` → add or delete a window through operator dialogs. The
-   **PAUSES** section shows each window as `●` paused (with a resume countdown) or `○` open.
-3. **From an agent, human-gated.** The model tools `dispatch_pause_add` / `dispatch_pause_delete` (and the
-   read-only `dispatch_pauses`) let an agent manage windows — but each write **pops an operator confirmation
-   the model can't answer**, and is refused when no operator is present.
+2. **In the panel.** Open `/dispatch`, press `w` → **add, edit, or delete** a window through operator
+   dialogs. Editing re-prompts each field with its current value, so a blank answer keeps it and you only
+   re-type what changes. The **PAUSES** section shows each window as `●` paused (with a resume countdown)
+   or `○` open.
+3. **From an agent, human-gated.** The model tools `dispatch_pause_add` / `dispatch_pause_edit` /
+   `dispatch_pause_delete` (and the read-only `dispatch_pauses`) let an agent manage windows — edit is a
+   **partial** change (pass only the fields to alter; the rest keep their value) — but each write **pops an
+   operator confirmation the model can't answer**, and is refused when no operator is present.
 
 ## Caveats
 

@@ -121,15 +121,16 @@ test("an unknown subcommand notifies and never touches the model channel", async
  * writes cannot interleave. This test is the deliberate record that model-callable writes were added on
  * purpose -- gated by an operator confirm (behaviour proven in crud.test.mjs), not tool absence.
  */
-const WRITE_TOOLS = ["dispatch_set", "dispatch_trigger_add", "dispatch_trigger_edit", "dispatch_trigger_delete", "dispatch_pause_add", "dispatch_pause_delete"];
+const WRITE_TOOLS = ["dispatch_set", "dispatch_trigger_add", "dispatch_trigger_edit", "dispatch_trigger_delete", "dispatch_pause_add", "dispatch_pause_edit", "dispatch_pause_delete"];
 test("registers exactly the read/control/enqueue/write tools, and never a raw-log tool", async () => {
   const { calls } = await loadRegistered();
   const names = calls.registerTool.map((t) => t.name).sort();
-  assert.equal(calls.registerTool.length, 13, "exactly thirteen tools");
+  assert.equal(calls.registerTool.length, 14, "exactly fourteen tools");
   assert.deepEqual(names, [
     "dispatch_pause",
     "dispatch_pause_add",
     "dispatch_pause_delete",
+    "dispatch_pause_edit",
     "dispatch_pauses",
     "dispatch_resume",
     "dispatch_run",
