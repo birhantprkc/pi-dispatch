@@ -137,3 +137,32 @@ test("doctor: a clean overlay passes; armed extensions are a warning, not a fail
 	assert.equal(code, 0, "armed extensions warn (⚠) but do not fail doctor");
 	assert.match(t2(), /⚠ Overlay extensions present and ARMED/);
 });
+
+// PI_AUTH_FROM_PI: the provider key may live in pi's auth.json, not the env — doctor reads it (real fs).
+function agentDirWith(cred) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-agent-"));
+	writeFileSync(join(dir, "auth.json"), JSON.stringify({ anthropic: cred }));
+	return dir;
+}
+
+test("doctor: PI_AUTH_FROM_PI with an api_key in auth.json passes the provider-key check", async () => {
+	const dir = agentDirWith({ type: "api_key", key: "sk-x" });
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", PI_AUTH_FROM_PI: "1", PI_CODING_AGENT_DIR: dir }, // no ANTHROPIC_API_KEY in env
+		{ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" },
+	);
+	assert.equal(code, 0, "the key comes from pi, so doctor is green");
+	assert.match(text(), /from pi auth\.json/);
+});
+
+test("doctor: PI_AUTH_FROM_PI over an OAuth login flags it as not usable for a service", async () => {
+	const dir = agentDirWith({ type: "oauth", access_token: "x" });
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", PI_AUTH_FROM_PI: "1", PI_CODING_AGENT_DIR: dir },
+		{ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" },
+	);
+	assert.equal(code, 1, "an OAuth/subscription login is not a usable service credential");
+	assert.match(text(), /OAuth\/subscription/);
+});

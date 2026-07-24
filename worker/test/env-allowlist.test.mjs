@@ -101,3 +101,52 @@ test("PI_FORWARD_ENV forwards ONLY the named vars that are present, never a pass
 	assert.equal(env.UNLISTED, undefined, "an unlisted host var is never forwarded");
 	assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined, "the stray host secret still does not ride along");
 });
+
+// --- PI_AUTH_FROM_PI: source the provider key from pi's auth.json when the env has none ---
+const authBase = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", agentDir: "/home/u/.pi/agent" };
+const authReader = (json) => (p) => {
+	assert.match(p, /auth\.json$/, "reads auth.json under the agent dir");
+	if (json === null) throw new Error("ENOENT");
+	return typeof json === "string" ? json : JSON.stringify(json);
+};
+
+test("PI_AUTH_FROM_PI injects the api key from auth.json under pi's expected var name", { skip }, () => {
+	const env = buildContainerEnv({
+		...authBase,
+		hostEnv: { HOME: "/root" }, // no ANTHROPIC_API_KEY on the host
+		authFromPi: true,
+		readFile: authReader({ anthropic: { type: "api_key", key: "sk-from-pi" } }),
+	});
+	assert.equal(env.ANTHROPIC_API_KEY, "sk-from-pi", "pi's own findEnvKeys resolves the var name -- no hand table");
+});
+
+test("PI_AUTH_FROM_PI: the env wins when the key is present (fallback only, auth.json never read)", { skip }, () => {
+	const env = buildContainerEnv({
+		...authBase,
+		hostEnv: { ANTHROPIC_API_KEY: "sk-env" },
+		authFromPi: true,
+		readFile: () => assert.fail("auth.json must not be read when the env already has the key"),
+	});
+	assert.equal(env.ANTHROPIC_API_KEY, "sk-env");
+});
+
+test("PI_AUTH_FROM_PI refuses an OAuth/subscription login (pre-spend)", { skip }, () => {
+	assert.throws(
+		() => buildContainerEnv({ ...authBase, hostEnv: {}, authFromPi: true, readFile: authReader({ anthropic: { type: "oauth", access_token: "x" } }) }),
+		(e) => e.piDispatchConfig === true && /OAuth|subscription/i.test(e.message),
+	);
+});
+
+test("PI_AUTH_FROM_PI refuses when auth.json is missing/unreadable, with guidance", { skip }, () => {
+	assert.throws(
+		() => buildContainerEnv({ ...authBase, hostEnv: {}, authFromPi: true, readFile: authReader(null) }),
+		(e) => e.piDispatchConfig === true && /pi login|environment/i.test(e.message),
+	);
+});
+
+test("without PI_AUTH_FROM_PI, a missing env key still refuses and auth.json is never consulted", { skip }, () => {
+	assert.throws(
+		() => buildContainerEnv({ ...authBase, hostEnv: {}, authFromPi: false, readFile: () => assert.fail("must not read auth.json when PI_AUTH_FROM_PI is off") }),
+		(e) => e.piDispatchConfig === true,
+	);
+});

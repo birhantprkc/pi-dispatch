@@ -106,6 +106,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		globalPiDir: resolveGlobalPiDir(env, fileExists), // REQ-GLOBAL-PI-OVERLAY: operator's ~/.pi/agent subset, :ro-mounted; null = off
 		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1", // fail-closed: overlay extensions load only when armed
 		forwardEnv: commaList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist
+		authFromPi: env.PI_AUTH_FROM_PI === "1", // fall back to the provider key in ~/.pi/agent/auth.json when the env has none (api-key only)
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")
 		pauseWindowsFile: env.PI_PAUSE_WINDOWS_FILE ?? null, // REQ-SCOPED-PAUSE-WINDOWS: per-folder/repo timed pause; null = no scoped pauses

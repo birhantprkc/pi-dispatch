@@ -400,6 +400,14 @@ Evidence convention as in `constitution.md`.
     hand-maintained copy is exactly the reinvention `no-reimplementing-pi` forbids. For `anthropic` the
     call returns `["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]` — **the array order *is* the
     precedence**, which is precisely the trap this rule exists for.
+  - **`PI_AUTH_FROM_PI=1` is an optional credential *source*, not a new injection path.** When set and the
+    provider key is absent from the worker env, the worker reads it **host-side** from `~/.pi/agent/auth.json`
+    (honoring `PI_CODING_AGENT_DIR`) and injects it under the variable name pi expects — the name resolved by
+    the same `findEnvKeys` oracle, so no hand table. It stays a HOST-SIDE read of a host-held secret,
+    env-injected exactly like the env path, **never a credential file mounted into the container**
+    (`CONST-TOKEN-SCOPED-PER-JOB`). **API-key credentials only**: an OAuth/subscription login is refused
+    pre-spend (it expires, the container cannot refresh it, and it is not the credential for an unattended
+    service). The env, when present, always wins — this is a fallback, not an override.
   - Mounts: `/job:ro`, `/workspace:rw`, — **local jobs only** — `/outbox:rw`, and — **only when
     `PI_GLOBAL_PI_DIR` is configured** — `/opt/pi-global:ro` — delivered by host bind mounts
     (`-v <hostPath>:<containerPath>`, per `DES-WORKER-ON-HOST` and `worker/src/docker-run.mjs`): the worker

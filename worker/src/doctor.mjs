@@ -8,6 +8,7 @@
  * misconfigured). The provider key is checked for presence only and never printed (secrets-and-pii).
  */
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
 import { findLiteralSecret } from "./import-pi.mjs";
@@ -69,10 +70,25 @@ export async function runDoctor(env = process.env, deps = {}) {
 	});
 
 	const keys = PROVIDER_KEYS[provider] ?? [`${provider.toUpperCase()}_API_KEY`];
+	let keyOk = keys.some((k) => (env[k] ?? "").trim().length > 0);
+	let keyNote = "";
+	// PI_AUTH_FROM_PI: the key may come from pi's auth.json instead of the env, so don't falsely report it missing.
+	if (!keyOk && env.PI_AUTH_FROM_PI === "1") {
+		const agentDir = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+		try {
+			const cred = JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf8"))?.[provider];
+			if (cred?.type === "api_key" && cred.key) {
+				keyOk = true;
+				keyNote = " — from pi auth.json (PI_AUTH_FROM_PI)";
+			} else if (cred?.type === "oauth") {
+				keyNote = " — pi login is OAuth/subscription: not usable for an unattended service, configure an API key";
+			}
+		} catch {}
+	}
 	checks.push({
-		ok: keys.some((k) => (env[k] ?? "").trim().length > 0),
-		label: `Provider key set (${provider}: ${keys.join(" or ")})`,
-		fix: `set ${keys[0]} in .env`,
+		ok: keyOk,
+		label: `Provider key set (${provider}: ${keys.join(" or ")})${keyNote}`,
+		fix: env.PI_AUTH_FROM_PI === "1" ? `run \`pi login\` with an API key for ${provider}, or set ${keys[0]} in .env` : `set ${keys[0]} in .env`,
 	});
 
 	// Global pi overlay (REQ-GLOBAL-PI-OVERLAY), only when configured. The overlay is mounted :ro into an

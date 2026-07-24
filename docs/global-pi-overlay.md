@@ -58,6 +58,18 @@ If your model uses a provider whose key variable pi's built-in table doesn't kno
 PI_FORWARD_ENV=MY_PROVIDER_KEY      # comma-separated NAMES; forwarded by exact -e NAME=VALUE, never a pass-through
 ```
 
+### The key is already in pi (`PI_AUTH_FROM_PI`)
+
+Logged into pi already and don't want to restate the key in `.env`? Set `PI_AUTH_FROM_PI=1`. When the
+provider key is absent from the worker's environment, the worker reads it **host-side** from
+`~/.pi/agent/auth.json` and env-injects it under the variable pi expects — a host-side read of a host-held
+secret, injected via env exactly like `.env`, **never a file mounted into the container**. The environment
+still wins when present; this is a fallback.
+
+**API-key logins only.** An OAuth/subscription login (`pi login`) is refused: those tokens expire and the
+container can't refresh them, and a subscription isn't the credential for an unattended paid service —
+configure an API key (with a spend limit) instead.
+
 ## Extensions (the sharp edge — opt-in and armed separately)
 
 Extensions run **code against adversarial input with open network egress**, and host extensions often carry

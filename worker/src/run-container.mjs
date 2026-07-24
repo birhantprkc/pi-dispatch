@@ -33,6 +33,7 @@ export function makeRunContainer({
 	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
 	allowGlobalExtensions = false,
 	forwardEnv = [],
+	authFromPi = false, // fall back to ~/.pi/agent/auth.json for the provider key when the env has none
 }) {
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
@@ -51,6 +52,7 @@ export function makeRunContainer({
 			hostEnv,
 			allowGlobalExtensions, // arms overlay extensions in the runner (fail-closed)
 			forwardEnv, // extra host var names to forward (e.g. a custom provider's key)
+			authFromPi, // source the provider key from pi's auth.json when the env has none
 		});
 
 		const args = buildDockerRunArgs({

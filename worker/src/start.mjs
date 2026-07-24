@@ -233,6 +233,7 @@ export async function startWorker(
 				globalPiDir: config.globalPiDir, // REQ-GLOBAL-PI-OVERLAY: :ro overlay mount when configured
 				allowGlobalExtensions: config.allowGlobalExtensions,
 				forwardEnv: config.forwardEnv,
+				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
 			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,

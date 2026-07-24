@@ -91,6 +91,12 @@ test("forwardEnv is a comma list of names -- trimmed, empties dropped, default [
 	assert.deepEqual(loadConfig({ PI_FORWARD_ENV: "MY_KEY, OTHER ,,THIRD" }).forwardEnv, ["MY_KEY", "OTHER", "THIRD"]);
 });
 
+test("authFromPi is armed only by PI_AUTH_FROM_PI=1", () => {
+	assert.equal(loadConfig({}).authFromPi, false);
+	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "1" }).authFromPi, true);
+	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "yes" }).authFromPi, false);
+});
+
 test("run-history env overrides logsDir, captureJobLogs, and logRetentionDays", () => {
 	const c = loadConfig({ PI_LOGS_DIR: "/x", PI_CAPTURE_JOB_LOGS: "1", PI_LOG_RETENTION_DAYS: "7" });
 	assert.equal(c.logsDir, "/x");
