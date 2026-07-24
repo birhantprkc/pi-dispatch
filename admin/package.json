@@ -1,13 +1,20 @@
 {
   "name": "@edgehero/pi-dispatch-admin",
-  "version": "0.1.1",
-  "description": "Operator console (a pi extension) + skill for the pi-dispatch self-hosted agent service: a /dispatch TUI for queue, spend, run history, triggers, and scheduled pause windows. Runs against a live pi-dispatch deployment.",
+  "version": "0.1.2",
+  "description": "Operator console (a pi extension) + skill for pi-dispatch: run the pi coding agent as a self-hosted service. A /dispatch TUI for the queue, spend caps, run history, editable triggers (cron/label/comment/PR), and scheduled pause windows — plus AI-operable, human-confirmed controls. Runs against a live pi-dispatch deployment.",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "pi",
     "pi-coding-agent",
     "coding-agent",
-    "extension"
+    "ai-agent",
+    "autonomous-agents",
+    "self-hosted",
+    "job-queue",
+    "cron",
+    "tui",
+    "dashboard"
   ],
   "license": "MIT",
   "author": "Rob Boerman",
