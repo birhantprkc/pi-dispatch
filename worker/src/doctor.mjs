@@ -72,14 +72,16 @@ export async function runDoctor(env = process.env, deps = {}) {
 	const keys = PROVIDER_KEYS[provider] ?? [`${provider.toUpperCase()}_API_KEY`];
 	let keyOk = keys.some((k) => (env[k] ?? "").trim().length > 0);
 	let keyNote = "";
-	// PI_AUTH_FROM_PI: the key may come from pi's auth.json instead of the env, so don't falsely report it missing.
-	if (!keyOk && env.PI_AUTH_FROM_PI === "1") {
+	// The key may come from pi's auth.json when the env has none (ON by default; PI_AUTH_FROM_PI=0 forces
+	// env-only) — so don't falsely report it missing.
+	const authFromPi = env.PI_AUTH_FROM_PI !== "0";
+	if (!keyOk && authFromPi) {
 		const agentDir = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 		try {
 			const cred = JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf8"))?.[provider];
 			if (cred?.type === "api_key" && cred.key) {
 				keyOk = true;
-				keyNote = " — from pi auth.json (PI_AUTH_FROM_PI)";
+				keyNote = " — from pi auth.json";
 			} else if (cred?.type === "oauth") {
 				keyNote = " — pi login is OAuth/subscription: not usable for an unattended service, configure an API key";
 			}
@@ -88,7 +90,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 	checks.push({
 		ok: keyOk,
 		label: `Provider key set (${provider}: ${keys.join(" or ")})${keyNote}`,
-		fix: env.PI_AUTH_FROM_PI === "1" ? `run \`pi login\` with an API key for ${provider}, or set ${keys[0]} in .env` : `set ${keys[0]} in .env`,
+		fix: authFromPi ? `run \`pi login\` with an API key for ${provider}, or set ${keys[0]} in .env` : `set ${keys[0]} in .env`,
 	});
 
 	// Global pi overlay (REQ-GLOBAL-PI-OVERLAY), only when configured. The overlay is mounted :ro into an

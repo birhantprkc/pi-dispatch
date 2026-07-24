@@ -145,22 +145,32 @@ function agentDirWith(cred) {
 	return dir;
 }
 
-test("doctor: PI_AUTH_FROM_PI with an api_key in auth.json passes the provider-key check", async () => {
+test("doctor: an api_key in pi auth.json passes the provider-key check BY DEFAULT (no flag set)", async () => {
 	const dir = agentDirWith({ type: "api_key", key: "sk-x" });
 	const { out, text } = capture();
 	const code = await runDoctor(
-		{ PI_PROVIDER: "anthropic", PI_AUTH_FROM_PI: "1", PI_CODING_AGENT_DIR: dir }, // no ANTHROPIC_API_KEY in env
+		{ PI_PROVIDER: "anthropic", PI_CODING_AGENT_DIR: dir }, // no ANTHROPIC_API_KEY, no PI_AUTH_FROM_PI — default on
 		{ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" },
 	);
-	assert.equal(code, 0, "the key comes from pi, so doctor is green");
+	assert.equal(code, 0, "the key comes from pi by default, so doctor is green");
 	assert.match(text(), /from pi auth\.json/);
 });
 
-test("doctor: PI_AUTH_FROM_PI over an OAuth login flags it as not usable for a service", async () => {
+test("doctor: PI_AUTH_FROM_PI=0 forces env-only — the pi login is ignored", async () => {
+	const dir = agentDirWith({ type: "api_key", key: "sk-x" });
+	const { out } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", PI_CODING_AGENT_DIR: dir, PI_AUTH_FROM_PI: "0" }, // opt out
+		{ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" },
+	);
+	assert.equal(code, 1, "with the fallback disabled, a missing env key fails the check");
+});
+
+test("doctor: an OAuth login in pi auth.json is flagged as not usable for a service", async () => {
 	const dir = agentDirWith({ type: "oauth", access_token: "x" });
 	const { out, text } = capture();
 	const code = await runDoctor(
-		{ PI_PROVIDER: "anthropic", PI_AUTH_FROM_PI: "1", PI_CODING_AGENT_DIR: dir },
+		{ PI_PROVIDER: "anthropic", PI_CODING_AGENT_DIR: dir },
 		{ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" },
 	);
 	assert.equal(code, 1, "an OAuth/subscription login is not a usable service credential");

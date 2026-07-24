@@ -35,12 +35,12 @@ export function providerKeyVars(provider, hostEnv) {
  * Resolve the provider credential(s) to inject, as `{ VAR_NAME: value }`.
  *
  * Primary source: the worker's own environment, by pi's expected variable name(s) (`findEnvKeys`).
- * Fallback (only when `PI_AUTH_FROM_PI` is set and the env has none): read the credential from the host's
- * pi `auth.json`. This is a HOST-SIDE read of a host-held secret, injected via env exactly like the env
- * path — never a credential file mounted into the container (`CONST-TOKEN-SCOPED-PER-JOB`). API-key
- * credentials only; an OAuth/subscription login is refused (it expires, the container cannot refresh it,
- * and it is not the credential for an unattended service). Throws a config-tagged error (pre-spend refusal)
- * when neither source yields a credential.
+ * Fallback (ON by default; `PI_AUTH_FROM_PI=0` forces env-only): when the env has none, read the credential
+ * from the host's pi `auth.json`. This is a HOST-SIDE read of a host-held secret, injected via env exactly
+ * like the env path — never a credential file mounted into the container (`CONST-TOKEN-SCOPED-PER-JOB`).
+ * API-key credentials only; an OAuth/subscription login is refused (it expires, the container cannot refresh
+ * it, and it is not the credential for an unattended service). Throws a config-tagged error (pre-spend
+ * refusal) when neither source yields a credential.
  */
 export function resolveProviderCredential({ provider, hostEnv, authFromPi = false, agentDir, readFile = readFileSync }) {
 	const envNames = providerKeyVars(provider, hostEnv);
@@ -65,19 +65,19 @@ function credentialFromPiAuth(provider, agentDir, readFile) {
 	try {
 		auth = JSON.parse(readFile(path, "utf8"));
 	} catch {
-		throw configError(`PI_AUTH_FROM_PI is set but ${path} is missing or unreadable — run \`pi login\`, or set the provider key in the worker environment`);
+		throw configError(`no credential for provider "${provider}": not in the worker environment, and no pi login at ${path} — set the key in .env, or run \`pi login\``);
 	}
 	const cred = auth?.[provider];
-	if (!cred) throw configError(`PI_AUTH_FROM_PI: ${path} has no credential for provider "${provider}"`);
+	if (!cred) throw configError(`no credential for provider "${provider}": not in the worker environment, and ${path} has no "${provider}" login — set the key in .env, or run \`pi login\``);
 	if (cred.type === "oauth") {
 		throw configError(
-			`PI_AUTH_FROM_PI: the pi login for "${provider}" is an OAuth/subscription token, which cannot power an unattended service (it expires and the container cannot refresh it). Configure an API key — with a provider-side spend limit — instead.`,
+			`the pi login for "${provider}" is an OAuth/subscription token, which cannot power an unattended service (it expires and the container cannot refresh it). Configure an API key — with a provider-side spend limit — instead.`,
 		);
 	}
-	if (cred.type !== "api_key" || !cred.key) throw configError(`PI_AUTH_FROM_PI: unsupported credential for "${provider}" in ${path}`);
+	if (cred.type !== "api_key" || !cred.key) throw configError(`unsupported pi credential for "${provider}" in ${path} — set an API key in .env`);
 	const name = resolveEnvName(provider, cred);
 	if (!name) {
-		throw configError(`PI_AUTH_FROM_PI: could not determine the environment variable pi expects for provider "${provider}" — set it in the worker environment manually`);
+		throw configError(`could not determine the environment variable pi expects for provider "${provider}" — set it in the worker environment manually`);
 	}
 	return { name, value: cred.key };
 }

@@ -169,11 +169,12 @@ Stated openly rather than discovered later:
   provider needs. In particular `ANTHROPIC_OAUTH_TOKEN` silently takes precedence over
   `ANTHROPIC_API_KEY`, so a stray variable in the host environment can quietly redirect which credential
   a job spends.
-- **`PI_AUTH_FROM_PI` sources the provider key from pi's `~/.pi/agent/auth.json` when the env has none.**
+- **By default the worker sources the provider key from pi's `~/.pi/agent/auth.json` when the env has none.**
   It is a host-side read env-injected into the container — never a credential file mounted in — and accepts
-  **API-key** logins only; an OAuth/subscription login is refused. Prefer an API key with a provider-side
-  spend limit for an unattended service; a subscription token is neither refreshable in the container nor
-  intended for automation.
+  **API-key** logins only; an OAuth/subscription login is refused. The env always wins when set; set
+  `PI_AUTH_FROM_PI=0` to force env-only (fail loudly on a missing env key rather than fall back to a pi login).
+  Prefer an API key with a provider-side spend limit for an unattended service; a subscription token is
+  neither refreshable in the container nor intended for automation.
 - **Treat `.pi/` on your default branch as production code**, because it is: it goes into the agent's
   system prompt. Review changes to it with the same care as `.github/workflows/`.
 - **The global pi overlay (`PI_GLOBAL_PI_DIR`) is production code too**, and it must be credential-free. It

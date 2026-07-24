@@ -44,7 +44,7 @@ docker compose -f deploy/docker-compose.yml up -d
 npm ci
 npx pi-dispatch init         # writes .env + triggers.json + pause-windows.json (never clobbers)
 #    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
-#    already logged into pi? set PI_AUTH_FROM_PI=1 instead and it reuses the key from ~/.pi/agent/auth.json
+#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
 npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the image, and your provider key
 
 # 4. Run the worker in one terminal
@@ -104,12 +104,12 @@ the safety floor always first and unremovable. `import-pi` **refuses** a `models
 separately (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS=1`) because they run code against adversarial
 input; the admin extension is hard-blocked. Full reference: [`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
 
-**Already logged into pi and don't want to restate the key?** Set `PI_AUTH_FROM_PI=1`. When the provider key
-is absent from the worker's environment, the worker reads it **host-side** from `~/.pi/agent/auth.json` and
-env-injects it into the job — a host-side read of a host-held secret, never a file mounted into the container.
-**API-key logins only**: an OAuth/subscription login (`pi login`) is refused — those tokens expire and can't
-be refreshed in the container, and a subscription isn't the credential for an unattended service; use an API
-key with a spend limit.
+**Already logged into pi? The key just works — by default.** When the provider key is absent from the
+worker's environment, the worker reads it **host-side** from `~/.pi/agent/auth.json` and env-injects it into
+the job — a host-side read of a host-held secret, never a file mounted into the container. Nothing to set;
+`PI_AUTH_FROM_PI=0` forces env-only if you'd rather fail loudly on a missing env key. **API-key logins only**:
+an OAuth/subscription login (`pi login`) is refused — those tokens expire and can't be refreshed in the
+container, and a subscription isn't the credential for an unattended service; use an API key with a spend limit.
 
 ## Run as a service
 

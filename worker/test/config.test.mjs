@@ -91,10 +91,11 @@ test("forwardEnv is a comma list of names -- trimmed, empties dropped, default [
 	assert.deepEqual(loadConfig({ PI_FORWARD_ENV: "MY_KEY, OTHER ,,THIRD" }).forwardEnv, ["MY_KEY", "OTHER", "THIRD"]);
 });
 
-test("authFromPi is armed only by PI_AUTH_FROM_PI=1", () => {
-	assert.equal(loadConfig({}).authFromPi, false);
+test("authFromPi defaults ON; only PI_AUTH_FROM_PI=0 forces env-only", () => {
+	assert.equal(loadConfig({}).authFromPi, true, "reusing the pi login is the default — no flag needed");
 	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "1" }).authFromPi, true);
-	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "yes" }).authFromPi, false);
+	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "0" }).authFromPi, false, "explicit 0 forces env-only (fail-loud on a missing env key)");
+	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "yes" }).authFromPi, true, "any non-0 value keeps the default on");
 });
 
 test("run-history env overrides logsDir, captureJobLogs, and logRetentionDays", () => {
