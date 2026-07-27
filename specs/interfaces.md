@@ -375,14 +375,25 @@ Evidence convention as in `constitution.md`.
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
   - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
-    (see below); `GITHUB_TOKEN` (scoped, short-lived — GitHub-backed jobs only); `PI_JOB_ID`; `PI_PROVIDER`;
+    (see below); `GITHUB_TOKEN` and `GH_TOKEN`, both set to the same minted per-job token (short-lived; gh
+    prefers `GH_TOKEN`, and mirroring the two names forecloses precedence surprises) — present for
+    GitHub-backed jobs and for local cron jobs that opt in via `run.github: true`
+    (`INT-TRIGGERS-FILE-CONTRACT`), absent otherwise; `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
     otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
     (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=1` (forwarded ONLY when the operator armed overlay
     extensions — fail-closed; `REQ-GLOBAL-PI-OVERLAY`); and each name in `PI_FORWARD_ENV` (an explicit operator
     allowlist of extra host vars — e.g. a custom provider's key — forwarded by exact `-e NAME=VALUE`, never a
-    pass-through, so it satisfies `no-broad-env-into-container`). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
+    pass-through, so it satisfies `no-broad-env-into-container`; `GITHUB_TOKEN` and `GH_TOKEN` are refused in
+    the allowlist at config load — a forwarded operator token would silently override the minted per-job
+    value). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
     NOT forwarded** — the daily token counter is enforced host-side, and the container stays queue/budget-blind.
+  - **Per-job token *scoping* (`CONST-TOKEN-SCOPED-PER-JOB`) is the App path's property, not `gh`'s.** With
+    `GITHUB_AUTH_SOURCE=gh` (the default) the minted value is the operator's own full-scope `gh auth token`,
+    so every token-carrying job holds whatever that login can do; a fine-grained PAT approximates per-job
+    scoping for a single owner, and only the App path delivers it. `doctor` warns and names the actual
+    scopes. Either way the credential reaches the container only as env values — the operator's
+    `~/.config/gh` is never mounted.
   - Env **baked into the image**, because they are facts about the image and not choices a job makes:
     `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`, `PLAYWRIGHT_MCP_BROWSER=chromium`,
     `PLAYWRIGHT_MCP_SANDBOX=false`. **`PLAYWRIGHT_MCP_BROWSER` is load-bearing**: `playwright-cli`
@@ -539,7 +550,8 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
               "pattern": "<5 or 6 space-separated fields>" },
       "run": { "kind": "local", "folder": "<absolute HOST path, must exist>", "flow": "<flow name>",
                "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
-               "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional> } },
+               "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional>,
+               "github": <optional boolean> } },
     { "on": { "type": "label", "any": [...], "all": [...], "none": [...] },
       "run": { "kind": "github", "flow": "<flow name>" } },
     { "on": { "type": "comment", "phrase": "<trigger phrase>" },       // at most one
@@ -552,6 +564,11 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind:"github"`. Off-diagonal throws a
   `piDispatchConfig` error — a `cron` trigger has no webhook delivery, issue/PR number, title, or body to
   supply a github run, and a webhook trigger is adversarial input that always produces a github job.
+- **`run.github` (cron only, optional boolean)**: absent or `false` = no token — the zero-GitHub default;
+  `true` = the worker mints the same per-job token the GitHub path mints and injects it as
+  `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
+  non-boolean value is refused at load; with `GITHUB_AUTH_SOURCE=app` a `run.github` job refuses at mint
+  time — an installation token is per-repo, and a local job has no repo to scope it to.
 - **Why**: The operator's trigger set is one host file — diffable, reviewable, git-trackable — rather than
   two files in two shapes across two services. The schema unifies the *view*; evaluation still splits by
   owner (a `label` is never scheduled; a `cron` never receives a webhook). `on.id` (cron only) must be
@@ -765,6 +782,7 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
 
 | Date | Change |
 |---|---|
+| 2026-07-27 | Closed the gh CLI gaps (issue #50): INT-TRIGGERS-FILE-CONTRACT's cron `run` gains an optional boolean `github` — absent/false = no token (the zero-GitHub default), `true` = the worker mints the SAME per-job token the GitHub path mints; a non-boolean value is refused at load, and `GITHUB_AUTH_SOURCE=app` refuses at mint time, since an installation token is per-repo and a local job has no repo to scope it to. INT-CONTAINER-RUNTIME-CONTRACT: the minted value is now injected as BOTH `GITHUB_TOKEN` and `GH_TOKEN` (gh prefers `GH_TOKEN`; mirroring forecloses precedence surprises), and both names are refused in the `PI_FORWARD_ENV` allowlist at config load — a forwarded operator token would otherwise silently override the minted one. Documented the `source:gh` trade-off next to `CONST-TOKEN-SCOPED-PER-JOB`: per-job scoping is the App path's property (a fine-grained PAT approximates it for a single owner); `gh` hands the operator's full-scope login to every token-carrying job, `doctor` names the actual scopes, and the operator's `~/.config/gh` is never mounted into a container. |
 | 2026-07-22 | Unified triggers (issue #20 + `pull_request` triggers): replaced INT-SCHEDULES-FILE-CONTRACT with **INT-TRIGGERS-FILE-CONTRACT** — one `triggers.json` of `{ on, run }` entries via `PI_TRIGGERS_FILE`, read by both worker (`on.type:cron`) and receiver (`label`/`comment`/`pull_request`), with the `on × run` diagonal enforced fail-loud at load. Expanded INT-WEBHOOK-PAYLOAD-SUBSET to consume the `pull_request` event and its fields (`number`/`title`/`body`/`author_association`/`labels[].name`/`head.{ref,sha,repo.full_name}`/`base.ref`) plus `issue.pull_request` as a presence marker — `head`/`base` are attacker-controlled DATA, never a clone ref. Amended INT-CONTAINER-JOB-INPUTS: `/job/event.json` now carries an `issue` OR a `pull_request` body per the job-data `target` discriminator. See `DES-TRIGGERS-UNIFIED-FILE`, `DES-PR-TRIGGER-ROUTES-TO-FLOW`. |
 | 2026-07-22 | Corrected INT-CONTAINER-RUNTIME-CONTRACT's mount-mechanism sentence: the `/job:ro`, `/workspace:rw`, and local-only `/outbox:rw` mounts are host bind mounts (`-v host:container`), not the superseded named-volume + `volume-subpath` mechanism. Aligns the INT with `DES-WORKER-ON-HOST` and the shipped `worker/src/docker-run.mjs`. Also corrected INT-RUN-HISTORY-FILE-CONTRACT's `chainRefused` annotation from `<bool>` to `<int>` (a count of refused `/outbox` requests on the parent; `0` = none), matching the shipped `buildRecord`, which stores the collector's running `refused` count verbatim. |
 | 2026-07-21 | Extended INT-CONFIG-OVERLAY-CONTRACT's write protocol: an invalid existing file is repaired by the next write, which rebuilds from scratch with the sanitized candidate and surfaces a loud key-only notice — the fail-closed guarantee is stated to live only on the worker's job-start read. |

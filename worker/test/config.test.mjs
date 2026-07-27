@@ -91,6 +91,16 @@ test("forwardEnv is a comma list of names -- trimmed, empties dropped, default [
 	assert.deepEqual(loadConfig({ PI_FORWARD_ENV: "MY_KEY, OTHER ,,THIRD" }).forwardEnv, ["MY_KEY", "OTHER", "THIRD"]);
 });
 
+test("forwardEnv refuses GITHUB_TOKEN and GH_TOKEN at boot -- a forwarded operator token would override the mint", () => {
+	for (const bad of ["GH_TOKEN", "GITHUB_TOKEN", "FOO,GH_TOKEN"]) {
+		assert.throws(
+			() => loadConfig({ PI_FORWARD_ENV: bad }),
+			(e) => e.piDispatchConfig === true && /CONST-TOKEN-SCOPED-PER-JOB/.test(e.message),
+			`PI_FORWARD_ENV=${bad}`,
+		);
+	}
+});
+
 test("authFromPi defaults ON; only PI_AUTH_FROM_PI=0 forces env-only", () => {
 	assert.equal(loadConfig({}).authFromPi, true, "reusing the pi login is the default — no flag needed");
 	assert.equal(loadConfig({ PI_AUTH_FROM_PI: "1" }).authFromPi, true);

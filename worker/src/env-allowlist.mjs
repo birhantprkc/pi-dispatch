@@ -97,7 +97,8 @@ function resolveEnvName(provider, cred) {
 
 /**
  * Assemble the container env. `hostEnv` is the worker's process.env; `job` carries the resolved
- * config and the per-job scoped token (GitHub-backed jobs only).
+ * config and the per-job scoped token (GitHub-backed jobs, and local cron jobs that opted in via
+ * run.github).
  *
  * Throws if the provider is not configured -- a deterministic misconfiguration the caller maps to
  * a pre-spend refusal, never a launched-then-failed container.
@@ -137,9 +138,16 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
 	}
 
-	// GitHub-backed jobs only. Local-folder jobs have no token (CONST-TOKEN-SCOPED-PER-JOB is
-	// scoped to GitHub jobs). Absent token => absent variable, never an empty one.
-	if (githubToken) env.GITHUB_TOKEN = githubToken;
+	// GitHub-backed jobs, and local cron jobs that opted in via run.github. Other local-folder jobs
+	// have no token (CONST-TOKEN-SCOPED-PER-JOB). The mint goes into BOTH variables because the gh
+	// CLI prefers GH_TOKEN over GITHUB_TOKEN -- mirroring forecloses any precedence surprise inside
+	// the container. This assignment deliberately sits AFTER the PI_FORWARD_ENV loop so a forwarded
+	// name can never override the mint (and loadConfig refuses those names at load anyway).
+	// Absent token => absent variable, never an empty one.
+	if (githubToken) {
+		env.GITHUB_TOKEN = githubToken;
+		env.GH_TOKEN = githubToken;
+	}
 
 	return env;
 }

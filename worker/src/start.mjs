@@ -259,7 +259,7 @@ export async function startWorker(
 			mintToken:
 				gh?.mintToken ??
 				(async () => {
-					throw configError("github jobs require a working GITHUB_AUTH_SOURCE (gh/pat/app)");
+					throw configError("github jobs and cron triggers with run.github require a working GITHUB_AUTH_SOURCE (gh/pat/app)");
 				}),
 			isDefaultBranchProtected: host.isDefaultBranchProtected,
 		},

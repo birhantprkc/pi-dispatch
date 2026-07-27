@@ -351,7 +351,9 @@ write waits on your confirmation.
 
 A cron trigger runs a local folder through a flow on a cron pattern — `pattern` is a 5- or 6-field cron
 expression; `provider`, `model`, and `maxTurns` are optional on `run` and fall back to the worker's
-defaults. A cron `folder` is a **host path** — the worker runs on the host
+defaults. `"github": true` on `run` is also optional — it mints the same per-job GitHub token the webhook
+path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off by default. A cron
+`folder` is a **host path** — the worker runs on the host
 ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must be
 readable by the worker's user.
 
@@ -405,8 +407,10 @@ pi-dispatch can also be triggered by GitHub — label an issue, and a container 
 opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECRET`), and the worker
 authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
 **PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
-for multi-tenant. Which labels, comment phrases, and pull_request actions fire which flow is configured in
-the same unified **`triggers.json`** above; the receiver **requires** `PI_TRIGGERS_FILE`.
+for multi-tenant. The `gh` source hands your full login scopes to every token-carrying job — `doctor`
+warns and names them; use a fine-grained PAT or an App for per-job scoping. Which labels, comment
+phrases, and pull_request actions fire which flow is configured in the same unified **`triggers.json`**
+above; the receiver **requires** `PI_TRIGGERS_FILE`.
 
 ```mermaid
 flowchart LR
