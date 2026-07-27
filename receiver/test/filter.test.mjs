@@ -4,10 +4,12 @@ import { filter } from "../src/filter.mjs";
 
 // The grouped webhook triggers, mirroring loadReceiverConfig's `cfg.triggers` shape (label rules, the
 // single comment trigger, pull_request rules, and the knownFlows set for comment `<phrase> <flow>` overrides).
+// Rule `index` values are deliberately NON-CONTIGUOUS: the filter must pass the loader's raw-file index
+// through to `trigger.matched.index` verbatim, never recompute a position of its own.
 const cfg = {
 	triggers: {
-		label: [{ predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
-		comment: { phrase: "@pi", defaultFlow: "triage" },
+		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+		comment: { index: 4, phrase: "@pi", defaultFlow: "triage" },
 		pullRequest: [],
 		knownFlows: new Set(["frontend-fix", "triage"]),
 	},
@@ -17,10 +19,10 @@ const cfg = {
 const matrixCfg = {
 	triggers: {
 		label: [
-			{ predicate: { any: ["ai-fix", "urgent-fix"], all: ["triaged"], none: ["blocked", "wontfix"] }, flow: "fix" },
-			{ predicate: { any: ["ai-review"] }, flow: "review" },
+			{ index: 2, predicate: { any: ["ai-fix", "urgent-fix"], all: ["triaged"], none: ["blocked", "wontfix"] }, flow: "fix" },
+			{ index: 5, predicate: { any: ["ai-review"] }, flow: "review" },
 		],
-		comment: { phrase: "@pi", defaultFlow: "triage" },
+		comment: { index: 7, phrase: "@pi", defaultFlow: "triage" },
 		pullRequest: [],
 		knownFlows: new Set(["fix", "review", "triage"]),
 	},
@@ -29,10 +31,10 @@ const matrixCfg = {
 const prCfg = {
 	triggers: {
 		label: [],
-		comment: { phrase: "@pi", defaultFlow: "triage" },
+		comment: { index: 1, phrase: "@pi", defaultFlow: "triage" },
 		pullRequest: [
-			{ actions: new Set(["labeled"]), predicate: { any: ["pi:review"] }, flow: "review" },
-			{ actions: new Set(["opened", "synchronize", "reopened"]), predicate: {}, flow: "autoreview" },
+			{ index: 3, actions: new Set(["labeled"]), predicate: { any: ["pi:review"] }, flow: "review" },
+			{ index: 6, actions: new Set(["opened", "synchronize", "reopened"]), predicate: {}, flow: "autoreview" },
 		],
 		knownFlows: new Set(["review", "autoreview", "triage"]),
 	},
@@ -135,9 +137,17 @@ test("a labeled issue with an allowlisted label enqueues, carrying only subset f
 		repo: "octo/repo",
 		target: { type: "issue", number: 42, title: "T", body: "B" },
 		flow: "frontend-fix",
-		trigger: { event: "issues", action: "labeled", deliveryId: "guid-abc", sender: { id: 7 } },
+		trigger: {
+			event: "issues",
+			action: "labeled",
+			deliveryId: "guid-abc",
+			sender: { id: 7 },
+			matched: { index: 2, type: "label", label: "pi:frontend" },
+		},
 	});
 	assert.equal("login" in r.job.trigger.sender, false);
+	// A label-triggered job carries NO comment key at all -- `comment` exists only on the comment route.
+	assert.equal("comment" in r.job.trigger, false);
 	for (const forbidden of ["provider", "model", "maxTurns", "issueNumber", "title", "body"]) {
 		assert.equal(forbidden in r.job, false, `job must not carry a top-level ${forbidden}`);
 	}
@@ -190,10 +200,40 @@ test("predicate: a label matching only the second flow routes to it (single-clau
 	assert.equal(r.job.flow, "review");
 });
 
+// -- trigger.matched on the label path ------------------------------------------------------------
+
+test("matched reports the WINNING rule's raw-file index and the any-hit label, per rule", () => {
+	// First rule wins: index 2 (non-contiguous, so a recomputed array position would be caught), and the
+	// label is the `any` entry actually present -- urgent-fix, not the rule's first-listed ai-fix.
+	const first = filter("issues", labeledSubset(["urgent-fix", "triaged"]), matrixCfg, SELF_ID, "d-mi1");
+	assert.equal(first.enqueue, true);
+	assert.deepEqual(first.job.trigger.matched, { index: 2, type: "label", label: "urgent-fix" });
+
+	// Second rule wins: its own index (5), its own any-hit.
+	const second = filter("issues", labeledSubset(["ai-review"]), matrixCfg, SELF_ID, "d-mi2");
+	assert.equal(second.enqueue, true);
+	assert.deepEqual(second.job.trigger.matched, { index: 5, type: "label", label: "ai-review" });
+});
+
+test("a rule matched via an `all`-only predicate reports all[0] as the matched label", () => {
+	// No `any` clause: the positive selector is `all`, and all ⊆ L on a match guarantees membership.
+	const allOnlyCfg = {
+		triggers: {
+			label: [{ index: 9, predicate: { all: ["triaged", "approved"] }, flow: "fix" }],
+			comment: null,
+			pullRequest: [],
+			knownFlows: new Set(["fix"]),
+		},
+	};
+	const r = filter("issues", labeledSubset(["approved", "triaged"]), allOnlyCfg, SELF_ID, "d-mi3");
+	assert.equal(r.enqueue, true);
+	assert.deepEqual(r.job.trigger.matched, { index: 9, type: "label", label: "triaged" });
+});
+
 // -- comment path ---------------------------------------------------------------------------------
 
 test("comment with the phrase but no defaultFlow and no @pi <flow> is dropped as no-flow", () => {
-	const noDefault = { triggers: { ...cfg.triggers, comment: { phrase: "@pi", defaultFlow: null } } };
+	const noDefault = { triggers: { ...cfg.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } };
 	const subset = commentSubset({ comment: { author_association: "MEMBER", body: "@pi please help" } });
 	const r = filter("issue_comment", subset, noDefault, SELF_ID, "d-noflow");
 	assert.equal(r.enqueue, false);
@@ -201,11 +241,14 @@ test("comment with the phrase but no defaultFlow and no @pi <flow> is dropped as
 });
 
 test("an explicit `@pi <flow>` names a known flow value and enqueues even with defaultFlow null", () => {
-	const noDefault = { triggers: { ...cfg.triggers, comment: { phrase: "@pi", defaultFlow: null } } };
+	const noDefault = { triggers: { ...cfg.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } };
 	const subset = commentSubset({ comment: { author_association: "COLLABORATOR", body: "@pi frontend-fix please" } });
 	const r = filter("issue_comment", subset, noDefault, SELF_ID, "d-explicit");
 	assert.equal(r.enqueue, true);
 	assert.equal(r.job.flow, "frontend-fix");
+	// The flow-override changes WHICH flow runs, never the match record: matched.phrase stays the
+	// configured phrase, not the override word.
+	assert.deepEqual(r.job.trigger.matched, { index: 4, type: "comment", phrase: "@pi" });
 });
 
 test("a comment lacking the trigger phrase is dropped", () => {
@@ -221,15 +264,21 @@ test("a valid comment with the default flow enqueues an issue target with defaul
 	assert.equal(r.enqueue, true);
 	assert.equal(r.job.flow, "triage");
 	assert.equal(r.job.target.type, "issue");
+	// The invoking comment rides on the trigger -- exactly the two subset fields, nothing else.
+	assert.deepEqual(r.job.trigger.comment, { body: "hey @pi take a look", author_association: "OWNER" });
+	assert.deepEqual(r.job.trigger.matched, { index: 4, type: "comment", phrase: "@pi" });
 });
 
 test("a comment ON A PR (issue.pull_request present) routes a pull_request target, not an issue", () => {
 	const subset = commentSubset({ issue: { number: 55, title: "PR T", body: "PR B", pull_request: true }, comment: { author_association: "OWNER", body: "@pi go" } });
 	const r = filter("issue_comment", subset, cfg, SELF_ID, "d-prcomment");
 	assert.equal(r.enqueue, true);
-	assert.equal(r.job.target.type, "pull_request");
-	assert.equal(r.job.target.number, 55);
+	// Target unchanged by the trigger-context work: still the PR's number/title/body from subset.issue.
+	assert.deepEqual(r.job.target, { type: "pull_request", number: 55, title: "PR T", body: "PR B" });
 	assert.equal(r.job.flow, "triage");
+	// The PR-comment variant carries the invoking comment too -- same contract as an issue comment.
+	assert.deepEqual(r.job.trigger.comment, { body: "@pi go", author_association: "OWNER" });
+	assert.deepEqual(r.job.trigger.matched, { index: 4, type: "comment", phrase: "@pi" });
 });
 
 // -- pull_request path ----------------------------------------------------------------------------
@@ -247,6 +296,9 @@ test("a PR labeled with a matching predicate enqueues a pull_request target with
 		base: { ref: "main" },
 	});
 	assert.equal(r.job.trigger.event, "pull_request");
+	// matched names the labeled rule (raw-file index 3) and the action that satisfied its action set.
+	assert.deepEqual(r.job.trigger.matched, { index: 3, type: "pull_request", action: "labeled" });
+	assert.equal("comment" in r.job.trigger, false);
 });
 
 test("a PR labeled with a non-matching label is dropped (no-matching-pr-trigger)", () => {
@@ -260,6 +312,8 @@ test("PR opened by a COLLABORATOR auto-fires (author gate satisfied)", () => {
 	assert.equal(r.enqueue, true);
 	assert.equal(r.job.flow, "autoreview");
 	assert.equal(r.job.target.type, "pull_request");
+	// The auto rule sits at raw-file index 6; matched.action is the action that fired, not the rule's set.
+	assert.deepEqual(r.job.trigger.matched, { index: 6, type: "pull_request", action: "opened" });
 });
 
 test("PR opened by a non-collaborator (fork, author NONE) is dropped -- the hard author gate", () => {
@@ -282,6 +336,7 @@ test("PR synchronize/reopened by a collaborator auto-fires; by a fork author is 
 	const ok = filter("pull_request", prSubset({ action: "synchronize", author: "MEMBER" }), prCfg, SELF_ID, "d-sync");
 	assert.equal(ok.enqueue, true);
 	assert.equal(ok.job.flow, "autoreview");
+	assert.deepEqual(ok.job.trigger.matched, { index: 6, type: "pull_request", action: "synchronize" });
 
 	const forked = filter("pull_request", prSubset({ action: "reopened", author: "NONE" }), prCfg, SELF_ID, "d-reopen");
 	assert.equal(forked.enqueue, false);

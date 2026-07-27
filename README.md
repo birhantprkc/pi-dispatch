@@ -357,6 +357,12 @@ path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off
 ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must be
 readable by the worker's user.
 
+Every local job — cron, manual, or chained — also gets a read-only `/job/event.json` (`source:
+cron|manual|chain`, the folder's basename, its HEAD sha; cron jobs additionally the trigger's id and
+pattern, the scheduled-for instant, and the previous run's timestamp), so a scheduled flow can e.g. triage
+only what changed since its last run. Comment-triggered GitHub jobs likewise now receive the invoking
+comment in `event.json` and the prompt.
+
 ```bash
 cp triggers.example.json triggers.json   # then edit the cron entry's "folder" to a REAL absolute path
 # In .env:  PI_TRIGGERS_FILE=/absolute/path/to/triggers.json

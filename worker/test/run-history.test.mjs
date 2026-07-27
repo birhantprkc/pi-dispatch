@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import { test } from "node:test";
-import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
+import { buildRecord, makeFindPreviousRun, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
 
 /**
  * A fake writable that records chunks and lets a test drive `finish`/`error` timing.
@@ -519,6 +519,132 @@ test("makeRecordWriter overwrites on a re-run: two same-id writes are truncating
 	assert.equal(fs.writes[0].path, fs.writes[1].path); // same job id -> same sidecar, last write wins
 	assert.equal(fs.calls.createWriteStream, 0); // truncating writeFileSync, never an append stream
 	assert.equal(JSON.parse(fs.writes[1].data).outcome, "completed");
+});
+
+// ---- makeFindPreviousRun: reads a scheduler's prior run back from the per-job sidecars ----
+
+/**
+ * A fake fs exposing only what findPreviousRun touches: `names` is the directory listing, `files` maps
+ * a sidecar filename to its raw content. `readdirThrows` models a missing logs dir (first boot);
+ * `readThrows` models an unreadable sidecar.
+ */
+function makeHistoryFs({ names = [], files = {}, readdirThrows = false, readThrows = false } = {}) {
+	return {
+		readdirSync() {
+			if (readdirThrows) throw new Error("ENOENT: no such file or directory");
+			return names;
+		},
+		readFileSync(path) {
+			if (readThrows) throw new Error("EACCES: permission denied");
+			const name = basename(path);
+			if (!(name in files)) throw new Error(`ENOENT: ${name}`);
+			return files[name];
+		},
+	};
+}
+
+test("makeFindPreviousRun picks the max-millis run strictly below beforeMillis and returns its endedAt", () => {
+	const fs = makeHistoryFs({
+		names: ["repeat_t_100.json", "repeat_t_300.json", "repeat_t_500.json", "repeat_t_700.json"],
+		files: {
+			"repeat_t_300.json": '{"endedAt":"WRONG-not-the-max"}',
+			"repeat_t_500.json": '{"startedAt":"2026-07-26T03:00:00.000Z","endedAt":"2026-07-26T03:05:00.000Z"}',
+		},
+	});
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs });
+	// 700 is >= beforeMillis (excluded: it is this very fire), 500 is the max below.
+	assert.equal(findPreviousRun({ schedulerId: "t", beforeMillis: 700 }), "2026-07-26T03:05:00.000Z");
+});
+
+test("makeFindPreviousRun ignores other schedulers, including the underscore collision (a vs a_1)", () => {
+	const fs = makeHistoryFs({
+		names: ["repeat_a_100.json", "repeat_a_1_100.json", "repeat_b_150.json", "a_100.json", "repeat_a_100.log"],
+		files: {
+			"repeat_a_100.json": '{"endedAt":"2026-07-26T01:00:00.000Z"}',
+			"repeat_a_1_100.json": '{"endedAt":"WRONG-scheduler-a_1"}',
+			"repeat_b_150.json": '{"endedAt":"WRONG-scheduler-b"}',
+		},
+	});
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs });
+	// Scheduler "a": only repeat_a_<digits>.json qualifies -- repeat_a_1_100.json has a non-digit tail
+	// after the "repeat_a_" prefix, so scheduler "a_1"'s files can never shadow scheduler "a"'s.
+	assert.equal(findPreviousRun({ schedulerId: "a", beforeMillis: 999 }), "2026-07-26T01:00:00.000Z");
+	// And the converse: scheduler "a_1" resolves its own file, not "a"'s.
+	assert.equal(findPreviousRun({ schedulerId: "a_1", beforeMillis: 999 }), "WRONG-scheduler-a_1");
+});
+
+test("makeFindPreviousRun falls back to startedAt when the prior record has no endedAt (crashed run)", () => {
+	const fs = makeHistoryFs({
+		names: ["repeat_t_100.json"],
+		files: { "repeat_t_100.json": '{"startedAt":"2026-07-26T02:00:00.000Z"}' },
+	});
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs });
+	assert.equal(findPreviousRun({ schedulerId: "t", beforeMillis: 999 }), "2026-07-26T02:00:00.000Z");
+});
+
+test("makeFindPreviousRun returns null when the logs dir is missing (readdir throws)", () => {
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs: makeHistoryFs({ readdirThrows: true }) });
+	assert.equal(findPreviousRun({ schedulerId: "t", beforeMillis: 999 }), null);
+});
+
+test("makeFindPreviousRun returns null when the scheduler has no prior run at all", () => {
+	const fs = makeHistoryFs({ names: ["local-abc.json", "repeat_other_100.json"] });
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs });
+	assert.equal(findPreviousRun({ schedulerId: "t", beforeMillis: 999 }), null);
+});
+
+test("makeFindPreviousRun returns null when every candidate is at or above beforeMillis", () => {
+	const fs = makeHistoryFs({
+		names: ["repeat_t_500.json", "repeat_t_700.json"],
+		files: { "repeat_t_500.json": '{"endedAt":"WRONG"}', "repeat_t_700.json": '{"endedAt":"WRONG"}' },
+	});
+	const findPreviousRun = makeFindPreviousRun({ logsDir: "/logs", fs });
+	assert.equal(findPreviousRun({ schedulerId: "t", beforeMillis: 500 }), null, "strictly below: 500 itself is excluded");
+});
+
+test("makeFindPreviousRun returns null on an unreadable or malformed sidecar", () => {
+	const unreadable = makeFindPreviousRun({
+		logsDir: "/logs",
+		fs: makeHistoryFs({ names: ["repeat_t_100.json"], readThrows: true }),
+	});
+	assert.equal(unreadable({ schedulerId: "t", beforeMillis: 999 }), null);
+
+	const malformed = makeFindPreviousRun({
+		logsDir: "/logs",
+		fs: makeHistoryFs({ names: ["repeat_t_100.json"], files: { "repeat_t_100.json": "{ not json" } }),
+	});
+	assert.equal(malformed({ schedulerId: "t", beforeMillis: 999 }), null);
+});
+
+test("makeFindPreviousRun NEVER throws: a throwing fs and hostile arguments all yield null", () => {
+	const throwing = makeFindPreviousRun({
+		logsDir: "/logs",
+		fs: {
+			readdirSync() {
+				throw new Error("boom");
+			},
+			readFileSync() {
+				throw new Error("boom");
+			},
+		},
+	});
+	const inputs = [
+		{ schedulerId: "t", beforeMillis: 999 },
+		{ schedulerId: undefined, beforeMillis: 999 },
+		{ schedulerId: "t", beforeMillis: null },
+		{ schedulerId: "t", beforeMillis: NaN },
+		{},
+	];
+	for (const input of inputs) {
+		assert.doesNotThrow(() => throwing(input), `input=${JSON.stringify(input)}`);
+		assert.equal(throwing(input), null);
+	}
+	// Nullish beforeMillis is refused even over a healthy fs -- no lookup without a fire instant.
+	const healthy = makeFindPreviousRun({
+		logsDir: "/logs",
+		fs: makeHistoryFs({ names: ["repeat_t_100.json"], files: { "repeat_t_100.json": '{"endedAt":"X"}' } }),
+	});
+	assert.equal(healthy({ schedulerId: "t", beforeMillis: null }), null);
 });
 
 // A fixed clock so the reaper's cutoff is deterministic: day 1000, in ms.

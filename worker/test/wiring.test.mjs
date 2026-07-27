@@ -282,6 +282,47 @@ test("collectChain receives the REAL BullMQ job (id + data), not runJob's effect
 	assert.equal(received.prepared.outboxDir, "/j/outbox", "prepared threads through to collectChain");
 });
 
+test("prepareWorkspace receives (effectiveJob, token, { queueJobId: <real BullMQ job id> })", { skip }, async () => {
+	// runJob's own `job` is the effectiveJob (a spread of job.data, no `.id`). prepare needs the real
+	// wrapper's id to derive a cron job's scheduled-for instant from the deterministic
+	// repeat:<id>:<millis> jobId (DES-CRON-VIA-BULLMQ-SCHEDULER), so makeProcessor must inject it as
+	// `queueJobId` -- mirroring the collectChain injection above. This locks that.
+	let received;
+	const job = {
+		id: "repeat:t:1758868620000",
+		attemptsMade: 0,
+		name: "local",
+		data: { kind: "local", folder: "/p", trigger: { id: "t", pattern: "0 3 * * *" } },
+	};
+	const processor = mod.makeProcessor({
+		cancelJob: () => {},
+		stopContainer: () => {},
+		redis: { async incr() { return 1; }, async expire() {} },
+		getSettings: () => ({ provider: "anthropic", model: "m", maxTurns: 30, dailyCap: 10, concurrency: 3 }),
+		timeoutMs: 100000,
+		deps: {
+			mintToken: async () => "t",
+			isDefaultBranchProtected: async () => true,
+			prepareWorkspace: async (j, t, opts) => {
+				received = { job: j, token: t, opts };
+				return { jobDir: "/j", workspace: "/p", sha: "s" };
+			},
+			runContainer: async () => ({ code: 0, aborted: false, turns: 1 }),
+			cleanup: async () => {},
+			comment: async () => {},
+		},
+	});
+
+	const result = await processor(job, "tok", new AbortController().signal);
+
+	assert.equal(result.outcome, "completed");
+	assert.deepEqual(received.opts, { queueJobId: "repeat:t:1758868620000" }, "the real wrapper's id reaches prepare as queueJobId");
+	assert.notEqual(received.job, job, "prepare receives the effectiveJob (a spread of job.data), not the raw wrapper");
+	assert.equal(received.job.kind, "local");
+	assert.deepEqual(received.job.trigger, { id: "t", pattern: "0 3 * * *" }, "the cron-only trigger data field rides the effectiveJob");
+	assert.equal(received.token, null, "an unflagged local job stays tokenless");
+});
+
 // End-to-end money-path acceptance: compose the REAL recordRun = writeRecord(buildRecord(...)) over a
 // fake fs and drive makeProcessor per outcome, asserting the SERIALIZED bytes. This is the only place
 // the whole record path (processor wrapper -> buildRecord -> writeRecord) is exercised end-to-end, so

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { materializePiDir } from "./materialize.mjs";
 
@@ -18,8 +18,13 @@ const exec = promisify(execFile);
  *
  * The task text is DATA (CONST-ISSUE-TEXT-IS-DATA): it goes into /job/prompt.md, never the
  * instructions. The operator supplies it via the CLI (`pi-dispatch run --task`).
+ *
+ * `event` is the trigger context the dispatcher derived (cron/manual/chain); it lands in
+ * /job/event.json (INT-CONTAINER-JOB-INPUTS) -- one file per concern, alongside prompt.md. The
+ * default keeps a directly-constructed call (tests, older wiring) honest: a job with no derived
+ * context is a manual run.
  */
-export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaultGit }) {
+export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaultGit, event = { source: "manual" } }) {
 	if (!existsSync(folder)) {
 		const error = new Error(`local folder does not exist: ${folder}`);
 		error.piDispatchConfig = true;
@@ -43,6 +48,20 @@ export async function prepareLocalWorkspace({ folder, task, jobDir, git = defaul
 
 	// The task the operator asked for. Plain data below the instructions.
 	writeFileSync(join(jobDir, "prompt.md"), String(task ?? ""), { mode: 0o444 });
+
+	// The trigger context, /job/event.json (INT-CONTAINER-JOB-INPUTS): one file per concern, 0o444 like
+	// the prompt, written unconditionally so every local run carries its origin. `folder` is the BASENAME
+	// only -- the full path embeds the operator's OS account name and /job is agent-readable, the same
+	// PII restraint run-history's `local:<basename>` target applies. The cron-only keys (trigger,
+	// scheduledFor, previousRunAt) appear only for a cron source, nulls preserved.
+	const eventBody = {
+		source: event.source,
+		...(event.trigger ? { trigger: event.trigger } : {}),
+		folder: basename(folder),
+		sha,
+		...(event.source === "cron" ? { scheduledFor: event.scheduledFor ?? null, previousRunAt: event.previousRunAt ?? null } : {}),
+	};
+	writeFileSync(join(jobDir, "event.json"), JSON.stringify(eventBody, null, 2), { mode: 0o444 });
 
 	// The folder itself is /workspace (rw). No clone: local jobs edit in place.
 	return { workspace: folder, jobDir, outboxDir, sha, materialised: written };

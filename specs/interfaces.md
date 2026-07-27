@@ -320,13 +320,42 @@ Evidence convention as in `constitution.md`.
   mounts `/outbox` (writable, `INT-OUTBOX-CONTRACT`); a **github** job does not.
   ```
   /job/prompt.md          task text (issue/PR payload, or the operator-supplied task)
-  /job/event.json         webhook payload subset — an `issue` OR a `pull_request` body per the target
-                          discriminator; ABSENT for local-folder jobs
+  /job/event.json         structured trigger context — written for EVERY job, github and local alike
+                          (both shapes below)
   /job/pi/APPEND_SYSTEM.md      project persona   ─┐ materialised by the worker from the
   /job/pi/skills/<name>/SKILL.md project skills    ├─ project's .pi/ at the DEFAULT-BRANCH SHA,
   /job/pi/extensions/...        project extensions ┘  via `git show`, never `fs.readFile`
   ```
   **The guardrails are baked into the image** at a path outside `agentDir` and are **not** mounted.
+- **`/job/event.json` — both shapes.** Written for **every** job, `0o444` like everything under `/job`,
+  one file per concern — trigger context lives here, never merged into the prompt file.
+  - A **github** job gets the webhook payload subset — an `issue` OR a `pull_request` body per the target
+    discriminator (`INT-WEBHOOK-PAYLOAD-SUBSET`) — plus three additions. `comment: { body,
+    author_association }`, comment-triggered jobs only: the invoking comment, carried on the job's
+    `trigger`; the body is untrusted user-authored data permitted in `/job` and the prompt's fenced data
+    region **only** — never in worker logs or the run record (`no-pii-in-logs`,
+    `CONST-ISSUE-TEXT-IS-DATA`). `sender: { id }` — **no `login`**: the subset never extracted it, so the
+    key was written but never populated, and it is now not written at all. And `matched: { index, type,
+    label | phrase | action }` — **HARNESS-COMPUTED** metadata, the filter's own decision record and not a
+    webhook payload field: `index` is the 0-based position of the winning entry in the raw `triggers.json`
+    `triggers` array (cron entries counted — the file index is the rule's identity), `type` is that
+    entry's `on.type`, and the third key names what satisfied the rule — for `label` the label that hit
+    (first `any` hit, else `all[0]`), for `comment` the configured `phrase`, for `pull_request` the
+    `action`. `matched` does **not** enter the prompt.
+  - A **local** job gets one of three `source`-discriminated shapes — naming the fields IS the contract:
+    ```
+    cron:    { source: "cron", trigger: { id, pattern }, folder: <basename>, sha: <folder HEAD>,
+               scheduledFor: <ISO>|null, previousRunAt: <ISO>|null }
+    manual:  { source: "manual", folder: <basename>, sha }   // CLI `pi-dispatch run` / admin dispatch_run
+    chain:   { source: "chain", folder: <basename>, sha }    // outbox-chained child
+    ```
+    `folder` is the **basename only** — the full host path embeds the operator's OS account name and
+    `/job` is agent-readable, the same restraint `INT-RUN-HISTORY-FILE-CONTRACT` applies to
+    `local:<basename>`. `sha` is the folder's HEAD at prepare time. `scheduledFor` derives from the BullMQ
+    `repeat:<id>:<millis>` job id; `previousRunAt` is the prior fire's `endedAt` (`startedAt` fallback),
+    looked up read-only from the run-history files by filename (`INT-RUN-HISTORY-FILE-CONTRACT`). The
+    local task prompt names `/job/event.json` in one harness line — discovery only, mirroring the github
+    prompt.
 - **Why the worker materialises `.pi/` instead of letting pi discover it**: pi's discovery reads from
   `cwd` — i.e. the **checked-out branch**, which for a PR-triggered job may be a fork. Materialising from
   the default-branch SHA into a read-only mount keeps three properties at once: the instructions are
@@ -519,6 +548,11 @@ Evidence convention as in `constitution.md`.
   - `issue.labels[].name` and `pull_request.labels[].name` are consumed as a **set**, evaluated by the
     `{any, all, none}` trigger predicate (`REQ-TRIGGER-AUTHOR-GATE`) — this changes *how* the field is
     used, not which fields are read.
+  - For a comment-triggered job, `comment.body` and `comment.author_association` now ride the job as
+    `trigger.comment` into `/job/event.json` and the prompt's fenced data region
+    (`INT-CONTAINER-JOB-INPUTS`) — the first time these two fields leave the receiver. The subset itself is
+    unchanged — both were already named here — and the body stays data-by-placement
+    (`CONST-ISSUE-TEXT-IS-DATA`).
   - **`pull_request.head.*` and `.base.*` are DATA only.** They are attacker-controlled (the head may be a
     fork) and are carried into `/job/event.json` for the flow's own `gh` use; they are **never** used as a
     clone ref. The worker still clones the base repo's default-branch SHA (`INT-CONTAINER-JOB-INPUTS`).
@@ -584,7 +618,9 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   cron `id`, a `:` in a cron `id`, a cron `run.folder` that does not exist, a `labeled` PR/label rule with
   no positive selector, or a second `comment` trigger, when the config loads, then load throws a
   `piDispatchConfig`-tagged error in both services. Given a valid `cron` entry, when it fires, then the
-  emitted job's `data` byte-matches the interactive local (`enqueueLocalJob`) shape.
+  emitted job's `data` byte-matches the interactive local (`enqueueLocalJob`) shape **plus exactly one
+  cron-only field**: `trigger: { id, pattern }` — a scheduled job must be able to name its own trigger and
+  pattern in `/job/event.json` (`INT-CONTAINER-JOB-INPUTS`), and `pattern` exists nowhere else at job time.
 
 ## INT-RUN-HISTORY-FILE-CONTRACT
 
@@ -631,8 +667,11 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   structured record; it is opt-in, host-side (never mounted into the container), and written only under
   `PI_CAPTURE_JOB_LOGS=1`. This is a **flat per-job file, not a database**: one `.json` (plus the optional
   `.log`) keyed by the sanitized job id, no schema and no query surface — upholding this file's standing
-  invariant that **there is deliberately no database**. The chain fields — `parentJobId`, `chainDepth`,
-  `chainRefused` — are **additive and nullable**, set as explicit literals by the same no-spread
+  invariant that **there is deliberately no database**. The files now also double as the `previousRunAt`
+  source for scheduled jobs (`INT-CONTAINER-JOB-INPUTS`): a read-only, filename-keyed scan for the prior
+  fire's `repeat_<id>_<millis>.json` — explicitly NOT a query surface — and retention
+  (`PI_LOG_RETENTION_DAYS`) naturally bounds how far back the lookup sees. The chain fields — `parentJobId`,
+  `chainDepth`, `chainRefused` — are **additive and nullable**, set as explicit literals by the same no-spread
   `buildRecord` (a chained job carries its parent id and host-computed depth; `chainRefused` records how many
   of a parent's own `/outbox` requests were refused). `chainRefused` is an **`<int>` count, not a boolean** —
   the collector returns a running `refused` count, and the record stores it verbatim (`0` = none), so the runs
@@ -782,6 +821,7 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
 
 | Date | Change |
 |---|---|
+| 2026-07-27 | Trigger context (issue #49): INT-CONTAINER-JOB-INPUTS — `/job/event.json` is now written for EVERY job kind, not only github. Local jobs get one of three `source`-discriminated shapes (`cron` with `trigger:{id,pattern}`, `scheduledFor`, and `previousRunAt`; `manual`; `chain`), each carrying the folder **basename** only (the full host path embeds the operator's OS account name and `/job` is agent-readable) plus the folder's HEAD `sha`. GitHub jobs gain `comment:{body,author_association}` for comment-triggered jobs — INT-WEBHOOK-PAYLOAD-SUBSET is UNCHANGED, both fields were already in its list; this is the first time they leave the receiver, still data-by-placement per CONST-ISSUE-TEXT-IS-DATA and never in worker logs or the run record — and a HARNESS-COMPUTED `matched:{index,type,label\|phrase\|action}` naming the raw triggers.json entry that fired (the filter's own decision record, not a payload field; never enters the prompt). `sender.login` deleted from event.json as written-but-never-populated — the subset extracts `sender.id` only, so the list is unchanged there too. INT-TRIGGERS-FILE-CONTRACT: the cron byte-match acceptance gains its one carve-out — scheduler `data` now carries a cron-only `trigger:{id,pattern}`, since `pattern` exists nowhere else at job time. INT-RUN-HISTORY-FILE-CONTRACT: the per-job `.json` files double as the `previousRunAt` lookup source — a read-only, filename-keyed scan, explicitly not a query surface, bounded by `PI_LOG_RETENTION_DAYS`. |
 | 2026-07-27 | Closed the gh CLI gaps (issue #50): INT-TRIGGERS-FILE-CONTRACT's cron `run` gains an optional boolean `github` — absent/false = no token (the zero-GitHub default), `true` = the worker mints the SAME per-job token the GitHub path mints; a non-boolean value is refused at load, and `GITHUB_AUTH_SOURCE=app` refuses at mint time, since an installation token is per-repo and a local job has no repo to scope it to. INT-CONTAINER-RUNTIME-CONTRACT: the minted value is now injected as BOTH `GITHUB_TOKEN` and `GH_TOKEN` (gh prefers `GH_TOKEN`; mirroring forecloses precedence surprises), and both names are refused in the `PI_FORWARD_ENV` allowlist at config load — a forwarded operator token would otherwise silently override the minted one. Documented the `source:gh` trade-off next to `CONST-TOKEN-SCOPED-PER-JOB`: per-job scoping is the App path's property (a fine-grained PAT approximates it for a single owner); `gh` hands the operator's full-scope login to every token-carrying job, `doctor` names the actual scopes, and the operator's `~/.config/gh` is never mounted into a container. |
 | 2026-07-22 | Unified triggers (issue #20 + `pull_request` triggers): replaced INT-SCHEDULES-FILE-CONTRACT with **INT-TRIGGERS-FILE-CONTRACT** — one `triggers.json` of `{ on, run }` entries via `PI_TRIGGERS_FILE`, read by both worker (`on.type:cron`) and receiver (`label`/`comment`/`pull_request`), with the `on × run` diagonal enforced fail-loud at load. Expanded INT-WEBHOOK-PAYLOAD-SUBSET to consume the `pull_request` event and its fields (`number`/`title`/`body`/`author_association`/`labels[].name`/`head.{ref,sha,repo.full_name}`/`base.ref`) plus `issue.pull_request` as a presence marker — `head`/`base` are attacker-controlled DATA, never a clone ref. Amended INT-CONTAINER-JOB-INPUTS: `/job/event.json` now carries an `issue` OR a `pull_request` body per the job-data `target` discriminator. See `DES-TRIGGERS-UNIFIED-FILE`, `DES-PR-TRIGGER-ROUTES-TO-FLOW`. |
 | 2026-07-22 | Corrected INT-CONTAINER-RUNTIME-CONTRACT's mount-mechanism sentence: the `/job:ro`, `/workspace:rw`, and local-only `/outbox:rw` mounts are host bind mounts (`-v host:container`), not the superseded named-volume + `volume-subpath` mechanism. Aligns the INT with `DES-WORKER-ON-HOST` and the shipped `worker/src/docker-run.mjs`. Also corrected INT-RUN-HISTORY-FILE-CONTRACT's `chainRefused` annotation from `<bool>` to `<int>` (a count of refused `/outbox` requests on the parent; `0` = none), matching the shipped `buildRecord`, which stores the collector's running `refused` count verbatim. |

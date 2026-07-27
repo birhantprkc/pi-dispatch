@@ -76,6 +76,8 @@ test("a valid cron trigger normalizes to the scheduler shape; omitted provider/m
 		model: undefined,
 		maxTurns: undefined,
 		github: undefined,
+		// The cron-only field carried into the local /job/event.json (INT-CONTAINER-JOB-INPUTS).
+		trigger: { id: "nightly-tidy", pattern: "0 3 * * *" },
 	});
 
 	// opts: retention only -- no jobId, attempts, or backoff.

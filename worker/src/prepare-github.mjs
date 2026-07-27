@@ -27,8 +27,11 @@
  *
  * The /job inputs written here are exactly INT-CONTAINER-JOB-INPUTS: `prompt.md` (the user prompt,
  * issue text as DATA), `event.json` (the INT-WEBHOOK-PAYLOAD-SUBSET body fields only — never a
- * header, never the `X-Hub-Signature-256` signature, never the token), and `pi/` (materialised
- * persona/skills). Neither the token nor any issue text is logged.
+ * header, never the `X-Hub-Signature-256` signature, never the token; on issue_comment jobs the
+ * named subset includes the invoking `comment` body fields, and the one non-webhook addition is
+ * `matched` — the filter's decision record of which triggers.json entry fired, by raw file index,
+ * harness-computed rather than taken from any payload), and `pi/` (materialised persona/skills).
+ * Neither the token nor any issue text is logged.
  *
  * A determinate gone-SHA (the default branch advanced past the resolved tip before the fetch) is a
  * POLICY outcome, returned as `{ outcome: "policy", reason: "sha-gone" }` — NOT thrown, so the
@@ -158,18 +161,21 @@ export async function prepareGithubWorkspace(
 		// Issue text is DATA: it enters the USER prompt (buildGithubPrompt), never a system prompt.
 		writeFile(
 			join(jobDir, "prompt.md"),
-			buildGithubPrompt({ flow: job.flow, target: job.target }),
+			buildGithubPrompt({ flow: job.flow, target: job.target, comment: job.trigger?.comment }),
 			{ mode: 0o444 },
 		);
 
-		// The INT-WEBHOOK-PAYLOAD-SUBSET body fields ONLY — no header, no signature, no token.
+		// The INT-WEBHOOK-PAYLOAD-SUBSET body fields ONLY — no header, no signature, no token. `matched`
+		// is the single harness-computed addition: the filter's decision record, not a webhook field.
 		const subset = {
 			event: job.trigger?.event,
 			action: job.trigger?.action,
 			delivery: job.trigger?.deliveryId,
 			repository: { full_name: job.repo },
 			...(job.target?.type === "pull_request" ? { pull_request: prEventBody(job.target) } : { issue: { number: job.target?.number, title: job.target?.title, body: job.target?.body } }),
-			sender: { id: job.trigger?.sender?.id, login: job.trigger?.sender?.login },
+			...(job.trigger?.comment ? { comment: { body: job.trigger.comment.body, author_association: job.trigger.comment.author_association } } : {}),
+			sender: { id: job.trigger?.sender?.id },
+			...(job.trigger?.matched ? { matched: job.trigger.matched } : {}),
 		};
 		writeFile(join(jobDir, "event.json"), JSON.stringify(subset, null, 2), { mode: 0o444 });
 

@@ -64,12 +64,23 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 	if (!resolved.enqueue) return resolved; // carries the drop reason
 
 	// (3) Build the job from the INT-WEBHOOK-PAYLOAD-SUBSET fields only. No sender.login (not in the
-	// subset), no provider/model/maxTurns (the worker fills defaults), no field outside the subset.
+	// subset), no provider/model/maxTurns (the worker fills defaults), no field outside the subset --
+	// with two trigger-context additions (issue #49): `matched` is harness-computed, the filter's own
+	// decision record naming the triggers.json entry that fired (not payload data at all); `comment`,
+	// present only on the comment route, carries the invoking comment's body/author_association, both
+	// fields INT-WEBHOOK-PAYLOAD-SUBSET already names.
 	const job = {
 		repo: subset.repository?.full_name,
 		target: resolved.target,
 		flow: resolved.flow,
-		trigger: { event: eventName, action, deliveryId, sender: { id: subset.sender.id } },
+		trigger: {
+			event: eventName,
+			action,
+			deliveryId,
+			sender: { id: subset.sender.id },
+			matched: resolved.matched,
+			...(resolved.comment ? { comment: resolved.comment } : {}),
+		},
 	};
 	return { enqueue: true, job };
 }
@@ -77,13 +88,14 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 /** Issue label path: the label allowlist IS the human approval gate -- only collaborators can label. */
 function routeIssueLabel(subset, triggers) {
 	const L = labelSet(subset.issue?.labels);
-	const flow = firstMatchingFlow(triggers.label, L);
-	if (flow === undefined) {
+	const rule = firstMatchingRule(triggers.label, L);
+	if (rule === undefined) {
 		return { enqueue: false, reason: "no-allowlisted-label" };
 	}
 	return {
 		enqueue: true,
-		flow,
+		flow: rule.flow,
+		matched: { index: rule.index, type: "label", label: matchedLabel(L, rule.predicate) },
 		target: { type: "issue", number: subset.issue?.number, title: subset.issue?.title, body: subset.issue?.body },
 	};
 }
@@ -116,6 +128,10 @@ function routeComment(subset, triggers) {
 	return {
 		enqueue: true,
 		flow,
+		matched: { index: triggers.comment.index, type: "comment", phrase },
+		// The invoking comment rides on the trigger: body and author_association are both named by
+		// INT-WEBHOOK-PAYLOAD-SUBSET, and the body stays DATA all the way down (CONST-ISSUE-TEXT-IS-DATA).
+		comment: { body: subset.comment.body, author_association: subset.comment.author_association },
 		target: { type: isPR ? "pull_request" : "issue", number: subset.issue?.number, title: subset.issue?.title, body: subset.issue?.body },
 	};
 }
@@ -143,7 +159,12 @@ function routePullRequest(subset, triggers, action) {
 			if (!authorOk) continue;
 			if (!matchesRule(L, rule.predicate)) continue;
 		}
-		return { enqueue: true, flow: rule.flow, target: buildPrTarget(pr) };
+		return {
+			enqueue: true,
+			flow: rule.flow,
+			matched: { index: rule.index, type: "pull_request", action },
+			target: buildPrTarget(pr),
+		};
 	}
 
 	// Surface the security-relevant author drop distinctly from a plain no-match so it is observable.
@@ -167,12 +188,24 @@ function labelSet(labels) {
 	return new Set(arr.map((l) => l?.name).filter((n) => typeof n === "string"));
 }
 
-/** First rule (in file order) whose predicate matches `L`, or undefined. */
-function firstMatchingFlow(rules, L) {
+/** First rule (in file order) whose predicate matches `L`, or undefined. The rule carries its raw-file `index`. */
+function firstMatchingRule(rules, L) {
 	for (const rule of rules ?? []) {
-		if (matchesRule(L, rule.predicate)) return rule.flow;
+		if (matchesRule(L, rule.predicate)) return rule;
 	}
 	return undefined;
+}
+
+/**
+ * The label that satisfied a matched rule's positive selector, for `trigger.matched.label`: the first
+ * `any` entry present in `L`, else `all[0]` (all ⊆ L holds whenever the rule matched, so membership is
+ * guaranteed), else null. Deterministic in rule order -- honest about WHICH label opened the gate, not
+ * merely that one did.
+ */
+function matchedLabel(L, predicate) {
+	const anyHit = (predicate?.any ?? []).find((x) => L.has(x));
+	if (anyHit !== undefined) return anyHit;
+	return predicate?.all?.[0] ?? null;
 }
 
 /**

@@ -34,16 +34,18 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 	assert.equal(c.bind, "0.0.0.0");
 	assert.equal(c.port, 3000);
 
-	// label rules, in file order.
+	// label rules, in file order; each carries its raw-file index (the rule's identity for matched.index).
 	assert.equal(c.triggers.label.length, 1);
+	assert.equal(c.triggers.label[0].index, 0);
 	assert.equal(c.triggers.label[0].flow, "frontend-fix");
 	assert.deepEqual(c.triggers.label[0].predicate.any, ["pi:frontend"]);
 
 	// the single comment trigger.
-	assert.deepEqual(c.triggers.comment, { phrase: "@pi", defaultFlow: "triage" });
+	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage" });
 
 	// pull_request rules: actions is a Set, predicate carries the label selectors.
 	assert.equal(c.triggers.pullRequest.length, 1);
+	assert.equal(c.triggers.pullRequest[0].index, 2);
 	assert.equal(c.triggers.pullRequest[0].flow, "review");
 	assert.ok(c.triggers.pullRequest[0].actions.has("labeled"));
 	assert.deepEqual(c.triggers.pullRequest[0].predicate.any, ["pi:review"]);
@@ -69,6 +71,23 @@ test("cron triggers in the shared file are validated but ignored by the receiver
 	assert.equal(c.triggers.label.length, 1);
 	assert.equal(c.triggers.pullRequest.length, 0);
 	assert.equal(c.triggers.comment, null);
+});
+
+test("rule indices are RAW file positions -- a leading cron entry still occupies index 0", () => {
+	// The index is the entry's identity IN THE FILE, so a skipped cron rule must shift the webhook
+	// rules' indices, never compact them: matched.index must point back at the exact triggers.json entry.
+	const json = JSON.stringify({
+		triggers: [
+			{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/p", flow: "tidy", task: "t" } },
+			{ on: { type: "label", any: ["pi:x"] }, run: { kind: "github", flow: "fix" } },
+			{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "triage" } },
+			{ on: { type: "pull_request", action: ["labeled"], any: ["pi:review"] }, run: { kind: "github", flow: "review" } },
+		],
+	});
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
+	assert.equal(c.triggers.label[0].index, 1);
+	assert.equal(c.triggers.comment.index, 2);
+	assert.equal(c.triggers.pullRequest[0].index, 3);
 });
 
 test("RECEIVER_PORT and RECEIVER_BIND overrides are honored", () => {
