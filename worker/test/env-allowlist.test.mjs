@@ -59,7 +59,7 @@ test("the container env is a CLOSED set: only the provider key, never the whole 
 	assert.equal(env.OPENAI_API_KEY, undefined); // wrong provider's key not forwarded either
 });
 
-test("a local-folder job (no token) gets NO GITHUB_TOKEN var at all -- not an empty one", { skip }, () => {
+test("a local-folder job (no token) gets NO GITHUB_TOKEN or GH_TOKEN var at all -- not an empty one", { skip }, () => {
 	const env = buildContainerEnv({
 		provider: "anthropic",
 		model: "m",
@@ -69,6 +69,34 @@ test("a local-folder job (no token) gets NO GITHUB_TOKEN var at all -- not an em
 		hostEnv: HOST,
 	});
 	assert.ok(!("GITHUB_TOKEN" in env), "absent token must mean absent variable");
+	assert.ok(!("GH_TOKEN" in env), "the mirror var is absent too, never an empty one");
+});
+
+test("the minted token is mirrored into BOTH GITHUB_TOKEN and GH_TOKEN (gh prefers GH_TOKEN)", { skip }, () => {
+	const env = buildContainerEnv({
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+		jobId: "j",
+		githubToken: "ghs_scoped",
+		hostEnv: HOST,
+	});
+	assert.equal(env.GITHUB_TOKEN, "ghs_scoped");
+	assert.equal(env.GH_TOKEN, "ghs_scoped", "gh reads GH_TOKEN first -- both must carry the same mint");
+});
+
+test("a forwarded GH_TOKEN can never override the mint -- the token assignment sits after the forward loop", { skip }, () => {
+	const env = buildContainerEnv({
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+		jobId: "j",
+		githubToken: "minted-token",
+		hostEnv: { ...HOST, GH_TOKEN: "operator-token" },
+		forwardEnv: ["GH_TOKEN"],
+	});
+	assert.equal(env.GH_TOKEN, "minted-token", "the operator token must not beat the per-job mint");
+	assert.equal(env.GITHUB_TOKEN, "minted-token");
 });
 
 test("PI_MAX_TOKENS is forwarded only when the per-job budget is set", { skip }, () => {

@@ -168,7 +168,13 @@ Stated openly rather than discovered later:
 - Do not blanket-forward host environment into job containers. Pass only the variables the configured
   provider needs. In particular `ANTHROPIC_OAUTH_TOKEN` silently takes precedence over
   `ANTHROPIC_API_KEY`, so a stray variable in the host environment can quietly redirect which credential
-  a job spends.
+  a job spends. `GITHUB_TOKEN` and `GH_TOKEN` are refused in `PI_FORWARD_ENV` at config load — the worker
+  sets both to the minted per-job value, and a forwarded operator token would silently override it.
+- **With `GITHUB_AUTH_SOURCE=gh` (the default), your entire gh login reaches every token-carrying job.**
+  The minted value is your own full-scope `gh auth token`, and `pi-dispatch doctor` warns and names the
+  scopes it carries (calling out broad ones like `admin:org`, `delete_repo`, `workflow`). Prefer a
+  fine-grained PAT — or an App — for real per-job scoping. Your `~/.config/gh` is never mounted into a
+  container; the credential reaches jobs only as env values.
 - **By default the worker sources the provider key from pi's `~/.pi/agent/auth.json` when the env has none.**
   It is a host-side read env-injected into the container — never a credential file mounted in — and accepts
   **API-key** logins only; an OAuth/subscription login is refused. The env always wins when set; set

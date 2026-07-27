@@ -6,6 +6,9 @@
  * CONST-TOKEN-SCOPED-PER-JOB: the App path mints one installation token per job, scoped to the one
  * repo, expiring in an hour. That short-lived, repo-scoped expiry IS the blast-radius bound for an
  * exfiltrated environment (App: 1h; a single-owner fine-grained PAT: operator-set, still short).
+ * The per-job SCOPING claim is the App path's property alone: `gh` and `pat` hand out the
+ * operator-scoped credential and rely on the operator keeping that credential narrow (the
+ * INT-CONTAINER-RUNTIME-CONTRACT trade-off note).
  *
  * Money-hole invariant: `mintToken` NEVER returns "" / null. `env-allowlist.mjs` forwards the token
  * as `GITHUB_TOKEN` only when truthy (`if (githubToken)`), so an empty token becomes an ABSENT
@@ -81,6 +84,13 @@ export async function makeGitHubAuth(cfg, deps = {}) {
 		const selfId = await resolveSelfId({ source: "app", octokit });
 
 		const mintToken = async (repo) => {
+			// A local run.github job passes no repo, and an installation token MUST be scoped to one
+			// (CONST-TOKEN-SCOPED-PER-JOB) -- refuse deterministically rather than mint broad.
+			if (!repo || !String(repo).trim()) {
+				throw configError(
+					"GITHUB_AUTH_SOURCE=app mints per-repo installation tokens, and a local run.github job has no repo to scope to -- use gh or pat for run.github cron triggers, or run the work as a github job",
+				);
+			}
 			const repositoryNames = [repoNameOf(repo)]; // scope to the ONE repo; owner stripped
 			let minted;
 			try {

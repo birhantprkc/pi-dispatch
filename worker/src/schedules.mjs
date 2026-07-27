@@ -44,8 +44,10 @@ function normalizeCronSchedule({ on, run }, path, existsSync) {
 
 	// Absent provider/model/maxTurns stay absent (undefined) so the value resolves at job start against the
 	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). data key order matches
-	// queue.mjs -- the shape the processor's runJob consumes.
-	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns };
+	// queue.mjs -- the shape the processor's runJob consumes. `github` (the opt-in token flag,
+	// INT-TRIGGERS-FILE-CONTRACT) rides along the same way: undefined drops out at JSON serialization, so
+	// an unflagged schedule stays byte-identical to today's.
+	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github };
 	// Retention only; the deterministic repeat:<id>:<millis> jobId supplies dedup, so no jobId here, and
 	// scheduler jobs are not retried (DES-CRON-VIA-BULLMQ-SCHEDULER) so no attempts/backoff.
 	const opts = { removeOnComplete: { age: 24 * 3600 }, removeOnFail: { age: 7 * 24 * 3600 } };

@@ -8,8 +8,10 @@ import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
  *
  * The order is the contract, and every step before `runContainer` must be free of provider spend:
  *
- *   1. mint a scoped token (GitHub jobs)          -- CONST-TOKEN-SCOPED-PER-JOB
- *   2. REFUSE an unprotected default branch       -- REQ-BRANCH-PROTECTION-PRECONDITION
+ *   1. mint a scoped token (GitHub jobs, and local jobs opted in via `github: true`)
+ *                                                 -- CONST-TOKEN-SCOPED-PER-JOB
+ *   2. REFUSE an unprotected default branch (GitHub jobs only -- a local job has no repo)
+ *                                                 -- REQ-BRANCH-PROTECTION-PRECONDITION
  *   3. resolve the default-branch SHA (fresh API), clone at it, materialise .pi/, write the prompt
  *   4. reserve a budget slot                      -- CONST-BUDGET-BEFORE-TOKENS
  *   5. ONLY NOW run the container (the only step that spends provider tokens)
@@ -30,7 +32,7 @@ export async function runJob(job, deps) {
 		softHoldPct, // int 1-99 or null; the soft-hold band applied to every active window
 		tokenCap = null, // int or null; the daily TOKEN cap (issue #25). Check-AFTER, so it gates the NEXT job on prior spend
 		recordSpend = recordTokenSpend, // injected so the post-container INCRBY is testable/stubbable
-		mintToken, // (repo) => scoped short-lived token | null for local-folder jobs
+		mintToken, // (repo) => scoped short-lived token. Called with the repo for github jobs, with undefined for local jobs opted in via `github: true`; unflagged local jobs never mint (token stays null)
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
 		// runContainer({ job, token, prepared, name, signal }) => { code, aborted, turns }. It MUST honour
@@ -48,25 +50,31 @@ export async function runJob(job, deps) {
 	} = deps;
 
 	const isGitHub = job.kind === "github";
+	// A local job opted in via `github: true` (cron trigger opt-in, INT-TRIGGERS-FILE-CONTRACT) mints the
+	// same scoped per-job token the github path mints (CONST-TOKEN-SCOPED-PER-JOB) -- repo arg undefined,
+	// since a local job has none. Unflagged local jobs stay tokenless, exactly as before.
+	const wantsGitHubToken = isGitHub || job.github === true;
 	let token = null;
 	let prepared = null;
 	let reserved = false;
 
 	try {
-		if (isGitHub) {
-			token = await mintToken(job.repo);
+		if (wantsGitHubToken) {
+			token = await mintToken(isGitHub ? job.repo : undefined);
 
 			// Defense-in-depth at the DI seam: mintToken is injected, so we cannot assume it routed
 			// through get-token's own empty-token guard. An empty credential here would reach
 			// env-allowlist's `if (githubToken)` as a falsy value -> GITHUB_TOKEN omitted -> an
 			// anonymous paid run. Refuse before reserveBudget so a bad token burns no cap slot.
-			if (isGitHub && (typeof token !== "string" || token.trim() === "")) {
+			if (typeof token !== "string" || token.trim() === "") {
 				throw configError("mintToken returned an empty credential");
 			}
+		}
 
+		if (isGitHub) {
 			// REQ-BRANCH-PROTECTION-PRECONDITION. The agent's token can merge (contents:write covers
 			// push AND merge), so branch protection is the only technical barrier to a self-merge.
-			// Refuse before spending anything.
+			// Refuse before spending anything. GitHub jobs only: a local job has no job.repo to check.
 			if (!(await isDefaultBranchProtected(job.repo, token))) {
 				await comment(job, "Refused: the default branch is not protected. See SECURITY.md.");
 				log("refused_unprotected", { repo: job.repo });

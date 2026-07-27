@@ -71,6 +71,19 @@ function commaList(raw) {
 		.filter((s) => s.length > 0);
 }
 
+// PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs
+// sets GITHUB_TOKEN and GH_TOKEN from the per-job mint; forwarding either from the host would
+// silently swap which credential every job spends, so this fails loud here rather than per-job.
+function forwardEnvList(raw) {
+	const names = commaList(raw);
+	if (names.includes("GITHUB_TOKEN") || names.includes("GH_TOKEN")) {
+		throw configError(
+			"PI_FORWARD_ENV must not forward GITHUB_TOKEN or GH_TOKEN -- the worker mints a per-job token (CONST-TOKEN-SCOPED-PER-JOB) and a forwarded operator token would silently override it",
+		);
+	}
+	return names;
+}
+
 // The operator's global pi overlay dir (REQ-GLOBAL-PI-OVERLAY). Unset/empty = feature off. When set it
 // must EXIST at boot -- a typo pointing at nothing would silently drop the operator's whole setup on
 // every job, so fail loud like every other config error rather than degrade to nothing.
@@ -105,7 +118,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		globalPiDir: resolveGlobalPiDir(env, fileExists), // REQ-GLOBAL-PI-OVERLAY: operator's ~/.pi/agent subset, :ro-mounted; null = off
 		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1", // fail-closed: overlay extensions load only when armed
-		forwardEnv: commaList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist
+		forwardEnv: forwardEnvList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist, GitHub token names refused
 		authFromPi: env.PI_AUTH_FROM_PI !== "0", // ON by default: use the key in ~/.pi/agent/auth.json when the env has none (api-key only). PI_AUTH_FROM_PI=0 forces env-only.
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
 		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")

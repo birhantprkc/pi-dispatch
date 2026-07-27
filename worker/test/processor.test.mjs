@@ -152,12 +152,68 @@ test("a whitespace-only minted token is also refused as configError", async () =
 	assert.equal(redis.incrCalls, 0, "whitespace is empty -- no slot burned");
 });
 
-test("a local job does not hit the empty-credential guard (guard is isGitHub-gated)", async () => {
+test("an unflagged local job does not hit the empty-credential guard (it never mints)", async () => {
 	const redis = fakeRedis();
 	const { deps: d } = deps({ redis, mintToken: async () => "" });
 	const localJob = { kind: "local", folder: "/home/rob/proj", provider: "anthropic", model: "m", maxTurns: 5 };
 	const r = await runJob(localJob, d);
-	assert.equal(r.outcome, "completed", "a local job never mints, so the empty-token guard cannot fire");
+	assert.equal(r.outcome, "completed", "an unflagged local job never mints, so the empty-token guard cannot fire");
+});
+
+// ---- run.github opt-in: a local cron job flagged `github: true` mints the same scoped per-job token
+// ---- the github path mints (CONST-TOKEN-SCOPED-PER-JOB), with no repo to pass or branch-check.
+
+const flaggedLocalJob = { kind: "local", folder: "/home/rob/proj", github: true, provider: "anthropic", model: "m", maxTurns: 5 };
+
+test("a run.github local job mints with an UNDEFINED repo, skips the branch check, and threads the token through", async () => {
+	const minted = [];
+	const tokens = { prepare: "unset", container: "unset" };
+	const { deps: d, calls } = deps({
+		mintToken: async (repo) => (minted.push(repo), "tok-local"),
+		prepareWorkspace: async (_job, token) => ((tokens.prepare = token), { workspaceDir: "/w", jobDir: "/j" }),
+		runContainer: async ({ token }) => ((tokens.container = token), { code: 0, aborted: false }),
+	});
+	const r = await runJob(flaggedLocalJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.deepEqual(minted, [undefined], "mintToken is called exactly once, with no repo (a local job has none)");
+	assert.ok(!calls.includes("branch-check"), "no branch-protection check -- REQ-BRANCH-PROTECTION-PRECONDITION is github-jobs-only");
+	assert.equal(tokens.prepare, "tok-local", "the minted token reaches prepareWorkspace");
+	assert.equal(tokens.container, "tok-local", "the minted token reaches runContainer");
+});
+
+test("a local job WITHOUT the flag never mints; the container sees a null token (today's behavior)", async () => {
+	const tokens = { container: "unset" };
+	const { deps: d, calls } = deps({
+		runContainer: async ({ token }) => ((tokens.container = token), { code: 0, aborted: false }),
+	});
+	const localJob = { kind: "local", folder: "/home/rob/proj", provider: "anthropic", model: "m", maxTurns: 5 };
+	const r = await runJob(localJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.ok(!calls.some((c) => c.startsWith("mint")), "no mint for an unflagged local job");
+	assert.equal(tokens.container, null, "token stays null exactly as before the opt-in existed");
+});
+
+test("a flagged local job whose mint rejects (config-tagged) propagates BEFORE reserveBudget -- no cap slot burned", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({
+		redis,
+		mintToken: async () => {
+			const e = new Error("github jobs and cron triggers with run.github require a working GITHUB_AUTH_SOURCE (gh/pat/app)");
+			e.piDispatchConfig = true;
+			throw e;
+		},
+	});
+	await assert.rejects(() => runJob(flaggedLocalJob, d), (e) => e.piDispatchConfig === true);
+	assert.equal(redis.incrCalls, 0, "reserveBudget never reached -- no slot burned on a broken auth source");
+	assert.ok(!calls.includes("run-container"), "no container, no provider spend");
+});
+
+test("a flagged local job with an empty minted token is refused by the empty-credential guard", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({ redis, mintToken: async () => "" });
+	await assert.rejects(() => runJob(flaggedLocalJob, d), (e) => e.piDispatchConfig === true);
+	assert.equal(redis.incrCalls, 0, "no slot burned on an empty credential");
+	assert.ok(!calls.includes("run-container"), "an empty credential must never reach a paid run");
 });
 
 test("container-never-started (spawn fault) after reserving RELEASES the slot, still throws InfraRetry", async () => {

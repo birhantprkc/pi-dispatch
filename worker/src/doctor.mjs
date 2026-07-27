@@ -6,6 +6,12 @@
  * runs even when GitHub auth is unset — a local-folder deployment needs none of it. Mirrors the kill
  * switch in cli.mjs, which reads only VALKEY_URL for the same reason (it must work when GitHub is
  * misconfigured). The provider key is checked for presence only and never printed (secrets-and-pii).
+ *
+ * GitHub auth gets two advisory (never failing) checks: the default GITHUB_AUTH_SOURCE=gh mints from the
+ * operator's FULL-scope gh login, which then reaches every token-carrying job container — the opposite of
+ * the App path's per-repo short-lived tokens (CONST-TOKEN-SCOPED-PER-JOB) — so doctor names the scopes it
+ * carries; and gh is preflighted inside the job image, since a token that works host-side but not
+ * in-container fails jobs mid-run, not at submit. Token values travel via the spawn env only, never argv.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -23,6 +29,9 @@ const PROVIDER_KEYS = {
 	google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 	gemini: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 };
+
+// gh login scopes that reach well past what a job should ever hold — called out by name in the fix line.
+const BROAD_SCOPES = ["admin:org", "delete_repo", "workflow"];
 
 export async function runDoctor(env = process.env, deps = {}) {
 	const {
@@ -62,6 +71,75 @@ export async function runDoctor(env = process.env, deps = {}) {
 		label: `Job image present (${jobImage})`,
 		fix: "docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest  (or build image/Dockerfile)",
 	});
+
+	// The default source `gh` mints job tokens from the operator's gh login, so the FULL-scope login token
+	// reaches every token-carrying job container — the opposite of the App path's per-repo short-lived
+	// tokens (CONST-TOKEN-SCOPED-PER-JOB). Both checks below warn, never fail: a local-only deployment with
+	// the default source is valid, for the same reason the worker's own auth at start is best-effort.
+	const ghSource = env.GITHUB_AUTH_SOURCE ?? "gh"; // config.mjs's own default, read directly — no loadConfig
+	if (ghSource === "gh") {
+		// gh writes `auth status` to stdout or stderr depending on version — capture both combined.
+		const status = await runCmdCapture(spawn, "gh", ["auth", "status"]);
+		if (status.code === 0) {
+			const scopes = parseGhTokenScopes(status.output);
+			const broad = (scopes ?? []).filter((s) => BROAD_SCOPES.includes(s));
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `GITHUB_AUTH_SOURCE=gh forwards your full gh login into every token-carrying job container (${
+					scopes ? `scopes: ${scopes.join(", ")}` : "scopes not reported (fine-grained token)"
+				})`,
+				fix:
+					(broad.length > 0 ? `this token carries broad scopes (${broad.join(", ")}) -- ` : "") +
+					"use a fine-grained PAT (GITHUB_AUTH_SOURCE=pat) or a GitHub App for per-job scoping -- see SECURITY.md",
+			});
+		} else {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: "GITHUB_AUTH_SOURCE is gh but `gh auth status` failed",
+				fix: "run `gh auth login` (or switch GITHUB_AUTH_SOURCE) -- github jobs and run.github cron triggers will refuse to run",
+			});
+		}
+	}
+
+	// Preflight gh INSIDE the job image: a token that works host-side but not in-container (no egress from
+	// containers, stale image) fails jobs mid-run, not at submit. Only meaningful when docker and the image
+	// are green; otherwise it is noise on top of the failures already reported above.
+	if (dockerCode === 0 && imageCode === 0) {
+		if (ghSource === "app") {
+			checks.push({ ok: true, label: "in-image gh auth: skipped (GITHUB_AUTH_SOURCE=app mints per-job)" });
+		} else {
+			let token = "";
+			if (ghSource === "gh") {
+				const minted = await runCmdCapture(spawn, "gh", ["auth", "token"]);
+				if (minted.code === 0) token = minted.output.trim();
+				// mint failed → skip: the status check above already warned that gh auth is broken
+			} else if (ghSource === "pat") {
+				const patVar = env.GITHUB_PAT_VAR ?? "GITHUB_PAT"; // config.mjs's patVar default, read directly
+				token = (env[patVar] ?? "").trim(); // absent → skip; loadConfig fails loud at worker boot anyway
+			}
+			if (token) {
+				// Value-less `-e` flags: docker forwards GH_TOKEN/GITHUB_TOKEN from the spawn env, so the
+				// token value never enters argv (visible in `ps`) and never reaches doctor's output.
+				const probe = await runCmdCapture(
+					spawn,
+					"docker",
+					["run", "--rm", "-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "--entrypoint", "gh", jobImage, "auth", "status"],
+					{ env: { ...env, GH_TOKEN: token, GITHUB_TOKEN: token } },
+				);
+				checks.push({
+					ok: probe.code === 0,
+					warn: true,
+					label:
+						probe.code === 0
+							? `gh authenticates inside the job image (${jobImage})`
+							: `gh cannot authenticate inside the job image (${jobImage})`,
+					fix: "check network egress from containers or rebuild/pull the job image -- jobs that use gh will fail mid-run",
+				});
+			}
+		}
+	}
 
 	checks.push({
 		ok: await probeValkey(valkeyUrl),
@@ -171,6 +249,57 @@ function runCmd(spawn, cmd, args) {
 		child.on("error", () => resolve(null)); // ENOENT etc. — the binary is not available
 		child.on("close", (code) => resolve(code));
 	});
+}
+
+/**
+ * Like runCmd but collects stdout+stderr into one combined string — gh moves its human output between
+ * the two across versions, so callers get both. Resolves `{code, output}`; `code: null` when the command
+ * could not be launched or overran the timeout (default 30s, so a hung docker daemon cannot stall doctor).
+ * `opts.env` is passed through to the spawn so secrets can travel via env instead of argv.
+ */
+function runCmdCapture(spawn, cmd, args, opts = {}) {
+	const { timeoutMs = 30000 } = opts;
+	return new Promise((resolve) => {
+		let child;
+		try {
+			child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...(opts.env ? { env: opts.env } : {}) });
+		} catch {
+			resolve({ code: null, output: "" });
+			return;
+		}
+		let output = "";
+		let done = false;
+		const finish = (code) => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			resolve({ code, output });
+		};
+		const timer = setTimeout(() => {
+			try {
+				child.kill();
+			} catch {}
+			finish(null);
+		}, timeoutMs);
+		child.stdout?.on("data", (d) => (output += d));
+		child.stderr?.on("data", (d) => (output += d));
+		child.on("error", () => finish(null)); // ENOENT etc. — the binary is not available
+		child.on("close", (code) => finish(code));
+	});
+}
+
+/**
+ * Pull the scope list out of `gh auth status` output. The line reads like
+ * `  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'` (older gh omits the quotes). Returns null
+ * when the line is absent — fine-grained tokens report no classic scopes at all.
+ */
+function parseGhTokenScopes(output) {
+	const m = output.match(/Token scopes:\s*(.+)/);
+	if (!m) return null;
+	return m[1]
+		.split(",")
+		.map((s) => s.trim().replace(/^'(.*)'$/, "$1"))
+		.filter((s) => s.length > 0);
 }
 
 /**

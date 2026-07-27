@@ -54,10 +54,10 @@ test("a non-object entry / on / run is a config error", () => {
 
 // --- cron (ported from schedules.test.mjs) ---
 
-test("a valid cron trigger normalizes; omitted provider/model/maxTurns pass through absent", () => {
+test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github pass through absent", () => {
 	const [t] = parse([CRON]);
 	assert.deepEqual(t.on, { type: "cron", id: "nightly-tidy", pattern: "0 3 * * *" });
-	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined });
+	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined });
 });
 
 test("cron entry-level provider/model/maxTurns pass through verbatim", () => {
@@ -94,6 +94,24 @@ test("cron id with an out-of-charset character is a config error", () => {
 
 test("duplicate cron id is a config error", () => {
 	assert.throws(() => parse([CRON, { ...CRON, run: { ...CRON.run, folder: "/other" } }]), (e) => isConfigError(e) && /duplicate/.test(e.message));
+});
+
+test("cron run.github: true survives normalization (the per-trigger token opt-in)", () => {
+	const [t] = parse([{ ...CRON, run: { ...CRON.run, github: true } }]);
+	assert.equal(t.run.github, true);
+	const [f] = parse([{ ...CRON, run: { ...CRON.run, github: false } }]);
+	assert.equal(f.run.github, false);
+});
+
+test("cron run.github absent stays absent (undefined) -- the zero-GitHub default", () => {
+	const [t] = parse([CRON]);
+	assert.equal(t.run.github, undefined);
+});
+
+test('cron run.github that is not strictly boolean ("true", 1, null) is a config error naming the trigger', () => {
+	assert.throws(() => parse([{ ...CRON, run: { ...CRON.run, github: "true" } }]), (e) => isConfigError(e) && e.message.includes("nightly-tidy"));
+	assert.throws(() => parse([{ ...CRON, run: { ...CRON.run, github: 1 } }]), (e) => isConfigError(e) && e.message.includes("nightly-tidy"));
+	assert.throws(() => parse([{ ...CRON, run: { ...CRON.run, github: null } }]), (e) => isConfigError(e) && e.message.includes("nightly-tidy"));
 });
 
 test("cron missing folder / flow / task is a config error", () => {

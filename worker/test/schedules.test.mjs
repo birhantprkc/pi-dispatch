@@ -75,6 +75,7 @@ test("a valid cron trigger normalizes to the scheduler shape; omitted provider/m
 		provider: undefined,
 		model: undefined,
 		maxTurns: undefined,
+		github: undefined,
 	});
 
 	// opts: retention only -- no jobId, attempts, or backoff.
@@ -90,6 +91,16 @@ test("run-level provider/model/maxTurns pass through verbatim into data", () => 
 	assert.equal(s.data.provider, "openai");
 	assert.equal(s.data.model, "gpt-x");
 	assert.equal(s.data.maxTurns, 5);
+});
+
+test("run.github: true flows into the scheduler data (the token opt-in reaches the job template)", () => {
+	const [s] = load([{ ...CRON, run: { ...CRON.run, github: true } }]);
+	assert.equal(s.data.github, true);
+});
+
+test("an unflagged cron trigger's data.github is undefined -- drops out at JSON serialization, schedule byte-identical to today's", () => {
+	const [s] = load([CRON]);
+	assert.equal(s.data.github, undefined);
 });
 
 test("multiple valid cron entries with distinct ids all normalize in order", () => {

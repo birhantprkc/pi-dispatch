@@ -124,11 +124,20 @@ function normalizeCron(on, run, index, path, state) {
 		throw configError(`cron trigger "${id}": run.task must be a non-empty string: ${path}`);
 	}
 
+	// Cron jobs are the zero-GitHub path by default; `run.github: true` is the per-trigger opt-in that
+	// makes the worker mint the same scoped per-job token the github path mints, so the container can use
+	// the gh CLI (INT-TRIGGERS-FILE-CONTRACT). Strictly boolean, fail-loud: a truthy string like "true"
+	// silently opting a trigger into a credential is exactly the drift this validator exists to refuse.
+	if (run.github !== undefined && typeof run.github !== "boolean") {
+		throw configError(`cron trigger "${id}": run.github must be true or false when present: ${path}`);
+	}
+
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
-	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT).
+	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github stays absent
+	// the same way, so an unflagged trigger's schedule is byte-identical to today's.
 	return {
 		on: { type: "cron", id, pattern },
-		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns },
+		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github },
 	};
 }
 

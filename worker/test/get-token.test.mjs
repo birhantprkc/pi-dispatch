@@ -104,6 +104,14 @@ test("gh happy: mintToken returns the trimmed `gh auth token` stdout, selfId res
 	assert.equal(await auth.mintToken("owner/repo"), "ghs_ghtoken");
 });
 
+test("gh mintToken(undefined) still resolves -- a local run.github job has no repo and gh ignores it", async () => {
+	const auth = await makeGitHubAuth(
+		{ source: "gh" },
+		{ Octokit: FakeOctokit(USER_ROUTES), execFile: fakeExecFile({ stdout: "ghs_ghtoken\n" }) },
+	);
+	assert.equal(await auth.mintToken(undefined), "ghs_ghtoken");
+});
+
 test("gh logged-out (exit 0, empty stdout) is a config error", async () => {
 	await assert.rejects(
 		() => makeGitHubAuth({ source: "gh" }, { Octokit: FakeOctokit(USER_ROUTES), execFile: fakeExecFile({ stdout: "" }) }),
@@ -150,6 +158,26 @@ test("app mint strips the owner: repositoryNames gets the bare repo name", async
 	await auth.mintToken("acme-corp/widgets");
 	assert.deepEqual(calls[0].repositoryNames, ["widgets"]);
 	assert.equal(calls[0].type, "installation");
+});
+
+test("app mintToken with no repo (local run.github job) is a config error steering to gh/pat", async () => {
+	const calls = [];
+	const auth = await makeGitHubAuth(
+		{ source: "app", appId: "123", installationId: "456", privateKeyPath: "/keys/app.pem" },
+		{
+			Octokit: FakeOctokit(APP_ROUTES),
+			createAppAuth: fakeCreateAppAuth({ result: { token: "ghs_x" }, calls }),
+			readFile: async () => "PEM",
+		},
+	);
+	for (const repo of [undefined, ""]) {
+		await assert.rejects(
+			() => auth.mintToken(repo),
+			(e) => e.piDispatchConfig === true && /run\.github/.test(e.message),
+			`repo=${JSON.stringify(repo)}`,
+		);
+	}
+	assert.equal(calls.length, 0, "the refusal happens before any mint attempt");
 });
 
 test("app missing config (no installationId) is a config error before any network call", async () => {

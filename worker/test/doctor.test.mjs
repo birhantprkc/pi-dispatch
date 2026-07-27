@@ -5,29 +5,58 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../src/doctor.mjs";
 
-// A fake `spawn`: resolves each `docker <sub>` to a canned exit code, or an "enoent" launch failure.
-function fakeSpawn(plan) {
-	return (_cmd, args) => {
-		const sub = args[0]; // "info" | "image"
-		const outcome = plan[sub];
-		const handlers = {};
-		queueMicrotask(() => {
-			if (outcome === "enoent") handlers.error?.(new Error("spawn docker ENOENT"));
-			else handlers.close?.(outcome);
+// A fake `spawn`: plan keys are command-line prefixes ("docker info", "docker image", "docker run",
+// "gh auth status", "gh auth token") mapped to a canned exit code, a `{code, output}` pair (output is
+// emitted on the fake stdout for doctor's capture helper), or "enoent" for a launch failure. Every spawn
+// is recorded into `calls` (cmd, args, opts) so tests can assert argv and the spawn env.
+function fakeSpawn(plan, calls = []) {
+	return (cmd, args, opts) => {
+		const line = [cmd, ...args].join(" ");
+		const key = Object.keys(plan).find((k) => line.startsWith(k));
+		const outcome = plan[key];
+		calls.push({ cmd, args, opts });
+		const stream = () => ({
+			handlers: {},
+			on(ev, cb) {
+				this.handlers[ev] = cb;
+				return this;
+			},
 		});
-		return {
+		const handlers = {};
+		const child = {
+			stdout: stream(),
+			stderr: stream(),
+			kill() {},
 			on(ev, cb) {
 				handlers[ev] = cb;
 				return this;
 			},
 		};
+		queueMicrotask(() => {
+			if (outcome === "enoent") {
+				handlers.error?.(new Error(`spawn ${cmd} ENOENT`));
+				return;
+			}
+			const { code, output } = typeof outcome === "object" && outcome !== null ? outcome : { code: outcome, output: "" };
+			if (output) child.stdout.handlers.data?.(output);
+			handlers.close?.(code);
+		});
+		return child;
 	};
 }
 function capture() {
 	const buf = [];
 	return { out: (s) => buf.push(s), text: () => buf.join("") };
 }
-const green = { info: 0, image: 0 };
+const green = { "docker info": 0, "docker image": 0 };
+// A classic-token `gh auth status` (newer gh quotes each scope; the parser also accepts unquoted).
+const ghStatusOutput = [
+	"github.com",
+	"  ✓ Logged in to github.com account octocat (keyring)",
+	"  - Active account: true",
+	"  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'",
+	"",
+].join("\n");
 
 test("doctor: all prerequisites present passes and exits 0", async () => {
 	const { out, text } = capture();
@@ -44,7 +73,7 @@ test("doctor: docker down, valkey down, no key exits 1 with fixes", async () => 
 	const { out, text } = capture();
 	const code = await runDoctor(
 		{ PI_PROVIDER: "anthropic" }, // no credential
-		{ out, spawn: fakeSpawn({ info: 1 }), probeValkey: async () => false, fileExists: () => true, nodeVersion: "22.19.0" },
+		{ out, spawn: fakeSpawn({ "docker info": 1 }), probeValkey: async () => false, fileExists: () => true, nodeVersion: "22.19.0" },
 	);
 	assert.equal(code, 1);
 	assert.match(text(), /start Docker/, "a down daemon (exit != 0) is distinguished from a missing binary");
@@ -56,7 +85,7 @@ test("doctor: a missing docker binary reads as 'install', not 'start'", async ()
 	const { out, text } = capture();
 	await runDoctor(
 		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x" },
-		{ out, spawn: fakeSpawn({ info: "enoent" }), probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0" },
+		{ out, spawn: fakeSpawn({ "docker info": "enoent" }), probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0" },
 	);
 	assert.match(text(), /install Docker/, "an unlaunchable docker is an install problem");
 });
@@ -65,9 +94,16 @@ test("doctor: the provider key value is never printed", async () => {
 	const { out, text } = capture();
 	await runDoctor(
 		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-secret-value" },
-		{ out, spawn: fakeSpawn(green), probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0" },
+		{
+			out,
+			spawn: fakeSpawn({ ...green, "gh auth status": { code: 0, output: ghStatusOutput }, "gh auth token": { code: 0, output: "gho_secret_mint\n" }, "docker run": 0 }),
+			probeValkey: async () => true,
+			fileExists: () => true,
+			nodeVersion: "22.19.0",
+		},
 	);
 	assert.doesNotMatch(text(), /sk-secret-value/, "the credential must never reach output");
+	assert.doesNotMatch(text(), /gho_secret_mint/, "the minted gh token must never reach output");
 });
 
 test("doctor: an outdated Node is flagged and fails", async () => {
@@ -175,4 +211,89 @@ test("doctor: an OAuth login in pi auth.json is flagged as not usable for a serv
 	);
 	assert.equal(code, 1, "an OAuth/subscription login is not a usable service credential");
 	assert.match(text(), /OAuth\/subscription/);
+});
+
+// GITHUB_AUTH_SOURCE=gh (the default) forwards the operator's full gh login into every token-carrying job
+// container (CONST-TOKEN-SCOPED-PER-JOB) — doctor surfaces the trade-off as a warning, never a failure.
+const ghDeps = (out, plan, calls) => ({ out, spawn: fakeSpawn(plan, calls), probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0" });
+const ghEnv = (extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", ...extra });
+
+test("doctor: default source gh warns with the login's scopes and names the broad ones", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(ghEnv(), ghDeps(out, { ...green, "gh auth status": { code: 0, output: ghStatusOutput } }));
+	assert.equal(code, 0, "the scope warning never fails doctor");
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=gh forwards your full gh login into every token-carrying job container \(scopes: gist, read:org, repo, workflow\)/);
+	assert.match(text(), /this token carries broad scopes \(workflow\)/, "broad scopes are called out by name");
+	assert.match(text(), /fine-grained PAT \(GITHUB_AUTH_SOURCE=pat\) or a GitHub App/);
+});
+
+test("doctor: a fine-grained token (no scopes line) is reported as such", async () => {
+	const { out, text } = capture();
+	await runDoctor(ghEnv(), ghDeps(out, { ...green, "gh auth status": { code: 0, output: "github.com\n  ✓ Logged in to github.com account octocat\n" } }));
+	assert.match(text(), /scopes not reported \(fine-grained token\)/);
+	assert.doesNotMatch(text(), /broad scopes/);
+});
+
+test("doctor: GITHUB_AUTH_SOURCE=pat emits no scope warning", async () => {
+	const { out, text } = capture();
+	await runDoctor(ghEnv({ GITHUB_AUTH_SOURCE: "pat" }), ghDeps(out, green));
+	assert.doesNotMatch(text(), /forwards your full gh login/);
+});
+
+test("doctor: source gh with gh missing warns 'auth status failed', still exits 0", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(ghEnv(), ghDeps(out, { ...green, "gh auth": "enoent" }));
+	assert.equal(code, 0, "a local-only deployment with the default source is valid — warn, don't fail");
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE is gh but `gh auth status` failed/);
+	assert.match(text(), /run `gh auth login` \(or switch GITHUB_AUTH_SOURCE\)/);
+});
+
+test("doctor: the in-image probe passes the token via the spawn env, never argv", async () => {
+	const calls = [];
+	const { out, text } = capture();
+	const plan = {
+		...green,
+		"gh auth status": { code: 0, output: ghStatusOutput },
+		"gh auth token": { code: 0, output: "gho_fake_mint_123\n" },
+		"docker run": 0,
+	};
+	const code = await runDoctor(ghEnv(), ghDeps(out, plan, calls));
+	assert.equal(code, 0);
+	const run = calls.find((c) => c.cmd === "docker" && c.args[0] === "run");
+	assert.ok(run, "the in-image probe spawned docker run");
+	assert.equal(run.args[run.args.indexOf("--entrypoint") + 1], "gh", "the image entrypoint is overridden to gh");
+	// value-less -e flags: only the names appear in argv, the values ride the spawn env
+	assert.deepEqual(run.args.filter((_, i) => run.args[i - 1] === "-e"), ["GH_TOKEN", "GITHUB_TOKEN"]);
+	assert.ok(!run.args.some((a) => a.includes("gho_fake_mint_123")), "the token never enters argv");
+	assert.equal(run.opts.env.GH_TOKEN, "gho_fake_mint_123");
+	assert.equal(run.opts.env.GITHUB_TOKEN, "gho_fake_mint_123");
+	assert.match(text(), /✓ gh authenticates inside the job image \(pi-job:latest\)/);
+	assert.doesNotMatch(text(), /gho_fake_mint_123/, "the token never reaches output");
+});
+
+test("doctor: an in-image gh auth failure warns with the egress fix, exits 0", async () => {
+	const { out, text } = capture();
+	const plan = { ...green, "gh auth status": { code: 0, output: ghStatusOutput }, "gh auth token": { code: 0, output: "gho_x\n" }, "docker run": 1 };
+	const code = await runDoctor(ghEnv(), ghDeps(out, plan));
+	assert.equal(code, 0, "an in-container auth failure warns but never fails doctor");
+	assert.match(text(), /⚠ gh cannot authenticate inside the job image \(pi-job:latest\)/);
+	assert.match(text(), /check network egress from containers/);
+});
+
+test("doctor: no in-image probe when docker is not green (gating)", async () => {
+	const calls = [];
+	const { out } = capture();
+	const plan = { "docker info": 1, "gh auth status": { code: 0, output: ghStatusOutput }, "gh auth token": { code: 0, output: "gho_x\n" } };
+	await runDoctor(ghEnv(), ghDeps(out, plan, calls));
+	assert.ok(!calls.some((c) => c.cmd === "docker" && c.args[0] === "run"), "no docker run on top of a down daemon");
+});
+
+test("doctor: GITHUB_AUTH_SOURCE=app skips the in-image probe (mints per-job)", async () => {
+	const calls = [];
+	const { out, text } = capture();
+	const code = await runDoctor(ghEnv({ GITHUB_AUTH_SOURCE: "app" }), ghDeps(out, green, calls));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ in-image gh auth: skipped \(GITHUB_AUTH_SOURCE=app mints per-job\)/);
+	assert.ok(!calls.some((c) => c.cmd === "docker" && c.args[0] === "run"), "app mints per-job — nothing to preflight");
+	assert.doesNotMatch(text(), /forwards your full gh login/, "no scope warning for source app");
 });
