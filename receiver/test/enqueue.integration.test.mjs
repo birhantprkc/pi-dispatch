@@ -24,8 +24,8 @@ const SELF_ID = 999;
 const cfg = {
 	webhookSecret: SECRET,
 	triggers: {
-		label: [{ predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
-		comment: { phrase: "@pi", defaultFlow: null },
+		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+		comment: { index: 1, phrase: "@pi", defaultFlow: null },
 		pullRequest: [],
 		knownFlows: new Set(["frontend-fix"]),
 	},

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { prepareLocalWorkspace } from "../src/prepare-local.mjs";
 
@@ -59,6 +59,58 @@ test("no GitHub anything: a local job needs no token, no repo, no network", asyn
 	const jobDir = mkdtempSync(join(tmpdir(), "pi-job-"));
 	const result = await prepareLocalWorkspace({ folder, task: "x", jobDir });
 	assert.ok(result.sha.match(/^[0-9a-f]{40}$/), "resolved HEAD locally, offline");
+});
+
+test("writes /job/event.json unconditionally: read-only, parseable, defaulting to the manual shape", async () => {
+	const folder = localRepo();
+	const jobDir = mkdtempSync(join(tmpdir(), "pi-job-"));
+	const result = await prepareLocalWorkspace({ folder, task: "x", jobDir });
+
+	const path = join(jobDir, "event.json");
+	assert.ok(existsSync(path), "event.json exists even when no event was passed");
+	assert.equal(statSync(path).mode & 0o777, 0o444, "read-only, like prompt.md");
+
+	const parsed = JSON.parse(readFileSync(path, "utf8"));
+	assert.deepEqual(parsed, { source: "manual", folder: basename(folder), sha: result.sha }, "exactly the frozen manual shape");
+	assert.deepEqual(Object.keys(parsed), ["source", "folder", "sha"], "frozen key order");
+	assert.ok(parsed.sha.match(/^[0-9a-f]{40}$/), "sha is the resolved HEAD");
+});
+
+test("event.json carries the folder BASENAME only -- the full path (OS account name) never lands in /job", async () => {
+	const folder = localRepo();
+	const jobDir = mkdtempSync(join(tmpdir(), "pi-job-"));
+	await prepareLocalWorkspace({ folder, task: "x", jobDir });
+
+	const bytes = readFileSync(join(jobDir, "event.json"), "utf8");
+	assert.ok(!bytes.includes(folder), "the full tmp folder path must not appear in the file bytes");
+	assert.ok(bytes.includes(basename(folder)), "the basename identifies the folder");
+});
+
+test("a cron-shaped event lands as the full frozen cron shape with nulls preserved", async () => {
+	const folder = localRepo();
+	const jobDir = mkdtempSync(join(tmpdir(), "pi-job-"));
+	const trigger = { id: "nightly-tidy", pattern: "0 3 * * *" };
+	const result = await prepareLocalWorkspace({
+		folder,
+		task: "x",
+		jobDir,
+		event: { source: "cron", trigger, scheduledFor: null, previousRunAt: null },
+	});
+
+	const parsed = JSON.parse(readFileSync(join(jobDir, "event.json"), "utf8"));
+	assert.deepEqual(parsed, {
+		source: "cron",
+		trigger,
+		folder: basename(folder),
+		sha: result.sha,
+		scheduledFor: null,
+		previousRunAt: null,
+	});
+	assert.deepEqual(
+		Object.keys(parsed),
+		["source", "trigger", "folder", "sha", "scheduledFor", "previousRunAt"],
+		"frozen key order for the cron shape",
+	);
 });
 
 test("a non-git folder is a clear config error, not a crash", async () => {

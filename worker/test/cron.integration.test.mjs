@@ -88,9 +88,11 @@ async function teardown({ queue, worker, redis, budgetKeys = [] }) {
 	await redis?.quit().catch(() => {});
 }
 
-// A normalized local-job template, the shape schedules.mjs emits and runJob consumes.
+// A normalized local-job template, the shape schedules.mjs emits and runJob consumes. `trigger` is the
+// cron-only data field (INT-CONTAINER-JOB-INPUTS); pure passthrough here -- the verbatim data assertion
+// below proves BullMQ carries it into the drained job untouched.
 function localTemplate(task = "nightly") {
-	return { kind: "local", folder: "/proj", flow: "tidy", task, provider: "anthropic", model: "m", maxTurns: 7 };
+	return { kind: "local", folder: "/proj", flow: "tidy", task, provider: "anthropic", model: "m", maxTurns: 7, trigger: { id: "t", pattern: "0 3 * * *" } };
 }
 
 // The injected deps runJob needs for a LOCAL job: no token, no branch check, workspace/cleanup/comment

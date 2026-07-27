@@ -55,11 +55,15 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
  *
  * The shared `parseTriggers` validates the WHOLE file (including the on x run diagonal and cron entries the
  * worker owns); this loader keeps only the webhook types and groups them for the filter:
- *   - `label`:       ordered `{ predicate, flow }` rules (first match wins in the filter).
- *   - `comment`:     the single `{ phrase, defaultFlow }` (or null when no comment trigger is configured).
- *   - `pullRequest`: ordered `{ actions:Set, predicate, flow }` rules.
+ *   - `label`:       ordered `{ index, predicate, flow }` rules (first match wins in the filter).
+ *   - `comment`:     the single `{ index, phrase, defaultFlow }` (or null when no comment trigger is configured).
+ *   - `pullRequest`: ordered `{ index, actions:Set, predicate, flow }` rules.
  *   - `knownFlows`:  every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
  *                    unlisted flow.
+ *
+ * Each grouped rule carries `index`: its 0-based position in the RAW `triggers` array, cron entries
+ * counted. The raw file index is the rule's identity -- the filter reports it on the job as
+ * `trigger.matched.index`, so a run is explainable back to the exact triggers.json entry that fired it.
  */
 function loadTriggers(env, readFile, fileExists) {
 	const path = env.PI_TRIGGERS_FILE ?? DEFAULT_TRIGGERS_PATH;
@@ -75,15 +79,15 @@ function loadTriggers(env, readFile, fileExists) {
 	const pullRequest = [];
 	const knownFlows = new Set();
 
-	for (const { on, run } of parsed) {
-		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it
+	for (const [index, { on, run }] of parsed.entries()) {
+		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it -- but it keeps its index
 		knownFlows.add(run.flow);
 		if (on.type === "label") {
-			label.push({ predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
+			label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
 		} else if (on.type === "comment") {
-			comment = { phrase: on.phrase, defaultFlow: run.flow }; // parseTriggers guarantees at most one
+			comment = { index, phrase: on.phrase, defaultFlow: run.flow }; // parseTriggers guarantees at most one
 		} else if (on.type === "pull_request") {
-			pullRequest.push({ actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
+			pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
 		}
 	}
 

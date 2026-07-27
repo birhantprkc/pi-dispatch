@@ -106,6 +106,13 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				// mirroring the name/signal injection above. Omitted when unwired so a bare processor falls back
 				// to runJob's no-op default (a chain fault can never flip a completed outcome either way).
 				...(deps.collectChain ? { collectChain: (ctx) => deps.collectChain({ ...ctx, job }) } : {}),
+				// prepareWorkspace needs the REAL BullMQ job's `.id` to derive a cron job's scheduled-for
+				// instant from the deterministic repeat:<id>:<millis> jobId (DES-CRON-VIA-BULLMQ-SCHEDULER)
+				// for the local /job/event.json. runJob's own `job` is the effectiveJob -- a spread of
+				// job.data with no `.id` -- and the real wrapper is only in scope here, so inject it as
+				// `queueJobId`, mirroring the collectChain injection above. Omitted when unwired so a bare
+				// processor keeps runJob's plain (job, token) call.
+				...(deps.prepareWorkspace ? { prepareWorkspace: (j, t) => deps.prepareWorkspace(j, t, { queueJobId: job.id }) } : {}),
 			});
 			recordRun({ job, result, startedAt, endedAt: new Date().toISOString() });
 			return result;

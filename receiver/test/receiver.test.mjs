@@ -9,9 +9,9 @@ const SELF_ID = 999;
 const cfg = {
 	webhookSecret: SECRET,
 	triggers: {
-		label: [{ predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
-		comment: { phrase: "@pi", defaultFlow: null },
-		pullRequest: [{ actions: new Set(["opened", "synchronize"]), predicate: {}, flow: "review" }],
+		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+		comment: { index: 1, phrase: "@pi", defaultFlow: null },
+		pullRequest: [{ index: 2, actions: new Set(["opened", "synchronize"]), predicate: {}, flow: "review" }],
 		knownFlows: new Set(["frontend-fix", "review"]),
 	},
 };
@@ -109,6 +109,40 @@ test("signed issues.labeled (pi:frontend) enqueues one github job and responds 2
 	assert.equal(calls[0].data.target.number, 42);
 	assert.equal(calls[0].opts.jobId, "gh-" + delivery);
 	assert.equal(res.statusCode, 202);
+});
+
+test("signed issue_comment with `@pi <flow>` enqueues 202: trigger.comment rides the job, never the log", async () => {
+	const delivery = "d-comment";
+	const payload = {
+		action: "created",
+		sender: { id: 1, login: "octocat-the-login" },
+		repository: { full_name: "octo/repo" },
+		issue: { number: 42, title: "T", body: "B" },
+		comment: { author_association: "OWNER", body: "@pi frontend-fix comment-body-marker" },
+	};
+	const raw = JSON.stringify(payload);
+
+	const logs = [];
+	const { calls, queue } = recordingQueue();
+	const handler = makeReceiver({ queue, selfId: SELF_ID, cfg, log: (entry) => logs.push(entry) });
+	const req = mockReq({ headers: headersFor("issue_comment", delivery, raw) });
+	const res = mockRes();
+	await drive(handler, req, res, raw);
+
+	assert.equal(res.statusCode, 202);
+	assert.equal(calls.length, 1);
+	// The enqueued job carries the invoking comment and the match record end to end.
+	assert.deepEqual(calls[0].data.trigger.comment, { body: "@pi frontend-fix comment-body-marker", author_association: "OWNER" });
+	assert.deepEqual(calls[0].data.trigger.matched, { index: 1, type: "comment", phrase: "@pi" });
+
+	// no-pii-in-logs: the comment body is job DATA, never log material -- the enqueued line carries
+	// stable identifiers only, and no login appears anywhere in it.
+	const enqueued = logs.find((entry) => entry.event === "enqueued");
+	assert.ok(enqueued, "an enqueued log line is emitted");
+	const line = JSON.stringify(enqueued);
+	assert.equal(line.includes("comment-body-marker"), false, "the enqueued log line must not carry the comment body");
+	assert.equal(line.includes("octocat-the-login"), false, "the enqueued log line must not carry a login");
+	assert.equal(line.includes("login"), false);
 });
 
 test("signed pull_request.opened by a collaborator enqueues a pull_request job and responds 202", async () => {

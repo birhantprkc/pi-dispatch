@@ -8,11 +8,12 @@ import { basename, join } from "node:path";
  * `process.env`, no randomness -- so the record shape and the filename/telemetry parsing are testable
  * without a container, a queue, or a disk: `sanitizeJobId`, `parseExitTurns`, `buildRecord`.
  *
- * The I/O factories -- `makeLogSink`, `makeRecordWriter`, `makeLogReaper` -- each inject their own `fs`
- * (and, for the reaper, their own clock via `now`), so they too are testable with a fake and no disk.
- * `makeLogSink` streams a job's raw output to a per-job `.log` and recovers the turn count from a
- * bounded tail; `makeRecordWriter` serialises a finished run to a JSON sidecar; `makeLogReaper` sweeps
- * aged `.log`/`.json` files at boot.
+ * The I/O factories -- `makeLogSink`, `makeRecordWriter`, `makeFindPreviousRun`, `makeLogReaper` --
+ * each inject their own `fs` (and, for the reaper, their own clock via `now`), so they too are testable
+ * with a fake and no disk. `makeLogSink` streams a job's raw output to a per-job `.log` and recovers the
+ * turn count from a bounded tail; `makeRecordWriter` serialises a finished run to a JSON sidecar;
+ * `makeFindPreviousRun` reads a scheduler's most recent prior sidecar back; `makeLogReaper` sweeps aged
+ * `.log`/`.json` files at boot.
  */
 
 /**
@@ -268,6 +269,51 @@ export function makeRecordWriter({ logsDir, fs = nodeFs, log = () => {} }) {
 			fs.writeFileSync(path, data);
 		} catch (err) {
 			log("run_record_failed", { jobId: record?.jobId, reason: err?.message });
+		}
+	};
+}
+
+/**
+ * Look up when the previous run of a given scheduler ended, for the cron `/job/event.json`
+ * (INT-CONTAINER-JOB-INPUTS).
+ *
+ * This reads the same per-job files INT-RUN-HISTORY-FILE-CONTRACT defines -- filename-keyed sidecars,
+ * no new query surface. A scheduled id is `repeat:<schedulerId>:<millis>` (DES-CRON-VIA-BULLMQ-SCHEDULER),
+ * which `makeRecordWriter` stores as `repeat_<schedulerId>_<millis>.json` via `sanitizeJobId`, so the
+ * scheduler's prior fires are exactly the files matching that prefix with a pure-digits trailing
+ * segment. The digits requirement is what disambiguates a scheduler id that itself contains `_`
+ * (schedulers "a" vs "a_1": `repeat_a_1_100.json` has a non-digit tail after "repeat_a_", so it never
+ * matches scheduler "a"). The max millis strictly below `beforeMillis` is the previous fire.
+ *
+ * Returns `record.endedAt ?? record.startedAt ?? null` as an ISO string. `endedAt` first: BullMQ never
+ * overlaps two fires of one scheduler, so the prior run's end is the honest high-water mark; `startedAt`
+ * covers a crashed run's partial record. ANY failure -- missing dir, no prior run, unreadable file, bad
+ * JSON, nullish `beforeMillis` -- yields `null`; the function NEVER throws (the module's fault-isolation
+ * posture: this feeds a job input, and a history blip must not fail a prepare). `fs` is injectable so
+ * the lookup is testable with a fake and no disk.
+ */
+export function makeFindPreviousRun({ logsDir, fs = nodeFs }) {
+	// The parameter default keeps the never-throw promise even for an argument-less call: destructuring
+	// binds before the try below, so without it `findPreviousRun()` would TypeError past the catch.
+	return function findPreviousRun({ schedulerId, beforeMillis } = {}) {
+		try {
+			if (typeof beforeMillis !== "number" || !Number.isFinite(beforeMillis)) return null;
+			const prefix = sanitizeJobId(`repeat:${schedulerId}:`);
+			const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const pattern = new RegExp(`^${escaped}(\\d+)\\.json$`);
+			let best = null;
+			for (const name of fs.readdirSync(logsDir)) {
+				const m = pattern.exec(name);
+				if (m === null) continue;
+				const millis = Number(m[1]);
+				if (!Number.isFinite(millis) || millis >= beforeMillis) continue;
+				if (best === null || millis > best.millis) best = { millis, name };
+			}
+			if (best === null) return null;
+			const record = JSON.parse(fs.readFileSync(join(logsDir, best.name), "utf8"));
+			return record.endedAt ?? record.startedAt ?? null;
+		} catch {
+			return null; // NEVER throws: a history fault must not fail the prepare that asked
 		}
 	};
 }

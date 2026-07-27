@@ -13,7 +13,7 @@ import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
-import { buildRecord, makeLogReaper, makeLogSink, makeRecordWriter } from "./run-history.mjs";
+import { buildRecord, makeFindPreviousRun, makeLogReaper, makeLogSink, makeRecordWriter } from "./run-history.mjs";
 import { effectiveSettings, readOverlay } from "./runtime-settings.mjs";
 import { loadSchedules } from "./schedules.mjs";
 import { makeStallGuard } from "./scheduler-stall-guard.mjs";
@@ -238,6 +238,9 @@ export async function startWorker(
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				resolveDefaultBranchSha: host.resolveDefaultBranchSha,
+				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
+				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
+				findPreviousRun: makeFindPreviousRun({ logsDir: config.logsDir }),
 			}),
 			cleanup,
 			comment: async (job, text) => {
