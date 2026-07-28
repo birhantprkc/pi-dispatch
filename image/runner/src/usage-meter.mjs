@@ -22,14 +22,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *
  * Three traps this module is shaped around, all verified by runtime probe, none by reading source:
  *
- * 1. THERE ARE TWO COPIES OF pi-ai ON DISK -- the hoisted `node_modules/@earendil-works/pi-ai` and the
- *    nested `node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai` -- with
- *    SEPARATE module-level registries. pi-coding-agent uses the NESTED one. A plain
- *    `import "@earendil-works/pi-ai"` from runner code binds the HOISTED copy and is a SILENT NO-OP:
- *    it registers, reports success, and meters nothing. `import.meta.resolve` reports a path that
- *    looks right and is wrong. Hence: no static pi import anywhere in this file, an ordered candidate
- *    list, and acceptance decided ONLY by a runtime mutation probe (register an inert provider through
- *    the ModelRegistry, then ask the candidate module whether it can see it).
+ * 1. A BARE pi-ai SPECIFIER IS NEVER THE COPY pi USES -- and what it IS depends on the install. Where
+ *    the WORKER's deps are installed too (a dev checkout, the contract-tests job) pi-ai is on disk
+ *    TWICE, with SEPARATE module-level registries: the hoisted `node_modules/@earendil-works/pi-ai`,
+ *    which is the WORKER's declared dependency, and the nested
+ *    `node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai`. pi-coding-agent
+ *    uses the NESTED one, so a plain `import "@earendil-works/pi-ai"` from runner code binds the
+ *    HOISTED copy and is a SILENT NO-OP: it registers, reports success, and meters nothing, while
+ *    `import.meta.resolve` reports a path that looks right and is wrong. The JOB IMAGE installs the
+ *    RUNNER's deps only, and the runner does not declare pi-ai (see resolvePiAiCompat below for why it
+ *    must not), so there the nested copy is the ONLY copy and that specifier does not resolve at all.
+ *    Hence: no static pi import anywhere in this file, an ordered candidate list built with tryResolve
+ *    around BOTH lookups so an unresolvable candidate is SKIPPED rather than thrown, and acceptance
+ *    decided ONLY by a runtime mutation probe (register an inert provider through the ModelRegistry,
+ *    then ask the candidate module whether it can see it).
  *
  * 2. `resetApiProviders()` -- what `AgentSession.reload()` calls -- WIPES the registry. So the meter
  *    cannot be install-once; it must be RE-ARMABLE, hence the unref'd re-arm interval.
