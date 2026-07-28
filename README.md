@@ -85,6 +85,15 @@ A container boundary, spend bounded *before* a container starts, nothing dropped
 enforces. Read [`SECURITY.md`](SECURITY.md) before you rely on it: it states plainly what is and is not
 defended.
 
+**What the spend numbers cover.** Recorded tokens and cost are **process-wide**: they include every session
+running inside the job's container, not just the top-level one — so a flow whose extension fans out into
+subagent sessions is accounted in full, and the per-job token budget (`PI_MAX_TOKENS`) is enforced against
+that same total. Two honest limits. `PI_MAX_TURNS` bounds only the **root** session's turns, because a
+subagent session runs its own loop that the root's turn counter never sees. And a package that spawns a
+**`pi` subprocess** is outside the container's Node process entirely and is **not metered** — its tokens are
+spent and will not appear in the run record; the 30-minute container timeout is the backstop there, along
+with the provider-side spend limit you should set anyway.
+
 ## Reuse your existing pi setup
 
 Already run `pi`? Give every job your host setup — custom models, global skills, a global persona — **layered
@@ -100,9 +109,19 @@ pi-dispatch doctor             # verifies the overlay carries no credential
 The overlay is mounted `/opt/pi-global:ro` into every container. Skills merge with the repo's (a repo skill
 of the same name overrides the global one); the prompt layers `guardrails → global persona → repo persona`,
 the safety floor always first and unremovable. `import-pi` **refuses** a `models.json` with a literal key and
-**never** copies `auth.json` — your credential stays in the environment. Extensions are opt-in and armed
-separately (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS=1`) because they run code against adversarial
-input; the admin extension is hard-blocked. Full reference: [`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
+**never** copies `auth.json` — your credential stays in the environment. Extensions come across **by
+default** and `import-pi` prints each one it staged, since staging is the vetting step; pass
+`--no-extensions` to skip them, or `PI_GLOBAL_ALLOW_EXTENSIONS=0` to keep them staged but dormant. The
+admin extension is hard-blocked either way. Full reference:
+[`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
+
+**Third-party pi packages, pinned once and declinable per trigger.** Jobs run with no network, so a package
+can't be installed at job time — declare it at an **exact** version in `pi-packages.json` and stage it into
+the overlay on your host with `pi-dispatch import-pi --with-packages`. From then on every job gets it; set
+`"packages": false` on any trigger that must run without it. Staging uses `--ignore-scripts` (a package's
+lifecycle scripts would otherwise run **as you, on your host**), refuses a floating version or an
+admin-shaped package name, and is all-or-nothing — a half-staged set would silently skip what didn't make
+it. `pi-dispatch doctor` shows what is staged and which triggers have opted out.
 
 **Already logged into pi? The key just works — by default.** When the provider key is absent from the
 worker's environment, the worker reads it **host-side** from `~/.pi/agent/auth.json` and env-injects it into
@@ -332,6 +351,11 @@ cron off), the receiver requires it.
 The `on × run` matrix is the trust boundary, enforced fail-loud at load: a `cron` trigger must run
 `local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs `github`.
 
+`"packages"` on any trigger's `run` (all four kinds) decides whether that trigger loads the third-party pi
+packages you staged into the global overlay. It is an **opt-out**: staged packages load for every job, and
+`"packages": false` is how one flow declines them. A non-boolean value is refused at load, and with nothing
+staged the flag loads nothing either way; `pi-dispatch doctor` reports both cases.
+
 ### Add a trigger from the panel
 
 You can edit `triggers.json` by hand, or add one from `/dispatch` without touching the file: press **`a`** and
@@ -442,6 +466,11 @@ flowchart LR
   GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
   default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
   the detail.
+- The checkout is always the base repo at its **default-branch SHA** — never a PR branch, even for a PR
+  trigger. Because of that the repo's own `AGENTS.md` and `.pi/extensions` are loaded, as they would be in
+  any `pi` run, which means **landing a commit on your default branch is enough to run code in a job
+  container**. Issue and comment text is *not* in that category and never has been: it stays data in the
+  user prompt. If you service repos you don't control, read the discovery section of `SECURITY.md` first.
 
 Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
 *before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the

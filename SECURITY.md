@@ -77,13 +77,19 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Branch protection is required.** The worker refuses to run against a repository whose default branch
   is unprotected, checked before any money is spent. This is the control that makes human review real
   rather than customary — without it, nothing technical stops a merge.
-- **System-prompt integrity.** Jobs run with context-file discovery disabled. A cloned repo's `AGENTS.md`
-  / `CLAUDE.md` are **not** trust-gated by pi and load from *every ancestor directory*, so they would
-  otherwise let anyone who can land a PR write our agent's standing instructions. Project instructions
-  arrive by a different route entirely: the worker reads `.pi/` from the **default branch at a pinned
-  SHA**, through git's object store (not the filesystem — a symlink would otherwise pull a host file into
-  the prompt), and mounts them **read-only**. The agent cannot rewrite the instructions it was given, and
-  a pull request cannot change them. Baked guardrails are read from a path the project cannot influence.
+- **System-prompt integrity, and the boundary that actually holds it.** A job's `/workspace` is **always
+  the base repository at its default-branch SHA** — the worker resolves that SHA, fetches that one commit
+  and checks it out detached. A pull request's branch is **never** checked out; its `head`/`base` travel
+  as data. So everything in the workspace is **merge-gated**: only someone who can land a commit on your
+  default branch can put it there. On that basis the repo's own `AGENTS.md` and `.pi/extensions` **are**
+  loaded, which is pi's normal behaviour — see *What is NOT defended* for what that costs.
+  Project instructions still arrive by a stricter route: the worker reads `.pi/` from the default branch
+  at the pinned SHA, through git's object store (not the filesystem — a symlink would otherwise pull a
+  host file into the prompt), and mounts it **read-only**, so the agent cannot rewrite mid-run the
+  instructions it was given. Baked guardrails are read from a path the project cannot influence and are
+  composed explicitly, so a repo's own `.pi/APPEND_SYSTEM.md` **cannot shadow the safety floor**. And the
+  line that has not moved: **webhook issue, PR and comment text is data** — it goes in the user prompt,
+  never the system prompt, whatever a repository's files say.
 - **We never merge.** No code path in this project calls a merge API; grep is the test. Note carefully
   what that does and does not mean — see below.
 - **Spend.** A daily cap checked *before* tokens are spent, a per-job turn budget enforced by our runner
@@ -104,6 +110,28 @@ Stated openly rather than discovered later:
   refuses to run without it. If you disable it, the honest worst case is: **one successful injection =
   full compromise of that repository within the hour**, including rewriting `.pi/` itself — which
   poisons every future job on that repo. That is standing compromise, not a one-shot.
+- **Merge access to a serviced repo means code execution in its job containers.** This is the newest
+  thing on this page and it is a deliberate trade. Because `/workspace` is merge-gated (above), jobs run
+  with pi's normal discovery: the repo's `AGENTS.md` becomes part of the agent's context, and
+  `/workspace/.pi/extensions` is **loaded and executed**. Anyone who can land a commit on your default
+  branch can therefore run arbitrary code inside a job container — with the job's GitHub token and
+  unrestricted network egress — where previously they could only supply text the agent reads. What bounds
+  it is the container, the token's narrow scope and short expiry, and your branch protection; **this
+  layer bounds nothing**. The practical rule: a repository whose default branch you would not hand a
+  shell to is not a repository to service. Note the population is the same one that could already write
+  `.pi/`, which this harness has always read and obeyed — the escalation is from *instructions* to *code*,
+  not from stranger to insider.
+  **If you service repositories you do not control, turn this off.** There is no environment variable
+  for it, deliberately: it is a two-line change in `image/runner/src/loader.mjs` (`buildResourceLoader`
+  sets `noContextFiles` and `noExtensions` to `false`; set both to `true`) plus an image rebuild.
+  `PI_GLOBAL_ALLOW_EXTENSIONS` is **not** this switch — it governs your own overlay's extensions and does
+  not touch what the workspace discovers.
+  One recursion case is closed rather than left to you: an extension that looks like this project's own
+  admin surface — by name, or by registering a `dispatch_*` tool — is **dropped before the session sees
+  it**, because a job that could call `dispatch_run` could enqueue paid jobs from inside a paid job. The
+  honest limit is that the file has already been imported by the time it is dropped; the container is
+  what bounds that. A side effect worth knowing: if a repo you service ships its own extension
+  registering a `dispatch_*` tool, it will be dropped in job containers. The drop is logged; rename it.
 - **Local-folder jobs have no gate and no undo.** No merge, no reviewer, no pull request to decline. The
   bar for writing the agent's standing instructions drops from "can merge to default" to "can write a
   file in that folder" — which includes anything you ever downloaded into it. If the folder is not under
@@ -142,7 +170,10 @@ Stated openly rather than discovered later:
   container), so this is a supply-chain risk, not an injection one. Keep Docker patched; do not run this
   on a host you care about.
 - **No multi-tenancy.** This is a single-operator tool. Nothing isolates one operator's jobs from
-  another's, because there is only meant to be one.
+  another's, because there is only meant to be one. This is also the assumption the discovery posture
+  above rests on: it is safe when the repositories you service are ones whose default branch you or your
+  collaborators control. A deployment servicing repositories owned by mutually-distrusting third parties
+  needs discovery turned back off **and** the GitHub App token path, neither of which is the default.
 - **An agent that can write a folder can self-authorize a flow by committing to it.** Making a flow
   AI-triggerable is a committed `ai-trigger: allow` in the folder's `.pi/`, so an agent that can write the
   folder can commit that opt-in, after which a **later** operator or CLI action could run that flow. This
@@ -181,16 +212,45 @@ Stated openly rather than discovered later:
   `PI_AUTH_FROM_PI=0` to force env-only (fail loudly on a missing env key rather than fall back to a pi login).
   Prefer an API key with a provider-side spend limit for an unattended service; a subscription token is
   neither refreshable in the container nor intended for automation.
-- **Treat `.pi/` on your default branch as production code**, because it is: it goes into the agent's
-  system prompt. Review changes to it with the same care as `.github/workflows/`.
+- **Treat `.pi/`, `AGENTS.md` and `.pi/extensions` on your default branch as production code**, because
+  they are: `.pi/APPEND_SYSTEM.md` and `AGENTS.md` reach the agent's prompt, and `.pi/extensions` is
+  **executed** in job containers. Review changes to them with the same care as `.github/workflows/` — and
+  note the review *is* the gate, since landing a commit on the default branch is the only qualification
+  any of it requires.
 - **The global pi overlay (`PI_GLOBAL_PI_DIR`) is production code too**, and it must be credential-free. It
   is mounted `:ro` into every job — a container that runs adversarial input — so a secret in it is a secret
   in the box. Stage it with `pi-dispatch import-pi` (it refuses a `models.json` with a literal key and never
   copies `auth.json`) and let `pi-dispatch doctor` re-check it; the provider key belongs in the environment,
   never a mounted file. Overlay **extensions run arbitrary code against adversarial input with open network
-  egress** and are not scanned for secrets: keep `PI_GLOBAL_ALLOW_EXTENSIONS` unset until you have vetted
-  every one, and never place the admin extension in the overlay (it can enqueue paid jobs — a recursion
-  vector; `import-pi` blocks it).
+  egress** and are not scanned for secrets — and they are staged and loaded **by default**. `import-pi`
+  copies `extensions/` unless you pass `--no-extensions`, and **prints every extension it staged**: read
+  that list, because it is the vetting step. Anything you do not want in job containers should not be in
+  the overlay; `PI_GLOBAL_ALLOW_EXTENSIONS=0` disables the whole directory if you want it staged but
+  dormant. Any other value than `0` or `1` is refused at boot rather than guessed — a typo must not
+  silently leave extensions loading. Never place the admin extension in the overlay (it can enqueue paid
+  jobs — a recursion vector; `import-pi` blocks it).
+- **Staged pi packages are third-party code you are choosing to run against adversarial input.** They live
+  inside the same overlay and pass four gates: an **exact** version in `pi-packages.json` (a floating
+  range turns a silent upstream release into every queued job becoming a no-op that still reports success),
+  host-side staging by `import-pi --with-packages`, a **per-trigger** `"packages"` switch — an **opt-OUT**,
+  so once staged they load for every job and `"packages": false` on a trigger is how one flow declines
+  them; there is deliberately no env flag deciding it fleet-wide — and runner-side validation: a
+  package that did not mount is refused before any spend, and a package skill that takes the name of a repo
+  or overlay skill loses — the repo's stays in force, and the attempt is logged. Two facts to hold on to.
+  Staging runs
+  `npm install --ignore-scripts`: **without that flag a package's — and every transitive dependency's —
+  lifecycle scripts would run AS YOU, ON YOUR HOST**, at stage time, which is a host compromise and not a
+  job one; the price is that a package needing a build step is staged INCOMPLETE and may fail at run time
+  (`import-pi` warns by name). And a package whose name looks like the dispatch admin is refused outright,
+  the same recursion block the admin extension gets. Jobs run with `PI_OFFLINE=1` set unconditionally, so a
+  package source can never become a network install from inside a container. Vet each one and pin it; you
+  are extending your own trust boundary to whoever publishes it.
+- **Token and cost accounting is process-wide, but it is not process-tree-wide.** The recorded totals cover
+  every session inside the job container's Node process, including subagent sessions an extension spawns,
+  and the per-job token budget is enforced against that total. A staged package that spawns a **`pi`
+  subprocess** is outside it: those tokens are spent, billed, and absent from the run record and the daily
+  token counter. `PI_MAX_TURNS` likewise bounds only the root session's turns. The backstops there are the
+  30-minute container timeout, the job-count caps, and your provider-side spend limit — not the meter.
 - **The admin surface is not a network service.** It is a pi extension in your own terminal session plus
   a `settings.json` file — it binds no port. Whoever can run pi with the extension loaded, or write
   `PI_SETTINGS_FILE`, holds operator power: the same trust as shell access on the host. Treat it that way.

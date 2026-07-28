@@ -12,6 +12,12 @@
  *
  * Negative fact: this module exists because of an upstream absence. If pi ships a turn
  * limit, delete this rather than carrying it forever as unexplained ballast.
+ *
+ * SCOPE (issue #58): this counts `turn_start` on the ROOT session's event bus and nothing else. That
+ * bus is per AgentSession INSTANCE, so a subagent session a staged package's extension spawns emits
+ * nothing on it -- a 16-wide fanout registers here as roughly ONE turn, and this module is
+ * structurally unable to see the difference. It bounds the root conversation's length, which is what
+ * it was written for; the PROCESS-WIDE token meter (src/usage-meter.mjs) is what bounds fanout spend.
  */
 
 /**

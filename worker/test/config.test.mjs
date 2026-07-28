@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import { test } from "node:test";
-import { configError, loadConfig } from "../src/config.mjs";
+import { configError, globalExtensionsEnabled, loadConfig } from "../src/config.mjs";
 
 test("loads conservative defaults with an empty-ish env", () => {
 	const c = loadConfig({});
@@ -79,11 +79,29 @@ test("globalPiDir: unset is null; set-but-missing fails loud; set-and-existing r
 	assert.equal(loadConfig({ PI_GLOBAL_PI_DIR: "/opt/pi-global" }, { fileExists: () => true }).globalPiDir, "/opt/pi-global");
 });
 
-test("allowGlobalExtensions is fail-closed: only the exact string '1' arms it", () => {
-	assert.equal(loadConfig({}).allowGlobalExtensions, false);
-	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "1" }).allowGlobalExtensions, true);
-	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "true" }).allowGlobalExtensions, false);
+test("allowGlobalExtensions is ON by default -- the operator staged those extensions, so they load", () => {
+	assert.equal(loadConfig({}).allowGlobalExtensions, true, "unset means LOAD: staging is the vetting step");
+	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "" }).allowGlobalExtensions, true, "empty is unset");
+	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "1" }).allowGlobalExtensions, true, "the legacy arming value still reads as ON");
+});
+
+test('allowGlobalExtensions: the exact string "0" is the opt-out', () => {
 	assert.equal(loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: "0" }).allowGlobalExtensions, false);
+	assert.equal(globalExtensionsEnabled({ PI_GLOBAL_ALLOW_EXTENSIONS: "0" }), false, "the exported reading doctor uses agrees");
+	assert.equal(globalExtensionsEnabled({}), true);
+});
+
+test("a malformed PI_GLOBAL_ALLOW_EXTENSIONS refuses boot -- it must never silently keep extensions loading", () => {
+	// The strict parse is unchanged; what it protects has flipped. `false` is the value an operator writes
+	// when they mean OFF, and a lenient read would leave their extensions running in every container while
+	// they believed otherwise. Loud beats either default here.
+	for (const bad of ["false", "true", "yes", "no", "2", " 0", "0 ", "off"]) {
+		assert.throws(
+			() => loadConfig({ PI_GLOBAL_ALLOW_EXTENSIONS: bad }),
+			(e) => e.piDispatchConfig === true && /PI_GLOBAL_ALLOW_EXTENSIONS/.test(e.message),
+			`PI_GLOBAL_ALLOW_EXTENSIONS=${JSON.stringify(bad)}`,
+		);
+	}
 });
 
 test("forwardEnv is a comma list of names -- trimmed, empties dropped, default []", () => {

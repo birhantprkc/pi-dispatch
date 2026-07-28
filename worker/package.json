@@ -18,6 +18,7 @@
     "./connection": "./src/connection.mjs",
     "./job-id": "./src/job-id.mjs",
     "./triggers": "./src/triggers.mjs",
+    "./packages": "./src/packages.mjs",
     "./pause-windows": "./src/pause-windows.mjs",
     "./identity": "./src/identity.mjs",
     "./get-token": "./src/get-token.mjs",

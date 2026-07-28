@@ -31,7 +31,7 @@ function fakeHost(overrides = {}) {
 // Drive startWorker with injected fakes and capture the exact object handed to createWorker
 // (deps are nested under `deps`). No real Redis: createWorkerFn is faked. The real ioredis client
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
-async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, order } = {}) {
+async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, makeRunContainer, order } = {}) {
 	const calls = [];
 	const registered = {};
 	const createWorkerFn = (arg) => {
@@ -77,6 +77,17 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 			return () => {};
 		});
 
+	// The container factory is faked for the same reason as the run-history ones: the wiring tests assert
+	// what boot HANDS it (image, overlay, staged packages), never a docker launch. It records its args and
+	// returns an inert runContainer that is stored in deps and never invoked here.
+	const runContainerCalls = [];
+	const runContainerFactory =
+		makeRunContainer ??
+		((args) => {
+			runContainerCalls.push(args);
+			return async () => ({ code: 0, aborted: false, turns: null, tokens: null });
+		});
+
 	const lines = [];
 	const origWrite = process.stdout.write;
 	process.stdout.write = (chunk) => {
@@ -92,6 +103,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 			makeLogSink: logSink,
 			makeRecordWriter: recordWriter,
 			makeLogReaper: logReaper,
+			makeRunContainer: runContainerFactory,
 		});
 	} finally {
 		process.stdout.write = origWrite;
@@ -111,7 +123,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 	});
 	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
 	// `registered` for the scheduler stall-guard test. Same object, one capture path.
-	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls };
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls, runContainerCalls };
 }
 
 // Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
@@ -363,6 +375,34 @@ test("run-history: the log reaper sweeps aged history BEFORE the worker starts d
 	assert.deepEqual(order, ["reapLogs", "createWorker"], "the log reaper must sweep before the worker is created");
 	assert.equal(reaperArgs.logsDir, "/tmp/pi-logs", "the log reaper must receive config.logsDir");
 	assert.equal(reaperArgs.retentionDays, 7, "the log reaper must receive config.logRetentionDays");
+});
+
+// REQ-GLOBAL-PI-OVERLAY staged packages. The overlay dir EXISTS (config refuses a missing one at load)
+// but holds no packages.json -- the shape of every deployment that never opted into staged packages.
+test("staged packages: an overlay with no packages.json boots to packagePaths [] and logs it -- never a boot failure", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const overlay = mkdtempSync(join(tmpdir(), "pi-global-"));
+	try {
+		const { captured, logs, runContainerCalls } = await runStart({ env: { PI_GLOBAL_PI_DIR: overlay }, makeAuth, makeHost: () => fakeHost() });
+
+		assert.ok(captured, "an unreadable/absent manifest must not block boot -- doctor is what fails loud on the mismatch");
+		assert.equal(runContainerCalls.length, 1, "the container factory is constructed exactly once, at boot");
+		assert.deepEqual(runContainerCalls[0].packagePaths, [], "an absent manifest resolves to the empty staged set, so every job stays unflagged");
+		assert.equal(runContainerCalls[0].globalPiDir, overlay, "the overlay itself is still mounted -- only the staged packages are missing");
+
+		const absent = logs.find((l) => l.event === "packages_manifest_absent");
+		assert.ok(absent, "the absent manifest must leave one log line, so a silent [] is never the only trace");
+		assert.equal(absent.overlay, overlay, "the line names the overlay it looked under (a deploy path is not PII)");
+	} finally {
+		rmSync(overlay, { recursive: true, force: true });
+	}
+});
+
+test("staged packages: no overlay configured means no manifest read and no packages_manifest_absent noise", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { logs, runContainerCalls } = await runStart({ makeAuth, makeHost: () => fakeHost() });
+	assert.deepEqual(runContainerCalls[0].packagePaths, [], "no overlay -> the empty staged set");
+	assert.ok(!logs.some((l) => l.event === "packages_manifest_absent"), "a deployment with no overlay at all has nothing to warn about");
 });
 
 test("run-history: worker_started announces logsDir, captureJobLogs and logRetentionDays (a path is not PII)", { skip }, async () => {

@@ -152,6 +152,54 @@ test("refuses before spawning if the provider is unconfigured (pre-spend guard)"
 	assert.equal(rec.cmd, undefined, "no container for an unconfigured provider");
 });
 
+// REQ-GLOBAL-PI-OVERLAY staged packages. The staged set lives on the factory (boot-time, like
+// allowGlobalExtensions); the per-job opt-OUT lives on the job (per-job, like maxTurns). Asserted through
+// the argv, which is the contract the container actually sees.
+const STAGED = ["/opt/pi-global/packages/pi-playwright", "/opt/pi-global/packages/pi-lint"];
+const PI_PACKAGES_ARG = "PI_PACKAGES=/opt/pi-global/packages/pi-playwright:/opt/pi-global/packages/pi-lint";
+
+/** Run one job through the factory with the staged set wired, and hand back the recorded argv. */
+async function argvFor(job, packagePaths = STAGED, factory = {}) {
+	const rec = {};
+	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, packagePaths, spawnFn: fakeSpawn(rec), ...factory });
+	await runContainer({ job, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	return rec.args;
+}
+
+test("packages: true passes the boot-staged set through to the container env", { skip }, async () => {
+	const args = await argvFor({ ...JOB, packages: true });
+	assert.ok(args.includes(PI_PACKAGES_ARG), "an explicitly opted-in job must carry the \":\"-joined staged container paths");
+});
+
+test("packages ABSENT loads the staged set -- staging is the opt-in, the trigger flag is only an opt-out", { skip }, async () => {
+	const args = await argvFor(JOB);
+	assert.ok(args.includes(PI_PACKAGES_ARG), "an unflagged job gets what the operator staged");
+});
+
+test("packages: false is the ONLY thing that withholds the staged set", { skip }, async () => {
+	const args = await argvFor({ ...JOB, packages: false });
+	assert.ok(!args.some((a) => String(a).startsWith("PI_PACKAGES")), "an explicit opt-out yields no PI_PACKAGES at all");
+});
+
+test("the STRING \"false\" does not opt out -- parseTriggers refuses it before it can become job data", { skip }, async () => {
+	// The strictness moved rather than vanished: `!== false` here is only safe because the trigger validator
+	// rejects every non-boolean run.packages fail-loud at load. This pins the halves together.
+	const args = await argvFor({ ...JOB, packages: "false" });
+	assert.ok(args.includes(PI_PACKAGES_ARG), "only the boolean false withholds; a string is not it");
+});
+
+test("packages: true with NOTHING staged still yields no PI_PACKAGES (the opt-in is not a promise)", { skip }, async () => {
+	const args = await argvFor({ ...JOB, packages: true }, []);
+	assert.ok(!args.some((a) => String(a).startsWith("PI_PACKAGES")), "an empty staged set omits the variable, never PI_PACKAGES=");
+});
+
+test("overlay extensions: the factory default emits nothing, and only an explicit false emits the opt-out", { skip }, async () => {
+	const on = await argvFor(JOB);
+	assert.ok(!on.some((a) => String(a).startsWith("PI_GLOBAL_ALLOW_EXTENSIONS")), "loading is the absence of the variable, on both sides");
+	const off = await argvFor(JOB, STAGED, { allowGlobalExtensions: false });
+	assert.ok(off.includes("PI_GLOBAL_ALLOW_EXTENSIONS=0"), "the operator's opt-out reaches the container verbatim");
+});
+
 test("tee: every chunk reaches BOTH onOutput and the sink, in order", { skip }, async () => {
 	const outputs = [];
 	const sink = makeRecordingSink();

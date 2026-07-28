@@ -40,8 +40,9 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 	assert.equal(c.triggers.label[0].flow, "frontend-fix");
 	assert.deepEqual(c.triggers.label[0].predicate.any, ["pi:frontend"]);
 
-	// the single comment trigger.
-	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage" });
+	// the single comment trigger. `packages` is asserted present-and-undefined: the grouper builds the key
+	// by construction and this whole-object deepEqual (assert/strict) counts an own undefined-valued key.
+	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined });
 
 	// pull_request rules: actions is a Set, predicate carries the label selectors.
 	assert.equal(c.triggers.pullRequest.length, 1);
@@ -88,6 +89,33 @@ test("rule indices are RAW file positions -- a leading cron entry still occupies
 	assert.equal(c.triggers.label[0].index, 1);
 	assert.equal(c.triggers.comment.index, 2);
 	assert.equal(c.triggers.pullRequest[0].index, 3);
+});
+
+// -- the per-trigger pi-packages opt-in (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -------
+
+test("each grouped webhook rule carries its own run.packages flag through to the filter", () => {
+	// Deliberately MIXED: the flag rides on the RULE, so a file where rules disagree must group them
+	// disagreeing -- the filter resolves it from whichever rule matched, never from a file-wide default.
+	const json = JSON.stringify({
+		triggers: [
+			{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix", packages: true } },
+			{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "triage", packages: true } },
+			{ on: { type: "pull_request", action: ["labeled"], any: ["pi:review"] }, run: { kind: "github", flow: "review", packages: false } },
+			{ on: { type: "label", any: ["pi:docs"] }, run: { kind: "github", flow: "docs" } },
+		],
+	});
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
+	assert.equal(c.triggers.label[0].packages, true);
+	assert.equal(c.triggers.comment.packages, true);
+	assert.equal(c.triggers.pullRequest[0].packages, false, "an explicit opt-out is grouped as false, never dropped");
+	assert.equal(c.triggers.label[1].packages, undefined, "an unflagged rule in the same file stays unflagged");
+});
+
+test("an unflagged triggers file groups packages as undefined on every rule -- the no-third-party-code default", () => {
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
+	assert.equal(c.triggers.label[0].packages, undefined);
+	assert.equal(c.triggers.comment.packages, undefined);
+	assert.equal(c.triggers.pullRequest[0].packages, undefined);
 });
 
 test("RECEIVER_PORT and RECEIVER_BIND overrides are honored", () => {

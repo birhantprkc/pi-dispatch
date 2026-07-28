@@ -47,6 +47,11 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 
 - **Statement**: The runner shall count agent turns and call `session.abort()` on exceeding a configured
   maximum. The maximum is a config knob with a conservative default.
+- **Scope**: **Root-session turns only.** The counter subscribes to the root `AgentSession`'s bus, and that
+  bus is per instance — a subagent session an extension spawns through `createAgentSession` emits no
+  `turn_start` on it (`INT-SDK-SESSION-OPTIONS`), so a 16-wide fanout registers here as roughly **one** turn.
+  This bound is per-session by construction and is not claimed to be process-wide; the process-wide spend
+  control is the token meter in `REQ-TOKEN-ACCOUNTING-AND-CAPS`.
 - **Why**: **pi has no max-turns, step-limit, or iteration cap of any kind.** The agent loop is a bare
   `while (true)` bounded only by an `AbortSignal`; the only control surface is `session.abort()`. The
   design document assumed pi provided this and listed it as "verify" — it does not, so we build it.
@@ -87,8 +92,19 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   point where the design document was wrong and nothing would have told us:
   - the baked `APPEND_SYSTEM.md` **and** a per-flow append both appear in the assembled prompt
     (the `??` trap drops the persona with no error, as does a forgotten `reload()`);
-  - a hostile `AGENTS.md` fixture's sentinel appears **nowhere** in the assembled prompt (`-nc` holds —
-    and note it is off by default, so this asserts against an *omission*);
+  - the repo's `AGENTS.md` fixture sentinel appears in `getAgentsFiles()` and **nowhere in the append
+    block** — the *inverse* of what this bullet asserted while `CONST-NO-CONTEXT-FILES-MANDATORY`
+    mandated `noContextFiles: true`, and the acceptance clause of the amendment that replaced it. The
+    silent failure being guarded moved rather than vanished: it used to be "discovery was left on by
+    omission", and is now "the repo's conventions stopped arriving, or arrived spliced into the safety
+    floor". Both are invisible at runtime, which is why the assertion is still here;
+  - a repo `.pi/extensions` entry's factory **ran**, while an admin-named or `dispatch_*`-registering one
+    is **absent** from the loaded set — the recursion guard, pinned on outcome rather than on the flag,
+    because project-resource discovery hangs on a pi default (`isProjectTrusted()`) that would take this
+    whole path down without a word if it flipped;
+  - a repo skill resolves **once**, from `/job/pi/skills` — `noSkills` staying `true` is what keeps the
+    pinned-SHA read-only mount the copy in force, and a regression there is a silent swap to the writable
+    working tree, not an error;
   - Chromium launches as the non-root runtime user (the `PLAYWRIGHT_BROWSERS_PATH` collision);
   - `pi -p` exits 0 (catches a flag rename);
   - the runner's turn budget fires at N **and exits 2** — not 0;
@@ -430,14 +446,21 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 
 ## REQ-TOKEN-ACCOUNTING-AND-CAPS
 
-- **Statement**: The harness shall (a) **account** every job's token usage — the runner accumulates the
-  per-turn `usage` pi emits on `subscribe()` (`OQ-010`) into per-job totals `{ input, output, total, cost }`,
-  emits them on the `exit` line, and the worker persists them in the run record and surfaces them in the admin
-  run views; (b) provide an **optional per-job token budget** (`maxTokens` / `PI_MAX_TOKENS`) that the runner
-  enforces in-run by aborting the session once cumulative tokens exceed it, exiting policy (`2`) with
-  `reason: "token_budget"`; and (c) provide an **optional daily token cap** (`dailyTokenCap` /
-  `PI_DAILY_TOKEN_CAP`) that refuses a new job pre-container once the day's recorded spend has reached it.
-  Both caps are unset-means-disabled and resolve `job.data > overlay > env` per job; accounting is always on.
+- **Statement**: The harness shall (a) **account** every job's token usage **process-wide** — the runner
+  wraps every api id in pi-ai's module-level api-provider registry, the one choke point every in-process
+  session funnels through, and accumulates each provider call's `usage` into per-job totals
+  `{ input, output, total, cost }` plus the attribution split
+  `{ metered, rootTotal, otherTotal, looseTotal, sessions, calls, unresolved, unpriced }`, emits them on the
+  `exit` line, and the worker persists them in the run record and surfaces them in the admin run views. The
+  per-turn sum off `session.subscribe()` (`OQ-010`) is the documented **fallback**, attached only when the
+  process-wide meter could not install, so exactly one accumulator is ever live and a double count is
+  impossible by construction; (b) provide an **optional per-job token budget** (`maxTokens` /
+  `PI_MAX_TOKENS`) that the runner enforces in-run — once the running total exceeds it the meter returns a
+  synthetic **aborted** stream for every subsequent provider call **by any session** and the root session is
+  aborted — exiting policy (`2`) with `reason: "token_budget"`; and (c) provide an **optional daily token
+  cap** (`dailyTokenCap` / `PI_DAILY_TOKEN_CAP`) that refuses a new job pre-container once the day's recorded
+  spend has reached it. Both caps are unset-means-disabled and resolve `job.data > overlay > env` per job;
+  accounting is always on.
 - **Why**: pi bounds neither tokens nor money; before this, spend was visible only on the provider bill.
   Accounting is the high-value piece — per-job token/cost in the run history is what lets an operator tune the
   **proactive** levers (`maxTurns`, the job-count caps). The two token caps are **backstops**, and both are
@@ -451,9 +474,38 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   relaxation of it. Under concurrency the daily counter is best-effort — N in-flight jobs each pass the check
   before any records, so the day can overshoot by up to N per-job budgets — which is acceptable for a lagging
   backstop and is not the job-count cap's atomic guarantee.
-- **Traces to**: `OQ-010`, `REQ-RUNNER-TURN-BUDGET`, `REQ-UPSTREAM-CONTRACT-TESTS`,
+  **Why the accounting is process-wide, and not per-session.**
+  *Negative fact — this scope exists because of an upstream absence.* A session's event bus is **per
+  instance**: `AgentSession._eventListeners` is an array on the instance and `Agent.listeners` a `Set` on
+  the instance, `createAgentSession` builds a fresh `Agent` + `AgentSession` every call,
+  `CreateAgentSessionOptions` carries **no parent or shared-bus option**, and **no event carries a
+  `sessionId`**. So a subagent session an extension spawns emits **nothing** on the parent's bus, and a
+  16-wide fanout registers there as roughly **one** turn — meaning a `subscribe()`-only meter understates
+  spend precisely on the most expensive jobs, which is the opposite of what a spend control is for. The one
+  choke point every in-process session shares is pi-ai's module-level api-provider registry: metering there
+  counts **calls** rather than turns, and `options.sessionId` (a declared field on pi-ai's `StreamOptions`)
+  reaches the provider, which is what makes the root/other split possible at all. If pi ever forwards a
+  child session's events onto its parent's bus, this scope becomes deletable — the absence is named here so
+  a future maintainer knows that, rather than leaving the meter as unexplained ballast.
+  **Honest note — the numbers get bigger, not just better.** With the meter active, a plain job that loads
+  no packages will report a `total` **greater than or equal to** the one the `subscribe()` sum reported,
+  because the meter also sees compaction and summarisation calls that never surfaced as a root `turn_end`.
+  The exit-line shape and every exit code are unchanged; the accounting is simply more complete. A daily
+  token counter fed by it therefore fills faster than before at identical real spend — that is the
+  correction, not a regression.
+  **What the breach actually stops.** `session.abort()` on the root is **voluntary and does not propagate**
+  to a child session, so aborting is not the brake. The forward brake is the meter: once breached, every
+  subsequent provider call by **any** session is answered with a synthetic aborted stream before it reaches
+  a provider (zero usage, `stopReason: "aborted"` so pi's own retry does not fire). The cap remains
+  structurally **lagging** either way, and the ultimate backstop stays `REQ-JOB-TIMEOUT-30M`.
+  **Residual gap, recorded not hidden**: a package that spawns a **`pi` subprocess** is invisible to any
+  in-process hook — pi's own SDK example does exactly that. Child-process sampling ships as diagnostics
+  (Linux `/proc`, logged at teardown); the fix belongs with `OQ-004`'s container-level proxy, because
+  reading usage off a subprocess needs TLS termination. Tracked at `OQ-011`.
+- **Traces to**: `OQ-010`, `OQ-011`, `REQ-RUNNER-TURN-BUDGET`, `REQ-UPSTREAM-CONTRACT-TESTS`,
   `CONST-BUDGET-BEFORE-TOKENS`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `INT-RUN-HISTORY-FILE-CONTRACT`,
-  `INT-CONFIG-OVERLAY-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`, `REQ-SPEND-CAPS-MULTI-WINDOW`
+  `INT-CONFIG-OVERLAY-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SDK-SESSION-OPTIONS`,
+  `REQ-SPEND-CAPS-MULTI-WINDOW`, `DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY`
 - **Acceptance**: Given any completed job, when it ends, then its run record carries a `tokens`
   `{ input, output, total, cost }` object and the admin run views show its total and cost; given `maxTokens`
   set and a job whose cumulative usage exceeds it, when the budget is hit, then the runner aborts, exits `2`
@@ -463,6 +515,15 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   and spent, when it ends on any outcome, then its tokens are added to the daily counter; given both caps
   unset, then usage is still accounted and no job is ever refused or aborted for tokens; given a pin bump that
   drops or reshapes `Usage`, then `REQ-UPSTREAM-CONTRACT-TESTS` fails the build, not a live job.
+  **Process-wide clauses.** Given **two concurrent sessions** in one process, one of them the root, when both
+  have spent, then the meter's `total` is the sum of both, `otherTotal` is the non-root session's spend **in
+  full**, `rootTotal + otherTotal + looseTotal === total`, and a control `attachTokenBudget` on the root sees
+  **only** the root's half — the negative half is asserted alongside the positive one, because it is the
+  undercount this scope exists to remove; given a **breach mid-fanout**, when the next provider call is made
+  by **any** session, then it is stopped before it reaches a provider (asserted on the provider's own call
+  log, not on the meter's totals) and the run exits `2` with `reason: "token_budget"`; given the meter
+  **could not install**, then the `subscribe()` fallback is attached instead, the exit line reports
+  `metered: false`, and the exit codes and record shape are unchanged.
 
 ## REQ-SCOPED-PAUSE-WINDOWS
 
@@ -505,27 +566,100 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   last; the baked `HARD_RULES.md` floor stays first and unremovable. The overlay is **credential-free by
   construction**: `pi-dispatch import-pi` stages the safe subset of `~/.pi/agent` (honoring
   `PI_CODING_AGENT_DIR`), **refusing** a `models.json` with a literal key and **never** copying `auth.json`
-  or `settings.json`; `pi-dispatch doctor` re-verifies. Overlay **extensions are fail-closed**: copied only
-  under `import-pi --with-extensions` (the admin extension hard-blocked), and loaded only when the operator
-  arms `PI_GLOBAL_ALLOW_EXTENSIONS=1`. A custom provider's key reaches the container through the explicit
-  `PI_FORWARD_ENV` name allowlist, never a host pass-through.
+  or `settings.json`; `pi-dispatch doctor` re-verifies. Overlay **extensions are staged and loaded by
+  DEFAULT**: `import-pi` copies `extensions/` unless the operator passes `--no-extensions`, **prints every
+  extension it staged by name** (the vetting step is a list the operator can read, not a flag they can
+  forget), and still **hard-blocks the admin extension**; they then load in every job unless
+  `PI_GLOBAL_ALLOW_EXTENSIONS` is exactly `"0"`. The knob is an **opt-OUT**, and unset, `""` and the legacy
+  `"1"` all mean load; **any other value is a loud `configError`** at all three enforcement points (worker
+  config, env-allowlist, runner config) — the strict parse is unchanged but what it defends against
+  flipped, since `=false` used to degrade safely to "dormant" and would now silently mean "on".
+  A custom provider's key reaches the container through the explicit `PI_FORWARD_ENV` name allowlist,
+  never a host pass-through.
+  The overlay additionally carries **operator-staged pi packages** at `packages/<dir>/`, and they are the
+  sharpest tier of all — third-party code, so they pass **four** gates, three of which refuse by default
+  and the fourth of which is a withdrawal. (1) The operator declares
+  each one in a pinned `pi-packages.json` at an **EXACT** version (`INT-PI-PACKAGES-FILE-CONTRACT`;
+  `CONST-PI-VERSION-PINNED`'s reasoning, since a floating range makes every queued job a silent no-op that
+  still reports success). (2) `pi-dispatch import-pi --with-packages` stages each one **on the host** into
+  its own self-contained directory (`--omit=dev --omit=peer --omit=optional --ignore-scripts
+  --install-strategy=nested`, all-or-nothing, plus a `packages.json` stage manifest), refusing a ranged
+  version, an **admin-like name** (a package that can enqueue paid jobs from inside a job container is the
+  same recursion vector the admin extension is blocked for), a package that contributes no pi resources, a
+  manifest entry that leaves the package dir, a missing transitive dependency, or a colliding staged dir.
+  (3) A **per-trigger** `run.packages` (all four trigger kinds; `INT-TRIGGERS-FILE-CONTRACT`) decides
+  whether the worker emits `PI_PACKAGES` — an **opt-OUT**: absent or `true` loads what the operator staged,
+  and only an explicit `false` withholds it, since staging is itself the deliberate act and the flag exists
+  so one flow can decline what the deployment pinned. `parseTriggers` still refuses a non-boolean at load,
+  which is now the *only* place that strictness lives. (4) The runner validates every
+  path, **refuses the job pre-spend** when one did not mount, appends them **last** to
+  `additionalExtensionPaths`, and re-imposes this requirement's own **"repo wins on conflict"** on skills
+  through the loader's declared `skillsOverride` seam, so a staged package can never take the name of a repo
+  or overlay skill (a collision that was attempted is *reported*, not refused).
+  `PI_OFFLINE=1` is set on **every** job so a package source can never become a live job-time `npm install`.
 - **Scope**: The container mount + env contract and the runner's resource loader; a new host-side CLI
   (`import-pi`) and `doctor` checks. Works with the **pulled** prebuilt image — a runtime mount, not a
   rebuild. Distinct from the per-repo `.pi/` (trusted-by-merge, materialized from a git SHA) and from the
-  admin-editable runtime settings overlay (which still may never carry persona).
+  admin-editable runtime settings overlay (which still may never carry persona). Staged packages ride the
+  **same** `/opt/pi-global:ro` mount — no new mount, no new trust boundary — and load for every job whose
+  trigger did not set `run.packages: false`. The admin panel **displays** each trigger's packages state and
+  the staged `name@version` set and deliberately **cannot set** the flag: changing which flows run
+  third-party code is a reviewed file edit, not a keystroke.
 - **Why**: Anyone who already runs pi has a configured `~/.pi/agent`; re-expressing it per-repo is friction
   the missing-layer pitch should remove. The overlay is **operator deploy-time config — the same trust class
   as baking the image** — so it may carry a persona layer, but it is mounted `:ro` into an adversarial-input
-  container, so it must hold no secret (`CONST-TOKEN-SCOPED-PER-JOB`) and extensions (arbitrary code, open
-  egress) stay opt-in and armed separately.
+  container, so it must hold no secret (`CONST-TOKEN-SCOPED-PER-JOB`).
+  **Why the overlay's extensions load by default.** An operator vetted this code twice before it ever
+  reached the overlay: once by running it in their own `~/.pi/agent`, and once by staging it with
+  `import-pi`, which prints every extension it copied. A third gate is friction, not safety — and the
+  friction had a cost, because an overlay that is present but dormant is a deployment silently missing the
+  setup its flows were written against, with no error to read. The setup the operator staged is the setup
+  their jobs get. That relaxation stops at the overlay: it never touches the spend caps, the per-job token
+  scoping, or the admin-extension block, and `PI_GLOBAL_ALLOW_EXTENSIONS=0` remains a one-line opt-out for
+  a deployment that wants them dormant.
+  **Why packages are staged on the host rather than installed in the job.** pi resolves any spec that is not
+  `npm:`/`git:`/a URL as a **local path** — in place, with no install, no network and no writes — which is
+  exactly what lets a job container load one with egress denied and `--ignore-scripts` already behind it.
+  The alternative, an `npm:` source resolved in-container, is a live network install of third-party code
+  inside an adversarial-input container on **every** run. **`--ignore-scripts` cuts both ways and the honest
+  half is stated at stage time**: lifecycle scripts would otherwise run as the operator, on the operator's
+  host, so they are refused — and a package that declares one (or an `optionalDependencies`) is therefore
+  staged **INCOMPLETE** and warned about, because it may fail at run time.
+  **Every way this feature breaks is silent**, which is why the refusals are loud: pi **skips** a local
+  package source that does not resolve with no error and no diagnostic, so an unmounted package would run
+  the flow to a clean exit `0` without the tools it was written for. Hence `doctor` surfaces the staged set,
+  its armed/dormant state, and the four silent-failure modes.
 - **Traces to**: `DES-OPERATOR-GLOBAL-OVERLAY`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SDK-SESSION-OPTIONS`,
-  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `DES-PERSONA-VIA-APPEND-SYSTEM-MD`
+  `INT-CONTAINER-JOB-INPUTS`, `INT-PI-PACKAGES-FILE-CONTRACT`, `INT-TRIGGERS-FILE-CONTRACT`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `CONST-PI-VERSION-PINNED`,
+  `DES-PERSONA-VIA-APPEND-SYSTEM-MD`
 - **Acceptance**: Given a configured overlay, a global skill is available to a job and a repo skill of the
   same name overrides it; the assembled prompt shows guardrails before the global persona before the repo
   persona; given a custom model in the overlay `models.json`, the runner resolves it; given `import-pi`
   against a `models.json` with a literal key, it refuses and writes nothing; given `auth.json` in the
-  overlay, `doctor` fails; given overlay extensions with `PI_GLOBAL_ALLOW_EXTENSIONS` unset, they do not
-  load; given `import-pi --with-extensions` over the admin extension, it is not copied.
+  overlay, `doctor` fails; given overlay extensions with `PI_GLOBAL_ALLOW_EXTENSIONS` unset, empty, or
+  `"1"`, they **load**; given exactly `"0"`, they do not; given any other value — `"false"`, `"yes"`,
+  `"true"` — the worker **refuses to boot**, the env-allowlist and the runner both refuse, and `doctor`
+  reports it as a hard failure rather than guessing a direction; given `import-pi` with no flags, the
+  overlay's extensions **are** copied and every one is printed by name; given `--no-extensions`, none is;
+  given either, over the admin extension, it is not copied.
+  **Staged packages.** Given a `pi-packages.json` entry with a ranged version, an admin-like name, a `dir`
+  that is not a plain segment, a duplicate `dir`, a package with no `pi` manifest and no resource dir, a
+  `pi` manifest entry containing `..` or a leading `/`, or a dependency npm hoisted out of the package dir,
+  when `import-pi --with-packages` runs, then it refuses and **nothing at all is staged** (all-or-nothing);
+  given a staged set and a trigger **without** `run.packages`, then `PI_PACKAGES` **is** emitted and one
+  staged dir contributes **both** extensions and skills — through the explicit `additionalExtensionPaths`
+  channel, which `reload()` honours regardless of `noSkills` — and the extension paths sort **after** the
+  repo's, the overlay's, and anything discovered under `/workspace`; given `run.packages: false`, then
+  `PI_PACKAGES` is not emitted and no package loads;
+  given a `PI_PACKAGES` entry that is relative, contains `..`, or does not exist in the container, then the
+  runner refuses **before any provider call** with exit `2`; given a staged skill whose name collides with a
+  repo or overlay skill, then the **repo (or overlay) skill is the one in force** — pi's raw load hands the
+  name to the package, since it orders package skill paths first and is first-path-wins, and the runner
+  takes it back through the loader's `skillsOverride` seam, so this entry's "repo wins on conflict" holds by
+  enforcement rather than by assertion; the job **runs**, and the attempt is reported so the operator learns
+  that a staged package shipped a name the repo had already published; given a repo skill and an overlay
+  skill of the same name, then the repo's still wins; given any job at all, then `PI_OFFLINE=1` is set.
 
 ---
 
@@ -547,6 +681,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-07-28 | **The pi-normal discovery posture, and operator-staged code on by default** (`CONST-NO-CONTEXT-FILES-MANDATORY` amended in the same change). `REQ-UPSTREAM-CONTRACT-TESTS`: the `AGENTS.md` bullet is **inverted** — it asserted the sentinel appears **nowhere** in the assembled prompt (`-nc` holds) and now asserts it appears in `getAgentsFiles()` and **nowhere in the append block**, because the shipped loader sets `noContextFiles: false`. Two bullets added, both pinned on **outcome** rather than on a flag: a repo `.pi/extensions` factory ran while an admin-named or `dispatch_*`-registering one is absent (project-resource discovery hangs on pi's `isProjectTrusted()` default, which would take the path down silently if it flipped), and a repo skill resolves **once** from `/job/pi/skills`. The silent failure this REQ exists for did not vanish, it **moved**, and the entry says so. `REQ-GLOBAL-PI-OVERLAY`: overlay extensions are **staged and loaded by default** — `import-pi` copies `extensions/` unless `--no-extensions` and **prints every extension it staged by name** (the vetting step is a list, not a flag), the admin extension is still hard-blocked, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives only as an **opt-OUT** where unset/`""`/legacy `"1"` load, exactly `"0"` disables, and **any other value is a loud `configError` at all three enforcement points** — the strict parse is unchanged but the damaging misreading flipped, since `=false` used to degrade safely to "dormant" and would now silently mean "on". A new `Why` paragraph records the reasoning: the operator vetted the code twice (running it in `~/.pi/agent`, staging it with a printed list), so a third gate is friction, and a present-but-dormant overlay is a deployment silently missing the setup its flows were written against. `run.packages` inverted to an **opt-OUT** on all four trigger kinds (absent or `true` load; only `false` withholds), with `parseTriggers`' load-time boolean validation now the only place that strictness lives; the four-gate framing restated honestly as three gates that refuse by default plus one withdrawal, and `Scope`'s "inert until a trigger arms them" corrected. Acceptance updated throughout for both inversions. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
 | 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
 | 2026-07-17 | Added REQ-CRON-SCHEDULED-JOBS, formalizing the implemented BullMQ Job Scheduler cron path: `local`-only triggers, loud `-10`/`-11` handling, per-scheduler stall teardown, startup orphan reconcile, and no in-tick retry. |
@@ -557,4 +692,5 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-22 | Amended REQ-ADMIN-VIA-PI-EXTENSION to the three-tool framing — `dispatch_run` is a third, spend-knobless model-callable enqueue gated by `DES-AI-TRIGGER-FLOW-GATE`; the `Statement` and `Why` both drop the superseded reads-plus-pause/resume-only categorical, keeping the cap-integrity rationale on the new premise that no model tool carries a spend knob, and the `Acceptance` gains a `dispatch_run` clause. Added REQ-AI-TRIGGERED-RUNS (the two AI-triggered producers — the `dispatch_run` tool/command and the worker's `/outbox` collector — under a per-flow pre-agent-SHA `ai-trigger: allow` gate, folder-confined to `PI_DISPATCH_RUN_ROOTS`, depth/count/rate-capped, budget unchanged; operator-typed CLI/command ungated). |
 | 2026-07-23 | Amended REQ-ADMIN-VIA-PI-EXTENSION: the admin surface is now AI-operable for writes via **confirm-gated** model tools — `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete` (plus a `dispatch_triggers` read) — each applying its change only after a human operator approves a `ctx.ui.confirm` showing the concrete before→after, and refusing (writing nothing) with no interactive UI. Replaces the "every write is operator-typed, never a model tool" categorical in `Statement`/`Why`/`Acceptance`; the cap-integrity rationale now rests on the un-forgeable human confirm rather than tool absence. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged. Added the bundled `operate-pi-dispatch` skill (advertised via `resources_discover`) that recommends how to use those human gates. |
 | 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
+| 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). REQ-TOKEN-ACCOUNTING-AND-CAPS: accounting is now **process-wide** — the runner meters at pi-ai's module-level api-provider registry, the choke point every in-process session shares, and the `subscribe()` per-turn sum is the documented **fallback**, attached only when the meter could not install. Records the negative fact that forces it (the event bus is per `AgentSession` instance, `CreateAgentSessionOptions` has no parent/bus option, no event carries a `sessionId`, so a 16-wide fanout registers as ~one turn), the honest note that a plain job's `total` now reads **>=** today's because compaction/summarisation calls were never root `turn_end`s, what a breach actually stops (`session.abort()` does not propagate to children; the forward brake is the synthetic aborted stream for every later call by any session; the backstop stays REQ-JOB-TIMEOUT-30M), and the residual subprocess gap (OQ-011). Acceptance gains the two-concurrent-sessions, breach-mid-fanout and meter-unavailable clauses. REQ-RUNNER-TURN-BUDGET gains a **Scope**: root-session turns only — the same per-instance bus bounds it, and it does not claim otherwise. REQ-GLOBAL-PI-OVERLAY: the overlay now also carries `packages/` — operator-staged third-party pi packages, gated four times over (exact pin in `pi-packages.json`, host-side `--ignore-scripts` staging with an admin-name block, a per-trigger `run.packages` opt-in, and runner-side path validation plus skill-precedence enforcement through the loader's `skillsOverride` seam, which re-imposes this REQ's own "repo wins on conflict" over pi's package-paths-first ordering), with `PI_OFFLINE=1` on every job so a package source can never become a job-time install. |
 | 2026-07-22 | Added REQ-TOKEN-ACCOUNTING-AND-CAPS (issue #25, unblocked by OQ-010): per-job token/cost accounting in the run record + admin views; an optional in-run per-job token budget (`maxTokens`/`PI_MAX_TOKENS`, exits policy `token_budget`); and an optional daily token cap (`dailyTokenCap`/`PI_DAILY_TOKEN_CAP`) enforced **check-AFTER** — the deliberate asymmetry with `CONST-BUDGET-BEFORE-TOKENS`, which is unchanged (still job-count, still check-before). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list with `maxTokens`/`dailyTokenCap`; retargeted REQ-SPEND-CAPS-MULTI-WINDOW's OQ-010 forward-reference to the new REQ. |

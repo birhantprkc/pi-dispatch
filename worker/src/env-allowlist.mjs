@@ -102,8 +102,14 @@ function resolveEnvName(provider, cred) {
  *
  * Throws if the provider is not configured -- a deterministic misconfiguration the caller maps to
  * a pre-spend refusal, never a launched-then-failed container.
+ *
+ * `packagePaths` is the operator-staged pi package set for THIS job: already-resolved absolute
+ * CONTAINER paths under the :ro overlay, empty for a job whose trigger opted OUT (or when nothing is staged).
+ *
+ * `allowGlobalExtensions` defaults to TRUE here, matching loadConfig's default (REQ-GLOBAL-PI-OVERLAY): a
+ * caller that says nothing gets the operator's staged setup, and only an explicit `false` withholds it.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv, allowGlobalExtensions = false, forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
 	// The provider credential(s), by pi's expected variable name(s) -- from the worker env, or (when
 	// PI_AUTH_FROM_PI is set and the env has none) host-side from pi's auth.json. Throws (config) if
 	// neither source yields one, which the processor turns into a pre-spend refusal.
@@ -122,9 +128,23 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
 		PLAYWRIGHT_MCP_BROWSER: "chromium",
 		PLAYWRIGHT_MCP_SANDBOX: "false",
-		// Arms loading of the global overlay's extensions in the runner (REQ-GLOBAL-PI-OVERLAY). Fail-closed:
-		// only set when the operator opted in, so an unset value keeps overlay extensions dormant.
-		PI_GLOBAL_ALLOW_EXTENSIONS: allowGlobalExtensions ? "1" : undefined,
+		// The overlay's extensions load in the runner unless the operator opted out (REQ-GLOBAL-PI-OVERLAY).
+		// ABSENT means LOAD on both sides of the mount, so this variable is emitted ONLY to carry the explicit
+		// "0" opt-out -- the one reading a container must never have to infer. Both halves agree on the same
+		// canonical string, so the container env is legible against the operator's own .env line.
+		PI_GLOBAL_ALLOW_EXTENSIONS: allowGlobalExtensions ? undefined : "0",
+		// ":"-delimited ABSOLUTE CONTAINER paths of the operator-staged pi packages (REQ-GLOBAL-PI-OVERLAY).
+		// The caller has already applied the per-trigger opt-out, so an empty list here means "this job loads
+		// none" -- either nothing is staged, or its trigger set run.packages:false. Empty emits no -e at all,
+		// never PI_PACKAGES=. The delimiter is ":" because these are CONTAINER (POSIX) paths -- never the
+		// host's path.delimiter, which is ";" on Windows.
+		PI_PACKAGES: packagePaths.length > 0 ? packagePaths.join(":") : undefined,
+		// Kill switch for job-time package installation, UNCONDITIONAL for every job. pi's resolver shells out
+		// to a REAL `npm install` for any npm:/git: source unless offline mode is on, and `~/.pi/agent` IS
+		// writable in the container. We emit only local paths, so nothing should reach that branch -- this
+		// makes it UNREACHABLE rather than merely unused. It is a narrowing, never a capability, which is why
+		// it is not gated on the opt-in.
+		PI_OFFLINE: "1",
 	};
 
 	// The provider credential(s), under pi's expected variable name(s), so pi's own auth resolution finds them.

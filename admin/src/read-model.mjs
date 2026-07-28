@@ -28,6 +28,7 @@ import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection
 import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
 import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
 import { gitDirty } from "@pi-dispatch/worker/git-dirty";
+import { readStageManifest } from "@pi-dispatch/worker/packages";
 
 // Re-exported so the command layer reaches the key contract through the admin's single worker-coupling
 // funnel, never re-deriving the five known keys.
@@ -46,6 +47,10 @@ export function resolvePaths(env = process.env) {
     settingsFile: settingsFilePath(env),
     triggersPath: env.PI_TRIGGERS_FILE ?? "deploy/triggers.json",
     pauseWindowsPath: env.PI_PAUSE_WINDOWS_FILE ?? "deploy/pause-windows.json",
+    // The operator's global pi overlay dir (REQ-GLOBAL-PI-OVERLAY), where the staged third-party pi
+    // packages live under `packages/`. `|| null` so unset AND empty both read as "no overlay" -- the
+    // normal deployment, in which no trigger can arm any package.
+    globalPiDir: env.PI_GLOBAL_PI_DIR || null,
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
     // The two dispatch_run bounds the extension enforces producer-side, read DIRECTLY from env (never
     // loadConfig, which throws on unrelated GitHub-auth problems). `delimitedList`/`nonNegativeInt` are
@@ -539,13 +544,23 @@ export function readTriggers({ triggersPath, fs = nodeFs }) {
   return { triggers };
 }
 
-/** Normalize one `{ on, run }` entry into its display record, or `null` when it is not usable. */
-function normalizeTriggerForDisplay(entry) {
+/**
+ * Normalize one `{ on, run }` entry into its display record, or `null` when it is not usable. Exported for
+ * the display tests; `readTriggers` is the only production caller.
+ *
+ * `packages` -- the trigger's `run.packages: true` opt-in to load the operator-staged third-party pi
+ * packages (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -- is carried on ALL FOUR kinds: a trigger
+ * that runs third-party code with open network egress must not render identically to one that does not.
+ * Anything other than a literal `true` reads as unarmed, so a malformed value fails closed in the display
+ * exactly as it does in the worker's validator.
+ */
+export function normalizeTriggerForDisplay(entry) {
   if (entry === null || typeof entry !== "object") return null;
   const on = entry.on;
   if (on === null || typeof on !== "object") return null;
   const run = entry.run !== null && typeof entry.run === "object" ? entry.run : {};
   const flow = typeof run.flow === "string" ? run.flow : null;
+  const packages = run.packages === true;
   switch (on.type) {
     case "cron":
       return {
@@ -557,11 +572,12 @@ function normalizeTriggerForDisplay(entry) {
         // Optional per-cron model override (passthrough into job.data); null when the entry resolves the
         // deployment default. Surfaced so the drill-in shows which schedules pin their own model.
         model: typeof run.model === "string" ? run.model : null,
+        packages,
       };
     case "label":
-      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow };
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages };
     case "comment":
-      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow };
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages };
     case "pull_request":
       return {
         type: "pull_request",
@@ -570,6 +586,7 @@ function normalizeTriggerForDisplay(entry) {
         all: normalizeSelector(on.all),
         none: normalizeSelector(on.none),
         flow,
+        packages,
       };
     default:
       return null;
@@ -580,6 +597,43 @@ function normalizeTriggerForDisplay(entry) {
 function normalizeSelector(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((member) => typeof member === "string");
+}
+
+/**
+ * Read the operator's staged pi packages for display: the `name@version` list a trigger with
+ * `run.packages: true` arms (REQ-GLOBAL-PI-OVERLAY). The panel shows WHICH pinned third-party code an armed
+ * trigger loads; it never stages, arms, or writes anything.
+ *
+ * Uses the worker's OWN `readStageManifest`, so the admin and the job path cannot drift on the manifest's
+ * location, shape, or re-validation -- the same rule as `parseTriggers` / `readOverlay` above. Degrades in
+ * every absent case to the SAME safe empty shape `{ stagedAt: null, packages: [] }` -- no overlay
+ * configured, no manifest on disk, or a malformed one -- so the caller never has to discriminate. That
+ * reader never throws by contract; the try/catch additionally covers the injected `fs` callbacks, so a
+ * viewer degrades rather than killing the panel.
+ */
+export function readStagedPackages({ globalPiDir, fs = nodeFs, readManifest = readStageManifest } = {}) {
+  const empty = { stagedAt: null, packages: [] };
+  if (typeof globalPiDir !== "string" || globalPiDir === "") return empty;
+  let manifest;
+  try {
+    manifest = readManifest({
+      globalPiDir,
+      readFile: (path) => fs.readFileSync(path, "utf8"),
+      fileExists: (path) => fs.existsSync(path),
+    });
+  } catch {
+    return empty;
+  }
+  const entries = Array.isArray(manifest?.packages) ? manifest.packages : [];
+  return {
+    stagedAt: typeof manifest?.stagedAt === "string" ? manifest.stagedAt : null,
+    packages: entries.filter((p) => p && typeof p.name === "string").map(nameAtVersion),
+  };
+}
+
+/** One manifest entry as `name@version`, or bare `name` when the entry pins no version string. */
+function nameAtVersion(pkg) {
+  return typeof pkg.version === "string" && pkg.version !== "" ? `${pkg.name}@${pkg.version}` : pkg.name;
 }
 
 /** The sanitized ids present in the logs dir (from `*.json` filenames), for `logs <id>` autocomplete. */

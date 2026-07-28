@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
@@ -14,6 +14,8 @@ import {
   readLogTail,
   readSettingsView,
   readTriggers,
+  normalizeTriggerForDisplay,
+  readStagedPackages,
   listRunIds,
   setQueuePaused,
   writeSettings,
@@ -125,6 +127,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     PI_LOGS_DIR: "/l",
     PI_SETTINGS_FILE: "/s.json",
     PI_TRIGGERS_FILE: "/f.json",
+    PI_GLOBAL_PI_DIR: "/srv/pi-global",
     PI_CAPTURE_JOB_LOGS: "1",
     PI_DISPATCH_RUN_ROOTS: "/root-a",
     PI_DISPATCH_RUN_PER_HOUR: "5",
@@ -134,6 +137,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     logsDir: "/l",
     settingsFile: "/s.json",
     triggersPath: "/f.json",
+    globalPiDir: "/srv/pi-global",
     captureJobLogs: true,
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
@@ -147,6 +151,8 @@ test("resolvePaths falls back to defaults on empty env (no worker config require
   assert.equal(p.valkeyUrl, "redis://127.0.0.1:6379");
   assert.equal(p.triggersPath, "deploy/triggers.json");
   assert.equal(p.captureJobLogs, false);
+  assert.equal(p.globalPiDir, null, "no overlay dir configured -> no staged packages to arm");
+  assert.equal(resolvePaths({ PI_GLOBAL_PI_DIR: "" }).globalPiDir, null, "an empty overlay dir reads as unset");
   assert.ok(typeof p.logsDir === "string" && p.logsDir.length > 0);
   assert.ok(typeof p.settingsFile === "string" && p.settingsFile.length > 0);
   assert.deepEqual(p.dispatchRunRoots, [], "default roots [] fails closed");
@@ -370,11 +376,31 @@ test("readTriggers normalizes each on.type into its discriminated display record
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
   assert.deepEqual(res.triggers, [
-    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null },
-    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix" },
-    { type: "comment", phrase: "@pi", flow: "fix" },
-    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review" },
+    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: false },
+    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: false },
+    { type: "comment", phrase: "@pi", flow: "fix", packages: false },
+    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: false },
   ]);
+});
+
+test("normalizeTriggerForDisplay carries the run.packages arming on all four kinds", () => {
+  const entries = [
+    { on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/p", flow: "tidy", packages: true } },
+    { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix", packages: true } },
+    { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: true } },
+    { on: { type: "pull_request", action: ["labeled"] }, run: { kind: "github", flow: "review", packages: true } },
+  ];
+  assert.deepEqual(
+    entries.map((e) => normalizeTriggerForDisplay(e).packages),
+    [true, true, true, true],
+    "every kind can arm the operator-staged packages, so every kind must display it",
+  );
+
+  // Unset, false, and a malformed value all read as unarmed -- the display fails closed like the validator.
+  for (const packages of [undefined, false, "true", 1, null]) {
+    const rec = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "fix", packages } });
+    assert.equal(rec.packages, false, `run.packages ${JSON.stringify(packages)} is not an arming`);
+  }
 });
 
 test("readTriggers skips an entry that is not a usable { on, run } object (viewer degrades)", () => {
@@ -389,7 +415,7 @@ test("readTriggers skips an entry that is not a usable { on, run } object (viewe
     }),
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
-  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix" }]);
+  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: false }]);
 });
 
 test("readTriggers returns { invalid } when there is no triggers array", () => {
@@ -406,6 +432,69 @@ test("readTriggers returns { invalid } when the file is not valid JSON", () => {
 
 test("readTriggers returns { missing:true } when the file is absent (viewer degrades)", () => {
   assert.deepEqual(readTriggers({ triggersPath: "/x/none.json", fs: triggerFs({}) }), { missing: true });
+});
+
+// ---- readStagedPackages (REQ-GLOBAL-PI-OVERLAY: what an armed trigger actually loads) ----
+
+// The worker's frozen `readStageManifest({ globalPiDir, readFile, fileExists })` contract, faked: it never
+// throws, and returns `{ stagedAt, packages: [{ name, version, dir }] }` or null.
+const fakeManifest = (manifest) => (args) => {
+  assert.equal(typeof args.globalPiDir, "string", "the reader is called with the overlay dir");
+  assert.equal(typeof args.readFile, "function", "all filesystem access is injected by the admin");
+  assert.equal(typeof args.fileExists, "function", "all filesystem access is injected by the admin");
+  return manifest;
+};
+
+test("readStagedPackages lists the staged manifest as name@version", () => {
+  const res = readStagedPackages({
+    globalPiDir: "/srv/pi-global",
+    readManifest: fakeManifest({
+      stagedAt: "2026-07-27T10:00:00.000Z",
+      packages: [
+        { name: "pi-web-search", version: "1.4.2", dir: "pi-web-search" },
+        { name: "pi-jira", version: "0.9.0", dir: "pi-jira" },
+      ],
+    }),
+  });
+  assert.deepEqual(res, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2", "pi-jira@0.9.0"] });
+});
+
+test("readStagedPackages reads a real manifest through the worker's own reader", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dispatch-overlay-"));
+  mkdirSync(join(dir, "packages"), { recursive: true });
+  writeFileSync(
+    join(dir, "packages", "packages.json"),
+    JSON.stringify({ stagedAt: "2026-07-27T10:00:00.000Z", packages: [{ name: "pi-web-search", version: "1.4.2", dir: "pi-web-search" }] }),
+  );
+  // No injected reader: the production default is the worker's `readStageManifest`, so the admin and the
+  // job path cannot drift on where the manifest lives or what it may contain.
+  assert.deepEqual(readStagedPackages({ globalPiDir: dir }), { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2"] });
+});
+
+test("readStagedPackages drops unusable entries and falls back to a bare name with no version", () => {
+  const res = readStagedPackages({
+    globalPiDir: "/srv/pi-global",
+    readManifest: fakeManifest({ stagedAt: 42, packages: [{ name: "pi-unpinned" }, { version: "1.0.0" }, null, "nope"] }),
+  });
+  assert.deepEqual(res, { stagedAt: null, packages: ["pi-unpinned"] }, "a nameless/malformed entry is skipped, not fatal");
+});
+
+test("readStagedPackages returns the safe empty shape whenever the overlay or manifest is absent", () => {
+  const empty = { stagedAt: null, packages: [] };
+  assert.deepEqual(readStagedPackages({ globalPiDir: null }), empty, "no overlay configured");
+  assert.deepEqual(readStagedPackages({ globalPiDir: "" }), empty, "an empty overlay path is no overlay");
+  assert.deepEqual(readStagedPackages(), empty, "no arguments at all");
+  assert.deepEqual(readStagedPackages({ globalPiDir: "/g", readManifest: fakeManifest(null) }), empty, "no manifest on disk");
+  assert.deepEqual(readStagedPackages({ globalPiDir: "/g", readManifest: fakeManifest({ packages: "not-an-array" }) }), empty, "a malformed manifest");
+  // The production default against an overlay dir that does not exist degrades the same way, never throws.
+  assert.deepEqual(readStagedPackages({ globalPiDir: join(tmpdir(), "pi-global-absent-xyz") }), empty, "the production default degrades too");
+});
+
+test("readStagedPackages never throws when the manifest reader does", () => {
+  const boom = () => {
+    throw new Error("unreadable overlay");
+  };
+  assert.deepEqual(readStagedPackages({ globalPiDir: "/g", readManifest: boom }), { stagedAt: null, packages: [] });
 });
 
 test("readSettingsView returns the validated overlay via the worker's own reader", () => {

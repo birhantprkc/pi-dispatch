@@ -310,6 +310,67 @@ test("the TRIGGERS section unifies the label allowlist with the schedulers block
   assert.match(out, /bug → github fix/, "the label trigger row: match → target flow");
 });
 
+// --- staged packages (REQ-GLOBAL-PI-OVERLAY): which triggers arm the operator's third-party code ---
+
+/** A one-trigger snapshot: `packages` is the trigger's arming, `staged` the overlay's manifest read. */
+const armedSnap = (packages, staged = { stagedAt: null, packages: [] }) => ({
+  ...SNAPSHOT,
+  runs: [],
+  activeJobId: null,
+  triggers: { triggers: [{ type: "label", any: ["bug"], all: [], none: [], flow: "fix", packages }] },
+  stagedPackages: staged,
+});
+
+const openTrigger = async (snap) => {
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  const list = stripAnsi(comp.render(80).join("\n"));
+  comp.handleInput("\r"); // row 0 is the trigger -- triggers lead the rows list
+  await flush();
+  const detail = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  return { list, detail };
+};
+
+test("the LIST badges an armed trigger, and leaves an unarmed one unmarked", async () => {
+  const armed = await openTrigger(armedSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2"] }));
+  assert.match(armed.list, /bug → github fix \[packages\]/, "an armed trigger row says it loads staged packages");
+
+  const plain = await openTrigger(armedSnap(false));
+  assert.doesNotMatch(plain.list, /\[packages\]/, "a trigger that loads no third-party code is unmarked");
+});
+
+test("the armed badge is colored post-layout: the badged row still measures exactly `inner` cols", async () => {
+  const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
+  const snap = armedSnap(true, { stagedAt: null, packages: ["pi-web-search@1.4.2"] });
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, theme, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  const lines = comp.render(80);
+  await comp.dispose();
+  assert.match(stripAnsi(lines.join("\n")), /\[packages\]/, "the badge survives under the color");
+  for (const l of lines) {
+    assert.equal(visibleLen(l), 80, `every framed line is exactly 80 visible cols: ${JSON.stringify(stripAnsi(l))}`);
+  }
+});
+
+test("TRIGGER_DETAIL's trust model names the staged packages and warns, only for an armed trigger", async () => {
+  const armed = await openTrigger(armedSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2", "pi-jira@0.9.0"] }));
+  assert.match(armed.detail, /TRUST MODEL/, "the armed lines join the per-kind trust model");
+  assert.match(armed.detail, /collaborator's label/, "the static per-kind trust model still renders");
+  assert.match(armed.detail, /packages armed · pi-web-search@1\.4\.2 · pi-jira@0\.9\.0/, "the staged names+versions");
+  assert.match(armed.detail, /third-party code on adversarial input, open network egress/, "the one-line consequence");
+
+  const plain = await openTrigger(armedSnap(false, { stagedAt: null, packages: ["pi-web-search@1.4.2"] }));
+  assert.match(plain.detail, /TRUST MODEL/);
+  assert.doesNotMatch(plain.detail, /packages armed/, "an unarmed trigger loads none of them, staged or not");
+  assert.doesNotMatch(plain.detail, /open network egress/);
+});
+
+test("TRIGGER_DETAIL says so when a trigger is armed but the overlay stages nothing", async () => {
+  const { detail } = await openTrigger(armedSnap(true, { stagedAt: null, packages: [] }));
+  assert.match(detail, /packages armed · \(none staged in the overlay\)/, "armed with nothing staged is stated, not blank");
+});
+
 test("Enter on a run opens its detail dump, and Esc backs out to the list without quitting", async () => {
   let closed = 0;
   const comp = makeDashboard({
@@ -341,6 +402,39 @@ test("Enter on a run opens its detail dump, and Esc backs out to the list withou
   await comp.dispose();
   assert.match(back, /p pause/, "Esc returns to the interactive list");
   assert.equal(closed, 0, "Esc from a sub-view never closes the overlay");
+});
+
+test("RUN_DETAIL breaks out the subagent token share, and shows nothing for a pre-metering record", async () => {
+  const openRun = async (tokens) => {
+    const comp = makeDashboard({
+      paths: {},
+      done() {},
+      tui: fakeTui(),
+      intervalMs: 100000,
+      deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, runs: [{ ...SNAPSHOT.runs[0], tokens }] }) }),
+    });
+    await flush();
+    comp.handleInput("\r"); // row 0 is the only run
+    await flush();
+    const out = stripAnsi(comp.render(80).join("\n"));
+    await comp.dispose();
+    return out;
+  };
+
+  const metered = await openRun({ input: 4000, output: 1000, total: 5000, cost: 0.0523, otherTotal: 1200 });
+  assert.match(metered, /tokens\s+5000/, "the existing tokens line is unchanged");
+  assert.match(metered, /of which\s+subagents: 1200/, "the process-wide meter's subagent share");
+
+  // A record written before the runner metered process-wide has no `otherTotal` at all: no line, and
+  // certainly no NaN or a misleading bare 0.
+  const preMetering = await openRun({ input: 4000, output: 1000, total: 5000, cost: 0.0523 });
+  assert.match(preMetering, /tokens\s+5000/);
+  assert.doesNotMatch(preMetering, /subagents/, "an older record renders nothing extra");
+  assert.doesNotMatch(preMetering, /NaN/);
+
+  // A metered run that spawned no subagent reports 0 -- also nothing, rather than a noise line.
+  assert.doesNotMatch(await openRun({ total: 5000, cost: 0.01, otherTotal: 0 }), /subagents/);
+  assert.doesNotMatch(await openRun(null), /subagents|NaN/, "a run with no usage at all still renders");
 });
 
 test("Enter on a cron trigger opens a detail with next/health/stalls from the scheduler", async () => {

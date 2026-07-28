@@ -8,6 +8,15 @@
  * never a host pass-through.
  */
 
+/**
+ * Where the operator's global pi overlay lands INSIDE the container (REQ-GLOBAL-PI-OVERLAY). Exported
+ * because packages.mjs derives the staged-packages root from it: the mount and that root are ONE fact on
+ * one side of the boundary, and two literals in two modules could drift apart with both test suites still
+ * green. A Linux container path, so it is always built with "/" -- never `path.join`, which yields
+ * backslashes when the worker itself runs on Windows.
+ */
+export const CONTAINER_GLOBAL_PI_DIR = "/opt/pi-global";
+
 /** The fixed isolation flags. Not configurable -- these ARE the boundary. */
 export const ISOLATION_FLAGS = [
 	"--rm", // ephemeral: gone after the run
@@ -70,7 +79,7 @@ export function buildDockerRunArgs({
 	// The operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY): custom models, global skills, a global
 	// persona, layered UNDER each repo's own .pi/. Read-only -- it is operator-authored deploy-time config,
 	// the same trust class as the baked floor, but the agent still must not rewrite it. Both job kinds.
-	if (globalPiDir) args.push("-v", `${globalPiDir}:/opt/pi-global:ro`);
+	if (globalPiDir) args.push("-v", `${globalPiDir}:${CONTAINER_GLOBAL_PI_DIR}:ro`);
 
 	args.push(image);
 	return args;

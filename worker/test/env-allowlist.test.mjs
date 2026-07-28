@@ -57,6 +57,28 @@ test("the container env is a CLOSED set: only the provider key, never the whole 
 	assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
 	assert.equal(env.HOME, undefined);
 	assert.equal(env.OPENAI_API_KEY, undefined); // wrong provider's key not forwarded either
+	// The closed set itself, pinned. A new name here is a change to INT-CONTAINER-RUNTIME-CONTRACT and
+	// must be deliberate. Undefined-valued keys are filtered: docker-run skips them, so they reach no
+	// container. PI_MAX_TOKENS and PI_PACKAGES are unset because this job has neither; PI_GLOBAL_ALLOW_EXTENSIONS
+	// is absent because absent MEANS load -- the variable now exists only to carry the "0" opt-out.
+	assert.deepEqual(
+		Object.keys(env)
+			.filter((k) => env[k] !== undefined)
+			.sort(),
+		[
+			"ANTHROPIC_API_KEY",
+			"GH_TOKEN",
+			"GITHUB_TOKEN",
+			"PI_JOB_ID",
+			"PI_MAX_TURNS",
+			"PI_MODEL",
+			"PI_OFFLINE",
+			"PI_PROVIDER",
+			"PLAYWRIGHT_BROWSERS_PATH",
+			"PLAYWRIGHT_MCP_BROWSER",
+			"PLAYWRIGHT_MCP_SANDBOX",
+		],
+	);
 });
 
 test("a local-folder job (no token) gets NO GITHUB_TOKEN or GH_TOKEN var at all -- not an empty one", { skip }, () => {
@@ -115,10 +137,39 @@ test("an unconfigured provider throws a config-tagged error (=> pre-spend refusa
 	);
 });
 
-test("PI_GLOBAL_ALLOW_EXTENSIONS is forwarded only when armed (fail-closed)", { skip }, () => {
+test("PI_GLOBAL_ALLOW_EXTENSIONS is emitted ONLY to carry the explicit opt-out", { skip }, () => {
 	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
-	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: true }).PI_GLOBAL_ALLOW_EXTENSIONS, "1");
-	assert.equal(buildContainerEnv(base).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "unset by default -> overlay extensions stay dormant");
+	// Absent means LOAD on both sides of the mount, so the loading case emits nothing at all.
+	assert.equal(buildContainerEnv(base).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "the default is ON, and ON is the absence of the variable");
+	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: true }).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "an explicit true is the same absence");
+	// The opt-out is the one thing a container must never have to infer.
+	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: false }).PI_GLOBAL_ALLOW_EXTENSIONS, "0", "PI_GLOBAL_ALLOW_EXTENSIONS=0 travels verbatim");
+});
+
+test("PI_PACKAGES is the \":\"-joined staged set, and absent when this job loads none", { skip }, () => {
+	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
+	const staged = buildContainerEnv({ ...base, packagePaths: ["/opt/pi-global/packages/pi-playwright", "/opt/pi-global/packages/pi-lint"] });
+	assert.equal(
+		staged.PI_PACKAGES,
+		"/opt/pi-global/packages/pi-playwright:/opt/pi-global/packages/pi-lint",
+		"CONTAINER (POSIX) paths joined with \":\" -- never the host's path.delimiter, which is \";\" on Windows",
+	);
+
+	// The caller has already applied the per-trigger opt-out, so an empty list here means "this job loads
+	// none" -- nothing staged, or a trigger that said run.packages: false. Either way: undefined, which
+	// docker-run skips, so no -e PI_PACKAGES at all -- never an empty string.
+	assert.equal(buildContainerEnv({ ...base, packagePaths: [] }).PI_PACKAGES, undefined, "an empty staged set omits the variable, never PI_PACKAGES=");
+	assert.equal(buildContainerEnv(base).PI_PACKAGES, undefined, "and so does the default");
+});
+
+test("PI_OFFLINE=1 on EVERY job -- flagged and unflagged alike (a narrowing, never a capability)", { skip }, () => {
+	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
+	assert.equal(buildContainerEnv({ ...base, packagePaths: ["/opt/pi-global/packages/pi-lint"] }).PI_OFFLINE, "1", "a packages job must not be able to reach npm install");
+	assert.equal(
+		buildContainerEnv(base).PI_OFFLINE,
+		"1",
+		"the ONE deliberate deviation from byte-identity for an unflagged job: disarming job-time installs takes nothing away that a job may have",
+	);
 });
 
 test("PI_FORWARD_ENV forwards ONLY the named vars that are present, never a pass-through", { skip }, () => {

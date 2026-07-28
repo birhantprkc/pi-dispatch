@@ -76,6 +76,11 @@ test("a valid cron trigger normalizes to the scheduler shape; omitted provider/m
 		model: undefined,
 		maxTurns: undefined,
 		github: undefined,
+		// `packages` is asserted PRESENT-and-undefined, not omitted: this is a whole-object deepEqual under
+		// assert/strict, which counts an own key holding undefined, and the normalizer builds the key by
+		// construction. Asserting it honestly pins the real shape -- the key exists, the flag does not --
+		// and JSON serialization still drops it, so the upserted schedule stays byte-identical to today's.
+		packages: undefined,
 		// The cron-only field carried into the local /job/event.json (INT-CONTAINER-JOB-INPUTS).
 		trigger: { id: "nightly-tidy", pattern: "0 3 * * *" },
 	});
@@ -103,6 +108,26 @@ test("run.github: true flows into the scheduler data (the token opt-in reaches t
 test("an unflagged cron trigger's data.github is undefined -- drops out at JSON serialization, schedule byte-identical to today's", () => {
 	const [s] = load([CRON]);
 	assert.equal(s.data.github, undefined);
+});
+
+test("run.packages: true flows into the scheduler data (the pi-packages opt-in reaches the job template)", () => {
+	const [s] = load([{ ...CRON, run: { ...CRON.run, packages: true } }]);
+	assert.equal(s.data.packages, true);
+	const [f] = load([{ ...CRON, run: { ...CRON.run, packages: false } }]);
+	assert.equal(f.data.packages, false, "an explicit opt-out reaches the template too, never coerced away");
+});
+
+test("an unflagged cron trigger's data.packages is undefined -- no third-party code by default", () => {
+	const [s] = load([CRON]);
+	assert.equal(s.data.packages, undefined);
+});
+
+test("github and packages reach the scheduler data independently -- neither opt-in implies the other", () => {
+	const [s] = load([{ ...CRON, run: { ...CRON.run, github: true, packages: true } }]);
+	assert.equal(s.data.github, true);
+	assert.equal(s.data.packages, true);
+	const [g] = load([{ ...CRON, run: { ...CRON.run, github: true } }]);
+	assert.equal(g.data.packages, undefined, "a token opt-in must not smuggle in third-party code");
 });
 
 test("multiple valid cron entries with distinct ids all normalize in order", () => {

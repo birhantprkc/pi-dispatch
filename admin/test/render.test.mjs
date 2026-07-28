@@ -148,6 +148,30 @@ test("renderTriggers renders each of the four on.types", () => {
   assert.match(out, /pull_request {2}action\[labeled\] any\[pi:review\] → review/);
 });
 
+test("renderTriggers marks an armed trigger with [packages] and leaves an unarmed one unchanged", () => {
+  const cron = (packages) => ({ type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", packages });
+  const armed = renderTriggers({ schedulers: [], triggers: { triggers: [cron(true)] } });
+  assert.match(armed, /cron {2}nightly {2}0 3 \* \* \* → \/srv\/p\/tidy {2}\[packages\]/, "an armed cron line carries the marker");
+
+  // A trigger that loads no third-party code must read exactly as it did before the marker existed.
+  const unarmed = renderTriggers({ schedulers: [], triggers: { triggers: [cron(false)] } });
+  assert.doesNotMatch(unarmed, /\[packages\]/);
+  assert.equal(unarmed, renderTriggers({ schedulers: [], triggers: { triggers: [cron(undefined)] } }), "unset reads as unarmed");
+
+  // All four kinds carry it -- every kind can arm the operator-staged packages.
+  const all = renderTriggers({
+    schedulers: [],
+    triggers: {
+      triggers: [
+        { type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true },
+        { type: "comment", phrase: "@pi", flow: "fix", packages: true },
+        { type: "pull_request", action: ["labeled"], any: [], all: [], none: [], flow: "review", packages: true },
+      ],
+    },
+  });
+  assert.equal(all.split("[packages]").length - 1, 3, "label, comment and pull_request each show the marker");
+});
+
 test("renderTriggers degrades on no schedulers and a missing triggers file", () => {
   const out = renderTriggers({ schedulers: [], triggers: { missing: true } });
   assert.match(out, /none configured/);

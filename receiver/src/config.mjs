@@ -55,11 +55,16 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
  *
  * The shared `parseTriggers` validates the WHOLE file (including the on x run diagonal and cron entries the
  * worker owns); this loader keeps only the webhook types and groups them for the filter:
- *   - `label`:       ordered `{ index, predicate, flow }` rules (first match wins in the filter).
- *   - `comment`:     the single `{ index, phrase, defaultFlow }` (or null when no comment trigger is configured).
- *   - `pullRequest`: ordered `{ index, actions:Set, predicate, flow }` rules.
+ *   - `label`:       ordered `{ index, predicate, flow, packages }` rules (first match wins in the filter).
+ *   - `comment`:     the single `{ index, phrase, defaultFlow, packages }` (or null when no comment trigger is configured).
+ *   - `pullRequest`: ordered `{ index, actions:Set, predicate, flow, packages }` rules.
  *   - `knownFlows`:  every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
  *                    unlisted flow.
+ *
+ * `packages` is the entry's per-trigger opt-in to load the operator-staged pi packages
+ * (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY). It rides on the RULE, not on the group, because the
+ * filter resolves it from the rule that actually matched -- two rules in one file may differ on it. Absent
+ * stays undefined so the filter can omit it entirely and leave an unflagged job byte-identical to today's.
  *
  * Each grouped rule carries `index`: its 0-based position in the RAW `triggers` array, cron entries
  * counted. The raw file index is the rule's identity -- the filter reports it on the job as
@@ -83,11 +88,11 @@ function loadTriggers(env, readFile, fileExists) {
 		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it -- but it keeps its index
 		knownFlows.add(run.flow);
 		if (on.type === "label") {
-			label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
+			label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages });
 		} else if (on.type === "comment") {
-			comment = { index, phrase: on.phrase, defaultFlow: run.flow }; // parseTriggers guarantees at most one
+			comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages }; // parseTriggers guarantees at most one
 		} else if (on.type === "pull_request") {
-			pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow });
+			pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages });
 		}
 	}
 

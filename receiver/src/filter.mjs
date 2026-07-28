@@ -69,10 +69,18 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 	// decision record naming the triggers.json entry that fired (not payload data at all); `comment`,
 	// present only on the comment route, carries the invoking comment's body/author_association, both
 	// fields INT-WEBHOOK-PAYLOAD-SUBSET already names.
+	//
+	// `packages` is a harness-computed EXECUTION knob read off the matched triggers.json entry (like
+	// `matched`), never payload data -- REQ-GLOBAL-PI-OVERLAY's per-trigger opt-in to load the operator-
+	// staged pi packages. It sits at JOB level, NOT inside `trigger`: `trigger` is the descriptive context
+	// object carried verbatim into /job/event.json (INT-CONTAINER-JOB-INPUTS) and must stay descriptive, so
+	// an execution switch has no business there. Omitted entirely when the matched rule did not set it, so
+	// an unflagged trigger's job literal is byte-identical to today's.
 	const job = {
 		repo: subset.repository?.full_name,
 		target: resolved.target,
 		flow: resolved.flow,
+		...(resolved.packages !== undefined ? { packages: resolved.packages } : {}),
 		trigger: {
 			event: eventName,
 			action,
@@ -95,6 +103,7 @@ function routeIssueLabel(subset, triggers) {
 	return {
 		enqueue: true,
 		flow: rule.flow,
+		packages: rule.packages, // the MATCHED rule's opt-in -- rules in one file may differ on it
 		matched: { index: rule.index, type: "label", label: matchedLabel(L, rule.predicate) },
 		target: { type: "issue", number: subset.issue?.number, title: subset.issue?.title, body: subset.issue?.body },
 	};
@@ -128,6 +137,9 @@ function routeComment(subset, triggers) {
 	return {
 		enqueue: true,
 		flow,
+		// The single comment trigger IS the matched rule here, so its opt-in is the job's. A `<phrase>
+		// <flow>` override changes WHICH flow runs, never which triggers.json entry authorized it.
+		packages: triggers.comment.packages,
 		matched: { index: triggers.comment.index, type: "comment", phrase },
 		// The invoking comment rides on the trigger: body and author_association are both named by
 		// INT-WEBHOOK-PAYLOAD-SUBSET, and the body stays DATA all the way down (CONST-ISSUE-TEXT-IS-DATA).
@@ -162,6 +174,7 @@ function routePullRequest(subset, triggers, action) {
 		return {
 			enqueue: true,
 			flow: rule.flow,
+			packages: rule.packages, // the MATCHED rule's opt-in -- rules in one file may differ on it
 			matched: { index: rule.index, type: "pull_request", action },
 			target: buildPrTarget(pr),
 		};

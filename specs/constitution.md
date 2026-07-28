@@ -82,36 +82,102 @@ that always fires is one nobody reads.
 
 ## CONST-NO-CONTEXT-FILES-MANDATORY
 
-- **Statement**: Every job shall run with context-file discovery disabled — unconditionally, for every
-  repository, without exception. On the CLI that is `--no-context-files` (`-nc`). **In the SDK, which is
-  what the runner uses, it is `noContextFiles: true` on a `DefaultResourceLoader` that the caller
-  constructs and passes as `resourceLoader`.** There is no session-level option and no default that
-  satisfies this.
-- **Why**: **This constraint is violated by *omission*, not only by commission.** When no
-  `resourceLoader` is passed, `createAgentSession` builds its own `DefaultResourceLoader` — which does
-  **not** set `noContextFiles`, and therefore loads `AGENTS.md`. There is no flag to forget; there is an
-  entire object to forget to build, and forgetting it fails open. Worse, constructing that loader is also
-  what obliges the caller to `await loader.reload()` themselves, which is a second silent trap — see
-  `INT-SDK-SESSION-OPTIONS`.
-  A cloned repository's `AGENTS.md` is **not trust-gated**. pi gates project `.pi/*` resources
-  behind `isProjectTrusted()`, but `AGENTS.md` and `CLAUDE.md` are absent from that list — they load from
-  every ancestor directory of cwd and are concatenated **into the system prompt** inside
-  `<project_context>`, landing *after* our persona in the same trusted region. Since this harness clones
-  third-party repositories, anyone who can land a PR in a serviced repo could otherwise write our
-  agent's standing instructions. That is the exact position `CONST-ISSUE-TEXT-IS-DATA` reserves for text
-  the agent must obey — so untrusted content must never reach it. **Accepted cost**: we lose the target
-  repo's legitimate conventions. An untrusted repo's conventions are untrusted; that is the trade.
-  *Negative fact — this constraint exists because of an upstream absence.* If pi ever trust-gates context
-  files, re-evaluate rather than carrying `-nc` forever as unexplained ballast.
+- **Statement**: A job's agent shall take standing instructions only from content that is **merge-gated
+  or operator-supplied**. A serviced repo's own files now qualify, and therefore **load**: the runner
+  sets `noContextFiles: false` and `noExtensions: false` on the `DefaultResourceLoader` it constructs,
+  so `/workspace/AGENTS.md` and `/workspace/.pi/extensions` are discovered natively, as in any pi run.
+  `noSkills` stays **`true`** — a mechanical exception, not a trust judgement (see *Why*). What makes
+  `/workspace` merge-gated is **construction**: a github job checks out the **base repo's
+  default-branch SHA**, never a PR head. **Webhook issue/PR/comment text is unchanged and is still
+  DATA** (`CONST-ISSUE-TEXT-IS-DATA`) — only repo *files* changed status, and that distinction is the
+  whole of what remains. A **multi-tenant** deployment, servicing repositories whose default branch the
+  operator does not control, must turn discovery back off.
+  **The entry keeps its ID, which no longer describes it.** IDs are permanent addresses (see the
+  preamble); this one is cited from `INT-SDK-SESSION-OPTIONS`, `REQ-UPSTREAM-CONTRACT-TESTS`, the runner
+  and its tests. A reader arriving at a constraint named `NO-CONTEXT-FILES` that permits context files is
+  in the right place: the *decision* was reversed, the *address* was not.
+- **Why**: **What this constraint said, and why the trade was reversed.** It required discovery off
+  "unconditionally, for every repository, without exception", on the grounds that "anyone who can land a
+  PR in a serviced repo could otherwise write our agent's standing instructions", and it named its own
+  price: *"we lose the target repo's legitimate conventions."* The price was real; the premise was half
+  wrong. `/workspace` is not a PR head — `prepare-github.mjs` resolves the base repo's default-branch SHA
+  from a fresh API call, fetches that one commit, and checks it out **detached**; a PR's `head`/`base`
+  ride in `event.json` as **data** and are never a clone ref. So the population that can influence a
+  workspace file was never "anyone who can open a PR". It is **anyone who can land a commit on the
+  default branch** — the same population `CONST-MERGE-NEVER-AUTOMATIC` and the branch-protection
+  precondition already treat as the trust boundary, and the same one that writes the `.pi/` this harness
+  materialises and obeys. Paying the stated price to exclude a population already trusted one layer down
+  was the wrong trade. The owner is reversing it.
+  **State plainly what that population gains, because it is not nothing.** Before: someone who lands a
+  commit on a serviced repo's default branch could supply **prompt text** the agent reads. After: they
+  can **execute code inside job containers** — a discovered `.pi/extensions` entry is arbitrary code,
+  running with the job's GitHub token and **unrestricted network egress** (`SECURITY.md`). The bound is
+  the container (`CONST-ISOLATION-CONTAINER-PER-JOB`) and the token's scope and expiry
+  (`CONST-TOKEN-SCOPED-PER-JOB`) — not this constraint, which no longer bounds it at all. Merge access
+  now implies code execution; a repository whose default branch you would not hand a shell to is not one
+  to service.
+  **`noSkills` stays on, and the reason is collision, not caution.** The repo's skills already reach the
+  agent through `/job/pi/skills`, materialised from the pinned SHA with `git cat-file` (no working tree,
+  no symlink following) onto a read-only mount. Enabling discovery **double-registers** every one of them
+  under `/workspace/.pi/skills`, and pi's `loadSkills` is first-path-wins with the **discovered** copy
+  ordered first — so the read-only mount would stop being the copy in force and be demoted to a
+  `{type:"collision"}` diagnostic. Same content, no benefit, real breakage.
+  **Discovery re-opened a recursion door, and it is closed at pi's own seam.** This repo ships
+  `.pi/extensions/dispatch.ts` and the operator services this repo; discovered, it hands a job's model
+  `dispatch_run` (enqueues a **paid** job) and `dispatch_set` (moves the daily cap), driven by a session
+  whose prompt carries adversarial issue text. The runner drops admin-like extensions through
+  `extensionsOverride` before the loader stores the set, on two signals — an entry-**name** pattern
+  mirroring the worker's, and a `^dispatch_` **tool-surface** check, which is the one that catches
+  `dispatch.ts` (a name no pattern would flag). Honest limit: the file is still resolved and imported and
+  its factory has already run by then; the container bounds that, this layer does not.
+  **What did NOT relax, and must not be read as having relaxed.** The guardrail floor is composed
+  explicitly via `appendSystemPromptOverride`, so a project `APPEND_SYSTEM.md` cannot shadow it — a path
+  that got *more* reachable here, since project trust is what routes that file. `SettingsManager.inMemory`
+  keeps a serviced repo's `.pi/settings.json` from lifting the spend caps. `PI_OFFLINE=1` stands, as does
+  the exact-version pin on staged packages. The original **omission** trap also stands for everything
+  else on that loader: the caller still builds the object and still owes it `reload()`
+  (`INT-SDK-SESSION-OPTIONS`). Two of its flags simply stopped being the thing that fails open.
+  *Negative fact — the original constraint existed because of an upstream absence, and only half of that
+  absence is still there.* pi **does** trust-gate `.pi/extensions` behind `isProjectTrusted()`; it still
+  does **not** gate `AGENTS.md`/`CLAUDE.md`, which load from every ancestor of cwd. The two flags relaxed
+  here are therefore relaxed for **different** upstream reasons, and only one of them is gated at all —
+  and the runner's in-memory settings report the project **trusted by default**, which is what holds that
+  gate open. If a future pi flips that default, repo extensions stop loading **silently**;
+  `INT-SDK-SESSION-OPTIONS` trap (f) is where that is pinned.
+  *Negative fact — there is no env knob for this, deliberately.* Turning discovery back off for a
+  multi-tenant deployment is an edit to the two literals in `buildResourceLoader`
+  (`image/runner/src/loader.mjs`) plus an image rebuild. `PI_GLOBAL_ALLOW_EXTENSIONS` is **not** that
+  knob — it governs the operator's *own* overlay extensions and never touches workspace discovery. A
+  posture this consequential is a reviewed commit, not a variable someone can set at 3am.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/trust-manager.ts:29-37 → TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES`
   (lists `settings.json`, `extensions`, `skills`, `prompts`, `themes`, `SYSTEM.md`, `APPEND_SYSTEM.md`;
   `AGENTS.md`/`CLAUDE.md` absent) · `→ resource-loader.ts:463-470 → noContextFiles` (sole gate) ·
   `→ sdk.ts:176-180` (default loader is constructed **without** `noContextFiles` when none is passed) ·
   `→ system-prompt.ts:145-152 → <project_context>` (emitted after the append section at `140-142`)
-- **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `REQ-UPSTREAM-CONTRACT-TESTS`, `INT-SDK-SESSION-OPTIONS`
+- **Evidence (pinned artifact — authoritative)**: `npm @earendil-works/pi-coding-agent@0.80.7 →
+  dist/core/package-manager.js:1935-1946` — `const projectTrusted = this.settingsManager.isProjectTrusted();`
+  then `if (projectTrusted) { addResources("extensions", collectAutoExtensionEntries(projectDirs.extensions), …) }`,
+  the branch that loads `/workspace/.pi/extensions` · `→ dist/core/settings-manager.js:153,166-171` —
+  `fromStorage` takes `options.projectTrusted ?? true` and `inMemory` forwards no options, so the runner's
+  settings report the project **trusted** · `→ dist/core/resource-loader.js:267-269` — `noExtensions`
+  selects `cliEnabledExtensions` alone versus `mergePaths(cliEnabledExtensions, enabledExtensions)`, the
+  discovered set merged **after** ours · `→ dist/core/resource-loader.js:281-283` — the `noSkills` branch,
+  where a discovered skill would be ordered **before** `additionalSkillPaths` ·
+  `→ dist/core/resource-loader.d.ts:78-79` — `extensionsOverride` / `skillsOverride` are declared options
+  at the pin
+- **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-ISOLATION-CONTAINER-PER-JOB`,
+  `CONST-TOKEN-SCOPED-PER-JOB`, `REQ-UPSTREAM-CONTRACT-TESTS`, `REQ-ADMIN-VIA-PI-EXTENSION`,
+  `INT-SDK-SESSION-OPTIONS`, `INT-CONTAINER-JOB-INPUTS`
 - **Acceptance**: Given a cloned repo whose `AGENTS.md` contains a sentinel string, when a job runs, the
-  sentinel appears nowhere in the assembled system prompt. Assertable offline at the loader boundary:
-  `getAgentsFiles().agentsFiles` is empty.
+  sentinel **is** present at the loader boundary — `getAgentsFiles().agentsFiles` carries
+  `/workspace/AGENTS.md` with that content — and is **absent** from `getAppendSystemPrompt()`, because pi
+  emits it into `<project_context>` after the append block rather than into the floor; the guardrail
+  sentinel survives both. Given a repo shipping `.pi/extensions`, an ordinary entry's factory **runs**,
+  while an entry whose name matches the admin pattern, or which registers a `dispatch_*` tool, is
+  **absent from `getExtensions().extensions`** and its drop is on the run log. Given a repo shipping
+  `.pi/skills`, each skill appears **once**, sourced from `/job/pi/skills`. Given webhook issue text
+  containing "ignore your instructions", nothing changes: it is still in the user prompt only. All of it
+  assertable offline at the loader boundary, at no token cost.
 
 ## CONST-ISSUE-TEXT-IS-DATA
 
@@ -311,7 +377,11 @@ that always fires is one nobody reads.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → CHANGELOG.md:31` (0.80.7, 2026-07-14) ·
   `→ CHANGELOG.md:5-10` (`[Unreleased]`: `authStorage`/`modelRegistry` replaced by `modelRuntime`)
 - **Traces to**: `REQ-UPSTREAM-CONTRACT-TESTS`, `OQ-005`
-- **Acceptance**: `package.json` / Dockerfile contain no `^` or `~` on any pi package.
+- **Acceptance**: `package.json` / Dockerfile contain no `^` or `~` on any pi package. An **operator-staged
+  third-party pi package** is pinned by the same reasoning and is enforced at **stage time**, not here: the
+  version in `pi-packages.json` must be exact and `import-pi --with-packages` refuses a range, a tag, or a
+  wildcard and stages nothing (`INT-PI-PACKAGES-FILE-CONTRACT`). This constraint's own statement and scope
+  are unchanged — the operator's file lives outside this repo, so it cannot be a grep here.
 
 ---
 
@@ -324,4 +394,6 @@ that always fires is one nobody reads.
 | 2026-07-17 | `CONST-TOKEN-SCOPED-PER-JOB` amended: Statement, Why, and Acceptance rewritten from a single-mechanism mandate (App installation token with one fixed expiry duration) to mechanism-neutral **required properties** — repo-scoped, minimally-permissioned, short-lived, host-held, env-injected, not merge-capable in practice. The App path satisfies them and stays **mandatory for multi-tenant**; a tightly-scoped short-expiry **fine-grained** PAT satisfies them for **single-owner**; a broad or long-lived classic PAT is excluded. The bound is the token's **expiry**, not a fixed duration — no acceptance clause mandates one. Provider-key exception preserved unchanged. |
 | 2026-07-21 | `CONST-ISOLATION-CONTAINER-PER-JOB` Statement amended: the absolute "No pi process shall run on the host" is scoped to **harness-invoked** agents, which is what it always meant — the harness never runs pi on the host and every job agent runs in its ephemeral container. Admin-via-pi-extension (`DES-ADMIN-VIA-PI-EXTENSION`) made the literal wording ambiguous, because an operator's own interactive pi session hosting the admin extension does run pi on the host; that session is out of scope (no adversarial input, operator-present, no harness credentials). Why, Evidence, Traces, and Acceptance unchanged; intent unchanged. |
 | 2026-07-23 | No statement change. Recording that per-folder/repo **scoped pause windows** (`REQ-SCOPED-PAUSE-WINDOWS` / `DES-SCOPED-PAUSE-VIA-MOVE-TO-DELAYED`) are consistent with `CONST-BUDGET-BEFORE-TOKENS`: the pause gate sits **before `reserveBudget`** in the processor, so a deferred job reserves no slot and spends nothing — a `moveToDelayed` deferral is not a job start. The cap's check-and-increment-before-the-container ordering is untouched. |
+| 2026-07-28 | Issue #58. `CONST-PI-VERSION-PINNED` is **NOT extended**: exactly one clause was added to its Acceptance recording that an operator-staged third-party pi package is pinned by the same reasoning and enforced at **stage time** by `import-pi --with-packages` (`INT-PI-PACKAGES-FILE-CONTRACT`), since the operator's `pi-packages.json` lives outside this repo and cannot be a grep here. Statement, Why, and Evidence are untouched. `CONST-ISOLATION-CONTAINER-PER-JOB` is **UNCHANGED, and was checked rather than forgotten**: staged pi packages ride the existing `/opt/pi-global:ro` overlay mount, so the mount list its Acceptance **enumerates** is unchanged — a separate `/opt/pi-packages:ro` mount was considered and rejected in `DES-OPERATOR-GLOBAL-OVERLAY` precisely because it would have required amending that enumeration for no capability the overlay lacks. `CONST-BUDGET-BEFORE-TOKENS` is likewise unchanged: the process-wide usage meter (`REQ-TOKEN-ACCOUNTING-AND-CAPS`) makes the recorded number **more complete**, not the ordering different — the job-count cap is still checked and incremented before the container. |
+| 2026-07-28 | `CONST-NO-CONTEXT-FILES-MANDATORY` **REVERSED**, not refined — the serious one on this table. The constraint as written (discovery off "unconditionally, for every repository, without exception") no longer holds: the runner sets `noContextFiles: false` and `noExtensions: false`, so a serviced repo's `AGENTS.md` and `.pi/extensions` load natively. **The justification is the constraint's own premise being half wrong.** It reasoned about "anyone who can land a PR", but `/workspace` is never a PR head — `prepare-github.mjs` resolves the **base repo's default-branch SHA**, fetches that one commit and checks it out detached, and a PR's `head`/`base` are data in `event.json`, never a clone ref. The real population is anyone who can **land a commit on the default branch**: already the trust boundary for `CONST-MERGE-NEVER-AUTOMATIC`, branch protection, and the `.pi/` this harness materialises and obeys. The stated accepted cost — losing the repo's legitimate conventions — was being paid to exclude a population already trusted one layer down. **What that population gains is stated in the entry rather than glossed**: previously they could supply prompt text; now they can execute code in job containers with the job token and open egress, bounded by `CONST-ISOLATION-CONTAINER-PER-JOB` and `CONST-TOKEN-SCOPED-PER-JOB` and no longer by this constraint. `noSkills` **stays `true`** for a mechanical reason (discovery double-registers every repo skill and, being first-path-wins with the discovered copy first, demotes the pinned-SHA read-only mount to a collision diagnostic), and a new `extensionsOverride` recursion guard drops admin-like extensions because this repo ships `.pi/extensions/dispatch.ts` and the operator services this repo. Statement, Why, Traces and Acceptance rewritten (the Acceptance is now the exact inverse: the sentinel that had to appear nowhere must now appear, as a context file and not in the append block); the original `Evidence (upstream)` lines are **preserved unchanged** — they were always accurate about pi and still are — and a pinned-artifact block is added for the trust default and the two merge branches that the reversal now depends on. Two caveats carry the negative-fact discipline forward: a **multi-tenant** deployment must turn discovery back off, and the knob is an edit to two literals in `buildResourceLoader` plus an image rebuild, **not** `PI_GLOBAL_ALLOW_EXTENSIONS` and not any env var. `CONST-ISSUE-TEXT-IS-DATA` is **UNCHANGED and was checked rather than forgotten**: webhook issue/PR/comment text is still DATA in the user prompt — only repo *files* changed status, and that distinction is what is left of the safety story. |
 | 2026-07-23 | No statement change. Recording that the admin surface's new **confirm-gated write tools** (`dispatch_set`, `dispatch_trigger_add`/`_edit`/`_delete`; see `DES-ADMIN-VIA-PI-EXTENSION` / `REQ-ADMIN-VIA-PI-EXTENSION`) **preserve** both `CONST-BUDGET-BEFORE-TOKENS` and `CONST-TRIGGER-AUTHOR-GATE`. `CONST-BUDGET-BEFORE-TOKENS` governs *ordering* (the cap is still checked-and-incremented before the container/provider call, worker-side) — a confirmed `dispatch_set` changes the cap's *value*, under an operator's approval, exactly as the operator-typed `/dispatch set` already did; it does not relax the ordering. `CONST-TRIGGER-AUTHOR-GATE` governs *webhook* events (who may start a job from GitHub activity) — a confirmed `dispatch_trigger_*` edits a locally-configured `triggers.json` entry with the operator's confirm as the human approval, and does not touch the webhook author/label gate. The gate is a `ctx.ui.confirm` the model cannot self-answer, fail-closed when no interactive operator is present. |

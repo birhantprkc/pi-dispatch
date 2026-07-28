@@ -141,20 +141,27 @@ export function renderTriggers({ schedulers, triggers } = {}) {
   return out.join("\n");
 }
 
-/** One trigger's display line, discriminated on `type`. A null field reads as "-". */
+/**
+ * One trigger's display line, discriminated on `type`. A null field reads as "-".
+ *
+ * An ARMED trigger (`run.packages: true`) carries a trailing `[packages]` marker: it loads the
+ * operator-staged third-party pi packages, so it must never read the same as one that does not. Unarmed
+ * lines are byte-identical to before -- the marker is purely additive.
+ */
 function triggerLine(t) {
   const flow = t?.flow ?? "-";
+  const pkgs = t?.packages === true ? "  [packages]" : "";
   switch (t?.type) {
     case "cron":
-      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}`;
+      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}${pkgs}`;
     case "label":
-      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}`;
+      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}${pkgs}`;
     case "comment":
-      return `comment  "${t.phrase ?? "-"}" → ${flow}`;
+      return `comment  "${t.phrase ?? "-"}" → ${flow}${pkgs}`;
     case "pull_request": {
       const clauses = ruleClauses(t);
       const action = `action[${(t.action ?? []).join(",")}]`;
-      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}`;
+      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}${pkgs}`;
     }
     default:
       return "(unknown trigger)";

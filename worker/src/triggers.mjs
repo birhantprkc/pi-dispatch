@@ -132,13 +132,38 @@ function normalizeCron(on, run, index, path, state) {
 		throw configError(`cron trigger "${id}": run.github must be true or false when present: ${path}`);
 	}
 
+	const packages = validatePackagesFlag(run, `cron trigger "${id}"`, path);
+
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
-	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github stays absent
-	// the same way, so an unflagged trigger's schedule is byte-identical to today's.
+	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages stay
+	// absent the same way -- and that matters more for `packages` now that absent means LOAD: writing a
+	// `true` in here would make the schedule payload claim an opt-in the operator never wrote, and would
+	// freeze today's default into every stored repeatable.
 	return {
 		on: { type: "cron", id, pattern },
-		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github },
+		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages },
 	};
+}
+
+/**
+ * Validate the per-trigger `run.packages` flag, shared by all four normalizers. It is an opt-OUT: the pi
+ * packages an operator pinned into the global overlay load for every job, and `run.packages: false` is how a
+ * single trigger withholds them (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY). Absent and `true` both
+ * mean load; the default is resolved by the worker (run-container.mjs), never frozen into the file here.
+ *
+ * Still strictly boolean and still fail-loud, because the failure mode a loose parse produces has flipped
+ * rather than gone away: `"false"` as a string is a trigger whose operator believes it runs no third-party
+ * code while it loads all of it. A validator that accepted the string would make that belief undetectable.
+ *
+ * `at` is the caller's message prefix -- cron names its id, the webhook normalizers name their file index --
+ * so every rejection still points at the entry the operator actually wrote. Returns the flag, undefined
+ * when absent, so an unflagged trigger normalizes byte-identically to today's.
+ */
+function validatePackagesFlag(run, at, path) {
+	if (run.packages !== undefined && typeof run.packages !== "boolean") {
+		throw configError(`${at}: run.packages must be true or false when present: ${path}`);
+	}
+	return run.packages;
 }
 
 /**
@@ -171,7 +196,8 @@ function normalizeLabel(on, run, index, path) {
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: label trigger run.flow must be a non-empty string: ${path}`);
 	}
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow } };
+	const packages = validatePackagesFlag(run, at, path);
+	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow, packages } };
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -186,7 +212,8 @@ function normalizeComment(on, run, index, path, state) {
 	if (state.commentCount > 1) {
 		throw configError(`${at}: at most one comment trigger is allowed: ${path}`);
 	}
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow } };
+	const packages = validatePackagesFlag(run, at, path);
+	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow, packages } };
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -211,8 +238,9 @@ function normalizePullRequest(on, run, index, path) {
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
 	}
+	const packages = validatePackagesFlag(run, at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
-		run: { kind: "github", flow: run.flow },
+		run: { kind: "github", flow: run.flow, packages },
 	};
 }
