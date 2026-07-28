@@ -186,7 +186,7 @@ test("PR trigger missing run.flow is a config error", () => {
 	assert.throws(() => parse([{ on: { type: "pull_request", action: ["opened"] }, run: { kind: "github" } }]), isConfigError);
 });
 
-// --- run.packages: the per-trigger pi-packages opt-in (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) ---
+// --- run.packages: the per-trigger pi-packages opt-OUT (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) ---
 
 // One shared validator serves all four kinds, so every case is asserted on all four: a normalizer that
 // forgot to call it would pass three and fail exactly one. `mentions` is what the rejection must name --
@@ -202,22 +202,34 @@ const withRun = (entry, over) => ({ ...entry, run: { ...entry.run, ...over } });
 test("run.packages: true survives normalization on all four trigger kinds", () => {
 	for (const { kind, entry } of KINDS) {
 		const [t] = parse([withRun(entry, { packages: true })]);
-		assert.equal(t.run.packages, true, `${kind} must carry the opt-in`);
-		const [f] = parse([withRun(entry, { packages: false })]);
-		assert.equal(f.run.packages, false, `${kind} must carry an explicit opt-out`);
+		assert.equal(t.run.packages, true, `${kind} must carry the explicit opt-in`);
 	}
 });
 
-test("run.packages absent stays absent (undefined) on all four kinds -- the no-third-party-code default", () => {
+test("run.packages: false -- the opt-out -- validates and survives on all four kinds", () => {
+	// The only value that now withholds the staged packages from a job, so it must reach the worker intact
+	// on every kind: a normalizer that dropped it would silently load third-party code the operator refused.
+	for (const { kind, entry } of KINDS) {
+		const [f] = parse([withRun(entry, { packages: false })]);
+		assert.equal(f.run.packages, false, `${kind} must carry the opt-out`);
+	}
+});
+
+test("run.packages absent stays absent (undefined) on all four kinds -- the default is resolved by the worker", () => {
+	// Absent now MEANS load, but the file must not say so: writing a `true` in here would claim an opt-in the
+	// operator never made, and would freeze today's default into every stored repeatable.
 	for (const { kind, entry } of KINDS) {
 		const [t] = parse([entry]);
 		assert.equal(t.run.packages, undefined, `${kind} must not invent a default`);
 	}
 });
 
-test('run.packages that is not strictly boolean ("true", 1, null, {}) is a config error naming the trigger, on all four kinds', () => {
+test('run.packages that is not strictly boolean ("true", "false", 1, null, {}) is a config error naming the trigger, on all four kinds', () => {
+	// `"false"` matters most now: it is what an operator writes when they mean "no third-party code here",
+	// and the worker's `!== false` reading would load everything anyway. Refusing the file is what keeps
+	// that belief and the behaviour from diverging.
 	for (const { kind, entry, mentions } of KINDS) {
-		for (const bad of ["true", 1, null, {}]) {
+		for (const bad of ["true", "false", 1, null, {}]) {
 			assert.throws(
 				() => parse([withRun(entry, { packages: bad })]),
 				(e) => isConfigError(e) && e.message.includes(mentions) && /run\.packages/.test(e.message),
@@ -227,14 +239,15 @@ test('run.packages that is not strictly boolean ("true", 1, null, {}) is a confi
 	}
 });
 
-test("cron run.github and run.packages are independent opt-ins that coexist", () => {
-	const [both] = parse([withRun(CRON, { github: true, packages: true })]);
+test("cron run.github (opt-in) and run.packages (opt-out) are independent and coexist", () => {
+	const [both] = parse([withRun(CRON, { github: true, packages: false })]);
 	assert.equal(both.run.github, true);
-	assert.equal(both.run.packages, true);
-	// Neither flag implies the other: a token opt-in must not smuggle in third-party code, or vice versa.
+	assert.equal(both.run.packages, false);
+	// Neither flag implies the other: a token opt-in must not smuggle in third-party code, and refusing the
+	// packages must not cost a trigger its scoped token.
 	const [g] = parse([withRun(CRON, { github: true })]);
 	assert.equal(g.run.packages, undefined);
-	const [p] = parse([withRun(CRON, { packages: true })]);
+	const [p] = parse([withRun(CRON, { packages: false })]);
 	assert.equal(p.run.github, undefined);
 });
 

@@ -11,8 +11,11 @@
  *   - the in-repo `.pi/extensions/dispatch.ts` shim, which pi loads only after
  *     the operator trusts this checkout (trust gating)
  *
- * A job container can never load this: the job loader sets `noExtensions: true`
- * and mounts only the serviced repo's /job/pi.
+ * A job container CAN reach this. The job loader runs `noExtensions: false`, so a
+ * serviced repo's `.pi/extensions` is discovered -- including this repo's own shim
+ * when pi-dispatch services itself. The runner's recursion guard is what keeps it
+ * out of the session: it drops admin-like extensions from the loaded set (by entry
+ * name, and by the `dispatch_*` tools below) and logs the drop.
  *
  * The extension is a thin channel over the read-model and the renderers: it
  * parses the subcommand, calls `read-model.mjs` for data and `render.mjs` for

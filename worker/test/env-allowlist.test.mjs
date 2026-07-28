@@ -59,7 +59,8 @@ test("the container env is a CLOSED set: only the provider key, never the whole 
 	assert.equal(env.OPENAI_API_KEY, undefined); // wrong provider's key not forwarded either
 	// The closed set itself, pinned. A new name here is a change to INT-CONTAINER-RUNTIME-CONTRACT and
 	// must be deliberate. Undefined-valued keys are filtered: docker-run skips them, so they reach no
-	// container (PI_MAX_TOKENS, PI_GLOBAL_ALLOW_EXTENSIONS and PI_PACKAGES are all unset for this job).
+	// container. PI_MAX_TOKENS and PI_PACKAGES are unset because this job has neither; PI_GLOBAL_ALLOW_EXTENSIONS
+	// is absent because absent MEANS load -- the variable now exists only to carry the "0" opt-out.
 	assert.deepEqual(
 		Object.keys(env)
 			.filter((k) => env[k] !== undefined)
@@ -136,13 +137,16 @@ test("an unconfigured provider throws a config-tagged error (=> pre-spend refusa
 	);
 });
 
-test("PI_GLOBAL_ALLOW_EXTENSIONS is forwarded only when armed (fail-closed)", { skip }, () => {
+test("PI_GLOBAL_ALLOW_EXTENSIONS is emitted ONLY to carry the explicit opt-out", { skip }, () => {
 	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
-	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: true }).PI_GLOBAL_ALLOW_EXTENSIONS, "1");
-	assert.equal(buildContainerEnv(base).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "unset by default -> overlay extensions stay dormant");
+	// Absent means LOAD on both sides of the mount, so the loading case emits nothing at all.
+	assert.equal(buildContainerEnv(base).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "the default is ON, and ON is the absence of the variable");
+	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: true }).PI_GLOBAL_ALLOW_EXTENSIONS, undefined, "an explicit true is the same absence");
+	// The opt-out is the one thing a container must never have to infer.
+	assert.equal(buildContainerEnv({ ...base, allowGlobalExtensions: false }).PI_GLOBAL_ALLOW_EXTENSIONS, "0", "PI_GLOBAL_ALLOW_EXTENSIONS=0 travels verbatim");
 });
 
-test("PI_PACKAGES is the \":\"-joined staged set, and absent when nothing is staged (fail-closed)", { skip }, () => {
+test("PI_PACKAGES is the \":\"-joined staged set, and absent when this job loads none", { skip }, () => {
 	const base = { provider: "anthropic", model: "m", maxTurns: 5, jobId: "j", hostEnv: HOST };
 	const staged = buildContainerEnv({ ...base, packagePaths: ["/opt/pi-global/packages/pi-playwright", "/opt/pi-global/packages/pi-lint"] });
 	assert.equal(
@@ -151,10 +155,11 @@ test("PI_PACKAGES is the \":\"-joined staged set, and absent when nothing is sta
 		"CONTAINER (POSIX) paths joined with \":\" -- never the host's path.delimiter, which is \";\" on Windows",
 	);
 
-	// Fail-closed, exactly like PI_GLOBAL_ALLOW_EXTENSIONS: undefined, which docker-run skips, so an
-	// unflagged (or unstaged) job emits no -e PI_PACKAGES at all -- never an empty string.
+	// The caller has already applied the per-trigger opt-out, so an empty list here means "this job loads
+	// none" -- nothing staged, or a trigger that said run.packages: false. Either way: undefined, which
+	// docker-run skips, so no -e PI_PACKAGES at all -- never an empty string.
 	assert.equal(buildContainerEnv({ ...base, packagePaths: [] }).PI_PACKAGES, undefined, "an empty staged set omits the variable, never PI_PACKAGES=");
-	assert.equal(buildContainerEnv(base).PI_PACKAGES, undefined, "the default is the same fail-closed absence");
+	assert.equal(buildContainerEnv(base).PI_PACKAGES, undefined, "and so does the default");
 });
 
 test("PI_OFFLINE=1 on EVERY job -- flagged and unflagged alike (a narrowing, never a capability)", { skip }, () => {

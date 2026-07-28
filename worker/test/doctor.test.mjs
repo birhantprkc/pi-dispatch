@@ -183,41 +183,74 @@ test("doctor: a literal key in the overlay models.json is a hard failure", async
 	assert.match(text(), /Overlay models\.json is credential-free/);
 });
 
-test("doctor: a clean overlay passes; armed extensions are a warning, not a failure", async () => {
+test("doctor: a clean overlay passes; staged extensions warn that they LOAD, with no flag set", async () => {
 	const clean = overlay({ models: JSON.stringify({ providers: { anthropic: { name: "Anthropic" } } }) });
 	const { out: o1, text: t1 } = capture();
 	assert.equal(await runDoctor(overlayEnv(clean), overlayDeps(o1)), 0, "a clean overlay does not fail doctor");
 	assert.doesNotMatch(t1(), /✗/);
 
-	const armed = overlay({ extensions: true });
+	// The newly-dangerous state: extensions staged once and forgotten are running in every container NOW.
+	const staged = overlay({ extensions: true });
 	const { out: o2, text: t2 } = capture();
-	const code = await runDoctor(overlayEnv(armed, { PI_GLOBAL_ALLOW_EXTENSIONS: "1" }), overlayDeps(o2));
-	assert.equal(code, 0, "armed extensions warn (⚠) but do not fail doctor");
-	assert.match(t2(), /⚠ Overlay extensions present and ARMED/);
+	const code = await runDoctor(overlayEnv(staged), overlayDeps(o2));
+	assert.equal(code, 0, "loading extensions warn (⚠) but do not fail doctor -- it is the intended posture");
+	assert.match(t2(), /⚠ Overlay extensions LOAD in every job \(PI_GLOBAL_ALLOW_EXTENSIONS is not 0\)/);
+	assert.match(t2(), /set PI_GLOBAL_ALLOW_EXTENSIONS=0 in \.env to disable them/);
+	assert.doesNotMatch(t2(), /dormant/, "nothing about a staged extensions dir is dormant any more");
 });
 
-// Staged packages (REQ-GLOBAL-PI-OVERLAY): the staged set, its arming state, and every way the pair goes
-// wrong SILENTLY — the flow runs without the tools it was written for and still exits 0.
+test("doctor: PI_GLOBAL_ALLOW_EXTENSIONS=0 reports the extensions as disabled, and passes", async () => {
+	const staged = overlay({ extensions: true });
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(staged, { PI_GLOBAL_ALLOW_EXTENSIONS: "0" }), overlayDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ Overlay extensions present but disabled \(PI_GLOBAL_ALLOW_EXTENSIONS=0\)/);
+	assert.doesNotMatch(text(), /LOAD in every job/);
+});
+
+test("doctor: a malformed PI_GLOBAL_ALLOW_EXTENSIONS is a hard failure, overlay or not", async () => {
+	// The worker refuses to boot on it, so doctor must not report a posture as if one had been chosen --
+	// least of all the "false means off" an operator writing that value is counting on.
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(overlay({ extensions: true }), { PI_GLOBAL_ALLOW_EXTENSIONS: "false" }), overlayDeps(out));
+	assert.equal(code, 1);
+	assert.match(text(), /✗ PI_GLOBAL_ALLOW_EXTENSIONS is "false", which is neither on nor off/);
+	assert.match(text(), /the worker refuses to boot on any other value/);
+	assert.doesNotMatch(text(), /Overlay extensions (LOAD|present but disabled)/, "no second line guessing how it would have resolved");
+
+	// And with no overlay configured at all: a knob that stops boot stops it either way.
+	const { out: o2, text: t2 } = capture();
+	const noOverlay = await runDoctor({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_GLOBAL_ALLOW_EXTENSIONS: "yes" }, overlayDeps(o2));
+	assert.equal(noOverlay, 1);
+	assert.match(t2(), /✗ PI_GLOBAL_ALLOW_EXTENSIONS is "yes"/);
+});
+
+// Staged packages (REQ-GLOBAL-PI-OVERLAY): what will actually load, plus every way the pair still goes
+// wrong SILENTLY -- the flow runs without the tools it was written for and still exits 0.
 const pkg = (over = {}) => ({ name: "pi-fmt", version: "1.2.3", dir: "pi-fmt", ...over });
 
-test("doctor: staged packages that no trigger arms are reported dormant, and pass", async () => {
+test("doctor: staged packages LOAD by default -- with no trigger flag anywhere, they still warn", async () => {
 	const dir = overlay({ packages: [pkg(), pkg({ name: "pi-lint", version: "0.4.0", dir: "pi-lint" })] });
 	const { out, text } = capture();
-	// packages: false proves the count is strictly `=== true`, not truthiness of a present flag.
-	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(false) }), overlayDeps(out));
-	assert.equal(code, 0);
+	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile() }), overlayDeps(out));
+	assert.equal(code, 0, "loading third-party code an operator staged is the intended posture — warn, don't fail");
 	assert.match(text(), /✓ Staged packages present \(pi-fmt@1\.2\.3, pi-lint@0\.4\.0\)/, "the pinned versions are named");
-	assert.match(text(), /✓ Staged packages present but dormant \(no trigger sets run\.packages: true\)/);
-	assert.doesNotMatch(text(), /ARMED/);
+	assert.match(text(), /⚠ Staged packages LOAD in every job \(0 trigger\(s\) opt out with run\.packages: false\)/);
+	assert.match(text(), /keep every version exactly pinned/);
+	assert.doesNotMatch(text(), /dormant|ARMED/, "there is no dormant state left, and no switch to be armed");
 });
 
-test("doctor: staged packages armed by a trigger warn (⚠) but do not fail", async () => {
+test("doctor: the opt-out count is reported, and counted strictly (=== false)", async () => {
 	const dir = overlay({ packages: [pkg()] });
 	const { out, text } = capture();
-	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(true) }), overlayDeps(out));
-	assert.equal(code, 0, "armed packages warn like armed extensions — a vetted stage is a valid deployment");
-	assert.match(text(), /⚠ Staged packages ARMED on 1 trigger\(s\) \(run\.packages: true\)/);
-	assert.match(text(), /keep every version exactly pinned/);
+	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(false) }), overlayDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /⚠ Staged packages LOAD in every job \(1 trigger\(s\) opt out with run\.packages: false\)/);
+
+	// An explicit `true` is not an opt-out, and no longer arms anything either -- it reads exactly like absent.
+	const { out: o2, text: t2 } = capture();
+	await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(true) }), overlayDeps(o2));
+	assert.match(t2(), /⚠ Staged packages LOAD in every job \(0 trigger\(s\) opt out with run\.packages: false\)/);
 });
 
 test("doctor: a manifest entry whose staged dir is gone fails", async () => {
@@ -246,11 +279,13 @@ test("doctor: an admin-like staged package is a hard failure (recursion vector)"
 	assert.match(text(), /enqueue paid jobs from INSIDE a job container/);
 });
 
-test("doctor: run.packages: true with nothing staged is the silently-package-less job", async () => {
+test("doctor: run.packages: true with nothing staged is still the silently-package-less job", async () => {
+	// The one check the flip does not touch. `true` no longer arms anything, but it is still an operator
+	// asserting the flow needs those packages -- and nothing staged still ends in a clean exit 0 without them.
 	const { out, text } = capture();
 	const code = await runDoctor(overlayEnv(overlay({}), { PI_TRIGGERS_FILE: triggersFile(true) }), overlayDeps(out));
-	assert.equal(code, 1, "the flag is set, nothing is staged, and the flow would run without its tools on a clean exit 0");
-	assert.match(text(), /✗ 1 trigger\(s\) set run\.packages: true but nothing is staged in .*packages/);
+	assert.equal(code, 1, "the flow would run without its tools on a clean exit 0");
+	assert.match(text(), /✗ 1 trigger\(s\) require staged packages \(run\.packages: true\) but nothing is staged in .*packages/);
 	assert.match(text(), /declare them in pi-packages\.json/);
 });
 
@@ -261,11 +296,20 @@ test("doctor: run.packages: true with PI_GLOBAL_PI_DIR unset fails", async () =>
 		overlayDeps(out),
 	);
 	assert.equal(code, 1);
-	assert.match(text(), /✗ 1 trigger\(s\) set run\.packages: true but PI_GLOBAL_PI_DIR is unset/);
+	assert.match(text(), /✗ 1 trigger\(s\) require staged packages \(run\.packages: true\) but PI_GLOBAL_PI_DIR is unset/);
 	assert.match(text(), /staged packages live inside the overlay and are mounted with it/);
 });
 
-test("doctor: a deployment with no packages and no armed trigger prints no package line at all", async () => {
+test("doctor: run.packages: false with nothing staged is a NO-OP, not a failure", async () => {
+	// Under the old posture an unmatched flag meant a flow silently missing its tools. An opt-out from a
+	// stage that does not exist takes nothing away, so it is no longer worth a line of the operator's time.
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(overlay({}), { PI_TRIGGERS_FILE: triggersFile(false) }), overlayDeps(out));
+	assert.equal(code, 0);
+	assert.doesNotMatch(text(), /package/i, "nothing staged and nothing wanted: nothing to say");
+});
+
+test("doctor: a deployment with no packages and no trigger flag prints no package line at all", async () => {
 	const clean = overlay({ models: JSON.stringify({ providers: { anthropic: { name: "Anthropic" } } }) });
 	const { out, text } = capture();
 	const code = await runDoctor(overlayEnv(clean, { PI_TRIGGERS_FILE: triggersFile() }), overlayDeps(out));

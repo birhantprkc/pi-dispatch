@@ -55,19 +55,60 @@ test("import-pi refuses a models.json with a literal key and writes nothing", as
 	assert.equal(existsSync(join(to, "models.json")), false, "a refused import writes no overlay at all");
 });
 
-test("import-pi skips extensions by default, and blocks the admin extension under --with-extensions", async () => {
+test("import-pi copies extensions BY DEFAULT, with no flag at all", async () => {
+	const from = hostAgent({ withExtensions: true });
+	const to = overlayDir();
+	const { out, text } = capture();
+
+	const code = await run(from, to, [], out);
+
+	assert.equal(code, 0);
+	assert.ok(existsSync(join(to, "extensions", "my-tool")), "the operator's own extension is staged without asking");
+	assert.match(text(), /1 extension -- these LOAD in every job; VET THESE/, "the count row states the new posture");
+	assert.match(text(), /PI_GLOBAL_ALLOW_EXTENSIONS=0/, "the next steps name the off switch, not an arming switch");
+});
+
+test("import-pi PRINTS the list of extensions it staged, not just a count", async () => {
+	// The one moment an operator can read what is about to run inside every job container. A bare count
+	// leaves them re-deriving the list from a directory the worker host never shows them.
+	const from = hostAgent({ withExtensions: true });
+	mkdirSync(join(from, "extensions", "second-tool"), { recursive: true });
+	writeFileSync(join(from, "extensions", "second-tool", "index.mjs"), "export default () => {};\n");
+	const { out, text } = capture();
+
+	await run(from, overlayDir(), [], out);
+
+	assert.match(text(), /2 extensions -- these LOAD in every job; VET THESE/);
+	assert.match(text(), /^\s+- my-tool$/m, "each staged extension is listed by name");
+	assert.match(text(), /^\s+- second-tool$/m);
+	assert.doesNotMatch(text(), /- pi-dispatch-admin/, "the blocked one is never listed as staged");
+});
+
+test("import-pi still hard-blocks the admin extension, default-on or not (recursion vector)", async () => {
+	const from = hostAgent({ withExtensions: true });
+	const to = overlayDir();
+	const { out, text } = capture();
+
+	await run(from, to, [], out);
+
+	assert.equal(existsSync(join(to, "extensions", "pi-dispatch-admin")), false, "it can enqueue paid jobs -- never into a job container");
+	assert.match(text(), /blocked extension "pi-dispatch-admin"/);
+	assert.match(text(), /1 extension --/, "and it is not counted among the staged");
+});
+
+test("--no-extensions is the escape hatch, and --with-extensions still parses as a no-op", async () => {
 	const from = hostAgent({ withExtensions: true });
 
 	const noExt = overlayDir();
-	await run(from, noExt, [], () => {});
-	assert.equal(existsSync(join(noExt, "extensions")), false, "extensions are not copied without --with-extensions");
-
-	const withExt = overlayDir();
 	const { out, text } = capture();
-	await run(from, withExt, ["--with-extensions"], out);
-	assert.ok(existsSync(join(withExt, "extensions", "my-tool")), "a normal extension is copied");
-	assert.equal(existsSync(join(withExt, "extensions", "pi-dispatch-admin")), false, "the admin extension is hard-blocked");
-	assert.match(text(), /blocked extension "pi-dispatch-admin"/);
+	await run(from, noExt, ["--no-extensions"], out);
+	assert.equal(existsSync(join(noExt, "extensions")), false, "--no-extensions copies nothing from extensions/");
+	assert.match(text(), /skipped -- --no-extensions was passed/);
+
+	// An existing setup script that still passes the old flag keeps working and keeps meaning the same thing.
+	const legacy = overlayDir();
+	await run(from, legacy, ["--with-extensions"], () => {});
+	assert.ok(existsSync(join(legacy, "extensions", "my-tool")), "the legacy flag is redundant, never an error");
 });
 
 test("import-pi errors clearly when the source agent dir is absent", async () => {
@@ -147,7 +188,7 @@ test("--with-packages stages a pinned package into packages/<dir> and writes the
 	]);
 	assert.match(manifest.stagedAt, /^\d{4}-\d{2}-\d{2}T/);
 	assert.match(text(), /packages\/.*2 packages -- third-party code, VET THESE/);
-	assert.match(text(), /run\.packages: true/, "next steps say the staged packages are dormant until a trigger asks for them");
+	assert.match(text(), /Staged packages load in every job -- set `run\.packages: false`/, "next steps name the opt-out, since staging is what loads them");
 	assert.equal(calls.length, 2, "one npm install per package");
 });
 

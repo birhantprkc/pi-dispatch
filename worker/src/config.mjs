@@ -95,11 +95,45 @@ function resolveGlobalPiDir(env, fileExists) {
 }
 
 /**
- * Parse the worker's config from `env` (default process.env). All defaults are conservative:
+ * Does the overlay's `extensions/` dir load in job containers (REQ-GLOBAL-PI-OVERLAY)?
+ *
+ * ON by default. The operator vetted this code twice already -- once by having it in their own `~/.pi/agent`,
+ * once by staging it into the overlay with `import-pi` -- so a third gate is friction, not safety, and the
+ * setup they staged is the setup a job should get. `PI_GLOBAL_ALLOW_EXTENSIONS` survives only as the
+ * opt-OUT: the exact string "0" disables them. Unset, empty, and the legacy "1" all mean LOAD, so an .env
+ * that still carries the old arming flag keeps working and says the same thing it always did.
+ *
+ * Any OTHER value is a config error, not a default in either direction. The strict-parse discipline is
+ * unchanged, but the thing it now defends against has flipped: under the old fail-closed reading a typo
+ * degraded to "dormant", which was merely disappointing; now the damaging misreading is "the operator
+ * believes they turned extensions off and they are still loading into every adversarial-input container".
+ * `PI_GLOBAL_ALLOW_EXTENSIONS=false` must therefore refuse to boot rather than be quietly ignored. "0" is
+ * the canonical opt-out because it is the exact inverse of the "1" already written in existing .env files
+ * and matches the single-character discipline of PI_AUTH_FROM_PI=0 / PI_CAPTURE_JOB_LOGS=1.
+ *
+ * Exported so `doctor` reports the same reading the worker will boot with (it deliberately re-reads env
+ * defaults rather than calling loadConfig, which throws on unrelated GitHub-auth problems).
+ */
+export function globalExtensionsEnabled(env) {
+	const raw = env.PI_GLOBAL_ALLOW_EXTENSIONS;
+	if (raw === undefined || raw === "" || raw === "1") return true;
+	if (raw === "0") return false;
+	throw configError(
+		`invalid PI_GLOBAL_ALLOW_EXTENSIONS: ${JSON.stringify(raw)} (want "0" to disable the overlay's extensions, or leave it unset to load them)`,
+	);
+}
+
+/**
+ * Parse the worker's config from `env` (default process.env). Every MONEY default is conservative:
  * spend controls (`PI_DAILY_CAP`, `PI_MAX_TURNS`) exist to bound money, so they default low, and a
  * cap of 0 would fail closed (budget.mjs refuses every job) rather than mean "unlimited". The optional
  * week/month ceilings and the soft-hold band default to disabled (`null`) -- the mandatory daily cap is
  * always the primary money bound; the others are additive ceilings an operator opts into.
+ *
+ * The operator's OWN staged setup is the deliberate exception: `allowGlobalExtensions` defaults to ON
+ * (REQ-GLOBAL-PI-OVERLAY). Staging is itself the vetting step, so the overlay an operator built is the
+ * overlay their jobs get, and the knob is an opt-out. That relaxation stops there -- it never touches the
+ * spend caps above, the per-job token scoping, or the admin-extension recursion block.
  */
 export function loadConfig(env = process.env, { fileExists = existsSync } = {}) {
 	const model = env.PI_MODEL ?? "claude-sonnet-4-5-20250929"; // dated snapshot; deterministic per CONST-PI-VERSION-PINNED
@@ -117,7 +151,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		dailyTokenCap: optionalBoundedInt(env, "PI_DAILY_TOKEN_CAP", 1), // issue #25; null = daily token counter disabled (check-AFTER, host-side)
 		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
 		globalPiDir: resolveGlobalPiDir(env, fileExists), // REQ-GLOBAL-PI-OVERLAY: operator's ~/.pi/agent subset, :ro-mounted; null = off
-		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1", // fail-closed: overlay extensions load only when armed
+		allowGlobalExtensions: globalExtensionsEnabled(env), // REQ-GLOBAL-PI-OVERLAY: ON unless PI_GLOBAL_ALLOW_EXTENSIONS=0
 		forwardEnv: forwardEnvList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist, GitHub token names refused
 		authFromPi: env.PI_AUTH_FROM_PI !== "0", // ON by default: use the key in ~/.pi/agent/auth.json when the env has none (api-key only). PI_AUTH_FROM_PI=0 forces env-only.
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),

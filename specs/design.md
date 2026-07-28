@@ -191,8 +191,11 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   - *`SYSTEM.md`* — replaces pi's default prompt entirely, losing its built-in tool guidance. We want to
     add to pi's behaviour, not supplant it.
   - *Project-level `.pi/APPEND_SYSTEM.md`* — trust-gated; headless ignores it without `--approve`.
-  - *`AGENTS.md`* — **forbidden**, not merely unused. See `CONST-NO-CONTEXT-FILES-MANDATORY`: it is not
-    trust-gated, so it is an injection vector, and `-nc` disables it anyway.
+  - *`AGENTS.md`* — not the persona channel, though it **does** now load
+    (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended: `/workspace` is the base repo's default-branch sha, so
+    it is merge-gated). It is rejected here for placement, not trust: pi emits context files into
+    `<project_context>` **after** the append block, so a repo's `AGENTS.md` carries its conventions and
+    can never *be* the floor. That ordering is what lets both ship.
   - *Extension returning `systemPrompt` from `before_agent_start`* — genuinely works and is
     cache-friendly when deterministic (the original pi-caveman demonstrates this). Rejected for moving
     parts: load-order chaining, per-prompt re-return, extension loading in headless mode. Reserve for
@@ -653,8 +656,9 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     an agent **cannot self-authorize by committing its own `SKILL.md`**: any `ai-trigger: allow` the agent
     writes lands in a commit later than the pinned SHA and is never consulted for that job. Reading
     committed, reviewed content at a pinned SHA rather than the working tree is the **same trust doctrine**
-    as `CONST-NO-CONTEXT-FILES-MANDATORY` (a cloned repo's `AGENTS.md` is not trust-gated and must not load)
-    and `DES-PERSONA-VIA-APPEND-SYSTEM-MD` (the persona is baked, not taken from the working tree), applied
+    as `CONST-NO-CONTEXT-FILES-MANDATORY` (which, as amended, admits merge-gated repo files precisely
+    *because* they are merge-gated — and still reads them at a fixed SHA, never from the live tree) and
+    `DES-PERSONA-VIA-APPEND-SYSTEM-MD` (the persona is baked, not taken from the working tree), applied
     one layer down to the trigger opt-in. Object-store reads are also **symlink-safe**: reading the blob by
     object id (`git cat-file blob <oid>`, blobs only, mode `100644`) mirrors the
     `worker/src/materialize.mjs` blob-only discipline, so an `ai-trigger` frontmatter symlinked at a token
@@ -863,24 +867,31 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   (`models.json`), global skills, and a global persona; the runner reads them (models path selection,
   `additionalSkillPaths` with the repo path first, a global persona entry in `appendSystemPromptOverride`).
   A host-side `pi-dispatch import-pi` stages the **credential-free** subset of `~/.pi/agent` and `doctor`
-  re-verifies it. Extensions are a separate, armed opt-in (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS`),
-  with the admin extension hard-blocked. A runtime **mount**, not a rebuild, so it works with the pulled image.
+  re-verifies it. Extensions are staged and loaded **by default** — `--no-extensions` is the escape hatch,
+  every staged extension is **printed by name**, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives as an opt-OUT
+  (`"0"`) — with the admin extension hard-blocked. A runtime **mount**, not a rebuild, so it works with the
+  pulled image.
   The overlay carries a fourth thing: **operator-staged pi packages** at `packages/<dir>/`, installed on the
   host by `import-pi --with-packages` from an exact-pinned `pi-packages.json` and handed to the runner as
-  `PI_PACKAGES` — absolute container paths, appended **last** to `additionalExtensionPaths`, and only for a
-  trigger that set `run.packages: true`.
+  `PI_PACKAGES` — absolute container paths, appended **last** to `additionalExtensionPaths`, for every job
+  except one whose trigger set `run.packages: false`.
 - **Why**: Four trust tiers, each refining but never removing the one above — baked floor (immutable) →
   operator overlay (deploy-time, operator-authored) → per-repo `.pi/` (trusted-by-merge) → adversarial input.
   The overlay sits at the operator's own trust level, which is why it may carry a persona (unlike the
   admin-editable settings overlay) yet must stay `:ro` and credential-free (it rides into an adversarial-input
   container: `CONST-TOKEN-SCOPED-PER-JOB`). Skills are **first-path-wins** in pi, so listing the repo path
   first makes repo skills override global ones — the "project refines global" semantics operators expect.
-  **The packages tier is a fifth tier inside tier 2, and it is gated four times, not two.** Overlay
-  extensions are the operator's *own* code and are doubly gated (copied under a flag, loaded under another);
-  a staged package is *someone else's* code, so it adds an exact version pin at declaration time and a
-  **per-trigger** arming that no env flag can express — a deployment can run one flow with a package and
-  every other flow without it. That fourth gate is finer-grained than the extensions gate on purpose:
-  arming is per capability-consumer, not per host. Staging happens on the **host** because pi resolves a
+  **The packages tier is a fifth tier inside tier 2, and it carries gates the overlay's own extensions do
+  not.** Overlay extensions are the operator's *own* code, vetted by having been run in their `~/.pi/agent`
+  and staged from a printed list, so they load by default and `PI_GLOBAL_ALLOW_EXTENSIONS=0` is the
+  opt-out. A staged package is *someone else's* code, so it adds an exact version pin at declaration time,
+  an all-or-nothing host-side stage, runner-side path validation, and a **per-trigger** `run.packages`
+  switch that no env flag can express — a deployment can run one flow without a package while every other
+  flow has it. That per-trigger switch is finer-grained than any env flag on purpose: the decision belongs
+  to the capability-consumer, not to the host. It defaults **open** for the same reason the overlay's
+  extensions do — the operator pinned and staged the thing deliberately — which makes it a withdrawal
+  rather than an arming, and leaves the pin, the stage and the runner's refusal as the gates that still
+  refuse by default. Staging happens on the **host** because pi resolves a
   non-`npm:`/`git:` spec as a **local path**, in place, with no install, no network and no writes — which is
   the only shape that loads under `PI_OFFLINE=1` inside a container with adversarial input.
   **The finding, and where it is actually fixed: on the raw load a staged skill beats the repo's.** pi
@@ -909,20 +920,27 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   `skillPaths` so the repo already wins makes it go quiet at exactly the moment the override becomes a
   no-op.
 - **Rejected**:
-  - *Copy `~/.pi` wholesale* — drags `auth.json` and MCP-credentialed extensions into the box; and pi's
-    `noSkills/noExtensions/noContextFiles` mean host-global *discovery* is off anyway, so most of it is inert.
+  - *Copy `~/.pi` wholesale* — drags `auth.json` and MCP-credentialed extensions into the box. The curated
+    subset is the point: what reaches a job should be a list someone chose and `import-pi` printed, not
+    whatever accumulated in an operator's home directory.
   - *Bake the overlay into the image* — a per-operator image defeats the pulled prebuilt image; the mount
     delivers the same content without a rebuild.
-  - *Load overlay extensions by default* — arbitrary code against adversarial input with open egress; arming
-    it must be a second, explicit decision, and the admin extension must never be among them.
+  - *Keep overlay extensions dormant until a second env flag arms them* — **superseded**; this is what
+    shipped first and it was the wrong default. The arming flag was a third gate behind two the operator
+    had already passed (running the code in their own `~/.pi/agent`, then staging it from a list
+    `import-pi` prints), and its failure mode was silent in the expensive direction: an overlay present but
+    dormant is a deployment quietly missing the setup its flows were written against, with no error to
+    read. It survives inverted, as `PI_GLOBAL_ALLOW_EXTENSIONS=0`. The admin extension must still never be
+    among them, and that is enforced by a refusal at stage time rather than by a default.
   - *A separate `/opt/pi-packages:ro` mount for staged packages* — it would buy nothing the overlay does not
     already carry, and it would cost an amendment to `CONST-ISOLATION-CONTAINER-PER-JOB`, whose acceptance
     **enumerates** the mounts a job may see. Widening a constitutional enumeration for zero new capability
     is the wrong trade; `packages/` rides the mount that already exists, and the mount list is unchanged.
-  - *A third env flag (`PI_GLOBAL_ALLOW_PACKAGES=1`) to arm them* — redundant and coarser than what ships.
-    Four gates already stand between an npm package and a job, and the fourth (`run.packages` per trigger)
-    is **finer** than any env flag could be: an env flag arms the whole deployment, which is precisely the
-    granularity a third-party-code switch should not have.
+  - *A third env flag (`PI_GLOBAL_ALLOW_PACKAGES`) for them* — redundant and coarser than what ships.
+    Three gates already refuse by default between an npm package and a job (the exact pin, the
+    all-or-nothing host stage, the runner's pre-spend path check), and the per-trigger `run.packages`
+    switch is **finer** than any env flag could be: an env flag decides for the whole deployment, which is
+    precisely the granularity a third-party-code switch should not have.
   - *Route packages through pi's own `settings.packages`* — that is the supported path for an interactive
     pi, and taking it would mean giving the runner a `SettingsManager` that reads a project file. The
     runner uses `SettingsManager.inMemory()` **deliberately**, so a serviced project's `.pi/settings.json`
@@ -1069,6 +1087,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-07-28 | **The pi-normal discovery posture** (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended). `DES-OPERATOR-GLOBAL-OVERLAY`: overlay extensions are staged and loaded **by default** — `--no-extensions` is the escape hatch, every staged extension is **printed by name**, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives inverted as the `"0"` opt-out — and staged packages load for every job except one whose trigger set `run.packages: false`. The "gated four times, not two" framing is restated honestly as **three gates that refuse by default** (exact pin, all-or-nothing host stage, runner pre-spend path check) **plus one withdrawal**, since the per-trigger switch now defaults open. The *Rejected* entry "load overlay extensions by default" is **superseded rather than deleted**: it is rewritten in place to record that this is what shipped first, that the arming flag sat behind two gates the operator had already passed, and that its failure mode was silent in the expensive direction — a present-but-dormant overlay is a deployment quietly missing the setup its flows were written against. The "copy `~/.pi` wholesale" rejection lost its stale justification (it argued host-global discovery was off anyway) and now rests on the curated-subset argument, which is the one that was always doing the work. Two cross-references de-staled elsewhere in the file: `DES-PERSONA-VIA-APPEND-SYSTEM-MD`'s *Rejected* `AGENTS.md` bullet said **"forbidden"** and now records that it loads but is rejected as the *persona channel* on **placement** (pi emits context files into `<project_context>` after the append block, so it can never be the floor); and `DES-AI-TRIGGER-FLOW-GATE`'s trust-doctrine parenthetical, which cited the constraint as "a cloned repo's `AGENTS.md` … must not load", now cites it as amended — the doctrine it was actually appealing to, reading committed content at a **fixed SHA** rather than the live tree, is unchanged. `DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY` was **checked and needed no change**: it asserts nothing about the discovery flags. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted) §2, §3, §4, §5, §9, §11. That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — **verified against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points. `DES-PERSONA-VIA-APPEND-SYSTEM-MD` is materially rewritten: the source doc's decisions #1 and #2 were mutually exclusive as written. `DES-NAME-KEEP-PI-DISPATCH` is new. `pi-harness` and `pi-sentry` were absent from the source doc's alternatives and are added. §5.7's "caches roll at midnight" caveat is **dropped** — 0.80.7 removed the date from the default system prompt. |
 | 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |
 | 2026-07-16 | **Resolved a spec/code contradiction.** `DES-WORKER-ON-HOST` added and `DES-JOB-FILES-VIA-VOLUME-SUBPATH` marked SUPERSEDED: the worker runs on the host (the `docker` CLI translates host paths, the daemon does not, and the VM prefix moved between Docker Desktop versions; local-folder jobs also *require* a host bind mount a named volume cannot give). The committed spec had rejected worker-on-host while the code already did it -- caught by a spec-conformance scan. `DES-CLI-TRIGGER-FOR-LOCAL` added: the CLI producer was built (user-directed) but unspecified; recorded with the check that `CONST-BUDGET-BEFORE-TOKENS` still holds because the cap is enforced in the processor, not the trigger. Repo-layout `deploy/` line corrected (compose runs Valkey only). |

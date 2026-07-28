@@ -21,12 +21,12 @@ export function parseRunnerEnv(env) {
 		model,
 		maxTurns,
 		maxTokens,
-		// REQ-GLOBAL-PI-OVERLAY: arm loading of the global overlay's extensions. Fail-closed -- anything
-		// but the exact string "1" leaves overlay extensions dormant. Not a configError: an unset flag is
-		// the normal, safe state, not a misconfiguration.
-		allowGlobalExtensions: env.PI_GLOBAL_ALLOW_EXTENSIONS === "1",
-		// INT-CONTAINER-JOB-INPUTS: the staged pi packages this trigger opted into, as ABSOLUTE
-		// container paths under /opt/pi-global/packages. Empty for every trigger that did not opt in.
+		// REQ-GLOBAL-PI-OVERLAY: does the global overlay's `extensions/` dir load? ON by default -- the
+		// operator staged that dir themselves with `import-pi`, so an unset flag means "load the setup they
+		// staged", not "there is nothing here". PI_GLOBAL_ALLOW_EXTENSIONS survives only as the opt-OUT.
+		allowGlobalExtensions: parseAllowGlobalExtensions(env, "PI_GLOBAL_ALLOW_EXTENSIONS"),
+		// INT-CONTAINER-JOB-INPUTS: the staged pi packages this job loads, as ABSOLUTE container paths under
+		// /opt/pi-global/packages. Empty when nothing is staged, or when the trigger opted out.
 		packages: parsePackagePaths(env, "PI_PACKAGES"),
 		retry: {
 			maxRetries: parsePositiveInt(env, "PI_RETRY_MAX", 2),
@@ -71,11 +71,31 @@ function parseOptionalPositiveInt(env, name) {
 }
 
 /**
+ * Parse the overlay-extensions opt-OUT (REQ-GLOBAL-PI-OVERLAY). Unset, empty, and the legacy "1" all mean
+ * LOAD; the exact string "0" is the only thing that disables. This mirrors the worker's
+ * `globalExtensionsEnabled` exactly -- the two sides of the mount must read the same variable the same way,
+ * and the runner cannot import from the worker (separate deployables), so the reading is duplicated here
+ * the way parsePositiveInt already is.
+ *
+ * Any other value is a configError (exit 2, not retried) rather than a silent default. The worker only ever
+ * emits "0" or nothing, so a third value here means a hand-run container or a worker-template regression --
+ * precisely the case where guessing is worst. Guessing "load" would run extensions an operator believes
+ * they disabled; guessing "disabled" would silently strip the setup a job's flow depends on and still exit
+ * 0. Refusing is the only answer that cannot lie about which of the two happened.
+ */
+function parseAllowGlobalExtensions(env, name) {
+	const raw = env[name];
+	if (raw === undefined || raw === "" || raw === "1") return true;
+	if (raw === "0") return false;
+	throw configError(`invalid ${name}: ${JSON.stringify(raw)} (want "0" to disable the overlay's extensions, or leave it unset to load them)`);
+}
+
+/**
  * Parse a ":"-delimited list of staged pi package roots (INT-CONTAINER-JOB-INPUTS).
  *
- * Unset or empty is `[]` -- a trigger that opted into no packages is the normal state, not a
- * misconfiguration. Every present entry must be an ABSOLUTE path with no `..` segment, or it is a
- * configError (exit 2, not retried).
+ * Unset or empty is `[]` -- a deployment that staged no packages, or a trigger that opted out with
+ * `run.packages: false`, is the normal state, not a misconfiguration. Every present entry must be an
+ * ABSOLUTE path with no `..` segment, or it is a configError (exit 2, not retried).
  *
  * The validation lives HERE, before pi ever sees the value, because pi's own resolver gives no
  * second chance:

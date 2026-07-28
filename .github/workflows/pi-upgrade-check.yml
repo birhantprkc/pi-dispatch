@@ -250,18 +250,34 @@ jobs:
       # unset, WITH a network -- is exactly the live third-party install this flag exists to prevent,
       # so it is not something to run in CI either. The real enforcement is that the worker sets
       # PI_OFFLINE=1 on every job and the runner re-asserts it in-process before the loader is built.
+      #
+      # The three suppression flags MIRROR image/runner/src/loader.mjs (noContextFiles:false,
+      # noExtensions:false, noSkills:true) rather than suppressing everything, so this probe exercises
+      # the configuration a job actually runs. They had drifted to all-true, which was the old posture
+      # (CONST-NO-CONTEXT-FILES-MANDATORY, since amended); the probe still passed, which is exactly the
+      # problem -- a probe that green-lights a config nothing uses proves nothing about the one that does.
+      #
+      # Syncing them does NOT weaken what is asserted, because the npm: source does not travel through
+      # the flag: resolveExtensionSources reads additionalExtensionPaths into cliExtensionPaths BEFORE
+      # the branch, and noExtensions only decides whether DISCOVERED paths merge in afterwards. But a
+      # bare `count === 0` WOULD have become weaker -- with discovery on it also asserts "nothing was
+      # discovered anywhere", which is true here (the image's ~/.pi/agent is empty and /tmp has no .pi/)
+      # and would silently stop being the thing under test the day either changed. So the assertion is
+      # a DIFFERENCE against the same loader without the npm: source: whatever discovery contributes,
+      # it contributes to both, and only the unresolvable source can move the number.
       - name: "PI_OFFLINE=1 turns an unresolvable npm: source into a clean skip"
         run: |
           PROBE='import { DefaultResourceLoader, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-          const loader = new DefaultResourceLoader({
+          const build = (additionalExtensionPaths) => new DefaultResourceLoader({
             cwd: "/tmp", agentDir: getAgentDir(), settingsManager: SettingsManager.inMemory({}),
-            noContextFiles: true, noSkills: true, noExtensions: true,
-            additionalExtensionPaths: ["npm:@pi-dispatch/definitely-does-not-exist"],
+            noContextFiles: false, noSkills: true, noExtensions: false,
+            additionalExtensionPaths,
           });
-          await loader.reload();
-          const n = loader.getExtensions().extensions.length;
-          if (n !== 0) { console.error("expected 0 extensions from an unresolvable npm: source, got " + n); process.exit(1); }
-          console.log("OK: offline skip, nothing installed");'
+          const count = async (paths) => { const l = build(paths); await l.reload(); return l.getExtensions().extensions.length; };
+          const baseline = await count([]);
+          const withSource = await count(["npm:@pi-dispatch/definitely-does-not-exist"]);
+          if (withSource !== baseline) { console.error("the unresolvable npm: source changed the loaded set: " + baseline + " -> " + withSource); process.exit(1); }
+          console.log("OK: offline skip, nothing installed (loaded " + baseline + " either way)");'
           docker run --rm --network none -e PI_OFFLINE=1 -e PROBE="$PROBE" \
             --entrypoint sh pi-job:ci -c 'cd /app && node --input-type=module -e "$PROBE"' \
             || { echo "::error::PI_OFFLINE=1 did not make an unresolvable npm: source a clean skip -- pi may have tried to install at load time."; exit 1; }

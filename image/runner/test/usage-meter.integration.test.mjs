@@ -160,6 +160,16 @@ function registerFakeProvider({ modelRegistry, compat, api, calls }) {
  * A minimal DefaultResourceLoader is supplied so the test stays hermetic: with none, createAgentSession
  * builds its own and discovers context files, skills and extensions from cwd and ~/.pi -- which would
  * make this proof depend on whatever is installed on the machine running it.
+ *
+ * THE THREE FLAGS BELOW DELIBERATELY DO NOT MATCH image/runner/src/loader.mjs, and this is the note that
+ * keeps them from being "fixed". The runner runs pi-normal (noContextFiles:false, noExtensions:false,
+ * noSkills:true) because a job's /workspace is merge-gated (CONST-NO-CONTEXT-FILES-MANDATORY, amended).
+ * This file is not a job: it runs on a developer's box and on CI, where noExtensions:false would discover
+ * ~/.pi/agent/extensions and RUN their factories inside a test that counts provider calls -- an extension
+ * registering its own api provider is precisely what trap (h) in INT-SDK-SESSION-OPTIONS is about, so a
+ * synced config would let the machine's pi setup change the number under assertion. Suppressing all three
+ * is what makes `calls` mean what the assertions say it means. The loader posture is pinned where it IS
+ * the subject -- image/runner/test/loader.test.mjs, which builds through buildResourceLoader itself.
  */
 async function openSession({ fx, sessionManager }) {
 	const settingsManager = pi.SettingsManager.inMemory({});

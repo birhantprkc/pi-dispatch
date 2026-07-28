@@ -44,16 +44,31 @@ Evidence convention as in `constitution.md`.
   const resourceLoader = new DefaultResourceLoader({
     cwd: "/workspace",
     agentDir: getAgentDir(),
-    noContextFiles: true,                              // CONST-NO-CONTEXT-FILES-MANDATORY
-    noSkills: true,                                    // exclude cwd/package discovery …
-    noExtensions: true,                                // … we supply ours explicitly instead
+    settingsManager,                                   // the SAME inMemory manager passed to the session
+    // Context files and extensions are DISCOVERED, as in any pi run: /workspace is the base repo's
+    // DEFAULT-BRANCH sha, so its files are merge-gated. CONST-NO-CONTEXT-FILES-MANDATORY was AMENDED
+    // to this posture — read the two together, not as a disagreement. See (c).
+    noContextFiles: false,                             // the repo's AGENTS.md loads
+    noExtensions: false,                               // /workspace/.pi/extensions is discovered — see (f), (j)
+    // Skills are the EXCEPTION, and it is mechanical, not a trust judgement: the repo's skills already
+    // arrive at /job/pi/skills from the pinned sha, and discovery would re-register them under a second
+    // path that WINS the first-path-wins collision. See (k).
+    noSkills: true,
     // Repo path FIRST so a repo skill overrides a global one of the same name (pi is first-path-wins).
     additionalSkillPaths:     ["/job/pi/skills", ...(existsSync("/opt/pi-global/skills") ? ["/opt/pi-global/skills"] : [])],
-    // Overlay extensions are fail-closed: only when PI_GLOBAL_ALLOW_EXTENSIONS=1 AND the dir is present.
-    // Operator-staged pi packages (REQ-GLOBAL-PI-OVERLAY) ride this same option, LAST — extension
-    // resolution is first-path-wins, so nothing a package ships can shadow a repo or overlay EXTENSION.
-    // That ordering fix does NOT extend to skills; skillsOverride below is where that is settled.
+    // Overlay extensions load unless the operator opted OUT (PI_GLOBAL_ALLOW_EXTENSIONS=0) AND the dir
+    // is present. Operator-staged pi packages (REQ-GLOBAL-PI-OVERLAY) ride this same option, LAST —
+    // extension resolution is first-path-wins, so nothing a package ships can shadow a repo or overlay
+    // EXTENSION. That ordering fix does NOT extend to skills; skillsOverride below is where that is
+    // settled. With noExtensions off, reload() merges the paths DISCOVERED under /workspace/.pi/
+    // extensions AFTER this whole list, so a workspace extension is last of all and shadows nothing.
     additionalExtensionPaths: ["/job/pi/extensions", ...(allowGlobalExtensions && existsSync("/opt/pi-global/extensions") ? ["/opt/pi-global/extensions"] : []), ...packagePaths],
+    // The recursion guard (REQ-ADMIN-VIA-PI-EXTENSION Scope), and the reason discovery is affordable at
+    // all: a serviced repo may ship an admin extension (THIS repo does, at .pi/extensions/dispatch.ts),
+    // which would hand a job's model dispatch_run — a PAID enqueue from inside a paid job. Applied to
+    // the loaded set BEFORE the loader stores it, so a dropped extension registers no tool and receives
+    // no event. FILTER, not refuse: refusing would end self-hosting. See (j).
+    extensionsOverride: (loaded) => dropAdminExtensions(loaded, { roots: extensionRoots, log }),
     // REQ-GLOBAL-PI-OVERLAY's "repo wins on conflict", ENFORCED. pi builds skillPaths as
     // mergePaths(cliEnabledSkills, additionalSkillPaths), so a staged package's skill paths come FIRST
     // whatever we do, and loadSkills is first-path-wins — path order cannot carry this. This declared
@@ -62,13 +77,18 @@ Evidence convention as in `constitution.md`.
     // /opt/pi-global/skills is replaced by the protected one (repo consulted before overlay), the
     // substitute coming from pi's own public loadSkillsFromDir({dir, source:"path"}). See (i).
     skillsOverride: (loaded) => enforceProtectedSkillPrecedence(loaded, { packageRoots: packagePaths, protectedRoots: ["/job/pi/skills", "/opt/pi-global/skills"] }),
-    // Floor first (unremovable), then operator-global, then repo (most specific). Deploy-time overlay
-    // persona is the SAME trust class as baking (DES-OPERATOR-GLOBAL-OVERLAY), distinct from the
-    // admin-editable runtime settings overlay, which still may never carry persona.
-    appendSystemPromptOverride: () => [guardrails, globalPersona, projectPersona].filter(Boolean),
+    // Floor first (unremovable), then the outbox protocol (local jobs only — the /outbox mount is what
+    // makes it relevant), then operator-global, then repo (most specific). Deploy-time overlay persona
+    // is the SAME trust class as baking (DES-OPERATOR-GLOBAL-OVERLAY), distinct from the admin-editable
+    // runtime settings overlay, which still may never carry persona. This override is ALSO what keeps
+    // the floor safe now that the project is discovered: it discards the discovered value entirely, so
+    // a project APPEND_SYSTEM.md cannot shadow the guardrails. See (e).
+    appendSystemPromptOverride: () => [guardrails, outboxProtocol, globalPersona, projectPersona].filter(Boolean),
   });
   await resourceLoader.reload();        // MANDATORY — createAgentSession will NOT do this for you
-  // NOTE: reload() is NOT called with `resolveProjectTrust`. Project trust is never granted.
+  // NOTE: reload() is NOT called with `resolveProjectTrust` — we never CALL it. That is not the same as
+  // the project being untrusted: the in-memory settings default to TRUSTED, and that default is what
+  // makes repo-extension discovery fire at all. See (f).
 
   // HOISTED: the ROOT session id must exist BEFORE the meter does. createAgentSession would otherwise
   // build its own SessionManager and the id would be readable only afterwards — too late to split
@@ -101,16 +121,21 @@ Evidence convention as in `constitution.md`.
   // The per-session accumulator is the FALLBACK, attached ONLY when the meter could not install, so the
   // two are never both counting: attachTokenBudget(session, maxTokens) if (!usageMeter.ok).
   ```
-  **Project instructions use pi's native structure — `.pi/APPEND_SYSTEM.md` and `.pi/skills/**/SKILL.md`
-  (the Agent Skills spec) — but are loaded through the explicit `additional*Paths` channel from a
-  read-only mount, never through pi's cwd discovery.** Inventing a bespoke `.pi-dispatch/` layout would
-  reimplement pi's resource system (`no-reimplementing-pi`); using cwd discovery would read from the
-  *checked-out branch* and grant project trust. This does neither.
+  **The project's persona and skills use pi's native structure — `.pi/APPEND_SYSTEM.md` and
+  `.pi/skills/**/SKILL.md` (the Agent Skills spec) — and are loaded through the explicit
+  `additional*Paths` channel from a read-only mount, not through pi's cwd discovery.** Inventing a
+  bespoke `.pi-dispatch/` layout would reimplement pi's resource system (`no-reimplementing-pi`). The
+  materialised route survives the discovery relaxation on its own merits, which are no longer about
+  trust: `/job/pi` is read from the pinned sha through git's object store (symlink-safe) and mounted
+  `:ro`, so the agent **cannot rewrite mid-run** the instructions it was handed — a property cwd
+  discovery cannot offer at any trust level. `AGENTS.md` and `.pi/extensions` **are** discovered from
+  cwd; see (c) and (f).
   **`appendSystemPrompt` is forbidden.** The smoke path is `pi -p`, **not** `pi --mode print` — that
   does not exist; `--mode` accepts `text|json|rpc` only. The internal mode union is
   `interactive|print|json|rpc` — there is no `tui`.
-- **Why**: **Three of the four things that make this contract dangerous are invisible at runtime**, and
-  each has its own mechanism. Read them as four separate traps, not one.
+- **Why**: **Nearly everything that makes this contract dangerous is invisible at runtime**, and each
+  hazard has its own mechanism. Read them as separate traps, not one — (a)–(f) are the loader's own, and
+  (g)–(k) were added as the runner grew the meter, the staged-package tier, and the discovery relaxation.
 
   **(a) `appendSystemPrompt` replaces discovery.** It does not compose with it. The `??` means the
   persona baked at `~/.pi/agent/APPEND_SYSTEM.md` is never looked for. No error, no warning, the job
@@ -123,11 +148,19 @@ Evidence convention as in `constitution.md`.
   This is the one trap here that is *not* silent — TypeScript's excess-property check rejects it on an
   object literal — but only if the options are written inline and not widened through a variable.
 
-  **(c) `noContextFiles: true` is the SDK equivalent of `-nc`, and it is OFF BY DEFAULT.** When no
-  `resourceLoader` is passed, `createAgentSession` builds `new DefaultResourceLoader({cwd, agentDir,
-  settingsManager})` — which loads `AGENTS.md`. **`CONST-NO-CONTEXT-FILES-MANDATORY` is therefore
-  violated by *omission*, not only by commission.** There is no flag to forget; there is a whole object
-  to forget to build.
+  **(c) `noContextFiles` and `noExtensions` are now `false` ON PURPOSE, and the value is the decision.**
+  Both default to `false` in pi, so the runner's setting them explicitly changes nothing at runtime — it
+  is written out anyway, because this is the option whose history `CONST-NO-CONTEXT-FILES-MANDATORY` is
+  about, and a value omitted is a value nobody can review. That constraint was **amended** to this
+  posture: `/workspace` is always the base repo's **default-branch sha** (`prepare-github.mjs` resolves
+  it, fetches that one commit, checks it out detached; a PR's `head`/`base` are data in `event.json` and
+  never a clone ref), so a workspace file is merge-gated content and may carry the agent's standing
+  instructions. **This is a relaxation, and the trap it leaves behind is the inverse of the old one**: the
+  old failure was forgetting to build the loader at all and loading `AGENTS.md` by omission; the new one
+  is assuming the *rest* of the loader is equally forgiving. It is not — (d), (e) and (f) all still bite,
+  and (e) bites harder than it did. Note also what did **not** move: `CONST-ISSUE-TEXT-IS-DATA` is
+  untouched, and webhook issue/PR/comment text is still data in the user prompt. Only repo **files**
+  changed status.
 
   **(d) `createAgentSession` does not `reload()` a loader you pass it.** `reload()` runs *only* inside
   the `if (!resourceLoader)` branch. `reload()` is the method that populates the persona;
@@ -138,6 +171,8 @@ Evidence convention as in `constitution.md`.
   at runtime will ever report it — see `REQ-UPSTREAM-CONTRACT-TESTS`.
 
   **(e) A trusted project's `.pi/APPEND_SYSTEM.md` SHADOWS the baked guardrails — it does not layer.**
+  **This one got MORE reachable, not less, when the flags in (c) relaxed** — read it as live, not
+  historical. The project **is** trusted (see (f)), and that is the sole gate on this path.
   `discoverAppendSystemPromptFile()` early-returns the project path when the project is trusted, and
   **never looks at the global one**. So "bake guardrails at `~/.pi/agent/APPEND_SYSTEM.md` and let the
   project add its own" is **incoherent**: the project's file would replace ours, silently, and the job
@@ -148,13 +183,26 @@ Evidence convention as in `constitution.md`.
   discovery result can shadow them, because discovery is no longer how they arrive. `base` becomes
   irrelevant and the override ignores it.
 
-  **(f) Project trust is never granted, and is not needed.** `reload({ resolveProjectTrust })` is the only
-  way to set it; we do not pass it. Trust would gate-in `.pi/settings.json`, `.pi/extensions`,
-  `.pi/skills`, `.pi/SYSTEM.md` from the **checked-out working tree** — which for a PR-triggered job is
-  the PR branch, possibly a fork. Instead `additionalSkillPaths` / `additionalExtensionPaths` are merged
-  **in both the `noSkills`/`noExtensions` branches and are not trust-checked at all**, so
-  `noSkills: true` + `additionalSkillPaths` loads *exactly* what we hand it and nothing from the tree.
-  Explicit beats gated: the same principle as `noContextFiles` + an explicit read.
+  **(f) We never CALL `resolveProjectTrust` — and the project is trusted anyway, by default.** These are
+  two different facts and an earlier revision of this entry collapsed them into "project trust is never
+  granted, and is not needed", which read as a safety property the code does not have. Precisely:
+  `reload({ resolveProjectTrust })` is the only way we could *set* trust, and we do not pass it — but
+  `SettingsManager.fromStorage` takes `options.projectTrusted ?? true` and `SettingsManager.inMemory`
+  forwards no options, so the manager the runner builds reports the project **TRUSTED** from the first
+  call. Not granting is not revoking.
+  **That default is load-bearing now, and it was inert before.** While `noSkills`/`noExtensions` were
+  both `true`, project-resource discovery was suppressed and trust had nothing to gate — the old wording
+  was harmless because it described a path nothing walked. With `noExtensions: false` it is exactly this
+  default that makes `addAutoDiscoveredResources`' `if (projectTrusted)` branch fire and load
+  `/workspace/.pi/extensions`. **So if a future pi flips that default to untrusted, repo extensions stop
+  loading and nothing reports it**: no error, no diagnostic, a clean exit 0 by a job missing capability
+  its flow expected. The loader tests therefore pin the **outcome** (the discovered factory ran), never
+  the flag — a test asserting `noExtensions === false` would stay green through that whole failure.
+  What trust does **not** reach: `additionalSkillPaths` / `additionalExtensionPaths` are merged in **both**
+  the `noSkills`/`noExtensions` branches and are **not** trust-checked at all, so with `noSkills: true`
+  the skills are *exactly* what we hand it and nothing from the tree — that half of the old wording
+  survives intact. Trust also routes `.pi/SYSTEM.md` and `.pi/APPEND_SYSTEM.md`, which is why (e) is a
+  live trap rather than a historical one, and why the guardrails are read explicitly instead.
 
   **(g) Never reach `@earendil-works/pi-ai` by bare specifier — and *what* a bare specifier does instead
   depends on which environment you are in.** Wherever the **worker's** dependencies are installed as well
@@ -206,6 +254,42 @@ Evidence convention as in `constitution.md`.
   attempt); the override appends its own diagnostic naming the enforced winner, so both stages are on the
   record. A job with no staged packages passes the loaded set through unchanged.
 
+  **(j) `extensionsOverride` is the recursion guard, and it does LESS than its name suggests.** Turning
+  on extension discovery (c) means a serviced repo's `/workspace/.pi/extensions` loads — and **this repo
+  ships one**, `.pi/extensions/dispatch.ts`, a two-line re-export of the admin extension, in a deployment
+  that services this very repo. Loaded into a job, it hands the model `dispatch_run` (enqueues a **paid**
+  job), `dispatch_set` (moves the daily cap) and the pause/resume/trigger writes, driven by a session
+  whose prompt carries adversarial issue text — the same recursion vector `import-pi` refuses to copy and
+  the package stager refuses to stage. `DefaultResourceLoaderOptions.extensionsOverride` is the analogue
+  of `skillsOverride`: a declared option at the pin, invoked on the `LoadExtensionsResult` **before the
+  loader stores anything**, and `createAgentSession` builds its `ExtensionRunner` from
+  `resourceLoader.getExtensions().extensions` — so an extension removed there registers no tool, receives
+  no event, and contributes no command.
+  **Two signals, because either alone leaves the case open.** An entry-**NAME** pattern (mirroring the
+  worker's `ADMIN_RE`; matched against the entry name, never the full path, or a checkout that merely
+  *sits under* a directory called `pi-dispatch` would have every extension dropped), and a `^dispatch_`
+  **TOOL-SURFACE** check. The second is the one that actually closes this repo's case: `dispatch.ts` is a
+  name no pattern would flag. **What it does NOT do, stated because the seam invites the opposite
+  assumption**: discovery still resolves the file, jiti still imports it, and its factory has **already
+  run** by the time the override is called (`loadFinalExtensionSet` → `extensionsOverride`, in that
+  order). Module-level side effects of the import are bounded by the container, not by this layer. Two
+  further honest limits: a serviced repo whose own extension registers a `dispatch_*` tool **loses it**
+  in job containers (a loud, logged drop the operator can rename around — traded against silent paid
+  recursion), and an admin re-export that is renamed **and** re-exports under other tool names is out of
+  reach of both signals. It is a **filter, not a refusal**: refusing the job would make self-hosting the
+  one thing this project cannot do.
+
+  **(k) `noSkills` stays `true` while the other two relaxed, and the reason is mechanical.** Not caution,
+  and not a trust judgement — it was *verified* that flipping it breaks things. The repo's skills already
+  reach the agent at `/job/pi/skills`, materialised from the pinned sha with `git cat-file` (no working
+  tree, so no symlink following) onto a read-only mount. Discovery registers every one of them a **second
+  time** under `/workspace/.pi/skills`, and pi's `skillPaths` in the discovery branch is
+  `mergePaths([...cliEnabledSkills, ...enabledSkills], additionalSkillPaths)` — the **discovered** copy
+  ahead of ours — with `loadSkills` first-path-wins. So the mount stops being the copy in force and is
+  demoted to a `{type:"collision"}` diagnostic, and the writable working-tree copy is what the agent
+  gets. It also feeds garbage to (i): `skillsOverride` decides between package roots and protected roots
+  and has no case for the same protected skill arriving twice. Same content, no benefit, real breakage.
+
   `modelRegistry.find(provider, modelId)` is a **method**, not a free function; there is no exported
   `getModel`. Pin the model explicitly: with `model` omitted, pi picks from settings and provider
   defaults, which is nondeterministic across images and silently changes cost per job. A missing model
@@ -229,7 +313,15 @@ Evidence convention as in `constitution.md`.
   `hasConfiguredAuth(model)`, `getAvailable()`, `getAll()`, `static create(authStorage, modelsJsonPath?)`
   · `→ dist/index.js` — `AuthStorage` and `ModelRegistry` are value exports; `ModelRuntime` is absent ·
   `→ dist/core/resource-loader.d.ts` — `noContextFiles`, `noSkills`, `noExtensions`,
-  `additionalSkillPaths`, `additionalExtensionPaths`, `appendSystemPromptOverride` all present at the pin
+  `additionalSkillPaths`, `additionalExtensionPaths`, `appendSystemPromptOverride` all present at the pin,
+  as are `extensionsOverride` and `skillsOverride` (`:78-79`) · `→ dist/core/resource-loader.js:267-269`
+  (the `noExtensions` branch: discovered paths merged **after** ours) · `→ :279` (`extensionsOverride`
+  applied to the result, before the loader stores it) · `→ :281-283` (the `noSkills` branch: discovered
+  skills would be ordered **before** `additionalSkillPaths`) · `→ :455` (`skillsOverride`) ·
+  `→ dist/core/settings-manager.js:153,166-171` (`fromStorage` takes `options.projectTrusted ?? true`;
+  `inMemory` forwards no options — the project is trusted by default) ·
+  `→ dist/core/package-manager.js:1935-1946` (the `if (projectTrusted)` branch that discovers
+  `.pi/extensions`)
 - **Evidence (HEAD — explains behaviour, does NOT establish the pin contains it)**:
   `earendil-works/pi @ 5e336cf → packages/coding-agent/src/core/sdk.ts:33-80`
   (option set; no append fields, `resourceLoader?: ResourceLoader`) · `→ sdk.ts:164` (`createAgentSession`
@@ -246,10 +338,14 @@ Evidence convention as in `constitution.md`.
 - **Traces to**: `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `CONST-PERSONA-IN-CACHED-PREFIX`,
   `CONST-NO-CONTEXT-FILES-MANDATORY`, `REQ-UPSTREAM-CONTRACT-TESTS`, `OQ-005`
 - **Acceptance**: Constructing the loader exactly as the runner does and calling `reload()`,
-  `getAppendSystemPrompt()` contains both the persona sentinel and the per-flow sentinel, and
-  `getAgentsFiles().agentsFiles` is empty in the presence of a hostile `AGENTS.md`. This is assertable
-  **offline, with no provider call** — the loader boundary is pure, which is what makes the scariest
-  assertions in this project free.
+  `getAppendSystemPrompt()` contains both the persona sentinel and the per-flow sentinel;
+  `getAgentsFiles().agentsFiles` **carries** `/workspace/AGENTS.md` and its content, while that content is
+  **absent** from `getAppendSystemPrompt()` (pi emits it into `<project_context>`, after the append
+  block); a workspace `.pi/APPEND_SYSTEM.md` does **not** displace the floor; a discovered repo extension's
+  factory **ran**, while an admin-named or `dispatch_*`-registering one is **absent** from
+  `getExtensions().extensions` and its drop is logged; and a repo skill resolves **once**, from
+  `/job/pi/skills`. All assertable **offline, with no provider call** — the loader boundary is pure, which
+  is what makes the scariest assertions in this project free.
   **The fully-assembled prompt is also assertable for free**, which `REQ-UPSTREAM-CONTRACT-TESTS`
   depends on. `buildSystemPrompt` is not exported from the package root (only its options type is), but
   an **inline extension** observing `before_agent_start` receives the complete assembled `systemPrompt`,
@@ -420,17 +516,32 @@ Evidence convention as in `constitution.md`.
                                                      via `git show`, never `fs.readFile`
   ```
   **The guardrails are baked into the image** at a path outside `agentDir` and are **not** mounted.
+- **What the container additionally reads from `/workspace`, and why it is not a `/job` input.** A job's
+  `/workspace` is the base repo at its **default-branch sha** — `prepare-github.mjs` resolves that sha,
+  fetches that one commit and checks it out **detached**, and a PR's `head`/`base` are `event.json` data,
+  never a clone ref — so its files are merge-gated. pi therefore discovers two things from it natively
+  (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended; `INT-SDK-SESSION-OPTIONS`): **`AGENTS.md`** (and
+  `CLAUDE.md`), landing in `<project_context>` *after* the append block, and **`/workspace/.pi/extensions`**,
+  whose entries run as code. Neither is copied into `/job`, and that is the distinction the two mounts
+  encode: `/job` is the **read-only, agent-untamperable** channel, read from the object store; `/workspace`
+  is the writable checkout the agent is working in, and an agent that rewrites `AGENTS.md` mid-run has
+  rewritten *its own* context — a merge-gated file it was already allowed to influence — not the
+  instructions in `/job`.
 - **`/job/pi/extensions` is NOT written, and the seam is deliberate.** An earlier revision of this list
   carried it; the worker's materialiser only ever emits `pi/APPEND_SYSTEM.md` and
   `pi/skills/<name>/SKILL.md`, so the path documented a file that never existed. Repo extensions stay
-  unmaterialised **on purpose** — a repo extension is arbitrary code from a merged branch, and this project
-  does not grant that the same free pass a skill gets. The runner still lists `/job/pi/extensions` in
-  `additionalExtensionPaths` (`INT-SDK-SESSION-OPTIONS`) so the seam exists the day that decision changes;
-  today it resolves to a permanent, unread `"path does not exist"` entry in `extensionsResult.errors` on
-  **every** job. That permanent entry is exactly why the staged-package existence check is **scoped to the
-  package roots** rather than surfacing pi's error list wholesale: an always-populated error channel cannot
-  be used to detect anything, so `assertPackagePathsExist` checks the roots it was handed, itself, before
-  the prompt is read and before any spend.
+  unmaterialised, and that is now a **routing** fact rather than a refusal: they arrive by cwd discovery
+  instead, which means there is exactly **one** path a repo extension has ever had and no double-load to
+  reconcile. The runner still lists `/job/pi/extensions` in `additionalExtensionPaths`
+  (`INT-SDK-SESSION-OPTIONS`) for symmetry; today it resolves to a permanent, unread
+  `"path does not exist"` entry in `extensionsResult.errors` on **every** job. That permanent entry is
+  exactly why the staged-package existence check is **scoped to the package roots** rather than surfacing
+  pi's error list wholesale: an always-populated error channel cannot be used to detect anything, so
+  `assertPackagePathsExist` checks the roots it was handed, itself, before the prompt is read and before
+  any spend.
+  **The admin extension is the one thing discovery may not deliver.** A serviced repo can ship one — this
+  repo does — so the runner drops admin-like entries at pi's `extensionsOverride` seam before the session
+  is built (`REQ-ADMIN-VIA-PI-EXTENSION` Scope, trap (j) in `INT-SDK-SESSION-OPTIONS`).
 - **Operator-staged pi packages** reach a job as `PI_PACKAGES` — a `":"`-delimited list of **absolute
   container paths** under `/opt/pi-global/packages/<dir>`, emitted only for a trigger that opted in
   (`INT-TRIGGERS-FILE-CONTRACT`) — **not** as a `/job` input. They live inside the operator overlay's
@@ -468,14 +579,18 @@ Evidence convention as in `constitution.md`.
     looked up read-only from the run-history files by filename (`INT-RUN-HISTORY-FILE-CONTRACT`). The
     local task prompt names `/job/event.json` in one harness line — discovery only, mirroring the github
     prompt.
-- **Why the worker materialises `.pi/` instead of letting pi discover it**: pi's discovery reads from
-  `cwd` — i.e. the **checked-out branch**, which for a PR-triggered job may be a fork. Materialising from
-  the default-branch SHA into a read-only mount keeps three properties at once: the instructions are
-  pi-native (`SKILL.md`, the Agent Skills spec — not a bespoke format we'd have to reimplement), they come
-  from a ref only a merger can change, and **the agent cannot rewrite them mid-run** because `/job` is
-  `:ro`. Read them with `git show <sha>:.pi/...` — `fs.readFile` off the clone follows **symlinks**, and
-  `loadSkillsFromDir` follows them too (`entry.isSymbolicLink()` → `statSync`), so a symlinked
-  `SKILL.md` or `APPEND_SYSTEM.md` would pull a worker-host file into the system prompt.
+- **Why the worker materialises `.pi/` instead of letting pi discover it**: not because the checkout is
+  untrusted — it is the default-branch sha either way — but because materialising buys two properties
+  discovery cannot. **The agent cannot rewrite them mid-run**, since `/job` is `:ro` while `/workspace` is
+  the tree it is actively editing; and the read is **symlink-safe**, because it goes through git's object
+  store rather than the filesystem. Both matter independently of trust. Read them with
+  `git show <sha>:.pi/...` — `fs.readFile` off the clone follows **symlinks**, and `loadSkillsFromDir`
+  follows them too (`entry.isSymbolicLink()` → `statSync`), so a symlinked `SKILL.md` or
+  `APPEND_SYSTEM.md` would otherwise pull a worker-host file into the system prompt. The instructions stay
+  pi-native (`SKILL.md`, the Agent Skills spec — not a bespoke format we'd have to reimplement) on the way
+  through. **This is also the whole reason `noSkills` stays `true`** while context files and extensions are
+  discovered: were it off, pi would register each repo skill a second time from `/workspace/.pi/skills` and
+  — first-path-wins, discovered copy first — the writable working-tree copy would take the mount's place.
 - **Why**: Read-only because the container is the **untrusted side**. The agent must not be able to
   rewrite the instructions it was handed — that filesystem permission is what makes
   `CONST-ISSUE-TEXT-IS-DATA` *enforceable* rather than merely asked-for. The persona is baked rather than
@@ -485,7 +600,9 @@ Evidence convention as in `constitution.md`.
   `additionalSkillPaths` is merged in **both** the `noSkills` and `else` branches and is **not**
   trust-checked · `→ resource-loader.ts:979-991 → discoverAppendSystemPromptFile` (project path
   **early-returns**, shadowing the global) · `→ resource-loader.ts:346-350` (`resolveProjectTrust` is the
-  only way trust is set) · `→ core/skills.ts:168-200 → loadSkillsFromDir` (layout is `**/SKILL.md`;
+  only way *we* could set trust — the in-memory default is already **trusted**, which is what makes
+  extension discovery fire; see `INT-SDK-SESSION-OPTIONS` trap (f)) ·
+  `→ core/skills.ts:168-200 → loadSkillsFromDir` (layout is `**/SKILL.md`;
   symlinks followed) · `→ skills.ts:67-81 → SkillFrontmatter` (`name`, `description`,
   `disable-model-invocation`; validated "per Agent Skills spec")
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-ISOLATION-CONTAINER-PER-JOB`,
@@ -522,10 +639,11 @@ Evidence convention as in `constitution.md`.
     (`INT-TRIGGERS-FILE-CONTRACT`), absent otherwise; `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
     otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
-    (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=1` (forwarded ONLY when the operator armed overlay
-    extensions — fail-closed; `REQ-GLOBAL-PI-OVERLAY`); `PI_PACKAGES` (the `":"`-delimited ABSOLUTE CONTAINER
-    paths of the operator-staged pi packages, forwarded ONLY when the trigger opted in via `run.packages: true`
-    **and** at least one package is staged — fail-closed exactly like the flag above, and **omitted entirely**
+    (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=0` (forwarded ONLY to carry the operator's explicit
+    opt-OUT — loading is the **absence** of the variable, on both sides of the mount, so an unset var and an
+    explicit `true` emit nothing at all; `REQ-GLOBAL-PI-OVERLAY`); `PI_PACKAGES` (the `":"`-delimited ABSOLUTE
+    CONTAINER paths of the operator-staged pi packages, forwarded whenever at least one package is staged
+    **and** the trigger did not withhold them with `run.packages: false`, and **omitted entirely**
     when empty, never an empty string. The delimiter is `":"` because these are CONTAINER paths; the host's
     `path.delimiter` is `";"` on Windows and would be wrong); and each name in `PI_FORWARD_ENV` (an explicit operator
     allowlist of extra host vars — e.g. a custom provider's key — forwarded by exact `-e NAME=VALUE`, never a
@@ -733,16 +851,22 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
   non-boolean value is refused at load; with `GITHUB_AUTH_SOURCE=app` a `run.github` job refuses at mint
   time — an installation token is per-repo, and a local job has no repo to scope it to.
-- **`run.packages` (ALL FOUR trigger kinds, optional boolean)**: absent or `false` = no staged packages —
-  the load-no-third-party-code default; `true` = the worker emits `PI_PACKAGES` with the container paths of
-  the pi packages the operator staged into the global overlay (`INT-PI-PACKAGES-FILE-CONTRACT`,
-  `INT-CONTAINER-RUNTIME-CONTRACT`), so the flow gets their extensions and skills. A non-boolean value is
-  refused at load — a truthy `"true"` string silently handing a trigger third-party code with open network
-  egress is exactly the drift this validator exists to refuse — and the worker additionally re-checks
-  `=== true` at wiring time, so hand-edited job data cannot arm it either. It is carried on all four kinds
-  rather than cron only (unlike `run.github`) because a staged package is a **capability of the flow**, and
-  a label/comment/PR trigger runs the same flows a cron trigger does. With nothing staged the flag emits
-  nothing at all, which is a silent no-op by construction — `doctor` is where that becomes visible.
+- **`run.packages` (ALL FOUR trigger kinds, optional boolean) — an opt-OUT**: absent or `true` = the
+  worker emits `PI_PACKAGES` with the container paths of the pi packages the operator staged into the
+  global overlay (`INT-PI-PACKAGES-FILE-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`), so the flow gets
+  their extensions and skills; **only an explicit `false` withholds them**. The polarity inverted with the
+  overlay's: staging a package is a deliberate, pinned, host-side act (`import-pi --with-packages`), so the
+  set an operator staged is the set their jobs get, and the per-trigger flag is how one flow opts *out*
+  rather than how every flow opts in. A non-boolean value is still **refused at load** — `parseTriggers`
+  validates strict booleans on all four kinds — and the refusal now matters in the opposite direction: the
+  damaging misreading used to be a truthy `"true"` string arming a trigger, and is now a `"false"` string
+  that looks like an opt-out and is not one. The worker's wiring-time re-check inverted to match
+  (`job.packages === false ? [] : packagePaths`), and the strictness that used to live in its `=== true`
+  did not disappear — it moved to the load-time validator, where a hand-edited string is refused before it
+  can ever become job data. It is carried on all four kinds rather than cron only (unlike `run.github`)
+  because a staged package is a **capability of the flow**, and a label/comment/PR trigger runs the same
+  flows a cron trigger does. With nothing staged the flag emits nothing at all, which is a silent no-op by
+  construction — `doctor` is where that becomes visible.
 - **Why**: The operator's trigger set is one host file — diffable, reviewable, git-trackable — rather than
   two files in two shapes across two services. The schema unifies the *view*; evaluation still splits by
   owner (a `label` is never scheduled; a `cron` never receives a webhook). `on.id` (cron only) must be
@@ -764,11 +888,12 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   pattern in `/job/event.json` (`INT-CONTAINER-JOB-INPUTS`), and `pattern` exists nowhere else at job time.
   The byte-match now additionally admits `packages` on the same terms as `github`: both stay **absent** when
   the trigger omits them (`undefined` drops out at JSON serialisation), so an unflagged trigger's `data` is
-  byte-identical to the pre-`packages` shape and only a trigger that opted in differs. Given a non-boolean
-  `run.packages` on any of the four kinds, when the config loads, then both services throw. **The env
-  carve-out is explicit**: a `packages: true` job additionally carries `PI_PACKAGES` **and** — like every
-  other job, opted in or not — `PI_OFFLINE=1`, so the container env is NOT byte-identical to the pre-issue
-  one even for an unflagged trigger. That is a deliberate, stated exception in the same spirit as the cron
+  byte-identical to the pre-`packages` shape and only a trigger that stated a value differs — which, under
+  the opt-out polarity, is the trigger that switched packages **off**. Given a non-boolean `run.packages`
+  on any of the four kinds, when the config loads, then both services throw. **The env carve-out is
+  explicit**: with packages staged, a job that did **not** set `packages: false` carries `PI_PACKAGES`
+  **and** — like every other job, opted out or not — `PI_OFFLINE=1`, so the container env is NOT
+  byte-identical to the pre-issue one even for an unflagged trigger. That is a deliberate, stated exception in the same spirit as the cron
   `trigger: { id, pattern }` carve-out above, and for the same reason: it is a narrowing the whole fleet
   gets, not a per-trigger capability (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
@@ -1096,6 +1221,7 @@ worker reads.
 
 | Date | Change |
 |---|---|
+| 2026-07-28 | **The pi-normal discovery posture** (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended in the same change). **INT-SDK-SESSION-OPTIONS**: the contract block showed all three suppression flags `true` and was two flags and two options behind the runner — it now mirrors the shipped loader (`noContextFiles: false`, `noExtensions: false`, `noSkills: true`, the `settingsManager`, `extensionsOverride`, and the `outboxProtocol` entry in `appendSystemPromptOverride` that a local job's `/outbox` mount adds). Trap **(c)** rewritten from "`noContextFiles: true` is the SDK equivalent of `-nc`, and it is OFF BY DEFAULT" to the amended posture, keeping the point that the value is written out **because** it is the decision on the record, and naming the inverted trap it leaves (the loader is not forgiving elsewhere). Trap **(f)** rewritten and this is the correction worth reading twice: it said "Project trust is never granted, and is not needed", which conflated *we never call `resolveProjectTrust`* (true) with *the project is untrusted* (false — `SettingsManager.fromStorage` takes `options.projectTrusted ?? true` and `inMemory` forwards no options). The distinction was **inert** while both discovery flags were `true` and is now **load-bearing**: that default is exactly what makes `addAutoDiscoveredResources`' `if (projectTrusted)` branch load `/workspace/.pi/extensions`, so if a future pi flips it, repo extensions stop loading **silently** — which is why the loader tests pin the outcome (the factory ran) and never the flag. Trap **(e)** flagged as MORE reachable, not historical. Two new traps: **(j)** the `extensionsOverride` recursion guard — two signals (entry-NAME pattern, and the `^dispatch_` TOOL-SURFACE check that actually catches this repo's `.pi/extensions/dispatch.ts`), applied before the loader stores the set so a dropped extension registers no tool and receives no event, with the honest limits recorded (the factory has already run; a repo's own `dispatch_*` tool is lost, logged and rename-able; a renamed re-export under other tool names is out of reach); **(k)** why `noSkills` STAYS `true` — mechanical, not caution: discovery double-registers every repo skill under `/workspace/.pi/skills` ahead of `additionalSkillPaths` and first-path-wins demotes the pinned-sha read-only mount to a collision diagnostic. Acceptance inverted to match (the `AGENTS.md` sentinel must now be **present** in `getAgentsFiles()` and **absent** from the append block), and a pinned-artifact evidence block added for the trust default and the two merge branches. **INT-CONTAINER-JOB-INPUTS**: a new bullet for what the container now reads from `/workspace` (`AGENTS.md`, `.pi/extensions`) and why neither is a `/job` input; the "why materialise" rationale re-grounded — it had claimed the checkout "for a PR-triggered job may be a fork", which `prepare-github.mjs` contradicts (always the base repo's default-branch sha, detached), so the surviving reasons are `:ro` untamperability and symlink-safety, both independent of trust. **INT-TRIGGERS-FILE-CONTRACT**: `run.packages` inverted to an **opt-OUT** (absent or `true` load; only `false` withholds), recording that the strictness which used to live in the worker's `=== true` moved to `parseTriggers`' load-time boolean validation, and that the damaging misreading flipped from a truthy `"true"` arming a trigger to a `"false"` string that looks like an opt-out and is not one. |
 | 2026-07-28 | **Corrected INT-SDK-SESSION-OPTIONS trap (g)**, which the row below stated as a flat, unconditional fact ("pi-ai is installed TWICE"). It is not unconditional — it is a property of the **install**, not of pi. The dual layout appears wherever the **worker's** dependencies are installed as well (a dev checkout, the contract-tests job), because the hoisted copy IS the worker's declared dependency, and that layout is what makes a bare specifier bind the wrong registry and meter nothing while reporting success. The **job image** installs the **runner's** dependencies only (`image/runner/package.json` declares `@earendil-works/pi-coding-agent` and `@playwright/cli`, never pi-ai), so there the nested copy is the ONLY copy and the same bare specifier does not resolve at all — `ERR_MODULE_NOT_FOUND`, not a wrong binding. The trap now leads with the invariant that holds in BOTH and is the thing worth remembering: **never reach pi-ai by bare specifier** — register through `modelRegistry.registerProvider` and let the **runtime mutation probe** decide which module object the registry actually writes to — and records that `resolvePiAiCompat` wraps **both** lookups in `tryResolve` for exactly this reason, so an unresolvable candidate is skipped rather than thrown and one implementation is correct in both environments. Found by the `image` CI job, whose pi-ai step asserted the dual layout *inside the container* and failed there while the code it was guarding was correct in both places; that step now runs `resolvePiAiCompat` inside the built image and asserts the NESTED copy is offered first with the compat surface the probe and the wrapper need, and the dual-copy fact stays pinned by `image/runner/test/pinned-api.test.mjs` in the contract-tests job, which is the environment where it is true. |
 | 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). **INT-SDK-SESSION-OPTIONS**: the contract block now mirrors the shipped wiring — a HOISTED `sessionManager` so `rootSessionId` exists before the meter, the meter installed after `ModelRegistry.create` and before `createAgentSession`, a deterministic `arm()` after it (extensions register their own api providers during the call), `packagePaths` appended LAST to `additionalExtensionPaths`, and a `skillsOverride` that re-imposes protected-root skill precedence. Three new traps: **(g)** pi-ai is installed TWICE with separate module-level registries and pi-coding-agent uses the NESTED one, so a bare specifier binds the hoisted copy and meters nothing while reporting success — `import.meta.resolve` names the wrong path, and only a runtime mutation probe can decide it; **(h)** `resetApiProviders()` (what `AgentSession.reload()` calls) WIPES the registry, so registration goes through `modelRegistry.registerProvider` (which `refresh()` re-applies) plus a re-arm, and a wrapped entry is recognised by object identity because `refresh()` returns fresh objects; **(i)** skill precedence is decided by `skillsOverride`, NOT by path order — pi puts a staged package's skill paths first in `skillPaths` and `loadSkills` is first-path-wins, but the loader's declared `skillsOverride` runs on that result before anything is stored, and pi's public `loadSkillsFromDir` supplies the substitute, so `REQ-GLOBAL-PI-OVERLAY`'s "repo wins on conflict" is enforced rather than asserted. **INT-CONTAINER-RUNTIME-CONTRACT**: env gains `PI_PACKAGES` (conditional, fail-closed, `":"`-delimited container paths, omitted when empty) and `PI_OFFLINE=1` — flagged as the ONE env addition that is not opt-in, because it is a narrowing that makes pi's job-time `npm install` branch unreachable rather than merely unused; the `/opt/pi-global` sentence now names `packages/` as a fourth thing the overlay carries, and states that **the mount list itself is unchanged**. **INT-CONTAINER-JOB-INPUTS**: DELETED the `/job/pi/extensions/...` line — the materialiser only ever writes `APPEND_SYSTEM.md` and `skills/<name>/SKILL.md`, so it documented a path the worker never writes — with a note that the seam is kept deliberately (repo extensions are arbitrary merged-branch code and are not materialised), that it already yields a permanent unread `"path does not exist"` error on every job, and that this permanence is precisely why the staged-package existence check is scoped to package roots instead of surfacing pi's error list. **INT-TRIGGERS-FILE-CONTRACT**: `run.packages` (optional boolean) on all four `run` shapes with its own bullet mirroring `run.github`, and the cron byte-match acceptance extended for `packages` plus an explicit `PI_OFFLINE=1` env carve-out (same precedent as the cron `trigger:{id,pattern}` carve-out). **NEW INT-PI-PACKAGES-FILE-CONTRACT**: the `pi-packages.json` shape, the exact-version rule citing `CONST-PI-VERSION-PINNED`, the npm name charset, the `dir` sanitisation and uniqueness rule, the admin-name refusal, the `..`/absolute manifest refusal, the npm flag set with the reason for each, the staged layout, and `packages.json` as the never-throwing worker/doctor read model. The install target travels as the exec's **`cwd`**, not `--prefix`, so argv carries **no filesystem path at all** — recorded as a load-bearing safety property, because it is what makes the win32 `shell: true` (required since Node 18.20.2 refuses to spawn `npm.cmd` without one) safe: everything left in argv is a literal flag or a pre-validated `name@version`. **INT-RUNNER-EXIT-CODE-PROTOCOL**: the eight new `tokens` telemetry keys, restating that none of them feeds classification, plus a row for a process-wide breach mid-fanout (exit `2` / `token_budget`, deliberately the same row — one flag, one code). **INT-RUN-HISTORY-FILE-CONTRACT**: the widened `tokens` object, still additive and nullable-as-a-whole, noting `parseExitTokens` and `buildRecord` are unchanged and that `recordTokenSpend` now charges process-wide spend. |
 | 2026-07-27 | Trigger context (issue #49): INT-CONTAINER-JOB-INPUTS — `/job/event.json` is now written for EVERY job kind, not only github. Local jobs get one of three `source`-discriminated shapes (`cron` with `trigger:{id,pattern}`, `scheduledFor`, and `previousRunAt`; `manual`; `chain`), each carrying the folder **basename** only (the full host path embeds the operator's OS account name and `/job` is agent-readable) plus the folder's HEAD `sha`. GitHub jobs gain `comment:{body,author_association}` for comment-triggered jobs — INT-WEBHOOK-PAYLOAD-SUBSET is UNCHANGED, both fields were already in its list; this is the first time they leave the receiver, still data-by-placement per CONST-ISSUE-TEXT-IS-DATA and never in worker logs or the run record — and a HARNESS-COMPUTED `matched:{index,type,label\|phrase\|action}` naming the raw triggers.json entry that fired (the filter's own decision record, not a payload field; never enters the prompt). `sender.login` deleted from event.json as written-but-never-populated — the subset extracts `sender.id` only, so the list is unchanged there too. INT-TRIGGERS-FILE-CONTRACT: the cron byte-match acceptance gains its one carve-out — scheduler `data` now carries a cron-only `trigger:{id,pattern}`, since `pattern` exists nowhere else at job time. INT-RUN-HISTORY-FILE-CONTRACT: the per-job `.json` files double as the `previousRunAt` lookup source — a read-only, filename-keyed scan, explicitly not a query surface, bounded by `PI_LOG_RETENTION_DAYS`. |

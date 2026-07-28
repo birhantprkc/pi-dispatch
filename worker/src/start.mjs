@@ -243,7 +243,7 @@ export async function startWorker(
 				openJobLog,
 				globalPiDir: config.globalPiDir, // REQ-GLOBAL-PI-OVERLAY: :ro overlay mount when configured
 				allowGlobalExtensions: config.allowGlobalExtensions,
-				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; only a job with packages:true receives them
+				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; every job receives them unless its trigger set packages:false
 				forwardEnv: config.forwardEnv,
 				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
 			}),

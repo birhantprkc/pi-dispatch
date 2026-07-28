@@ -136,7 +136,9 @@ function normalizeCron(on, run, index, path, state) {
 
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
 	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages stay
-	// absent the same way, so an unflagged trigger's schedule is byte-identical to today's.
+	// absent the same way -- and that matters more for `packages` now that absent means LOAD: writing a
+	// `true` in here would make the schedule payload claim an opt-in the operator never wrote, and would
+	// freeze today's default into every stored repeatable.
 	return {
 		on: { type: "cron", id, pattern },
 		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages },
@@ -144,11 +146,14 @@ function normalizeCron(on, run, index, path, state) {
 }
 
 /**
- * Validate the per-trigger `run.packages` opt-in, shared by all four normalizers. Cron and webhook jobs
- * load no third-party code by default; `run.packages: true` is the per-trigger opt-in that loads the pi
- * packages an operator pinned into the global overlay (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY).
- * Strictly boolean and fail-loud, because a truthy string silently handing a trigger third-party code with
- * open network egress is exactly the drift this validator exists to refuse.
+ * Validate the per-trigger `run.packages` flag, shared by all four normalizers. It is an opt-OUT: the pi
+ * packages an operator pinned into the global overlay load for every job, and `run.packages: false` is how a
+ * single trigger withholds them (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY). Absent and `true` both
+ * mean load; the default is resolved by the worker (run-container.mjs), never frozen into the file here.
+ *
+ * Still strictly boolean and still fail-loud, because the failure mode a loose parse produces has flipped
+ * rather than gone away: `"false"` as a string is a trigger whose operator believes it runs no third-party
+ * code while it loads all of it. A validator that accepted the string would make that belief undetectable.
  *
  * `at` is the caller's message prefix -- cron names its id, the webhook normalizers name their file index --
  * so every rejection still points at the entry the operator actually wrote. Returns the flag, undefined

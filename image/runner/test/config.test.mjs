@@ -66,6 +66,33 @@ test("optional retry knobs override their defaults and are validated too", () =>
 	assert.throws(() => parseRunnerEnv({ ...base, PI_RETRY_MAX: "0" }), (e) => e.piDispatchExit === EXIT_POLICY);
 });
 
+// --- REQ-GLOBAL-PI-OVERLAY: the overlay-extensions opt-OUT (PI_GLOBAL_ALLOW_EXTENSIONS) ---
+
+test("PI_GLOBAL_ALLOW_EXTENSIONS unset means LOAD -- the operator staged that dir themselves", () => {
+	// The worker emits nothing for the loading case, so "absent" is the shape almost every job arrives with.
+	assert.equal(parseRunnerEnv({ ...base }).allowGlobalExtensions, true);
+	assert.equal(parseRunnerEnv({ ...base, PI_GLOBAL_ALLOW_EXTENSIONS: "" }).allowGlobalExtensions, true);
+	assert.equal(parseRunnerEnv({ ...base, PI_GLOBAL_ALLOW_EXTENSIONS: "1" }).allowGlobalExtensions, true, "the legacy arming value still reads as ON");
+});
+
+test('PI_GLOBAL_ALLOW_EXTENSIONS="0" is the opt-out, and the only one', () => {
+	assert.equal(parseRunnerEnv({ ...base, PI_GLOBAL_ALLOW_EXTENSIONS: "0" }).allowGlobalExtensions, false);
+});
+
+test("a malformed PI_GLOBAL_ALLOW_EXTENSIONS is a config error (exit 2), never a guessed default", () => {
+	// The worker only ever emits "0" or nothing, so a third value means a hand-run container or a template
+	// regression. Guessing "load" runs extensions someone disabled; guessing "off" strips a flow's setup and
+	// still exits 0. Refusing is the only outcome that cannot lie about which happened. Mirrors the worker.
+	for (const bad of ["false", "true", "yes", "no", "2", " 0", "off"]) {
+		try {
+			parseRunnerEnv({ ...base, PI_GLOBAL_ALLOW_EXTENSIONS: bad });
+			assert.fail(`expected throw for PI_GLOBAL_ALLOW_EXTENSIONS=${JSON.stringify(bad)}`);
+		} catch (error) {
+			assert.equal(error.piDispatchExit, EXIT_POLICY, `PI_GLOBAL_ALLOW_EXTENSIONS=${JSON.stringify(bad)}`);
+		}
+	}
+});
+
 // --- INT-CONTAINER-JOB-INPUTS: staged pi packages (PI_PACKAGES) ---
 
 test("PI_PACKAGES unset or empty is no packages, not an error", () => {

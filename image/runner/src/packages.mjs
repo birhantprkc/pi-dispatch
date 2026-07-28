@@ -1,12 +1,119 @@
 /**
- * Staged pi packages: the two questions the runner must answer about them (INT-CONTAINER-JOB-INPUTS).
+ * What a job's session is allowed to load: the staged-package questions (INT-CONTAINER-JOB-INPUTS) and
+ * the admin-extension recursion guard (REQ-ADMIN-VIA-PI-EXTENSION).
  *
- * Both helpers here are PURE -- they take plain objects (diagnostics, path strings) and touch no
- * filesystem and no pi import, so the decisions they encode are testable without a container.
+ * Every helper here is PURE -- plain objects in (pi diagnostics, path strings, loaded-extension
+ * records), a decision out. No filesystem, no pi import; `node:path` is string arithmetic and reads
+ * nothing. So every decision this file encodes is testable without a container.
  */
+import { basename, dirname } from "node:path";
 
 /** Roots whose skills a staged package must never be able to replace. */
 export const PROTECTED_SKILL_ROOTS = ["/job/pi/skills", "/opt/pi-global/skills"];
+
+/**
+ * The admin extension, BY NAME -- a deliberate duplicate of `ADMIN_RE` in worker/src/import-pi.mjs.
+ *
+ * It cannot be imported. The job image installs the RUNNER's dependencies and the runner's source; the
+ * worker's is not in the container at all, so there is nothing to import from. The duplication is
+ * therefore forced, and the copy is the hazard: widen the worker's ADMIN_RE (a renamed admin package, a
+ * second admin name) without widening this one and the runner quietly stops recognising the very thing
+ * the worker refuses to stage -- a hole that opens with no failing test and no log line. CHANGE BOTH,
+ * IN THE SAME COMMIT. worker/src/import-pi.mjs is the original; worker/src/packages.mjs imports it for
+ * staged package names and dirs, and this file is the third reader.
+ */
+export const ADMIN_EXTENSION_RE = /pi-dispatch|dispatch-admin/i;
+
+/**
+ * The admin surface's tool namespace, which is what the guard is ACTUALLY defending against.
+ *
+ * A name catches an entry that admits what it is; this catches one that does not. The vector is not a
+ * filename, it is `dispatch_run` (enqueues a PAID job from inside a paid job), `dispatch_set` (moves
+ * the daily cap) and `dispatch_pause`/`_resume`/`_trigger_*` (durable queue controls) becoming
+ * LLM-callable inside a container whose prompt carries adversarial issue text. This project's own
+ * `.pi/extensions/dispatch.ts` is exactly that shape: two lines, a name no pattern would flag, and the
+ * whole admin tool set behind it. An extension that registers these tools IS the admin surface however
+ * it is spelled on disk.
+ *
+ * The cost is stated rather than hidden: a serviced repo whose own extension registers a `dispatch_*`
+ * tool loses it in job containers. That is a loud, logged drop an operator can rename around, traded
+ * against a silent paid recursion -- and no read tool is worth the other side of that trade.
+ */
+export const ADMIN_TOOL_RE = /^dispatch_/;
+
+/** `index.*` names nothing -- the DIRECTORY does. Covers the extensions pi will resolve: .ts and .js. */
+const INDEX_ENTRY_RE = /^index\.[cm]?[jt]sx?$/i;
+
+/**
+ * The name an extension is KNOWN BY: its file's basename, or `<dir>/index.js` when the file is the
+ * index pi resolved a directory to, because there the directory is the name.
+ *
+ * The name and NOT the full path, and that choice is the guard's whole precision. Matching
+ * ADMIN_EXTENSION_RE against a full path tests every ANCESTOR too, and an ancestor is not the
+ * extension: a checkout that happens to sit under a directory called `pi-dispatch` (this repo, on the
+ * operator's own host, and the tmpdir these tests run in) would have every one of its extensions
+ * dropped -- the guard failing open into "the serviced repo loads nothing", which is the failure mode
+ * that gets a guard deleted. The container's own roots are fixed (/workspace, /job/pi, /opt/pi-global),
+ * so a path test buys nothing there anyway.
+ *
+ * What the name test therefore catches: an entry that carries the admin name itself -- `pi-dispatch.ts`,
+ * `dispatch-admin/index.js`, `PI-Dispatch-admin.js`, a staged package dir named for the admin package.
+ * What it CANNOT catch: a re-export under any other name. That gap is real and it is why the tool-name
+ * signal above exists; neither signal alone closes this.
+ */
+export function extensionEntryName(path) {
+	if (typeof path !== "string" || path === "") return "";
+	const name = basename(path);
+	return INDEX_ENTRY_RE.test(name) ? `${basename(dirname(path))}/${name}` : name;
+}
+
+/** pi hands back a Map of registered tools; tests and callers may hand back plain names. */
+function toolNames(tools) {
+	if (tools instanceof Map) return [...tools.keys()];
+	if (Array.isArray(tools)) return tools;
+	return [];
+}
+
+/**
+ * Why this loaded extension must not reach the session, or null to keep it. Two independent signals,
+ * reported separately so a run log says which one fired -- they fail in different directions and an
+ * operator debugging a missing extension needs to know whether it was the name or the surface.
+ */
+export function adminExtensionReason(extension) {
+	if (ADMIN_EXTENSION_RE.test(extensionEntryName(extension?.path))) return "admin-name";
+	if (toolNames(extension?.tools).some((tool) => ADMIN_TOOL_RE.test(tool))) return "admin-tools";
+	return null;
+}
+
+/**
+ * Split pi's loaded extensions into the ones a job's session may have and the ones it may not
+ * (REQ-ADMIN-VIA-PI-EXTENSION Scope: the admin surface is the operator's, never a job's).
+ *
+ * FILTER, NOT REFUSE. The operator services this very repo, and this very repo ships an admin shim at
+ * `.pi/extensions/dispatch.ts` -- refusing the job would make self-hosting the one thing pi-dispatch
+ * cannot do. Dropping one extension leaves the job exactly as capable as it was before native
+ * extension discovery was turned on.
+ *
+ * `kept` is the ORIGINAL objects (order preserved: extension resolution is first-path-wins and the
+ * trust ordering lives in that order). `dropped` is a record built to be LOGGED -- entry name, owning
+ * root, reason -- and it carries no path field at all, so no caller can leak a host path or file
+ * content through it by accident. `roots` should be listed most-specific first; a staged package root
+ * lives UNDER /opt/pi-global, so an overlay-first list would attribute a package's extension to the
+ * overlay.
+ */
+export function partitionAdminExtensions(extensions = [], { roots = [] } = {}) {
+	const kept = [];
+	const dropped = [];
+	for (const extension of extensions ?? []) {
+		const reason = adminExtensionReason(extension);
+		if (!reason) {
+			kept.push(extension);
+			continue;
+		}
+		dropped.push({ name: extensionEntryName(extension?.path), root: owningRoot(extension?.path, roots), reason });
+	}
+	return { kept, dropped };
+}
 
 /**
  * Find staged-package skills that TRIED to shadow a repo or operator-overlay skill

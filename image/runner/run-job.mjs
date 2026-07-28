@@ -92,10 +92,15 @@ async function main() {
 	// project's .pi/settings.json cannot override our spend controls.
 	const settingsManager = SettingsManager.inMemory({ retry: { enabled: true, ...cfg.retry } });
 
+	// `log` is handed over so the loader's own findings arrive on THIS writer, with this job's id: the
+	// recursion guard drops an extension during reload() (see dropAdminExtensions), and a drop that
+	// landed on a second, id-less writer would be an operator's only clue to a missing tool while being
+	// unattributable to a run.
 	const resourceLoader = await buildLoadedResourceLoader({
 		settingsManager,
 		allowGlobalExtensions: cfg.allowGlobalExtensions,
 		packagePaths: cfg.packages,
+		log,
 	});
 
 	if (cfg.packages.length > 0) {

@@ -7,8 +7,11 @@
  * `auth.json` / env and reaches the container through the env allowlist, never a mounted file. So this
  * command copies only the safe subset and REFUSES a `models.json` that embeds a literal key.
  *
- * Copied:   models.json (definitions only, sanitized), skills/, APPEND_SYSTEM.md, and — only under
- *           --with-extensions — extensions/ (verbatim; the admin extension is hard-blocked).
+ * Copied:   models.json (definitions only, sanitized), skills/, APPEND_SYSTEM.md, and extensions/ (verbatim;
+ *           the admin extension is hard-blocked). Extensions come along BY DEFAULT -- staging is the vetting
+ *           step, and an overlay missing the operator's own extensions is not the setup they asked for --
+ *           with `--no-extensions` as the escape hatch. Every extension staged is PRINTED by name, because
+ *           this is the moment the operator can still see what is about to run inside every job container.
  * Staged:   packages/ — only under --with-packages — pinned third-party pi packages, installed here on the
  *           host so a job container can load them from the overlay with NO network access (issue #58).
  * Never:    auth.json, settings.json, sessions/, themes/, prompts/, tools/.
@@ -84,7 +87,9 @@ export async function runImportPi(argv = [], deps = {}) {
 		platform = process.platform,
 	} = deps;
 
-	const withExtensions = argv.includes("--with-extensions");
+	// Extensions are copied unless the operator says otherwise. `--with-extensions` is still accepted and is
+	// now a no-op, so an existing setup script keeps working and keeps meaning what it always meant.
+	const withExtensions = !argv.includes("--no-extensions");
 	const withPackages = argv.includes("--with-packages");
 	const from = flagValue(argv, "--from") ?? defaultFrom(env);
 	const to = flagValue(argv, "--to") ?? join(cwd, "pi-global");
@@ -141,18 +146,29 @@ export async function runImportPi(argv = [], deps = {}) {
 		results.push(["APPEND_SYSTEM.md", "global persona (layers under each repo's persona)"]);
 	}
 
-	// extensions/ — the sharp edge. Off unless --with-extensions; the admin extension is always blocked.
+	// extensions/ -- the sharp edge, and copied BY DEFAULT: the operator staged this overlay to be their own
+	// setup, and one they have to arm twice more is not that. The admin extension stays hard-blocked (it can
+	// enqueue paid jobs from inside a container: a recursion vector, not part of this relaxation).
+	//
+	// Every copied name is listed, not just counted. What lands here runs in every job container from the
+	// next job onward, so the operator gets ONE moment to read the actual names -- a bare "3 extensions" row
+	// would leave them re-deriving the list from a directory they cannot see from the worker host.
 	const extSrc = join(from, "extensions");
 	if (withExtensions && fs.existsSync(extSrc)) {
 		const { copied, blocked } = copyExtensions(fs, extSrc, join(to, "extensions"), out);
-		if (copied > 0) results.push(["extensions/", `${copied} extension${copied === 1 ? "" : "s"} — VET THESE`]);
+		if (copied.length > 0) {
+			results.push(["extensions/", `${copied.length} extension${copied.length === 1 ? "" : "s"} -- these LOAD in every job; VET THESE`]);
+			// Note-less rows: the printer emits them bare, so the names read as a list under the count above.
+			for (const name of copied) results.push([`  - ${name}`, ""]);
+		}
 		for (const name of blocked) out(`  blocked extension "${name}" — the admin extension must never run inside a job.\n`);
 		out(
 			"\n⚠ Extensions run code against adversarial input with open network egress and are NOT scanned for\n" +
-				"  secrets. Review every one, then arm them with PI_GLOBAL_ALLOW_EXTENSIONS=1 (they stay dormant otherwise).\n",
+				"  secrets. They load in every job as staged -- review every one listed below, and set\n" +
+				"  PI_GLOBAL_ALLOW_EXTENSIONS=0 in .env if you need them off.\n",
 		);
 	} else if (fs.existsSync(extSrc)) {
-		results.push(["extensions/", "skipped — re-run with --with-extensions to include (the risky part)"]);
+		results.push(["extensions/", "skipped -- --no-extensions was passed (nothing from extensions/ reaches a job)"]);
 	}
 
 	// packages/ — pinned third-party pi packages, staged from npm on THIS host so the job container never
@@ -171,7 +187,9 @@ export async function runImportPi(argv = [], deps = {}) {
 	}
 
 	out(`Imported the credential-free subset of ${from} → ${to}\n\n`);
-	for (const [name, note] of results) out(`  ${name.padEnd(18)} ${note}\n`);
+	// A note-less row is a list item under the row above it (the extension names), so it prints bare rather
+	// than padded out to a column that has nothing to hold.
+	for (const [name, note] of results) out(note ? `  ${name.padEnd(18)} ${note}\n` : `  ${name}\n`);
 	out(`\n  (auth.json, settings.json, sessions/ are never copied — your credential stays in env/auth.json.)\n`);
 	out(nextSteps(to, withExtensions, withPackages));
 	return 0;
@@ -194,9 +212,12 @@ function copyNamedDirs(fs, src, dst, out) {
 	return n;
 }
 
-/** Like copyNamedDirs but reports the admin extension it refuses to copy. */
+/**
+ * Like copyNamedDirs but reports the admin extension it refuses to copy. Returns the NAMES copied, not a
+ * count: the caller prints them, so the operator sees exactly what is now going into job containers.
+ */
 function copyExtensions(fs, src, dst, out) {
-	let copied = 0;
+	const copied = [];
 	const blocked = [];
 	for (const name of fs.readdirSync(src)) {
 		if (ADMIN_RE.test(name)) {
@@ -212,7 +233,7 @@ function copyExtensions(fs, src, dst, out) {
 		if (st.isSymbolicLink?.()) continue;
 		if (st.isDirectory()) copyTree(fs, childSrc, join(dst, name));
 		else fs.copyFileSync(childSrc, join(dst, name));
-		copied++;
+		copied.push(name);
 	}
 	return { copied, blocked };
 }
@@ -418,10 +439,12 @@ function flagValue(argv, flag) {
 
 function nextSteps(to, withExtensions, withPackages) {
 	const steps = [`Set PI_GLOBAL_PI_DIR=${to} in .env`, "pi-dispatch doctor        # verifies the overlay is credential-free"];
-	if (withExtensions) steps.push("After vetting, set PI_GLOBAL_ALLOW_EXTENSIONS=1 in .env to load the overlay's extensions");
-	// Staged packages are inert until a trigger asks for them -- nothing loads them otherwise, which would
-	// otherwise read as "staging silently did nothing".
-	if (withPackages) steps.push('Set `run.packages: true` on each trigger in triggers.json that needs the staged packages -- nothing loads them otherwise');
+	// The vetting step is no longer a switch to flip -- it already happened by staging. What is left is the
+	// off switch, named here so an operator who does not want the extensions is not left hunting for it.
+	if (withExtensions) steps.push("Vet the extensions listed above -- they load in every job; set PI_GLOBAL_ALLOW_EXTENSIONS=0 in .env to disable them");
+	// Same inversion for packages: staging is what loads them, so the step worth naming is how to withhold
+	// them from a trigger that should not run third-party code.
+	if (withPackages) steps.push('Staged packages load in every job -- set `run.packages: false` on any trigger in triggers.json that must not load them');
 	return `
 Next:
 ${steps.map((step, i) => `  ${i + 1}. ${step}\n`).join("")}`;

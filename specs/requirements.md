@@ -92,8 +92,19 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   point where the design document was wrong and nothing would have told us:
   - the baked `APPEND_SYSTEM.md` **and** a per-flow append both appear in the assembled prompt
     (the `??` trap drops the persona with no error, as does a forgotten `reload()`);
-  - a hostile `AGENTS.md` fixture's sentinel appears **nowhere** in the assembled prompt (`-nc` holds —
-    and note it is off by default, so this asserts against an *omission*);
+  - the repo's `AGENTS.md` fixture sentinel appears in `getAgentsFiles()` and **nowhere in the append
+    block** — the *inverse* of what this bullet asserted while `CONST-NO-CONTEXT-FILES-MANDATORY`
+    mandated `noContextFiles: true`, and the acceptance clause of the amendment that replaced it. The
+    silent failure being guarded moved rather than vanished: it used to be "discovery was left on by
+    omission", and is now "the repo's conventions stopped arriving, or arrived spliced into the safety
+    floor". Both are invisible at runtime, which is why the assertion is still here;
+  - a repo `.pi/extensions` entry's factory **ran**, while an admin-named or `dispatch_*`-registering one
+    is **absent** from the loaded set — the recursion guard, pinned on outcome rather than on the flag,
+    because project-resource discovery hangs on a pi default (`isProjectTrusted()`) that would take this
+    whole path down without a word if it flipped;
+  - a repo skill resolves **once**, from `/job/pi/skills` — `noSkills` staying `true` is what keeps the
+    pinned-SHA read-only mount the copy in force, and a regression there is a silent swap to the writable
+    working tree, not an error;
   - Chromium launches as the non-root runtime user (the `PLAYWRIGHT_BROWSERS_PATH` collision);
   - `pi -p` exits 0 (catches a flag rename);
   - the runner's turn budget fires at N **and exits 2** — not 0;
@@ -555,12 +566,19 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   last; the baked `HARD_RULES.md` floor stays first and unremovable. The overlay is **credential-free by
   construction**: `pi-dispatch import-pi` stages the safe subset of `~/.pi/agent` (honoring
   `PI_CODING_AGENT_DIR`), **refusing** a `models.json` with a literal key and **never** copying `auth.json`
-  or `settings.json`; `pi-dispatch doctor` re-verifies. Overlay **extensions are fail-closed**: copied only
-  under `import-pi --with-extensions` (the admin extension hard-blocked), and loaded only when the operator
-  arms `PI_GLOBAL_ALLOW_EXTENSIONS=1`. A custom provider's key reaches the container through the explicit
-  `PI_FORWARD_ENV` name allowlist, never a host pass-through.
+  or `settings.json`; `pi-dispatch doctor` re-verifies. Overlay **extensions are staged and loaded by
+  DEFAULT**: `import-pi` copies `extensions/` unless the operator passes `--no-extensions`, **prints every
+  extension it staged by name** (the vetting step is a list the operator can read, not a flag they can
+  forget), and still **hard-blocks the admin extension**; they then load in every job unless
+  `PI_GLOBAL_ALLOW_EXTENSIONS` is exactly `"0"`. The knob is an **opt-OUT**, and unset, `""` and the legacy
+  `"1"` all mean load; **any other value is a loud `configError`** at all three enforcement points (worker
+  config, env-allowlist, runner config) — the strict parse is unchanged but what it defends against
+  flipped, since `=false` used to degrade safely to "dormant" and would now silently mean "on".
+  A custom provider's key reaches the container through the explicit `PI_FORWARD_ENV` name allowlist,
+  never a host pass-through.
   The overlay additionally carries **operator-staged pi packages** at `packages/<dir>/`, and they are the
-  sharpest tier of all — third-party code, so they are gated **four** times over. (1) The operator declares
+  sharpest tier of all — third-party code, so they pass **four** gates, three of which refuse by default
+  and the fourth of which is a withdrawal. (1) The operator declares
   each one in a pinned `pi-packages.json` at an **EXACT** version (`INT-PI-PACKAGES-FILE-CONTRACT`;
   `CONST-PI-VERSION-PINNED`'s reasoning, since a floating range makes every queued job a silent no-op that
   still reports success). (2) `pi-dispatch import-pi --with-packages` stages each one **on the host** into
@@ -569,8 +587,11 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   version, an **admin-like name** (a package that can enqueue paid jobs from inside a job container is the
   same recursion vector the admin extension is blocked for), a package that contributes no pi resources, a
   manifest entry that leaves the package dir, a missing transitive dependency, or a colliding staged dir.
-  (3) A **per-trigger** `run.packages: true` (all four trigger kinds; `INT-TRIGGERS-FILE-CONTRACT`) is what
-  makes the worker emit `PI_PACKAGES` at all — nothing loads them otherwise. (4) The runner validates every
+  (3) A **per-trigger** `run.packages` (all four trigger kinds; `INT-TRIGGERS-FILE-CONTRACT`) decides
+  whether the worker emits `PI_PACKAGES` — an **opt-OUT**: absent or `true` loads what the operator staged,
+  and only an explicit `false` withholds it, since staging is itself the deliberate act and the flag exists
+  so one flow can decline what the deployment pinned. `parseTriggers` still refuses a non-boolean at load,
+  which is now the *only* place that strictness lives. (4) The runner validates every
   path, **refuses the job pre-spend** when one did not mount, appends them **last** to
   `additionalExtensionPaths`, and re-imposes this requirement's own **"repo wins on conflict"** on skills
   through the loader's declared `skillsOverride` seam, so a staged package can never take the name of a repo
@@ -580,14 +601,22 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   (`import-pi`) and `doctor` checks. Works with the **pulled** prebuilt image — a runtime mount, not a
   rebuild. Distinct from the per-repo `.pi/` (trusted-by-merge, materialized from a git SHA) and from the
   admin-editable runtime settings overlay (which still may never carry persona). Staged packages ride the
-  **same** `/opt/pi-global:ro` mount — no new mount, no new trust boundary — and are inert until a trigger
-  arms them. The admin panel **displays** armed triggers and the staged `name@version` set and deliberately
-  **cannot set** the flag: arming third-party code is a reviewed file edit, not a keystroke.
+  **same** `/opt/pi-global:ro` mount — no new mount, no new trust boundary — and load for every job whose
+  trigger did not set `run.packages: false`. The admin panel **displays** each trigger's packages state and
+  the staged `name@version` set and deliberately **cannot set** the flag: changing which flows run
+  third-party code is a reviewed file edit, not a keystroke.
 - **Why**: Anyone who already runs pi has a configured `~/.pi/agent`; re-expressing it per-repo is friction
   the missing-layer pitch should remove. The overlay is **operator deploy-time config — the same trust class
   as baking the image** — so it may carry a persona layer, but it is mounted `:ro` into an adversarial-input
-  container, so it must hold no secret (`CONST-TOKEN-SCOPED-PER-JOB`) and extensions (arbitrary code, open
-  egress) stay opt-in and armed separately.
+  container, so it must hold no secret (`CONST-TOKEN-SCOPED-PER-JOB`).
+  **Why the overlay's extensions load by default.** An operator vetted this code twice before it ever
+  reached the overlay: once by running it in their own `~/.pi/agent`, and once by staging it with
+  `import-pi`, which prints every extension it copied. A third gate is friction, not safety — and the
+  friction had a cost, because an overlay that is present but dormant is a deployment silently missing the
+  setup its flows were written against, with no error to read. The setup the operator staged is the setup
+  their jobs get. That relaxation stops at the overlay: it never touches the spend caps, the per-job token
+  scoping, or the admin-extension block, and `PI_GLOBAL_ALLOW_EXTENSIONS=0` remains a one-line opt-out for
+  a deployment that wants them dormant.
   **Why packages are staged on the host rather than installed in the job.** pi resolves any spec that is not
   `npm:`/`git:`/a URL as a **local path** — in place, with no install, no network and no writes — which is
   exactly what lets a job container load one with egress denied and `--ignore-scripts` already behind it.
@@ -608,15 +637,21 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
   same name overrides it; the assembled prompt shows guardrails before the global persona before the repo
   persona; given a custom model in the overlay `models.json`, the runner resolves it; given `import-pi`
   against a `models.json` with a literal key, it refuses and writes nothing; given `auth.json` in the
-  overlay, `doctor` fails; given overlay extensions with `PI_GLOBAL_ALLOW_EXTENSIONS` unset, they do not
-  load; given `import-pi --with-extensions` over the admin extension, it is not copied.
+  overlay, `doctor` fails; given overlay extensions with `PI_GLOBAL_ALLOW_EXTENSIONS` unset, empty, or
+  `"1"`, they **load**; given exactly `"0"`, they do not; given any other value — `"false"`, `"yes"`,
+  `"true"` — the worker **refuses to boot**, the env-allowlist and the runner both refuse, and `doctor`
+  reports it as a hard failure rather than guessing a direction; given `import-pi` with no flags, the
+  overlay's extensions **are** copied and every one is printed by name; given `--no-extensions`, none is;
+  given either, over the admin extension, it is not copied.
   **Staged packages.** Given a `pi-packages.json` entry with a ranged version, an admin-like name, a `dir`
   that is not a plain segment, a duplicate `dir`, a package with no `pi` manifest and no resource dir, a
   `pi` manifest entry containing `..` or a leading `/`, or a dependency npm hoisted out of the package dir,
   when `import-pi --with-packages` runs, then it refuses and **nothing at all is staged** (all-or-nothing);
-  given a staged set and a trigger **without** `run.packages`, then `PI_PACKAGES` is not emitted and no
-  package loads; given `run.packages: true`, then one staged dir contributes **both** extensions and skills
-  despite `noExtensions`/`noSkills`, and the extension paths sort **after** the repo's and the overlay's;
+  given a staged set and a trigger **without** `run.packages`, then `PI_PACKAGES` **is** emitted and one
+  staged dir contributes **both** extensions and skills — through the explicit `additionalExtensionPaths`
+  channel, which `reload()` honours regardless of `noSkills` — and the extension paths sort **after** the
+  repo's, the overlay's, and anything discovered under `/workspace`; given `run.packages: false`, then
+  `PI_PACKAGES` is not emitted and no package loads;
   given a `PI_PACKAGES` entry that is relative, contains `..`, or does not exist in the container, then the
   runner refuses **before any provider call** with exit `2`; given a staged skill whose name collides with a
   repo or overlay skill, then the **repo (or overlay) skill is the one in force** — pi's raw load hands the
@@ -646,6 +681,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-07-28 | **The pi-normal discovery posture, and operator-staged code on by default** (`CONST-NO-CONTEXT-FILES-MANDATORY` amended in the same change). `REQ-UPSTREAM-CONTRACT-TESTS`: the `AGENTS.md` bullet is **inverted** — it asserted the sentinel appears **nowhere** in the assembled prompt (`-nc` holds) and now asserts it appears in `getAgentsFiles()` and **nowhere in the append block**, because the shipped loader sets `noContextFiles: false`. Two bullets added, both pinned on **outcome** rather than on a flag: a repo `.pi/extensions` factory ran while an admin-named or `dispatch_*`-registering one is absent (project-resource discovery hangs on pi's `isProjectTrusted()` default, which would take the path down silently if it flipped), and a repo skill resolves **once** from `/job/pi/skills`. The silent failure this REQ exists for did not vanish, it **moved**, and the entry says so. `REQ-GLOBAL-PI-OVERLAY`: overlay extensions are **staged and loaded by default** — `import-pi` copies `extensions/` unless `--no-extensions` and **prints every extension it staged by name** (the vetting step is a list, not a flag), the admin extension is still hard-blocked, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives only as an **opt-OUT** where unset/`""`/legacy `"1"` load, exactly `"0"` disables, and **any other value is a loud `configError` at all three enforcement points** — the strict parse is unchanged but the damaging misreading flipped, since `=false` used to degrade safely to "dormant" and would now silently mean "on". A new `Why` paragraph records the reasoning: the operator vetted the code twice (running it in `~/.pi/agent`, staging it with a printed list), so a third gate is friction, and a present-but-dormant overlay is a deployment silently missing the setup its flows were written against. `run.packages` inverted to an **opt-OUT** on all four trigger kinds (absent or `true` load; only `false` withholds), with `parseTriggers`' load-time boolean validation now the only place that strictness lives; the four-gate framing restated honestly as three gates that refuse by default plus one withdrawal, and `Scope`'s "inert until a trigger arms them" corrected. Acceptance updated throughout for both inversions. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
 | 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
 | 2026-07-17 | Added REQ-CRON-SCHEDULED-JOBS, formalizing the implemented BullMQ Job Scheduler cron path: `local`-only triggers, loud `-10`/`-11` handling, per-scheduler stall teardown, startup orphan reconcile, and no in-tick retry. |
