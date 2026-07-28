@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { CONTAINER_PACKAGES_ROOT, containerPackagePaths, parsePackagesFile, readStageManifest, stagedDirName } from "../src/packages.mjs";
+
+// parsePackagesFile is pure over the file TEXT -- no fs (mirrors triggers.test.mjs).
+const PATH = "/pi-packages.json";
+const parse = (packages) => parsePackagesFile(JSON.stringify({ packages }), PATH);
+const isConfigError = (e) => e.piDispatchConfig === true;
+
+const OK = { name: "@quintinshaw/pi-dynamic-workflows", version: "0.1.0" };
+
+// --- stagedDirName ---
+
+test("stagedDirName flattens a scope into one path segment and leaves a plain name alone", () => {
+	assert.equal(stagedDirName("@quintinshaw/pi-dynamic-workflows"), "quintinshaw__pi-dynamic-workflows");
+	assert.equal(stagedDirName("pi-widgets"), "pi-widgets");
+	assert.equal(stagedDirName("@a/b"), "a__b");
+	assert.equal(stagedDirName("@scope.io/name_2.x"), "scope.io__name_2.x");
+	assert.equal(stagedDirName("a/b").includes("/"), false, "the staged dir is ONE segment -- never a nested path");
+});
+
+// --- parsePackagesFile: the happy path ---
+
+test("a valid packages file normalizes to {name, version, dir}, dir defaulting from the name", () => {
+	const parsed = parse([OK, { name: "pi-widgets", version: "1.4.2-rc.1+build.9", dir: "widgets" }]);
+	assert.deepEqual(parsed, [
+		{ name: "@quintinshaw/pi-dynamic-workflows", version: "0.1.0", dir: "quintinshaw__pi-dynamic-workflows" },
+		{ name: "pi-widgets", version: "1.4.2-rc.1+build.9", dir: "widgets" },
+	]);
+});
+
+test("an empty packages array is valid -> []", () => {
+	assert.deepEqual(parse([]), []);
+});
+
+test("invalid JSON and a missing packages array are config errors naming the path", () => {
+	assert.throws(() => parsePackagesFile("{ not json", PATH), (e) => isConfigError(e) && e.message.includes(PATH));
+	assert.throws(() => parsePackagesFile(JSON.stringify({ nope: [] }), PATH), (e) => isConfigError(e) && e.message.includes(PATH));
+	assert.throws(() => parsePackagesFile(JSON.stringify({ packages: {} }), PATH), isConfigError);
+});
+
+// --- parsePackagesFile: refusals ---
+
+test("a non-object entry is a config error", () => {
+	assert.throws(() => parse([7]), isConfigError);
+	assert.throws(() => parse(["@scope/name"]), isConfigError);
+	assert.throws(() => parse([null]), isConfigError);
+	assert.throws(() => parse([["@scope/name", "1.0.0"]]), isConfigError);
+});
+
+test("a missing or malformed name is refused", () => {
+	assert.throws(() => parse([{ version: "1.0.0" }]), (e) => isConfigError(e) && /name/.test(e.message));
+	assert.throws(() => parse([{ name: "", version: "1.0.0" }]), isConfigError);
+	assert.throws(() => parse([{ name: "Has Spaces", version: "1.0.0" }]), (e) => isConfigError(e) && /npm package name/.test(e.message));
+	assert.throws(() => parse([{ name: "../escape", version: "1.0.0" }]), isConfigError);
+	assert.throws(() => parse([{ name: `a${"b".repeat(220)}`, version: "1.0.0" }]), (e) => isConfigError(e) && /214/.test(e.message));
+});
+
+test("the admin package is refused by name and by dir -- it can enqueue paid jobs", () => {
+	assert.throws(() => parse([{ name: "@edgehero/pi-dispatch-admin", version: "1.0.0" }]), (e) => isConfigError(e) && /admin/.test(e.message));
+	assert.throws(() => parse([{ name: "dispatch-admin", version: "1.0.0" }]), isConfigError);
+	assert.throws(() => parse([{ name: "pi-widgets", version: "1.0.0", dir: "pi-dispatch" }]), (e) => isConfigError(e) && /admin/.test(e.message));
+});
+
+test("a missing version is refused", () => {
+	assert.throws(() => parse([{ name: "pi-widgets" }]), (e) => isConfigError(e) && /version/.test(e.message));
+	assert.throws(() => parse([{ name: "pi-widgets", version: "" }]), isConfigError);
+	assert.throws(() => parse([{ name: "pi-widgets", version: 1 }]), isConfigError);
+});
+
+test("a RANGE, tag, or wildcard version is refused, and the message explains the silent-no-op failure", () => {
+	for (const version of ["^1.0.0", "~1.0.0", "latest", "1.x", "*", ">=1.0.0", "1.0", "next"]) {
+		assert.throws(
+			() => parse([{ name: "pi-widgets", version }]),
+			(e) => isConfigError(e) && /EXACT/.test(e.message) && /no-op/.test(e.message) && /CONST-PI-VERSION-PINNED/.test(e.message),
+			`version ${version} must be refused`,
+		);
+	}
+});
+
+test("a dir that is not a plain, contained segment is refused, pointing at an explicit dir", () => {
+	assert.throws(() => parse([{ ...OK, dir: "../escape" }]), (e) => isConfigError(e) && /dir/.test(e.message));
+	assert.throws(() => parse([{ ...OK, dir: ".." }]), isConfigError);
+	assert.throws(() => parse([{ ...OK, dir: "nested/dir" }]), isConfigError);
+	assert.throws(() => parse([{ ...OK, dir: "/abs" }]), isConfigError);
+	assert.throws(() => parse([{ ...OK, dir: "" }]), isConfigError);
+	assert.throws(() => parse([{ ...OK, dir: 7 }]), isConfigError);
+});
+
+test("a dir over 64 characters is refused (including one DERIVED from a long name)", () => {
+	assert.throws(() => parse([{ ...OK, dir: "d".repeat(65) }]), (e) => isConfigError(e) && /64/.test(e.message) && /"dir"/.test(e.message));
+	const longName = `@${"s".repeat(30)}/${"n".repeat(40)}`;
+	assert.throws(() => parse([{ name: longName, version: "1.0.0" }]), (e) => isConfigError(e) && /64/.test(e.message));
+	assert.deepEqual(parse([{ name: longName, version: "1.0.0", dir: "short" }])[0].dir, "short", "an explicit dir is the fix");
+});
+
+test("two packages sharing one staged dir are refused, naming BOTH", () => {
+	assert.throws(
+		() => parse([{ name: "@a/widgets", version: "1.0.0", dir: "widgets" }, { name: "@b/widgets", version: "2.0.0", dir: "widgets" }]),
+		(e) => isConfigError(e) && e.message.includes("@a/widgets") && e.message.includes("@b/widgets"),
+	);
+});
+
+// --- readStageManifest: the never-throws direction ---
+
+test("readStageManifest returns the manifest when the staged receipt is well-formed", () => {
+	const manifest = { stagedAt: "2026-07-28T00:00:00.000Z", packages: [{ name: "@a/b", version: "1.0.0", dir: "a__b", extra: "dropped" }] };
+	const got = readStageManifest({
+		globalPiDir: "/opt/overlay",
+		fileExists: () => true,
+		readFile: () => JSON.stringify(manifest),
+	});
+	assert.deepEqual(got, { stagedAt: "2026-07-28T00:00:00.000Z", packages: [{ name: "@a/b", version: "1.0.0", dir: "a__b" }] });
+});
+
+test("readStageManifest returns null and NEVER throws on missing, unreadable, or garbage input", () => {
+	const read = (text, fileExists = () => true) => readStageManifest({ globalPiDir: "/opt/overlay", fileExists, readFile: () => text });
+	assert.equal(readStageManifest({ globalPiDir: null }), null, "overlay off");
+	assert.equal(readStageManifest({}), null);
+	assert.equal(read("{}", () => false), null, "missing file");
+	assert.equal(read("{ not json"), null);
+	assert.equal(read("null"), null);
+	assert.equal(read(JSON.stringify({ packages: "nope" })), null);
+	assert.equal(read(JSON.stringify({ packages: [7] })), null);
+	assert.equal(read(JSON.stringify({ packages: [{ name: "@a/b", version: "1.0.0" }] })), null, "an entry without a dir is garbage");
+	assert.equal(read(JSON.stringify({ packages: [{ name: "@a/b", version: "1.0.0", dir: "../escape" }] })), null, "a dir that escapes is garbage");
+	assert.equal(
+		readStageManifest({
+			globalPiDir: "/opt/overlay",
+			fileExists: () => true,
+			readFile: () => {
+				throw new Error("EACCES");
+			},
+		}),
+		null,
+		"an unreadable manifest degrades to nothing staged, it does not crash the worker",
+	);
+	assert.deepEqual(read(JSON.stringify({ packages: [] })), { stagedAt: null, packages: [] });
+});
+
+// --- containerPackagePaths: the Windows path.join trap ---
+
+test("containerPackagePaths builds POSIX container paths -- forward slashes even on Windows", () => {
+	const paths = containerPackagePaths({ packages: [{ name: "@a/b", version: "1.0.0", dir: "a__b" }, { name: "w", version: "1.0.0", dir: "widgets" }] });
+	// The LITERAL strings: these are paths INSIDE the Linux container, so path.join (backslashes on a
+	// Windows worker host) would produce a spec pi cannot resolve.
+	assert.deepEqual(paths, ["/opt/pi-global/packages/a__b", "/opt/pi-global/packages/widgets"]);
+	assert.equal(paths.some((p) => p.includes("\\")), false, "never a backslash");
+	assert.equal(CONTAINER_PACKAGES_ROOT, "/opt/pi-global/packages");
+});
+
+test("containerPackagePaths is empty for a null/garbage manifest (the overlay simply has nothing staged)", () => {
+	assert.deepEqual(containerPackagePaths(null), []);
+	assert.deepEqual(containerPackagePaths(undefined), []);
+	assert.deepEqual(containerPackagePaths({}), []);
+	assert.deepEqual(containerPackagePaths({ packages: [] }), []);
+	assert.deepEqual(containerPackagePaths({ packages: [{ name: "x", version: "1.0.0" }] }), []);
+});

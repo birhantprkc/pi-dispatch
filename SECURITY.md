@@ -191,6 +191,27 @@ Stated openly rather than discovered later:
   egress** and are not scanned for secrets: keep `PI_GLOBAL_ALLOW_EXTENSIONS` unset until you have vetted
   every one, and never place the admin extension in the overlay (it can enqueue paid jobs — a recursion
   vector; `import-pi` blocks it).
+- **Staged pi packages are third-party code you are choosing to run against adversarial input.** They live
+  inside the same overlay and are gated four times: an **exact** version in `pi-packages.json` (a floating
+  range turns a silent upstream release into every queued job becoming a no-op that still reports success),
+  host-side staging by `import-pi --with-packages`, a **per-trigger** `"packages": true` (nothing loads them
+  otherwise — there is deliberately no env flag that arms them fleet-wide), and runner-side validation: a
+  package that did not mount is refused before any spend, and a package skill that takes the name of a repo
+  or overlay skill loses — the repo's stays in force, and the attempt is logged. Two facts to hold on to.
+  Staging runs
+  `npm install --ignore-scripts`: **without that flag a package's — and every transitive dependency's —
+  lifecycle scripts would run AS YOU, ON YOUR HOST**, at stage time, which is a host compromise and not a
+  job one; the price is that a package needing a build step is staged INCOMPLETE and may fail at run time
+  (`import-pi` warns by name). And a package whose name looks like the dispatch admin is refused outright,
+  the same recursion block the admin extension gets. Jobs run with `PI_OFFLINE=1` set unconditionally, so a
+  package source can never become a network install from inside a container. Vet each one and pin it; you
+  are extending your own trust boundary to whoever publishes it.
+- **Token and cost accounting is process-wide, but it is not process-tree-wide.** The recorded totals cover
+  every session inside the job container's Node process, including subagent sessions an extension spawns,
+  and the per-job token budget is enforced against that total. A staged package that spawns a **`pi`
+  subprocess** is outside it: those tokens are spent, billed, and absent from the run record and the daily
+  token counter. `PI_MAX_TURNS` likewise bounds only the root session's turns. The backstops there are the
+  30-minute container timeout, the job-count caps, and your provider-side spend limit — not the meter.
 - **The admin surface is not a network service.** It is a pi extension in your own terminal session plus
   a `settings.json` file — it binds no port. Whoever can run pi with the extension loaded, or write
   `PI_SETTINGS_FILE`, holds operator power: the same trust as shell access on the host. Treat it that way.

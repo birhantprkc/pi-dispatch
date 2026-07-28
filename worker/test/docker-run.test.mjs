@@ -58,6 +58,27 @@ test("env is an explicit -e NAME=VALUE allowlist, never a pass-through or --env-
 	}
 });
 
+/** Every `-v` VALUE in argv, in order -- the enumerated mount list CONST-ISOLATION-CONTAINER-PER-JOB pins. */
+function mounts(args) {
+	return args.filter((_a, i) => args[i - 1] === "-v");
+}
+
+test("PI_PACKAGES rides the env allowlist and adds NO mount -- the staged packages live under the existing overlay bind", () => {
+	const withPkgs = buildDockerRunArgs({ ...base, env: { ...base.env, PI_PACKAGES: "/a:/b" } });
+	const i = withPkgs.indexOf("PI_PACKAGES=/a:/b");
+	assert.ok(i > 0, "the joined package paths must be passed as an explicit -e value");
+	assert.equal(withPkgs[i - 1], "-e", "PI_PACKAGES is an env entry, not a flag of its own");
+
+	const without = buildDockerRunArgs({ ...base, env: { ...base.env, PI_PACKAGES: undefined } });
+	assert.ok(!without.some((a) => a.startsWith("PI_PACKAGES")), "an unflagged job must have no PI_PACKAGES element at all, not an empty one");
+
+	// The mount list is the security boundary: staging packages must never widen it. Both argvs carry
+	// exactly the mounts the base job already had.
+	const expected = mounts(buildDockerRunArgs(base));
+	assert.deepEqual(mounts(withPkgs), expected, "a packages job must add no new -v mount");
+	assert.deepEqual(mounts(without), expected, "and neither does the unflagged one");
+});
+
 test("an undefined env value is skipped, not passed as empty", () => {
 	const args = buildDockerRunArgs({ ...base, env: { PI_MODEL: "m", GITHUB_TOKEN: undefined } });
 	assert.ok(!args.some((a) => a.startsWith("GITHUB_TOKEN")), "absent token must not appear at all");

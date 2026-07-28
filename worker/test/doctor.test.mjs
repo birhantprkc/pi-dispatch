@@ -128,12 +128,34 @@ test("doctor: a missing .env is a warning, not a hard failure", async () => {
 
 // The overlay checks read real files (doctor uses real readFileSync for models.json), so use temp dirs and
 // doctor's default fileExists; the docker/valkey checks stay faked green so ONLY the overlay drives the outcome.
-function overlay({ auth = false, models, extensions = false } = {}) {
+// `packages` is the stage manifest's entry list; each entry's dir is created alongside it UNLESS the entry
+// carries `stage: false` (the manifest-names-a-dir-that-is-gone case). `packagesNoManifest` creates the
+// packages/ dir with no packages.json in it — staged bytes nothing knows the names of.
+function overlay({ auth = false, models, extensions = false, packages, packagesNoManifest = false } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-overlay-"));
 	if (auth) writeFileSync(join(dir, "auth.json"), "{}");
 	if (models !== undefined) writeFileSync(join(dir, "models.json"), models);
 	if (extensions) mkdirSync(join(dir, "extensions", "x"), { recursive: true });
+	if (packages || packagesNoManifest) {
+		const pkgDir = join(dir, "packages");
+		mkdirSync(pkgDir, { recursive: true });
+		for (const p of packages ?? []) if (p.stage !== false) mkdirSync(join(pkgDir, p.dir), { recursive: true });
+		if (!packagesNoManifest) {
+			const entries = (packages ?? []).map(({ name, version, dir: d }) => ({ name, version, dir: d }));
+			writeFileSync(join(pkgDir, "packages.json"), JSON.stringify({ stagedAt: "2026-07-28T00:00:00.000Z", packages: entries }));
+		}
+	}
 	return dir;
+}
+
+// Doctor counts armed triggers with the SHARED parseTriggers, so the fixture must write a file that really
+// validates — a stub `{triggers:[{run:{packages:true}}]}` would be swallowed by the never-throw guard and
+// silently count 0, making every ARMED assertion pass for the wrong reason.
+function triggersFile(packages) {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-")), "triggers.json");
+	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", ...(packages === undefined ? {} : { packages }) };
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run }] }));
+	return path;
 }
 const overlayEnv = (dir, extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_GLOBAL_PI_DIR: dir, ...extra });
 const overlayDeps = (out) => ({ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" });
@@ -172,6 +194,83 @@ test("doctor: a clean overlay passes; armed extensions are a warning, not a fail
 	const code = await runDoctor(overlayEnv(armed, { PI_GLOBAL_ALLOW_EXTENSIONS: "1" }), overlayDeps(o2));
 	assert.equal(code, 0, "armed extensions warn (⚠) but do not fail doctor");
 	assert.match(t2(), /⚠ Overlay extensions present and ARMED/);
+});
+
+// Staged packages (REQ-GLOBAL-PI-OVERLAY): the staged set, its arming state, and every way the pair goes
+// wrong SILENTLY — the flow runs without the tools it was written for and still exits 0.
+const pkg = (over = {}) => ({ name: "pi-fmt", version: "1.2.3", dir: "pi-fmt", ...over });
+
+test("doctor: staged packages that no trigger arms are reported dormant, and pass", async () => {
+	const dir = overlay({ packages: [pkg(), pkg({ name: "pi-lint", version: "0.4.0", dir: "pi-lint" })] });
+	const { out, text } = capture();
+	// packages: false proves the count is strictly `=== true`, not truthiness of a present flag.
+	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(false) }), overlayDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ Staged packages present \(pi-fmt@1\.2\.3, pi-lint@0\.4\.0\)/, "the pinned versions are named");
+	assert.match(text(), /✓ Staged packages present but dormant \(no trigger sets run\.packages: true\)/);
+	assert.doesNotMatch(text(), /ARMED/);
+});
+
+test("doctor: staged packages armed by a trigger warn (⚠) but do not fail", async () => {
+	const dir = overlay({ packages: [pkg()] });
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(dir, { PI_TRIGGERS_FILE: triggersFile(true) }), overlayDeps(out));
+	assert.equal(code, 0, "armed packages warn like armed extensions — a vetted stage is a valid deployment");
+	assert.match(text(), /⚠ Staged packages ARMED on 1 trigger\(s\) \(run\.packages: true\)/);
+	assert.match(text(), /keep every version exactly pinned/);
+});
+
+test("doctor: a manifest entry whose staged dir is gone fails", async () => {
+	const dir = overlay({ packages: [pkg(), pkg({ name: "pi-lint", version: "0.4.0", dir: "pi-lint", stage: false })] });
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(dir), overlayDeps(out));
+	assert.equal(code, 1, "a name with no dir behind it loads nothing, and pi reports nothing");
+	assert.match(text(), /✗ Staged packages present \(pi-fmt@1\.2\.3, pi-lint@0\.4\.0\)/);
+	assert.match(text(), /staged dir missing for pi-lint/, "only the entry that is actually gone is named");
+});
+
+test("doctor: a packages/ dir with no manifest fails — nothing knows what is staged", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(overlay({ packagesNoManifest: true })), overlayDeps(out));
+	assert.equal(code, 1);
+	assert.match(text(), /✗ Staged packages manifest readable \(packages\/packages\.json\)/);
+	assert.match(text(), /import-pi --with-packages/);
+});
+
+test("doctor: an admin-like staged package is a hard failure (recursion vector)", async () => {
+	const dir = overlay({ packages: [pkg({ name: "dispatch-admin", version: "0.1.0", dir: "dispatch-admin" })] });
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(dir), overlayDeps(out));
+	assert.equal(code, 1);
+	assert.match(text(), /✗ Staged package looks like the dispatch admin \(dispatch-admin\)/);
+	assert.match(text(), /enqueue paid jobs from INSIDE a job container/);
+});
+
+test("doctor: run.packages: true with nothing staged is the silently-package-less job", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(overlay({}), { PI_TRIGGERS_FILE: triggersFile(true) }), overlayDeps(out));
+	assert.equal(code, 1, "the flag is set, nothing is staged, and the flow would run without its tools on a clean exit 0");
+	assert.match(text(), /✗ 1 trigger\(s\) set run\.packages: true but nothing is staged in .*packages/);
+	assert.match(text(), /declare them in pi-packages\.json/);
+});
+
+test("doctor: run.packages: true with PI_GLOBAL_PI_DIR unset fails", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_TRIGGERS_FILE: triggersFile(true) }, // no overlay at all
+		overlayDeps(out),
+	);
+	assert.equal(code, 1);
+	assert.match(text(), /✗ 1 trigger\(s\) set run\.packages: true but PI_GLOBAL_PI_DIR is unset/);
+	assert.match(text(), /staged packages live inside the overlay and are mounted with it/);
+});
+
+test("doctor: a deployment with no packages and no armed trigger prints no package line at all", async () => {
+	const clean = overlay({ models: JSON.stringify({ providers: { anthropic: { name: "Anthropic" } } }) });
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(clean, { PI_TRIGGERS_FILE: triggersFile() }), overlayDeps(out));
+	assert.equal(code, 0);
+	assert.doesNotMatch(text(), /package/i, "a non-adopter's output is unchanged by this feature");
 });
 
 // PI_AUTH_FROM_PI: the provider key may live in pi's auth.json, not the env — doctor reads it (real fs).

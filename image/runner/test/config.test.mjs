@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseRunnerEnv } from "../src/config.mjs";
+import { assertPackagePathsExist, enforceOfflineMode, parseRunnerEnv } from "../src/config.mjs";
 import { EXIT_POLICY } from "../src/outcome.mjs";
 
 const base = { PI_PROVIDER: "anthropic", PI_MODEL: "claude-x", PI_MAX_TURNS: "20" };
@@ -64,4 +64,99 @@ test("optional retry knobs override their defaults and are validated too", () =>
 	assert.equal(cfg.retry.maxRetries, 5);
 	assert.equal(cfg.retry.baseDelayMs, 500);
 	assert.throws(() => parseRunnerEnv({ ...base, PI_RETRY_MAX: "0" }), (e) => e.piDispatchExit === EXIT_POLICY);
+});
+
+// --- INT-CONTAINER-JOB-INPUTS: staged pi packages (PI_PACKAGES) ---
+
+test("PI_PACKAGES unset or empty is no packages, not an error", () => {
+	// A trigger that opted into no packages is the normal state. Every job would fail otherwise.
+	assert.deepEqual(parseRunnerEnv({ ...base }).packages, []);
+	assert.deepEqual(parseRunnerEnv({ ...base, PI_PACKAGES: "" }).packages, []);
+});
+
+test("PI_PACKAGES parses one and many absolute entries, in order", () => {
+	assert.deepEqual(parseRunnerEnv({ ...base, PI_PACKAGES: "/opt/pi-global/packages/tools" }).packages, [
+		"/opt/pi-global/packages/tools",
+	]);
+	assert.deepEqual(
+		parseRunnerEnv({ ...base, PI_PACKAGES: "/opt/pi-global/packages/tools:/opt/pi-global/packages/review" }).packages,
+		["/opt/pi-global/packages/tools", "/opt/pi-global/packages/review"],
+	);
+});
+
+test("empty PI_PACKAGES segments are dropped, not turned into a cwd-relative path", () => {
+	// "a::b" and a trailing ":" are what a shell template leaves behind. An empty string reaching pi
+	// would resolve to the cwd itself -- /workspace, the adversarial clone.
+	assert.deepEqual(parseRunnerEnv({ ...base, PI_PACKAGES: "/a::/b:" }).packages, ["/a", "/b"]);
+	assert.deepEqual(parseRunnerEnv({ ...base, PI_PACKAGES: ":::" }).packages, []);
+});
+
+test("a RELATIVE PI_PACKAGES entry is a config error, not a path resolved against /workspace", () => {
+	// pi resolves a relative local source against the process cwd, which is the checked-out repo.
+	// `packages/tools` would therefore load an extension out of a fork's branch. Exit 2, not retried.
+	for (const bad of ["packages/tools", "./packages/tools", "tools", "/ok:relative/tools"]) {
+		try {
+			parseRunnerEnv({ ...base, PI_PACKAGES: bad });
+			assert.fail(`expected throw for PI_PACKAGES=${JSON.stringify(bad)}`);
+		} catch (error) {
+			assert.equal(error.piDispatchExit, EXIT_POLICY, `PI_PACKAGES=${JSON.stringify(bad)}`);
+		}
+	}
+});
+
+test("a PI_PACKAGES entry containing a `..` segment is a config error", () => {
+	// An absolute path may still climb out of the read-only staging mount.
+	for (const bad of ["/opt/pi-global/packages/../../../workspace", "/opt/pi-global/packages/..", "/../etc"]) {
+		try {
+			parseRunnerEnv({ ...base, PI_PACKAGES: bad });
+			assert.fail(`expected throw for PI_PACKAGES=${JSON.stringify(bad)}`);
+		} catch (error) {
+			assert.equal(error.piDispatchExit, EXIT_POLICY, `PI_PACKAGES=${JSON.stringify(bad)}`);
+		}
+	}
+
+	// The NEGATIVE half: `..` only counts as a whole segment, so a legitimate name containing dots
+	// still parses. Rejecting these would make a valid staging layout unusable.
+	assert.deepEqual(parseRunnerEnv({ ...base, PI_PACKAGES: "/opt/pi-global/packages/a..b" }).packages, [
+		"/opt/pi-global/packages/a..b",
+	]);
+});
+
+test("a staged package path that never mounted is a config error naming the path", () => {
+	// pi skips an absent local source with no error and no diagnostic, so without this the job runs
+	// to a clean exit 0 without the tools its flow was written for. fileExists is injected: the
+	// classification is asserted without a container.
+	const present = ["/opt/pi-global/packages/tools", "/opt/pi-global/packages/review"];
+	const fileExists = (path) => path !== "/opt/pi-global/packages/review";
+	try {
+		assertPackagePathsExist(present, { fileExists });
+		assert.fail("expected a throw for the unmounted package path");
+	} catch (error) {
+		assert.equal(error.piDispatchExit, EXIT_POLICY);
+		assert.ok(
+			error.message.includes("/opt/pi-global/packages/review"),
+			`the error must name the missing path; got ${JSON.stringify(error.message)}`,
+		);
+	}
+
+	// The POSITIVE half: all present is silent, and no packages at all is silent too.
+	assert.doesNotThrow(() => assertPackagePathsExist(present, { fileExists: () => true }));
+	assert.doesNotThrow(() => assertPackagePathsExist([], { fileExists: () => false }));
+});
+
+test("enforceOfflineMode sets PI_OFFLINE=1 and is idempotent", () => {
+	// Offline is a property of the runner, not of its caller: a hand-run container or a worker
+	// regression must not be able to re-arm pi's job-time-install path.
+	const unset = {};
+	enforceOfflineMode(unset);
+	assert.equal(unset.PI_OFFLINE, "1");
+	enforceOfflineMode(unset);
+	assert.equal(unset.PI_OFFLINE, "1", "a second call must not change it");
+
+	// It only ever tightens: anything that is not exactly "1" is overwritten.
+	for (const weak of ["0", "", "true", "yes", "no"]) {
+		const env = { PI_OFFLINE: weak };
+		enforceOfflineMode(env);
+		assert.equal(env.PI_OFFLINE, "1", `PI_OFFLINE=${JSON.stringify(weak)} must be overwritten`);
+	}
 });

@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+// Static import: packages.mjs is pure -- no pi, no fs -- so it needs none of the gating below.
+import { findShadowedSkills } from "../src/packages.mjs";
 
 /**
  * REQ-UPSTREAM-CONTRACT-TESTS -- the assertions that catch the failures nothing else will.
@@ -249,4 +251,334 @@ test("no overlay mounted -> the loader behaves exactly as before (guardrails + r
 	const appended = loader.getAppendSystemPrompt().join("\n\n");
 	assert.ok(appended.includes(GUARDRAIL_SENTINEL) && appended.includes(PERSONA_SENTINEL));
 	assert.ok(!appended.includes(GLOBAL_PERSONA_SENTINEL), "an absent overlay contributes nothing");
+});
+
+// --- INT-CONTAINER-JOB-INPUTS: operator-staged pi packages, passed as PI_PACKAGES ---
+const PKG_SKILL_SENTINEL = "PKG-SKILL-SENTINEL-a48b";
+const PKG_EXT_SENTINEL = "PKG-EXT-SENTINEL-b59c";
+const PKG_NESTED_DEP_SENTINEL = "PKG-NESTED-DEP-SENTINEL-c6ad";
+const REPO_EXT_SENTINEL = "REPO-EXT-SENTINEL-d7be";
+const OVERLAY_EXT_SENTINEL = "OVERLAY-EXT-SENTINEL-e8cf";
+
+/**
+ * A REAL staged pi package: a directory whose package.json carries a `pi` manifest listing an
+ * extension and a skill. This is the layout an operator stages under
+ * $PI_GLOBAL_PI_DIR/packages/<dir>/ and the worker passes as an absolute container path.
+ *
+ * Plain `.js` and no external imports on purpose: the fixture must need no build step, and the
+ * extension must be loadable by the pinned SDK exactly as staged. The package name must not look
+ * like this project's own -- a staged package is third-party by definition.
+ */
+function fixturePackage({ skillName = "pkg-skill", nestedDep = false } = {}) {
+	const dir = join(mkdtempSync(join(tmpdir(), "staged-pkg-")), "fixture-pi-pkg");
+	mkdirSync(join(dir, "ext"), { recursive: true });
+	mkdirSync(join(dir, "skills", skillName), { recursive: true });
+
+	writeFileSync(
+		join(dir, "package.json"),
+		`${JSON.stringify(
+			{
+				name: "fixture-pi-pkg",
+				version: "0.0.0",
+				type: "module",
+				pi: { extensions: ["ext/sentinel.js"], skills: [`skills/${skillName}/SKILL.md`] },
+			},
+			null,
+			"\t",
+		)}\n`,
+	);
+
+	// The extension proves it RAN, not merely that its path was listed: registerCommand writes into
+	// the Extension object the loader hands back, so the sentinel is observable without a session.
+	const body = nestedDep
+		? `import { marker } from "nested-fixture-dep";\n\nexport default function (api) {\n\tapi.registerCommand(marker, { description: "loaded a nested dep" });\n}\n`
+		: `export default function (api) {\n\tapi.registerCommand("${PKG_EXT_SENTINEL}", { description: "staged package extension" });\n}\n`;
+	writeFileSync(join(dir, "ext", "sentinel.js"), body);
+
+	writeFileSync(
+		join(dir, "skills", skillName, "SKILL.md"),
+		`---\nname: ${skillName}\ndescription: ${PKG_SKILL_SENTINEL} a staged package skill\n---\n\nRun the staged flow.\n`,
+	);
+
+	if (nestedDep) {
+		// The layout the staged package depends on: its deps live in its OWN nested node_modules, with
+		// nothing installed at job time (the runner forces PI_OFFLINE=1). Extensions resolve pi's own
+		// packages through a jiti alias map, but everything else must come from here.
+		const dep = join(dir, "node_modules", "nested-fixture-dep");
+		mkdirSync(dep, { recursive: true });
+		writeFileSync(
+			join(dep, "package.json"),
+			`${JSON.stringify({ name: "nested-fixture-dep", version: "0.0.0", type: "module", main: "index.js" }, null, "\t")}\n`,
+		);
+		writeFileSync(join(dep, "index.js"), `export const marker = "${PKG_NESTED_DEP_SENTINEL}";\n`);
+	}
+
+	return dir;
+}
+
+/** A .pi-shaped dir whose extensions/ loads one extension, for asserting path ORDER. */
+function fixtureExtensionDir(prefix, commandName) {
+	const dir = mkdtempSync(join(tmpdir(), prefix));
+	mkdirSync(join(dir, "extensions"), { recursive: true });
+	// index.js, not a loose foo.js: pi adds the DIRECTORY itself as the extension source, so a
+	// directory of loose files resolves to nothing. That is a property of the mount shape, not of
+	// this test -- a bare .js dropped in /job/pi/extensions never loads either.
+	writeFileSync(
+		join(dir, "extensions", "index.js"),
+		`export default function (api) {\n\tapi.registerCommand("${commandName}", { description: "ordering fixture" });\n}\n`,
+	);
+	return dir;
+}
+
+/** Every command name the loaded extensions registered -- the proof their factories actually ran. */
+function extensionCommands(loader) {
+	return loader.getExtensions().extensions.flatMap((extension) => [...extension.commands.keys()]);
+}
+
+test("a staged package contributes BOTH a skill and an extension, through noSkills/noExtensions", { skip }, async () => {
+	// THE load-bearing assertion for staged packages. noSkills:true/noExtensions:true suppress cwd and
+	// package DISCOVERY, and it would be entirely reasonable to expect them to suppress this too --
+	// they do not: reload() keeps cliEnabledExtensions/cliEnabledSkills in both branches, so ONE
+	// staged dir listed in additionalExtensionPaths contributes its extension AND its skill via the
+	// package.json "pi" manifest. The whole staging design rests on that; if a pi bump changes it,
+	// jobs would run without the tools their flow was written for and still exit 0.
+	const pkg = fixturePackage();
+	const { loader } = await load({ packagePaths: [pkg] });
+
+	const { skills } = loader.getSkills();
+	const pkgSkill = skills.find((s) => s.name === "pkg-skill");
+	assert.ok(pkgSkill, `expected the staged skill; got ${JSON.stringify(skills.map((s) => s.name))}`);
+	assert.ok(pkgSkill.description.includes(PKG_SKILL_SENTINEL), "the staged skill's own content must reach the loader");
+
+	const extensionPaths = loader.getExtensions().extensions.map((e) => e.path);
+	assert.ok(
+		extensionPaths.includes(join(pkg, "ext", "sentinel.js")),
+		`expected the staged extension; got ${JSON.stringify(extensionPaths)}`,
+	);
+	assert.ok(extensionCommands(loader).includes(PKG_EXT_SENTINEL), "the staged extension's factory must have run");
+
+	// And it is ADDITIVE: the repo's own materialised skill still loads alongside it.
+	assert.ok(skills.find((s) => s.name === "bug-fix")?.description.includes(SKILL_SENTINEL), "the repo skill must survive");
+});
+
+test("no packages passed -> a staged package on disk contributes nothing", { skip }, async () => {
+	// The NEGATIVE half. The package is built exactly as above and simply not listed, so this fails
+	// the moment the runner starts discovering package dirs on its own rather than loading only what
+	// the worker handed over for a trigger that opted in.
+	const pkg = fixturePackage();
+	const { loader } = await load({ packagePaths: [] });
+
+	const { skills } = loader.getSkills();
+	assert.ok(!skills.some((s) => s.name === "pkg-skill"), "an unlisted staged package must contribute no skill");
+
+	const surface = [
+		JSON.stringify(loader.getSkills()),
+		JSON.stringify(loader.getExtensions().extensions.map((e) => e.path)),
+		JSON.stringify(extensionCommands(loader)),
+		loader.getAppendSystemPrompt().join("\n\n"),
+	].join("\n");
+	assert.ok(!surface.includes(PKG_SKILL_SENTINEL), "an unlisted package's skill reached the loader");
+	assert.ok(!surface.includes(PKG_EXT_SENTINEL), "an unlisted package's extension reached the loader");
+	assert.ok(!surface.includes(pkg), "an unlisted package's path reached the loader");
+});
+
+test("a hostile skill in the workspace tree is still NOT loaded with packages on", { skip }, async () => {
+	// Package resolution reads the cwd for project settings, so arming additionalExtensionPaths is
+	// exactly the change that could quietly re-open cwd discovery -- and the repo's .pi/skills/evil
+	// comes from the CHECKED-OUT branch, a fork's on a PR-triggered job. Re-assert it with packages on.
+	const { loader } = await load({ packagePaths: [fixturePackage()] });
+	const { skills } = loader.getSkills();
+	assert.ok(!skills.some((s) => s.name === "evil"), "a workspace-tree skill was loaded; cwd discovery is on");
+	const surface = [JSON.stringify(loader.getSkills()), loader.getAppendSystemPrompt().join("\n\n")].join("\n");
+	assert.ok(!surface.includes(HOSTILE_SENTINEL), "hostile skill content reached the loader");
+});
+
+test("package extension paths come LAST -- repo, then overlay, then packages", { skip }, async () => {
+	// Extension resolution is first-path-wins, so ordering IS the trust ordering: nothing a staged
+	// package ships may shadow a repo or operator-overlay extension. Asserted on the loaded
+	// extensions themselves, in load order, not on an internal field.
+	const jobPiDir = fixtureExtensionDir("job-pi-ext-", REPO_EXT_SENTINEL);
+	const globalPiDir = fixtureExtensionDir("pi-global-ext-", OVERLAY_EXT_SENTINEL);
+	const pkg = fixturePackage();
+	const { loader } = await load({ jobPiDir, globalPiDir, allowGlobalExtensions: true, packagePaths: [pkg] });
+
+	const paths = loader.getExtensions().extensions.map((e) => e.path);
+	const repoIndex = paths.indexOf(join(jobPiDir, "extensions"));
+	const overlayIndex = paths.indexOf(join(globalPiDir, "extensions"));
+	const packageIndex = paths.indexOf(join(pkg, "ext", "sentinel.js"));
+	// All three must be PRESENT first: an indexOf of -1 would satisfy the `<` comparisons for free.
+	assert.ok(repoIndex >= 0 && overlayIndex >= 0 && packageIndex >= 0, `missing one of them: ${JSON.stringify(paths)}`);
+	assert.ok(repoIndex < overlayIndex, "the repo extensions path must precede the overlay's");
+	assert.ok(overlayIndex < packageIndex, "the overlay extensions path must precede the staged packages'");
+});
+
+test("a staged package CANNOT shadow a repo skill -- the REPO wins, and the attempt stays visible", { skip }, async () => {
+	// REQ-GLOBAL-PI-OVERLAY's "repo wins on conflict", asserted as an OUTCOME.
+	//
+	// Two separate facts are pinned here and they must not be allowed to collapse into one:
+	//
+	//   (1) UPSTREAM's raw behaviour. pi builds skillPaths as mergePaths(cliEnabledSkills,
+	//       additionalSkillPaths) -- package paths first -- and loadSkills is first-path-wins, so the
+	//       STAGED bug-fix is the one the raw load keeps and the repo's is dropped to a collision
+	//       diagnostic. That is pinned below via that diagnostic, so a pi bump that reorders
+	//       skillPaths fails HERE and tells you the override has quietly become a no-op instead of
+	//       letting it rot unnoticed.
+	//
+	//   (2) OUR enforcement on top of it. skillsOverride is a declared loader option and
+	//       enforceProtectedSkillPrecedence uses it to put the repo's skill back in force. If that
+	//       option is ever dropped or stops being honoured, fact (1) still holds and THIS half fails
+	//       -- which is the whole reason the two are asserted separately.
+	const pkg = fixturePackage({ skillName: "bug-fix" });
+	const { loader, jobPi } = await load({ packagePaths: [pkg] });
+
+	const { skills, diagnostics } = loader.getSkills();
+	const bugFix = skills.find((s) => s.name === "bug-fix");
+	assert.ok(bugFix, `expected a bug-fix skill; got ${JSON.stringify(skills.map((s) => s.name))}`);
+	assert.ok(bugFix.description.includes(SKILL_SENTINEL), "the REPO bug-fix must be the one in force");
+	assert.ok(!bugFix.description.includes(PKG_SKILL_SENTINEL), "the staged bug-fix must not be in force");
+	assert.equal(bugFix.filePath, join(jobPi, "skills", "bug-fix", "SKILL.md"));
+	assert.equal(skills.filter((s) => s.name === "bug-fix").length, 1, "substitution, not duplication");
+
+	// (1) pi's own ordering, untouched: the raw load kept the package's and dropped the repo's.
+	const raw = diagnostics.find(
+		(d) => d.type === "collision" && d.collision?.name === "bug-fix" && d.collision.winnerPath.startsWith(pkg),
+	);
+	assert.ok(raw, `expected pi's raw collision diagnostic; got ${JSON.stringify(diagnostics)}`);
+	assert.equal(raw.collision.winnerPath, join(pkg, "skills", "bug-fix", "SKILL.md"));
+	assert.equal(raw.collision.loserPath, join(jobPi, "skills", "bug-fix", "SKILL.md"));
+
+	// (2) our enforcement, recorded as its own diagnostic naming the winner that is actually running.
+	const enforced = diagnostics.find(
+		(d) => d.type === "collision" && d.collision?.name === "bug-fix" && d.collision.winnerPath.startsWith(jobPi),
+	);
+	assert.ok(enforced, "the enforced outcome must be on the record too, not inferred from the raw one");
+	assert.equal(enforced.collision.winnerPath, join(jobPi, "skills", "bug-fix", "SKILL.md"));
+	assert.equal(enforced.collision.loserPath, join(pkg, "skills", "bug-fix", "SKILL.md"));
+
+	// The detector still reports the ATTEMPT off pi's unmodified diagnostic. It no longer refuses the
+	// job -- it is what puts the collision in the run log, so an operator is never left to discover
+	// from behaviour that a staged package shipped a name the repo had already published.
+	const shadowed = findShadowedSkills(diagnostics, {
+		packageRoots: [pkg],
+		protectedRoots: [join(jobPi, "skills")],
+	});
+	assert.equal(shadowed.length, 1, "findShadowedSkills must still flag the attempt");
+	assert.equal(shadowed[0].name, "bug-fix");
+});
+
+test("a staged package cannot shadow an OPERATOR OVERLAY skill either", { skip }, async () => {
+	// /opt/pi-global/skills is operator deploy-time config, the same trust class as the baked floor.
+	// The protected set is both roots, not just the repo's.
+	const pkg = fixturePackage({ skillName: "global-only" });
+	const globalPiDir = globalOverlay();
+	const { loader } = await load({ globalPiDir, packagePaths: [pkg] });
+
+	const skill = loader.getSkills().skills.find((s) => s.name === "global-only");
+	assert.ok(skill.description.includes(GLOBAL_SKILL_SENTINEL), "the OVERLAY skill must be the one in force");
+	assert.ok(!skill.description.includes(PKG_SKILL_SENTINEL), "the staged skill must not be in force");
+	assert.equal(skill.filePath, join(globalPiDir, "skills", "global-only", "SKILL.md"));
+});
+
+test("a staged skill whose name collides with nothing is left completely alone", { skip }, async () => {
+	// The negative half of the override: it must displace ONLY a name a protected root published.
+	// An override that quietly dropped every package skill would pass the two tests above.
+	const pkg = fixturePackage();
+	const { loader } = await load({ packagePaths: [pkg] });
+	const skill = loader.getSkills().skills.find((s) => s.name === "pkg-skill");
+	assert.ok(skill?.description.includes(PKG_SKILL_SENTINEL), "a non-colliding staged skill must survive intact");
+	assert.equal(skill.filePath, join(pkg, "skills", "pkg-skill", "SKILL.md"));
+});
+
+// --- enforceProtectedSkillPrecedence, decided on injected input (no skills tree, no collisions) ---
+
+/** A Skill-shaped record; only name and filePath are load-bearing for the precedence decision. */
+const fakeSkill = (name, filePath) => ({ name, description: `${name} desc`, filePath, baseDir: "", sourceInfo: {} });
+
+/** Stands in for pi's loadSkillsFromDir: a fixed skill list per directory. */
+const fakeLoadDir = (byDir) => ({ dir }) => ({ skills: byDir[dir] ?? [], diagnostics: [] });
+
+test("enforceProtectedSkillPrecedence swaps only package skills a protected root also publishes", { skip }, () => {
+	const base = {
+		skills: [fakeSkill("deploy", "/pkg/skills/deploy/SKILL.md"), fakeSkill("lint", "/pkg/skills/lint/SKILL.md")],
+		diagnostics: [{ type: "warning", message: "unrelated" }],
+	};
+	const result = loaderModule.enforceProtectedSkillPrecedence(base, {
+		packageRoots: ["/pkg"],
+		protectedRoots: ["/job/pi/skills"],
+		loadDir: fakeLoadDir({ "/job/pi/skills": [fakeSkill("deploy", "/job/pi/skills/deploy/SKILL.md")] }),
+	});
+
+	assert.deepEqual(result.skills.map((s) => s.filePath), [
+		"/job/pi/skills/deploy/SKILL.md",
+		"/pkg/skills/lint/SKILL.md",
+	]);
+	assert.equal(result.diagnostics.length, 2, "the incoming diagnostics survive and the swap adds one");
+	assert.deepEqual(result.diagnostics[1].collision, {
+		resourceType: "skill",
+		name: "deploy",
+		winnerPath: "/job/pi/skills/deploy/SKILL.md",
+		loserPath: "/pkg/skills/deploy/SKILL.md",
+	});
+});
+
+test("enforceProtectedSkillPrecedence consults protected roots in order -- repo beats overlay", { skip }, () => {
+	// Same precedence the additionalSkillPaths order encodes. Getting this backwards would hand a repo
+	// skill's name to the overlay whenever a package happened to collide with it -- a bug reachable
+	// only through a three-way collision, so nothing else would catch it.
+	const result = loaderModule.enforceProtectedSkillPrecedence(
+		{ skills: [fakeSkill("deploy", "/pkg/skills/deploy/SKILL.md")], diagnostics: [] },
+		{
+			packageRoots: ["/pkg"],
+			protectedRoots: ["/job/pi/skills", "/opt/pi-global/skills"],
+			loadDir: fakeLoadDir({
+				"/job/pi/skills": [fakeSkill("deploy", "/job/pi/skills/deploy/SKILL.md")],
+				"/opt/pi-global/skills": [fakeSkill("deploy", "/opt/pi-global/skills/deploy/SKILL.md")],
+			}),
+		},
+	);
+	assert.equal(result.skills[0].filePath, "/job/pi/skills/deploy/SKILL.md");
+});
+
+test("enforceProtectedSkillPrecedence is a no-op with no packages, and never reads the protected roots", { skip }, () => {
+	// The common path: every job without PI_PACKAGES. Re-reading and re-parsing both skill trees on
+	// each of those would be pure cost for a collision that cannot exist.
+	const base = { skills: [fakeSkill("deploy", "/job/pi/skills/deploy/SKILL.md")], diagnostics: [] };
+	const result = loaderModule.enforceProtectedSkillPrecedence(base, {
+		packageRoots: [],
+		protectedRoots: ["/job/pi/skills"],
+		loadDir: () => assert.fail("the protected roots must not be read when no package can collide"),
+	});
+	assert.deepEqual(result, base);
+});
+
+test("enforceProtectedSkillPrecedence leaves an already-correct load untouched", { skip }, () => {
+	// If a future pi reorders skillPaths so the repo already wins, this must become a no-op rather than
+	// a second, opposite bug that swaps the winner back out.
+	const base = { skills: [fakeSkill("deploy", "/job/pi/skills/deploy/SKILL.md")], diagnostics: [] };
+	const result = loaderModule.enforceProtectedSkillPrecedence(base, {
+		packageRoots: ["/pkg"],
+		protectedRoots: ["/job/pi/skills"],
+		loadDir: fakeLoadDir({ "/job/pi/skills": [fakeSkill("deploy", "/job/pi/skills/deploy/SKILL.md")] }),
+	});
+	assert.deepEqual(result.skills, base.skills);
+	assert.deepEqual(result.diagnostics, [], "no swap happened, so nothing is claimed to have happened");
+});
+
+test("a staged extension resolves a dep from the package's OWN nested node_modules", { skip }, async () => {
+	// The staged layout's second load-bearing assumption: a package vendors its deps into
+	// <pkg>/node_modules and resolves them fully offline, with nothing installed at job time. If this
+	// regresses, the extension fails to load and the job runs WITHOUT it -- the error lands in
+	// extensionsResult.errors, which nothing reads, so the only symptom is a missing tool.
+	const pkg = fixturePackage({ nestedDep: true });
+	const { loader } = await load({ packagePaths: [pkg] });
+
+	const extensionPath = join(pkg, "ext", "sentinel.js");
+	assert.ok(
+		extensionCommands(loader).includes(PKG_NESTED_DEP_SENTINEL),
+		"the extension must have imported its nested dep and run",
+	);
+	// The negative half, scoped to the package path ONLY: /job/pi/extensions produces its own
+	// "does not exist" error on every job, so a blanket "errors is empty" would be red forever.
+	const packageErrors = loader.getExtensions().errors.filter((e) => e.path.startsWith(pkg));
+	assert.deepEqual(packageErrors, [], `the staged extension must load with no error: ${JSON.stringify(packageErrors)}`);
 });

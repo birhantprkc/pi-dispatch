@@ -32,6 +32,7 @@ export function makeRunContainer({
 	spawnFn = spawn,
 	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
 	allowGlobalExtensions = false,
+	packagePaths = [], // REQ-GLOBAL-PI-OVERLAY: container paths of the operator-staged packages, resolved once at boot
 	forwardEnv = [],
 	authFromPi = false, // fall back to ~/.pi/agent/auth.json for the provider key when the env has none
 }) {
@@ -51,6 +52,10 @@ export function makeRunContainer({
 			githubToken: token ?? undefined,
 			hostEnv,
 			allowGlobalExtensions, // arms overlay extensions in the runner (fail-closed)
+			// REQ-GLOBAL-PI-OVERLAY: the per-job value comes off `job` (like maxTurns), the staged set off
+			// the closure (like allowGlobalExtensions) -- so only a trigger that opted in sees the packages.
+			// Strict `=== true`, so any non-boolean job data (a hand-edited trigger's string "true") is off.
+			packagePaths: job.packages === true ? packagePaths : [],
 			forwardEnv, // extra host var names to forward (e.g. a custom provider's key)
 			authFromPi, // source the provider key from pi's auth.json when the env has none
 		});

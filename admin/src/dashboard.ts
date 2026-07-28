@@ -23,7 +23,7 @@ import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { STALL_KEY } from "@pi-dispatch/worker/scheduler-stall-guard";
 import { windowEndAt } from "@pi-dispatch/worker/pause-windows";
-import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows } from "./read-model.mjs";
+import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows, readStagedPackages } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
 import { box, meter, clip } from "./panel.mjs";
@@ -87,6 +87,11 @@ export function createDashboardDeps(paths: any) {
         settings: readSettingsView({ settingsFile: paths.settingsFile }),
         triggers: readTriggers({ triggersPath: paths.triggersPath }),
         pauseWindows: readPauseWindows({ pauseWindowsPath: paths.pauseWindowsPath }),
+        // The operator's staged third-party pi packages (REQ-GLOBAL-PI-OVERLAY), for the armed triggers'
+        // trust model. Like the four reads above it is a plain file read whose fs access lives entirely in
+        // read-model.mjs -- this module never touches the filesystem -- and it degrades to a safe empty
+        // shape rather than throwing, so a broken overlay cannot take the whole snapshot down.
+        stagedPackages: readStagedPackages({ globalPiDir: paths.globalPiDir }),
         // ONLY the id off the active Job -- a Job's `.data` holds issue title/body/username (PII), so it
         // never enters the snapshot (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT).
         activeJobId: activeList?.[0]?.id ?? null,
@@ -385,7 +390,7 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
     const detailTitle = `trigger · ${t?.type ?? "?"}`;
     const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
     const sched = cronSchedInfo(t, snapshot);
-    const lines = renderTriggerDetail(t, framed ? dw - 4 : 24, styler, sched);
+    const lines = renderTriggerDetail(t, framed ? dw - 4 : 24, styler, sched, snapshot?.stagedPackages);
     if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "e edit · x delete · esc back"];
     const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: triggerDetailHints(dw - 4, styler) });
     return centerBlock(boxed, Math.trunc(width), dw);
@@ -590,7 +595,11 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   const cursor = sel ? styler.fg("accent", "›") : " ";
   const kind = t?.type ?? "?";
   const badge = styler.cell(kind, KIND_WIDTH, { color: KIND_COLOR[kind] ?? "muted" });
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}`, inner, styler);
+  // An armed trigger (`run.packages: true`) loads the operator-staged third-party pi packages, so the row
+  // says so: without this, a trigger running third-party code with open network egress renders identically
+  // to one that does not. Amber, and appended AFTER the layout parts, so color stays post-layout.
+  const pkgs = t?.packages === true ? " " + styler.fg("warning", "[packages]") : "";
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
@@ -699,7 +708,7 @@ function settingsLines(settings: any, inner: number, styler: any): string[] {
  * no crammed "produces" line. Read-only; `e`/`x` drive edit/delete through the command loop. Every line is
  * `inner` cols.
  */
-function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = null): string[] {
+function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = null, staged: any = null): string[] {
   if (!t) return [styler.cell("(no trigger)", inner, { color: "dim" })];
   const out: string[] = [];
   const kv = (k: string, v: string, color = "text") =>
@@ -757,7 +766,21 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
   blank();
   section("trust model");
   for (const line of trustModel(t)) out.push(fitLine(styler.fg("border", "· ") + styler.fg("text", line), inner, styler));
+  // An ARMED trigger (`run.packages: true`) additionally loads the operator-staged third-party pi packages
+  // into the job — name+version, so the operator sees exactly which pinned code this trigger runs, plus the
+  // one-line consequence. Display only: arming is an edit to the reviewed triggers file, never a panel key.
+  if (t.packages === true) {
+    const armed = (text: string) => out.push(fitLine(styler.fg("border", "· ") + styler.fg("warning", text), inner, styler));
+    armed(`packages armed · ${stagedNames(staged)}`);
+    armed("third-party code on adversarial input, open network egress");
+  }
   return out;
+}
+
+/** The staged `name@version` list for the armed trust-model line, or the nothing-staged notice. */
+function stagedNames(staged: any): string {
+  const list = Array.isArray(staged?.packages) ? staged.packages : [];
+  return list.length > 0 ? list.join(" · ") : "(none staged in the overlay)";
 }
 
 /** The static per-kind trust model (who authorizes it, how it dedups, which service owns it). */
@@ -933,6 +956,14 @@ function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[]
   // Per-job token accounting (issue #25): total + cost-USD, or `-` when the container died before reporting.
   const cost = typeof r.tokens?.cost === "number" ? ` · $${r.tokens.cost.toFixed(4)}` : "";
   out.push(kv("tokens", `${show(r.tokens?.total)}${cost}`));
+
+  // The share of that total spent by subagent sessions a staged package spawned in-process, from the
+  // runner's process-wide metering. Records written BEFORE metering carry no `otherTotal`, so the line
+  // appears only for a positive number -- never a NaN, and never a bare 0 on a pre-metering record.
+  const otherTotal = r.tokens?.otherTotal;
+  if (typeof otherTotal === "number" && Number.isFinite(otherTotal) && otherTotal > 0) {
+    out.push(kv("of which", `subagents: ${otherTotal}`, "dim"));
+  }
 
   // chain: root vs child, depth, spawned children (scanned from the run window -- best-effort, no new I/O),
   // and refused-child count.

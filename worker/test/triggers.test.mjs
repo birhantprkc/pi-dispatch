@@ -54,10 +54,10 @@ test("a non-object entry / on / run is a config error", () => {
 
 // --- cron (ported from schedules.test.mjs) ---
 
-test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github pass through absent", () => {
+test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github/packages pass through absent", () => {
 	const [t] = parse([CRON]);
 	assert.deepEqual(t.on, { type: "cron", id: "nightly-tidy", pattern: "0 3 * * *" });
-	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined });
+	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined, packages: undefined });
 });
 
 test("cron entry-level provider/model/maxTurns pass through verbatim", () => {
@@ -124,7 +124,7 @@ test("cron missing folder / flow / task is a config error", () => {
 
 test("a valid label trigger normalizes", () => {
 	const [t] = parse([LABEL]);
-	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix" } });
+	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix", packages: undefined } });
 });
 
 test("label trigger with no positive selector (none-only) is a config error", () => {
@@ -144,7 +144,7 @@ test("label trigger missing run.flow is a config error", () => {
 
 test("a valid comment trigger normalizes", () => {
 	const [t] = parse([COMMENT]);
-	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } });
+	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: undefined } });
 });
 
 test("comment trigger missing phrase or flow is a config error", () => {
@@ -160,7 +160,7 @@ test("a second comment trigger is a config error (at most one)", () => {
 
 test("a valid labeled PR trigger normalizes with its predicate", () => {
 	const [t] = parse([PR_LABELED]);
-	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review" } });
+	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review", packages: undefined } });
 });
 
 test("a labeled PR trigger with no positive selector is a config error", () => {
@@ -184,6 +184,58 @@ test("PR trigger with an unsupported action is a config error", () => {
 
 test("PR trigger missing run.flow is a config error", () => {
 	assert.throws(() => parse([{ on: { type: "pull_request", action: ["opened"] }, run: { kind: "github" } }]), isConfigError);
+});
+
+// --- run.packages: the per-trigger pi-packages opt-in (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) ---
+
+// One shared validator serves all four kinds, so every case is asserted on all four: a normalizer that
+// forgot to call it would pass three and fail exactly one. `mentions` is what the rejection must name --
+// cron names its id, the webhook kinds their raw-file index -- so the operator can find the entry.
+const KINDS = [
+	{ kind: "cron", entry: CRON, mentions: "nightly-tidy" },
+	{ kind: "label", entry: LABEL, mentions: "trigger at index 0" },
+	{ kind: "comment", entry: COMMENT, mentions: "trigger at index 0" },
+	{ kind: "pull_request", entry: PR_LABELED, mentions: "trigger at index 0" },
+];
+const withRun = (entry, over) => ({ ...entry, run: { ...entry.run, ...over } });
+
+test("run.packages: true survives normalization on all four trigger kinds", () => {
+	for (const { kind, entry } of KINDS) {
+		const [t] = parse([withRun(entry, { packages: true })]);
+		assert.equal(t.run.packages, true, `${kind} must carry the opt-in`);
+		const [f] = parse([withRun(entry, { packages: false })]);
+		assert.equal(f.run.packages, false, `${kind} must carry an explicit opt-out`);
+	}
+});
+
+test("run.packages absent stays absent (undefined) on all four kinds -- the no-third-party-code default", () => {
+	for (const { kind, entry } of KINDS) {
+		const [t] = parse([entry]);
+		assert.equal(t.run.packages, undefined, `${kind} must not invent a default`);
+	}
+});
+
+test('run.packages that is not strictly boolean ("true", 1, null, {}) is a config error naming the trigger, on all four kinds', () => {
+	for (const { kind, entry, mentions } of KINDS) {
+		for (const bad of ["true", 1, null, {}]) {
+			assert.throws(
+				() => parse([withRun(entry, { packages: bad })]),
+				(e) => isConfigError(e) && e.message.includes(mentions) && /run\.packages/.test(e.message),
+				`${kind} must refuse packages=${JSON.stringify(bad)}`,
+			);
+		}
+	}
+});
+
+test("cron run.github and run.packages are independent opt-ins that coexist", () => {
+	const [both] = parse([withRun(CRON, { github: true, packages: true })]);
+	assert.equal(both.run.github, true);
+	assert.equal(both.run.packages, true);
+	// Neither flag implies the other: a token opt-in must not smuggle in third-party code, or vice versa.
+	const [g] = parse([withRun(CRON, { github: true })]);
+	assert.equal(g.run.packages, undefined);
+	const [p] = parse([withRun(CRON, { packages: true })]);
+	assert.equal(p.run.github, undefined);
 });
 
 // --- mixed file ---

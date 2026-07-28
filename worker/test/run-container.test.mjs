@@ -152,6 +152,42 @@ test("refuses before spawning if the provider is unconfigured (pre-spend guard)"
 	assert.equal(rec.cmd, undefined, "no container for an unconfigured provider");
 });
 
+// REQ-GLOBAL-PI-OVERLAY staged packages. The staged set lives on the factory (boot-time, like
+// allowGlobalExtensions); the opt-in lives on the job (per-job, like maxTurns). Asserted through the
+// argv, which is the contract the container actually sees.
+const STAGED = ["/opt/pi-global/packages/pi-playwright", "/opt/pi-global/packages/pi-lint"];
+
+/** Run one job through the factory with the staged set wired, and hand back the recorded argv. */
+async function argvFor(job, packagePaths = STAGED) {
+	const rec = {};
+	const runContainer = mod.makeRunContainer({ image: "pi-job:x", hostEnv: HOST, packagePaths, spawnFn: fakeSpawn(rec) });
+	await runContainer({ job, prepared: PREPARED, name: "j1", signal: new AbortController().signal });
+	return rec.args;
+}
+
+test("packages: true passes the boot-staged set through to the container env", { skip }, async () => {
+	const args = await argvFor({ ...JOB, packages: true });
+	assert.ok(
+		args.includes("PI_PACKAGES=/opt/pi-global/packages/pi-playwright:/opt/pi-global/packages/pi-lint"),
+		"an opted-in job must carry the \":\"-joined staged container paths",
+	);
+});
+
+test("packages absent / false / the STRING \"true\" all pass [] -- strict === true, so odd job data is off", { skip }, async () => {
+	for (const packages of [undefined, false, "true"]) {
+		const args = await argvFor({ ...JOB, ...(packages === undefined ? {} : { packages }) });
+		assert.ok(
+			!args.some((a) => String(a).startsWith("PI_PACKAGES")),
+			`job.packages=${JSON.stringify(packages)} must yield no PI_PACKAGES at all -- fail-closed`,
+		);
+	}
+});
+
+test("packages: true with NOTHING staged still yields no PI_PACKAGES (the opt-in is not a promise)", { skip }, async () => {
+	const args = await argvFor({ ...JOB, packages: true }, []);
+	assert.ok(!args.some((a) => String(a).startsWith("PI_PACKAGES")), "an empty staged set omits the variable, never PI_PACKAGES=");
+});
+
 test("tee: every chunk reaches BOTH onOutput and the sink, in order", { skip }, async () => {
 	const outputs = [];
 	const sink = makeRecordingSink();

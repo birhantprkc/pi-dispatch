@@ -363,6 +363,96 @@ test("an unsupported PR action (closed) is dropped as unhandled-event", () => {
 	assert.equal(r.reason, "unhandled-event");
 });
 
+// -- the per-trigger pi-packages opt-in (REQ-GLOBAL-PI-OVERLAY) -----------------------------------
+
+// The flag rides on the RULE, so these configs deliberately disagree between rules: the filter must read it
+// off whichever rule actually matched. Indices stay non-contiguous, as above.
+const pkgCfg = {
+	triggers: {
+		label: [
+			{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", packages: true },
+			{ index: 5, predicate: { any: ["pi:docs"] }, flow: "docs" },
+		],
+		comment: { index: 4, phrase: "@pi", defaultFlow: "triage", packages: true },
+		pullRequest: [
+			{ index: 3, actions: new Set(["labeled"]), predicate: { any: ["pi:review"] }, flow: "review", packages: true },
+			{ index: 6, actions: new Set(["opened"]), predicate: {}, flow: "autoreview" },
+		],
+		knownFlows: new Set(["frontend-fix", "docs", "triage", "review", "autoreview"]),
+	},
+};
+
+test("a matched label/comment/PR rule with packages: true puts packages on the JOB", () => {
+	const labeled = filter("issues", issuesSubset(), pkgCfg, SELF_ID, "d-pkg-label");
+	assert.equal(labeled.enqueue, true);
+	assert.equal(labeled.job.packages, true);
+
+	const commented = filter("issue_comment", commentSubset(), pkgCfg, SELF_ID, "d-pkg-comment");
+	assert.equal(commented.enqueue, true);
+	assert.equal(commented.job.packages, true);
+
+	const pr = filter("pull_request", prSubset({ action: "labeled", labels: ["pi:review"] }), pkgCfg, SELF_ID, "d-pkg-pr");
+	assert.equal(pr.enqueue, true);
+	assert.equal(pr.job.packages, true);
+});
+
+test("packages is a job-level execution knob and NEVER reaches trigger -- it must not land in /job/event.json", () => {
+	// `trigger` is the descriptive context object carried verbatim into the container's event.json; an
+	// execution switch appearing there would be indistinguishable from webhook-described fact.
+	for (const [event, subset, delivery] of [
+		["issues", issuesSubset(), "d-nt-label"],
+		["issue_comment", commentSubset(), "d-nt-comment"],
+		["pull_request", prSubset({ action: "labeled", labels: ["pi:review"] }), "d-nt-pr"],
+	]) {
+		const r = filter(event, subset, pkgCfg, SELF_ID, delivery);
+		assert.equal(r.enqueue, true, `${event} must enqueue`);
+		assert.equal(r.job.packages, true);
+		assert.equal("packages" in r.job.trigger, false, `${event}: packages must not sit inside trigger`);
+	}
+});
+
+test("an UNFLAGGED rule yields a job whose keys are exactly today's four -- byte-identical, no packages key", () => {
+	const labeled = filter("issues", labeledSubset(["pi:docs"]), pkgCfg, SELF_ID, "d-unflagged-label");
+	assert.equal(labeled.enqueue, true);
+	assert.equal(labeled.job.flow, "docs");
+	assert.deepEqual(Object.keys(labeled.job), ["repo", "target", "flow", "trigger"]);
+
+	const pr = filter("pull_request", prSubset({ action: "opened", author: "COLLABORATOR" }), pkgCfg, SELF_ID, "d-unflagged-pr");
+	assert.equal(pr.enqueue, true);
+	assert.equal(pr.job.flow, "autoreview");
+	assert.deepEqual(Object.keys(pr.job), ["repo", "target", "flow", "trigger"]);
+
+	// The whole pre-existing suite runs against configs with no packages key at all -- prove that shape too.
+	const legacy = filter("issues", issuesSubset(), cfg, SELF_ID, "d-unflagged-legacy");
+	assert.deepEqual(Object.keys(legacy.job), ["repo", "target", "flow", "trigger"]);
+});
+
+test("packages comes from the FIRST matching rule when two rules differ, exactly like flow", () => {
+	// One event, both label rules eligible; file order decides, so the flag cannot be picked up from a
+	// later rule that merely happens to also match.
+	const bothCfg = {
+		triggers: {
+			label: [
+				{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" },
+				{ index: 5, predicate: { any: ["pi:docs"] }, flow: "docs", packages: true },
+			],
+			comment: null,
+			pullRequest: [],
+			knownFlows: new Set(["frontend-fix", "docs"]),
+		},
+	};
+	const first = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), bothCfg, SELF_ID, "d-firstwins");
+	assert.equal(first.enqueue, true);
+	assert.equal(first.job.flow, "frontend-fix", "the first rule in file order wins");
+	assert.equal("packages" in first.job, false, "the loser's flag must not bleed onto the job");
+
+	// Reverse the file order: now the flagged rule is first and its flag is the one that applies.
+	const reversed = { triggers: { ...bothCfg.triggers, label: [...bothCfg.triggers.label].reverse() } };
+	const second = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), reversed, SELF_ID, "d-firstwins2");
+	assert.equal(second.job.flow, "docs");
+	assert.equal(second.job.packages, true);
+});
+
 // -- unhandled events -----------------------------------------------------------------------------
 
 test("an unhandled event is dropped as unhandled-event", () => {

@@ -132,13 +132,33 @@ function normalizeCron(on, run, index, path, state) {
 		throw configError(`cron trigger "${id}": run.github must be true or false when present: ${path}`);
 	}
 
+	const packages = validatePackagesFlag(run, `cron trigger "${id}"`, path);
+
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
-	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github stays absent
-	// the same way, so an unflagged trigger's schedule is byte-identical to today's.
+	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages stay
+	// absent the same way, so an unflagged trigger's schedule is byte-identical to today's.
 	return {
 		on: { type: "cron", id, pattern },
-		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github },
+		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages },
 	};
+}
+
+/**
+ * Validate the per-trigger `run.packages` opt-in, shared by all four normalizers. Cron and webhook jobs
+ * load no third-party code by default; `run.packages: true` is the per-trigger opt-in that loads the pi
+ * packages an operator pinned into the global overlay (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY).
+ * Strictly boolean and fail-loud, because a truthy string silently handing a trigger third-party code with
+ * open network egress is exactly the drift this validator exists to refuse.
+ *
+ * `at` is the caller's message prefix -- cron names its id, the webhook normalizers name their file index --
+ * so every rejection still points at the entry the operator actually wrote. Returns the flag, undefined
+ * when absent, so an unflagged trigger normalizes byte-identically to today's.
+ */
+function validatePackagesFlag(run, at, path) {
+	if (run.packages !== undefined && typeof run.packages !== "boolean") {
+		throw configError(`${at}: run.packages must be true or false when present: ${path}`);
+	}
+	return run.packages;
 }
 
 /**
@@ -171,7 +191,8 @@ function normalizeLabel(on, run, index, path) {
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: label trigger run.flow must be a non-empty string: ${path}`);
 	}
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow } };
+	const packages = validatePackagesFlag(run, at, path);
+	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow, packages } };
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -186,7 +207,8 @@ function normalizeComment(on, run, index, path, state) {
 	if (state.commentCount > 1) {
 		throw configError(`${at}: at most one comment trigger is allowed: ${path}`);
 	}
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow } };
+	const packages = validatePackagesFlag(run, at, path);
+	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow, packages } };
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -211,8 +233,9 @@ function normalizePullRequest(on, run, index, path) {
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
 	}
+	const packages = validatePackagesFlag(run, at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
-		run: { kind: "github", flow: run.flow },
+		run: { kind: "github", flow: run.flow, packages },
 	};
 }

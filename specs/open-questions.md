@@ -188,6 +188,21 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   one caveat: usage is **nested inside the message payload, not a top-level event field** — the bare
   `turn_start` on this bus still carries nothing (that is why `REQ-RUNNER-TURN-BUDGET` counts turns
   itself). The cumulative, as-billed session total is separately available via `session.getSessionStats()`.
+- **Scope correction (2026-07-28)**: the answer above is **true and root-session-scoped**, and the second
+  half was never said. `session.subscribe()` delivers the events of **that session instance and no other**:
+  `_eventListeners` is an array on the instance, `Agent.listeners` a `Set` on the instance,
+  `CreateAgentSessionOptions` carries no parent/shared-bus option, and **no event carries a `sessionId`**.
+  So "pi emits per-turn token usage on the subscribe stream" answers *"can we meter a session?"* and not
+  *"can we meter a job?"* — a subagent session an extension spawns through `createAgentSession` emits
+  nothing on the parent's bus, and a 16-wide fanout registers there as roughly **one** turn. Everything
+  built on this row is unaffected in shape and was understating spend precisely on the most expensive jobs.
+  Issue #58 moves the accounting to pi-ai's module-level api-provider registry — the one choke point every
+  in-process session shares — and keeps this bus sum as the fallback
+  (`REQ-TOKEN-ACCOUNTING-AND-CAPS`, `DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY`). The row is corrected in
+  place rather than deleted, because the *question it asked* was answered correctly and the gap was in the
+  question's reach, not in its answer — and a register that quietly widens a past answer teaches the next
+  reader to trust its scope more than it deserves. The same correction bounds `REQ-RUNNER-TURN-BUDGET`,
+  whose counter reads the same per-instance bus and is now explicitly scoped to root-session turns.
 - **Why it mattered**: this gated the entire hypothetical token-cap chain (usage capture → per-job token
   budget → daily token counter → per-job token totals in run history). No usage on the stream = no token
   cap at all. pi-dispatch bounds **jobs** (`CONST-BUDGET-BEFORE-TOKENS`) and **turns**
@@ -216,6 +231,40 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   Usage` required on `AssistantMessage`), `:251-272` (`Usage` shape) · runtime-confirmed `npm
   @earendil-works/pi-agent-core@0.80.7 → dist/agent-loop.js:108,130` (emits `turn_end` with the finalized
   message untouched). All three packages resolve to `0.80.7` under the lockfile.
+
+## OQ-011 — A package that spawns a `pi` SUBPROCESS is unmetered
+
+- **Status**: **ACCEPTED RISK** — *wants explicit ratification*
+- **Position**: v1 ships with **in-process** token accounting. The process-wide meter
+  (`REQ-TOKEN-ACCOUNTING-AND-CAPS`) covers every session created inside the runner's own Node process,
+  which is the fanout an extension normally produces. It cannot see a **child process**: a staged package
+  that shells out to the `pi` binary gets its own Node process, its own pi-ai module registry, and its own
+  provider calls, none of which pass through anything the runner wrapped. Those tokens are spent, billed,
+  and absent from both the exit line and the daily token counter. This is not hypothetical — **pi's own SDK
+  example spawns a `pi` subprocess**, so it is the pattern a package author is most likely to copy.
+- **Why it is a risk row and not a constraint**: no in-process hook can close it, in any language. A
+  constraint that ships unenforced is worse than an honest open risk — it teaches readers that the
+  constitution is aspirational, which corrodes every other entry in it. The same reasoning that put
+  `OQ-004` here rather than in `constitution.md`.
+- **What detection ships today**: a Linux-only child-process sampler (`/proc/self/task/*/children`),
+  sampled on the meter's re-arm tick and logged at teardown as a distinct/peak child count. It is purely
+  diagnostic — it degrades to nothing off Linux, swallows every error, and can never fail a job — and it
+  detects only that a job **went wide**, never what that went-wide cost. Naming a number it cannot know
+  would be worse than reporting none.
+- **What would close it**: a container-level egress proxy that terminates TLS and accounts provider traffic
+  per container rather than per process. That is the same mechanism `OQ-004` names, arriving for a
+  different reason — which is why this closes **with** `OQ-004` rather than before it. Reading usage off a
+  subprocess needs to read its HTTP, and reading its HTTP needs TLS termination; there is no cheaper
+  version of this.
+- **What bounds it meanwhile**: the job-count caps (`CONST-BUDGET-BEFORE-TOKENS`), `maxTurns` on the root
+  session, the 30-minute container timeout (`REQ-JOB-TIMEOUT-30M`), and the provider-side spend limit
+  `SECURITY.md` tells every operator to set. Also the four gates in front of a staged package at all: an
+  operator declares it, pins it, stages it, and arms it per trigger.
+- **Related risk**: `OQ-004` (unrestricted egress) — same fix, and it remains **ACCEPTED RISK**, unchanged
+  by this entry.
+- **Needs**: maintainer ratification that shipping staged packages with in-process-only metering is
+  acceptable, given that the unmetered path requires an operator to have staged and armed a package that
+  spawns `pi`.
 
 ---
 
@@ -260,4 +309,5 @@ adversarial passes did.
 | 2026-07-21 | Added OQ-008 (runtime trigger editing — cron toggle, label→flow — deferred; the admin extension ships triggers display-only). |
 | 2026-07-22 | Added OQ-009 (chaining from a GitHub-job parent, and cross-folder chaining, deferred; this slice ships same-folder, local-parent-only chaining). |
 | 2026-07-22 | Added OQ-010 — spike #21 closed **YES**: pinned pi `0.80.7` emits per-turn token usage on the `subscribe()` stream (nested `event.message.usage`), verified against the npm artifact. Records the lagging-control constraint and unblocks a follow-up for the token-cap chain. |
+| 2026-07-28 | Issue #58. **OQ-010 scope-corrected in place** (kept, not rewritten): its CLOSED answer was **root-session-scoped** and never said so — `subscribe()` delivers one instance's events, `CreateAgentSessionOptions` has no parent/shared-bus option, and no event carries a `sessionId`, so a subagent fanout emits nothing on the parent's bus and registers as ~one turn. The answer to the question asked is unchanged; the gap was the question's reach. Accounting moved to pi-ai's module-level api-provider registry with the bus sum kept as the fallback, and `REQ-RUNNER-TURN-BUDGET` is now explicitly bounded to root-session turns by the same fact. Added **OQ-011** (`ACCEPTED RISK — wants explicit ratification`): a staged package that spawns a **`pi` subprocess** is invisible to any in-process hook — pi's own SDK example does exactly that — so its tokens miss the exit line and the daily counter. Records what detection ships today (Linux `/proc` child sampling, diagnostic only, logged at teardown), what bounds it meanwhile, and that it closes **with** `OQ-004`, because reading usage off a subprocess needs TLS termination and therefore the same container-level proxy. |
 | 2026-07-22 | OQ-010 **Unblocks** retargeted: the #25 follow-up landed as `REQ-TOKEN-ACCOUNTING-AND-CAPS` (per-job token/cost accounting + optional in-run per-job token budget + optional check-after daily token cap). The recorded lagging-control constraint is what shapes that REQ's asymmetry with `CONST-BUDGET-BEFORE-TOKENS`. |

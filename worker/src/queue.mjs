@@ -63,9 +63,12 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  *     re-labels or repeated PR pushes coalesce to one active job. It coexists with jobId; it does not
  *     replace it.
  */
-export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns }) {
+export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages }) {
 	const jobId = deliveryJobId(trigger.deliveryId);
-	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns };
+	// `packages` (the matched trigger's opt-in to load the operator-staged pi packages,
+	// INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) lands on `data` only when the filter resolved
+	// one, exactly like chainDepth/parentJobId above, so an unflagged trigger's job data is byte-identical.
+	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }) };
 	await queue.add("github", data, {
 		jobId,
 		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms

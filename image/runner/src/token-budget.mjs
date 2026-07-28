@@ -25,6 +25,13 @@
  * Usage is accumulated on turn_end ONLY. Each turn is a distinct billed API call, so summing the
  * per-turn usage yields the job's total billed tokens and cost. `agent_end` carries `messages[]`,
  * a terminal snapshot of those same messages -- accumulating it too would double-count.
+ *
+ * SCOPE as of issue #58: this is now the FALLBACK meter and cap. It subscribes to ONE session's bus,
+ * which is per AgentSession instance, so it cannot see a subagent session an extension spawns -- the
+ * process-wide meter in src/usage-meter.mjs is the primary. run-job.mjs attaches this ONLY when that
+ * meter could not install (`usageMeter.ok === false`), so exactly one accumulator is ever live and
+ * the two can never both count the same tokens. Do not attach it alongside the meter "for safety":
+ * the totals would double and the cap would fire at half the configured budget.
  */
 export function attachTokenBudget(session, maxTokens, { onAbort } = {}) {
 	if (maxTokens !== null && maxTokens !== undefined && (!Number.isInteger(maxTokens) || maxTokens < 1)) {

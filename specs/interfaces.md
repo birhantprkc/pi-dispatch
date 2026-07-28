@@ -50,7 +50,18 @@ Evidence convention as in `constitution.md`.
     // Repo path FIRST so a repo skill overrides a global one of the same name (pi is first-path-wins).
     additionalSkillPaths:     ["/job/pi/skills", ...(existsSync("/opt/pi-global/skills") ? ["/opt/pi-global/skills"] : [])],
     // Overlay extensions are fail-closed: only when PI_GLOBAL_ALLOW_EXTENSIONS=1 AND the dir is present.
-    additionalExtensionPaths: ["/job/pi/extensions", ...(allowGlobalExtensions && existsSync("/opt/pi-global/extensions") ? ["/opt/pi-global/extensions"] : [])],
+    // Operator-staged pi packages (REQ-GLOBAL-PI-OVERLAY) ride this same option, LAST — extension
+    // resolution is first-path-wins, so nothing a package ships can shadow a repo or overlay EXTENSION.
+    // That ordering fix does NOT extend to skills; skillsOverride below is where that is settled.
+    additionalExtensionPaths: ["/job/pi/extensions", ...(allowGlobalExtensions && existsSync("/opt/pi-global/extensions") ? ["/opt/pi-global/extensions"] : []), ...packagePaths],
+    // REQ-GLOBAL-PI-OVERLAY's "repo wins on conflict", ENFORCED. pi builds skillPaths as
+    // mergePaths(cliEnabledSkills, additionalSkillPaths), so a staged package's skill paths come FIRST
+    // whatever we do, and loadSkills is first-path-wins — path order cannot carry this. This declared
+    // loader option runs on loadSkills' result before anything is stored, so precedence is re-imposed
+    // there: a kept skill under a package root whose name also exists under /job/pi/skills or
+    // /opt/pi-global/skills is replaced by the protected one (repo consulted before overlay), the
+    // substitute coming from pi's own public loadSkillsFromDir({dir, source:"path"}). See (i).
+    skillsOverride: (loaded) => enforceProtectedSkillPrecedence(loaded, { packageRoots: packagePaths, protectedRoots: ["/job/pi/skills", "/opt/pi-global/skills"] }),
     // Floor first (unremovable), then operator-global, then repo (most specific). Deploy-time overlay
     // persona is the SAME trust class as baking (DES-OPERATOR-GLOBAL-OVERLAY), distinct from the
     // admin-editable runtime settings overlay, which still may never carry persona.
@@ -59,16 +70,36 @@ Evidence convention as in `constitution.md`.
   await resourceLoader.reload();        // MANDATORY — createAgentSession will NOT do this for you
   // NOTE: reload() is NOT called with `resolveProjectTrust`. Project trust is never granted.
 
-  const { session } = await createAgentSession({
+  // HOISTED: the ROOT session id must exist BEFORE the meter does. createAgentSession would otherwise
+  // build its own SessionManager and the id would be readable only afterwards — too late to split
+  // rootTotal from otherTotal, and an undefined root files every call as unattributed.
+  const sessionManager = SessionManager.inMemory("/workspace");
+  const rootSessionId  = sessionManager.getSessionId();
+
+  // Declared BEFORE the meter so onBreach can close over it; assigned the moment the session exists.
+  let session;
+
+  // Process-wide usage meter (REQ-TOKEN-ACCOUNTING-AND-CAPS). AFTER ModelRegistry.create — it registers
+  // THROUGH the registry so refresh() re-applies it — and BEFORE createAgentSession, so the first call
+  // of the run is already metered. See (g) and (h).
+  const meter      = createUsageMeter({ maxTokens, rootSessionId, onBreach: () => { void session?.abort(); } });
+  const usageMeter = await installProcessUsageMeter({ modelRegistry, meter });
+
+  ({ session } = await createAgentSession({
     cwd: "/workspace",
     agentDir: getAgentDir(),
     authStorage,
     modelRegistry,
     model,
-    sessionManager: SessionManager.inMemory("/workspace"),
+    sessionManager,
     settingsManager: SettingsManager.inMemory({ retry: { maxRetries, baseDelayMs } }),
     resourceLoader,
-  });
+  }));
+
+  usageMeter.arm();   // extensions register their OWN api providers during createAgentSession — an api id
+                      // that did not exist at install time is unwrapped until this deterministic re-arm.
+  // The per-session accumulator is the FALLBACK, attached ONLY when the meter could not install, so the
+  // two are never both counting: attachTokenBudget(session, maxTokens) if (!usageMeter.ok).
   ```
   **Project instructions use pi's native structure — `.pi/APPEND_SYSTEM.md` and `.pi/skills/**/SKILL.md`
   (the Agent Skills spec) — but are loaded through the explicit `additional*Paths` channel from a
@@ -124,6 +155,43 @@ Evidence convention as in `constitution.md`.
   **in both the `noSkills`/`noExtensions` branches and are not trust-checked at all**, so
   `noSkills: true` + `additionalSkillPaths` loads *exactly* what we hand it and nothing from the tree.
   Explicit beats gated: the same principle as `noContextFiles` + an explicit read.
+
+  **(g) There are TWO copies of `@earendil-works/pi-ai` on disk, with SEPARATE module-level registries —
+  and a bare specifier binds the wrong one.** The hoisted `node_modules/@earendil-works/pi-ai` and the
+  nested `node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai` are distinct
+  modules with distinct api-provider registries; **pi-coding-agent uses the NESTED one**. So
+  `import "@earendil-works/pi-ai"` from runner code is a **silent no-op**: it registers, reports success,
+  and meters nothing. **`import.meta.resolve` names a path that looks right and is not the live one** — it
+  reports the hoisted copy — so path inspection cannot decide this and only a **runtime mutation probe**
+  can: register an inert provider through the `ModelRegistry`, then ask each candidate module whether it
+  can see it. This is why `run-job.mjs` carries **no pi-ai specifier at all** (a test guards the file for
+  that string) and why the meter loads its candidate by dynamic import in a proved order.
+
+  **(h) `resetApiProviders()` WIPES the registry, so a raw registration cannot be install-once.** It is
+  what `AgentSession.reload()` calls. Registering through `modelRegistry.registerProvider` is what makes
+  `ModelRegistry.refresh()` **re-apply** our wrappers instead of dropping them; a bare
+  `resetApiProviders()` re-applies nothing, which is why an unref'd re-arm interval (plus the deterministic
+  `arm()` after `createAgentSession`) exists at all. Two consequences worth stating: overriding a
+  **builtin** api id flips compat's `shouldUseBuiltinModels` to false, so the wrapper must reproduce the
+  catalog path rather than blindly delegate (two of the builtin providers substitute baseUrl placeholders
+  and inject headers in that layer); and `refresh()` hands back **fresh** provider objects, so
+  "did we already wrap this?" is answerable only by object identity, never by api id.
+
+  **(i) Skill precedence is decided by `skillsOverride`, not by path order.** `additionalSkillPaths` sets
+  the order *among our own* paths (repo before overlay), but pi builds `skillPaths` as
+  `mergePaths(cliEnabledSkills, additionalSkillPaths)` — the paths a staged package contributes through its
+  `pi` manifest come **first** regardless of where the package was listed in `additionalExtensionPaths` —
+  and `loadSkills` is **first-path-wins**, keeping the first skill of a given name and dropping every later
+  one to a `{type:"collision"}` diagnostic. So on the raw load a package's skill takes the repo's name.
+  `DefaultResourceLoaderOptions.skillsOverride` is the seam that settles it: a declared option on the
+  pinned loader, invoked with `{skills, diagnostics}` the moment `loadSkills` returns and **before the
+  loader stores anything**, whose return value is what the loader keeps. The runner uses it to put the
+  protected skill back in force, building the substitute from pi's **public** `loadSkillsFromDir({dir,
+  source: "path"})` — the same loader `loadSkills` itself uses for an explicit path — so the skill that ends
+  up in force is exactly what pi would have kept had the package never shipped the name. pi's own collision
+  diagnostic is left untouched (it is the true record of the raw load, and the runner reads it to report the
+  attempt); the override appends its own diagnostic naming the enforced winner, so both stages are on the
+  record. A job with no staged packages passes the loaded set through unchanged.
 
   `modelRegistry.find(provider, modelId)` is a **method**, not a free function; there is no exported
   `getModel`. Pin the model explicitly: with `model` omitted, pi picks from settings and provider
@@ -230,6 +298,7 @@ Evidence convention as in `constitution.md`.
   | Provider 429 / 5xx / network death | `stopReason: "error"` | `1` — infra, retryable |
   | Our turn budget or timeout aborts | `stopReason: "aborted"` | `2` |
   | Our per-job **token budget** aborts | `stopReason: "aborted"` | `2` — `decideExit` intercepts it as `reason: "token_budget"` BEFORE the generic `"aborted"`, exactly as the turn budget is intercepted (`REQ-TOKEN-ACCOUNTING-AND-CAPS`) |
+  | The **process-wide** token budget breaches mid-fanout (a subagent session's call trips it) | `stopReason: "aborted"` on the root — every later call **by any session** is answered with a synthetic aborted stream | `2` / `token_budget` — the same row as above by design: `decideExit` reads one `tokenAborted` flag and neither meter gets its own exit code, so an operator never has to learn which one fired |
   | Normal completion | `stopReason: "stop"` \| `"toolUse"` | `0` |
   | **Output truncated at the token limit** | `stopReason: "length"` | `0`, **but log it** — it is a completed run, not a silent failure, and must not be mistaken for either |
 
@@ -241,6 +310,17 @@ Evidence convention as in `constitution.md`.
   (`parseExitTurns` / `parseExitTokens`) into the run record and **must not feed exit-code or retry
   classification** — that is this protocol's job. The catch-path exit line (a preflight throw, no session
   ran) omits both, so each parses to `null`.
+  **`tokens` gained eight keys with the process-wide meter** (`REQ-TOKEN-ACCOUNTING-AND-CAPS`), and **not
+  one of them feeds classification either**: `metered` (`true` from the process-wide meter, `false` from
+  the `subscribe()` fallback — the flag that tells a reader whether the total covers every in-process
+  session or only the root's turns), `rootTotal` / `otherTotal` / `looseTotal` (the attribution split;
+  they sum to `total` exactly, and a non-zero `otherTotal` **is** the subagent spend a per-session bus
+  cannot see), `sessions` (distinct session ids observed), `calls` (provider calls observed, not turns),
+  `unresolved` (streams still unsettled when the job ended — non-zero means the totals are a **floor**, not
+  a total) and `unpriced` (calls whose usage carried no finite cost; counted rather than guessed, because a
+  silent `0` would read as "this call was free"). The four original keys keep their meaning and position,
+  so a reader that only knows them is unaffected. The fallback line carries `metered: false` and the four
+  originals only.
 - **Why**: This exit code **is** the mechanism `CONST-RETRY-INFRA-ONLY` is implemented by. The worker
   has no other channel to distinguish "the agent ran and said no" from "the container died" — collapse
   them and you either burn money blind-retrying determinate outcomes, or you silently swallow real infra
@@ -323,10 +403,29 @@ Evidence convention as in `constitution.md`.
   /job/event.json         structured trigger context — written for EVERY job, github and local alike
                           (both shapes below)
   /job/pi/APPEND_SYSTEM.md      project persona   ─┐ materialised by the worker from the
-  /job/pi/skills/<name>/SKILL.md project skills    ├─ project's .pi/ at the DEFAULT-BRANCH SHA,
-  /job/pi/extensions/...        project extensions ┘  via `git show`, never `fs.readFile`
+  /job/pi/skills/<name>/SKILL.md project skills    ┘  project's .pi/ at the DEFAULT-BRANCH SHA,
+                                                     via `git show`, never `fs.readFile`
   ```
   **The guardrails are baked into the image** at a path outside `agentDir` and are **not** mounted.
+- **`/job/pi/extensions` is NOT written, and the seam is deliberate.** An earlier revision of this list
+  carried it; the worker's materialiser only ever emits `pi/APPEND_SYSTEM.md` and
+  `pi/skills/<name>/SKILL.md`, so the path documented a file that never existed. Repo extensions stay
+  unmaterialised **on purpose** — a repo extension is arbitrary code from a merged branch, and this project
+  does not grant that the same free pass a skill gets. The runner still lists `/job/pi/extensions` in
+  `additionalExtensionPaths` (`INT-SDK-SESSION-OPTIONS`) so the seam exists the day that decision changes;
+  today it resolves to a permanent, unread `"path does not exist"` entry in `extensionsResult.errors` on
+  **every** job. That permanent entry is exactly why the staged-package existence check is **scoped to the
+  package roots** rather than surfacing pi's error list wholesale: an always-populated error channel cannot
+  be used to detect anything, so `assertPackagePathsExist` checks the roots it was handed, itself, before
+  the prompt is read and before any spend.
+- **Operator-staged pi packages** reach a job as `PI_PACKAGES` — a `":"`-delimited list of **absolute
+  container paths** under `/opt/pi-global/packages/<dir>`, emitted only for a trigger that opted in
+  (`INT-TRIGGERS-FILE-CONTRACT`) — **not** as a `/job` input. They live inside the operator overlay's
+  existing `:ro` mount (`REQ-GLOBAL-PI-OVERLAY`, `INT-PI-PACKAGES-FILE-CONTRACT`); `/job` remains the
+  per-job, per-repo channel and carries none of them. A relative entry, a `..` segment, or a path that did
+  not mount is a **pre-spend** `configError` (exit `2`), because pi **skips** an unresolvable local package
+  source with no error and no diagnostic — so an unmounted package would otherwise run the flow to a clean
+  exit `0` without the tools it was written for.
 - **`/job/event.json` — both shapes.** Written for **every** job, `0o444` like everything under `/job`,
   one file per concern — trigger context lives here, never merged into the prompt file.
   - A **github** job gets the webhook payload subset — an `issue` OR a `pull_request` body per the target
@@ -411,12 +510,27 @@ Evidence convention as in `constitution.md`.
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
     otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
     (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=1` (forwarded ONLY when the operator armed overlay
-    extensions — fail-closed; `REQ-GLOBAL-PI-OVERLAY`); and each name in `PI_FORWARD_ENV` (an explicit operator
+    extensions — fail-closed; `REQ-GLOBAL-PI-OVERLAY`); `PI_PACKAGES` (the `":"`-delimited ABSOLUTE CONTAINER
+    paths of the operator-staged pi packages, forwarded ONLY when the trigger opted in via `run.packages: true`
+    **and** at least one package is staged — fail-closed exactly like the flag above, and **omitted entirely**
+    when empty, never an empty string. The delimiter is `":"` because these are CONTAINER paths; the host's
+    `path.delimiter` is `";"` on Windows and would be wrong); and each name in `PI_FORWARD_ENV` (an explicit operator
     allowlist of extra host vars — e.g. a custom provider's key — forwarded by exact `-e NAME=VALUE`, never a
     pass-through, so it satisfies `no-broad-env-into-container`; `GITHUB_TOKEN` and `GH_TOKEN` are refused in
     the allowlist at config load — a forwarded operator token would silently override the minted per-job
     value). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
     NOT forwarded** — the daily token counter is enforced host-side, and the container stays queue/budget-blind.
+  - **`PI_OFFLINE=1` is set UNCONDITIONALLY, on every job — the one env addition here that is not opt-in.**
+    Every other variable above is forwarded only when something armed it; this one is not, and the reason is
+    that it is a **narrowing, never a capability**. pi's package resolver shells out to a real `npm install`
+    for any `npm:`/`git:` source unless offline mode is on, and `~/.pi/agent` **is** writable in the
+    container — so an unresolved source would become a live network install of third-party code, at agent
+    runtime, from inside a container whose own input can influence what is requested. The worker emits only
+    local paths, so nothing should reach that branch; setting the flag makes it **unreachable** rather than
+    merely unused. Gating it on the packages opt-in would leave the branch armed for every job that did
+    **not** opt in, which is exactly backwards. The runner re-asserts it in-process for the same reason
+    (`INT-SDK-SESSION-OPTIONS`): offline is a property of the runner, not of whoever started it, so a
+    hand-run `docker run` or a future worker regression cannot re-arm the install path.
   - **Per-job token *scoping* (`CONST-TOKEN-SCOPED-PER-JOB`) is the App path's property, not `gh`'s.** With
     `GITHUB_AUTH_SOURCE=gh` (the default) the minted value is the operator's own full-scope `gh auth token`,
     so every token-carrying job holds whatever that login can do; a fine-grained PAT approximates per-job
@@ -454,7 +568,10 @@ Evidence convention as in `constitution.md`.
     (`-v <hostPath>:<containerPath>`, per `DES-WORKER-ON-HOST` and `worker/src/docker-run.mjs`): the worker
     runs on the host and binds the per-job inputs dir, the workspace folder, the outbox dir, and the operator's
     global pi overlay directly. `/opt/pi-global` is the operator's own `~/.pi/agent` subset — custom models, global
-    skills, a global persona — layered UNDER each repo's `.pi/` (`REQ-GLOBAL-PI-OVERLAY`, `DES-OPERATOR-GLOBAL-OVERLAY`);
+    skills, a global persona, and (fourth) the **staged pi packages** under `packages/<dir>/`, which ride this same
+    mount rather than adding one: **the mount list itself is unchanged**, which is what keeps
+    `CONST-ISOLATION-CONTAINER-PER-JOB`'s enumerated acceptance untouched — layered UNDER each repo's `.pi/`
+    (`REQ-GLOBAL-PI-OVERLAY`, `DES-OPERATOR-GLOBAL-OVERLAY`);
     it is `:ro` and **credential-free by construction** (`import-pi` refuses a literal-key `models.json` and never
     copies `auth.json`; `CONST-TOKEN-SCOPED-PER-JOB`). No credential is ever written to `/outbox` or `/opt/pi-global`
     (same rule as `/workspace`).
@@ -585,14 +702,14 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
       "run": { "kind": "local", "folder": "<absolute HOST path, must exist>", "flow": "<flow name>",
                "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
                "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional>,
-               "github": <optional boolean> } },
+               "github": <optional boolean>, "packages": <optional boolean> } },
     { "on": { "type": "label", "any": [...], "all": [...], "none": [...] },
-      "run": { "kind": "github", "flow": "<flow name>" } },
+      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean> } },
     { "on": { "type": "comment", "phrase": "<trigger phrase>" },       // at most one
-      "run": { "kind": "github", "flow": "<default flow>" } },
+      "run": { "kind": "github", "flow": "<default flow>", "packages": <optional boolean> } },
     { "on": { "type": "pull_request", "action": ["labeled"|"opened"|"synchronize"|"reopened", ...],
               "any": [...], "all": [...], "none": [...] },
-      "run": { "kind": "github", "flow": "<flow name>" } } ] }
+      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean> } } ] }
   ```
 - **The on × run diagonal is the trust boundary, enforced fail-loud at load**: `cron ⟹ run.kind:"local"`;
   every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind:"github"`. Off-diagonal throws a
@@ -603,6 +720,16 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
   non-boolean value is refused at load; with `GITHUB_AUTH_SOURCE=app` a `run.github` job refuses at mint
   time — an installation token is per-repo, and a local job has no repo to scope it to.
+- **`run.packages` (ALL FOUR trigger kinds, optional boolean)**: absent or `false` = no staged packages —
+  the load-no-third-party-code default; `true` = the worker emits `PI_PACKAGES` with the container paths of
+  the pi packages the operator staged into the global overlay (`INT-PI-PACKAGES-FILE-CONTRACT`,
+  `INT-CONTAINER-RUNTIME-CONTRACT`), so the flow gets their extensions and skills. A non-boolean value is
+  refused at load — a truthy `"true"` string silently handing a trigger third-party code with open network
+  egress is exactly the drift this validator exists to refuse — and the worker additionally re-checks
+  `=== true` at wiring time, so hand-edited job data cannot arm it either. It is carried on all four kinds
+  rather than cron only (unlike `run.github`) because a staged package is a **capability of the flow**, and
+  a label/comment/PR trigger runs the same flows a cron trigger does. With nothing staged the flag emits
+  nothing at all, which is a silent no-op by construction — `doctor` is where that becomes visible.
 - **Why**: The operator's trigger set is one host file — diffable, reviewable, git-trackable — rather than
   two files in two shapes across two services. The schema unifies the *view*; evaluation still splits by
   owner (a `label` is never scheduled; a `cron` never receives a webhook). `on.id` (cron only) must be
@@ -613,7 +740,8 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   (`INT-CONFIG-OVERLAY-CONTRACT`). A `labeled` PR rule (like a `label` rule) requires a positive selector;
   at most one `comment` trigger may be configured.
 - **Traces to**: `DES-TRIGGERS-UNIFIED-FILE`, `DES-CRON-VIA-BULLMQ-SCHEDULER`, `REQ-TRIGGER-AUTHOR-GATE`,
-  `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`
+  `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`, `INT-PI-PACKAGES-FILE-CONTRACT`,
+  `REQ-GLOBAL-PI-OVERLAY`
 - **Acceptance**: Given an off-diagonal entry (`cron`→`github`, or any webhook type→`local`), a duplicate
   cron `id`, a `:` in a cron `id`, a cron `run.folder` that does not exist, a `labeled` PR/label rule with
   no positive selector, or a second `comment` trigger, when the config loads, then load throws a
@@ -621,6 +749,125 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   emitted job's `data` byte-matches the interactive local (`enqueueLocalJob`) shape **plus exactly one
   cron-only field**: `trigger: { id, pattern }` — a scheduled job must be able to name its own trigger and
   pattern in `/job/event.json` (`INT-CONTAINER-JOB-INPUTS`), and `pattern` exists nowhere else at job time.
+  The byte-match now additionally admits `packages` on the same terms as `github`: both stay **absent** when
+  the trigger omits them (`undefined` drops out at JSON serialisation), so an unflagged trigger's `data` is
+  byte-identical to the pre-`packages` shape and only a trigger that opted in differs. Given a non-boolean
+  `run.packages` on any of the four kinds, when the config loads, then both services throw. **The env
+  carve-out is explicit**: a `packages: true` job additionally carries `PI_PACKAGES` **and** — like every
+  other job, opted in or not — `PI_OFFLINE=1`, so the container env is NOT byte-identical to the pre-issue
+  one even for an unflagged trigger. That is a deliberate, stated exception in the same spirit as the cron
+  `trigger: { id, pattern }` carve-out above, and for the same reason: it is a narrowing the whole fleet
+  gets, not a per-trigger capability (`INT-CONTAINER-RUNTIME-CONTRACT`).
+
+## INT-PI-PACKAGES-FILE-CONTRACT
+
+**operator → stager → worker + runner.** The operator declares which third-party pi packages exist; the
+host-side stager materialises them into the global overlay and writes a receipt; the worker and `doctor`
+read that receipt. Three consumers, one declaration, and the file the operator edits is never the file the
+worker reads.
+
+- **Contract**:
+  ```
+  pi-packages.json  (path via `--packages-file <path>`, else PI_PACKAGES_FILE, else <cwd>/pi-packages.json;
+                     read ONLY by `pi-dispatch import-pi --with-packages` — never at job time)
+  { "packages": [
+    { "name":    "<npm package name: /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/, <= 214 chars>",
+      "version": "<EXACT: MAJOR.MINOR.PATCH[-prerelease][+build] — no range, tag, or wildcard>",
+      "dir":     "<optional staged dir: /^[a-z0-9](?:[a-z0-9_.-]{0,62}[a-z0-9])?$/i, <= 64 chars,
+                   unique across entries; default `@scope/name` -> `scope__name`>" } ] }
+  ```
+  Unknown fields are dropped, so consumers only ever read validated ones. Every rejection below is a
+  fail-loud `configError` naming the offending package, raised **before a single directory is created**.
+  - **Exact versions only.** `CONST-PI-VERSION-PINNED`'s reasoning applied to third-party code, not a new
+    rule: a floating range turns a silent upstream minor into every queued job becoming a no-op **with no
+    signal**, and the queue still reports success — the worst failure class available. Pinning converts
+    that into an operator-visible edit of a version string. The refusal message states this in full,
+    because it looks pedantic until you know the failure mode it prevents.
+  - **Admin-like names are refused**, on both `name` and `dir` (`/pi-dispatch|dispatch-admin/i`) — the
+    twin of the admin-extension block `import-pi` already enforces, for the same reason: a package that can
+    enqueue paid jobs from **inside** a job container is a recursion vector.
+  - **`dir` is a single path segment.** It becomes one component of a container path, so slashes, `..` and
+    anything outside the charset are refused, length is checked **before** the charset (too long and bad
+    characters are different operator mistakes deserving different fixes), and two packages may not share
+    one `dir`.
+  - **Staging** installs each package into a private `.staging-<i>` dir carrying its own root
+    `package.json` — which pins npm's idea of "the project" to that dir so it cannot walk up into the
+    operator's own checkout — via an **ARRAY argv**, never a shell string, because a name out of a config
+    file must never become shell syntax on the operator's host:
+    `npm install <name>@<version> --omit=dev --omit=peer --omit=optional --ignore-scripts
+    --install-strategy=nested --no-audit --no-fund --loglevel=error`, run with **`cwd: <staging>`**.
+    **The install target travels as the exec's `cwd`, not as `--prefix <staging>`, and that is a safety
+    property rather than a style choice**: npm installs into the cwd's `node_modules` by default, so
+    dropping the flag removes **the only filesystem path from argv**. What remains is literal flags this
+    file spells out plus one `name@version` token whose halves were both validated before anything was
+    created (`NPM_NAME_RE`, `EXACT_VERSION_RE` — neither admits a space, a quote, or a cmd
+    metacharacter). That is exactly what makes `shell: true` safe on **win32**, where it is **required**:
+    npm ships there as `npm.cmd`, and since Node 18.20.2 / 20.12.2 (CVE-2024-27980) spawning a
+    `.cmd`/`.bat` without a shell throws `EINVAL` outright — and this package floors at Node >= 22.19, so
+    every Node it can run on behaves that way. Non-win32 gets `cwd` alone and no shell.
+    **Re-introducing a path into argv, or loosening either regex, invalidates that argument** and must be
+    revisited together with the win32 branch.
+    `--ignore-scripts` is load-bearing: without it the lifecycle scripts of this package **and of every
+    transitive dependency** run **as the operator, on the operator's host**, at stage time.
+    `--omit=peer` because pi resolves its own packages for an extension through a **jiti alias map** at
+    load time, so a staged peer copy is ignored dead weight — and a floating pi version at that.
+    `--omit=dev` and `--omit=optional` keep the staged tree to what a run actually imports.
+    `--install-strategy=nested` asks npm to keep every dependency inside the package dir, and the result is
+    **asserted rather than trusted**: the flag's name and default have moved across npm versions, so each
+    declared `dependencies` key is checked to exist under the package's own `node_modules/`.
+  - **Post-install assertions, all refusals**: `package.json` readable at `<staging>/node_modules/<name>`;
+    its `version` **equals** the pin (npm reporting success is not evidence it staged what you asked for);
+    every declared dependency present inside the package dir; a `pi` manifest **or** one of
+    `extensions/`/`skills/`/`prompts/`/`themes/` present (a package contributing no pi resources loads as a
+    silent no-op, and staging exists to turn that run-time nothing into a stage-time error); and no string
+    anywhere in the `pi` manifest that leaves the package dir (a leading `/` or `\`, or a `..` segment) —
+    manifest entries resolve relative to the package dir at job time, so one that climbs out would reach
+    the rest of the read-only overlay.
+  - **Warn, do not refuse**: a package declaring `scripts.install|preinstall|postinstall` or
+    `optionalDependencies` is staged **INCOMPLETE** — the build step did not run and the optional
+    dependency was not fetched — and may fail at run time. Stated at stage time rather than discovered
+    mid-job.
+  - **All-or-nothing.** Every package is installed and asserted in its staging dir; only once **all** have
+    passed is each `renameSync`d into `<overlay>/packages/<dir>/`. A failure rolls back the renames and the
+    staging dirs and removes a `packages/` root it created. A half-staged set is worse than none, because
+    pi would load the packages that made it and silently skip the rest. (`renameSync`, never a copy: the
+    copy helper's symlink guard uses `statSync`, which **follows** links, so it would copy the target of
+    every `node_modules/.bin` symlink instead of skipping it.)
+  - **Staged layout and the receipt**:
+    ```
+    <PI_GLOBAL_PI_DIR>/packages/<dir>/package.json        the package, self-contained
+    <PI_GLOBAL_PI_DIR>/packages/<dir>/node_modules/**     its OWN deps — no install, no network at job time
+    <PI_GLOBAL_PI_DIR>/packages/packages.json             the stage manifest (the receipt)
+    { "stagedAt": "<ISO-8601>", "packages": [ { "name", "version", "dir" } ] }
+    ```
+    `packages.json` is **the read model** for everything downstream: the worker turns it into container
+    paths `/opt/pi-global/packages/<dir>` (built with template literals, never `path.join` — the worker may
+    run on Windows and these are Linux container paths), and `doctor` and the admin panel read it to show
+    what is staged. Reading it **NEVER throws**: it runs on the job path, where a corrupt or half-written
+    manifest must degrade to "no staged packages" rather than crash the worker mid-queue, and its entries
+    are **re-validated on the way in** because the file is a host artifact an operator may have hand-edited
+    between stage time and job time.
+- **Why**: Two directions, two error policies, and the split is the whole point. `pi-packages.json` is the
+  **operator's** declaration, read once, on the host, by an interactive command — so it fails **loud** and
+  names the offending package. `packages.json` is the **stager's receipt**, read on the money path by a
+  long-running worker — so it fails **quiet** and degrades to nothing staged. Inverting either would be
+  wrong in the expensive direction: a loud job-path read turns one bad byte into a stalled queue, and a
+  quiet stage-time read silently ships an unpinned or admin-shaped package into every job container.
+  Staging on the **host** rather than resolving `npm:` in-container is what lets a job load third-party
+  extensions with egress denied and `PI_OFFLINE=1` set (`INT-CONTAINER-RUNTIME-CONTRACT`): pi treats any
+  spec that is not `npm:`/`git:`/a URL as a **local path** and resolves it in place — no install, no
+  network, no writes.
+- **Traces to**: `REQ-GLOBAL-PI-OVERLAY`, `CONST-PI-VERSION-PINNED`, `DES-OPERATOR-GLOBAL-OVERLAY`,
+  `INT-TRIGGERS-FILE-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-CONTAINER-JOB-INPUTS`
+- **Acceptance**: Given a ranged version, an admin-like `name` or `dir`, a `dir` that is not a plain
+  segment or is duplicated, a name outside the npm charset, a package whose staged `version` differs from
+  the pin, a dependency npm hoisted out of the package dir, a package with neither a `pi` manifest nor a
+  resource dir, or a manifest string with a leading separator or a `..` segment, when
+  `import-pi --with-packages` runs, then it refuses, says which package and why, and **nothing is staged**;
+  given a package declaring lifecycle scripts or `optionalDependencies`, then it stages with a printed
+  INCOMPLETE warning; given a successful stage, then `<overlay>/packages/packages.json` lists exactly the
+  declared `{name, version, dir}` triples and each `dir` exists beside it; given a missing, unreadable, or
+  garbage `packages.json` at job time, then the worker reads it as **no staged packages** and never throws.
 
 ## INT-RUN-HISTORY-FILE-CONTRACT
 
@@ -640,7 +887,10 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
     "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
-    "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number> } | null,  // per-job usage totals; null when the container died before the exit line
+    "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number>,          // per-job usage totals; null when the container died before the exit line
+                   "metered": <bool>,                                                          // true = process-wide meter; false = the subscribe() fallback (then the keys below are absent)
+                   "rootTotal": <int>, "otherTotal": <int>, "looseTotal": <int>,                // attribution split; sums to `total`
+                   "sessions": <int>, "calls": <int>, "unresolved": <int>, "unpriced": <int> } | null,
     "budgetReserved": <bool> | null,
     "attempt":   <int>,
     "parentJobId": "<job id: same id-space as jobId>" | null,
@@ -678,11 +928,23 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   view can surface "2 refused" rather than a bare yes/no. The `reason` enum is **untouched**: a chain refusal is
   **pre-enqueue of the child**, so there is no child record and no new terminal reason — `chainRefused` is
   a separate count on the **parent**, never an enum value. The `tokens` field is **additive and nullable**
-  in exactly the same way — an explicit no-spread literal `{ input, output, total, cost }` of the runner's
-  per-job usage totals (`REQ-TOKEN-ACCOUNTING-AND-CAPS`), or `null` when the container died before emitting
-  the runner `exit` line. It is PII-free by construction: integer token counts and a numeric cost only, no
+  in exactly the same way — an explicit no-spread literal of the runner's per-job usage totals
+  (`REQ-TOKEN-ACCOUNTING-AND-CAPS`), or `null` when the container died before emitting the runner `exit`
+  line. It is PII-free by construction: integer token counts and a numeric cost only, no
   payload text. It is read-only telemetry recovered from the exit line (`parseExitTokens`) exactly as
   `turns` is, and like `turns` it never feeds exit-code or retry classification (`INT-RUNNER-EXIT-CODE-PROTOCOL`).
+  **The process-wide meter widened the object, not the contract.** `tokens` grew `metered`, the
+  `rootTotal`/`otherTotal`/`looseTotal` split, and the `sessions`/`calls`/`unresolved`/`unpriced` counters
+  — additive inside an already-additive field, and still **nullable as a whole** (a container that died
+  before the exit line still records `tokens: null`, not a partial). `parseExitTokens` is **unchanged**: it
+  scans from the end for the last `exit` event and accepts any object with a numeric `total`, so it parsed
+  both shapes on the day the meter landed and needs no version negotiation. `buildRecord` is unchanged for
+  the same reason — it stores `source.tokens` verbatim, so the widened object rides through with no new
+  field to forget. What **did** change is the meaning of the number `recordTokenSpend` charges to the daily
+  counter: it is now **process-wide** spend, including in-process subagent sessions and the
+  compaction/summarisation calls that never surfaced as a root `turn_end`, so at identical real spend the
+  counter fills faster than it used to. That is the correction the meter exists for, and `metered` is what
+  lets a reader tell a corrected total from a legacy one.
 - **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `REQ-TOKEN-ACCOUNTING-AND-CAPS`
 - **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
@@ -821,6 +1083,7 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
 
 | Date | Change |
 |---|---|
+| 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). **INT-SDK-SESSION-OPTIONS**: the contract block now mirrors the shipped wiring — a HOISTED `sessionManager` so `rootSessionId` exists before the meter, the meter installed after `ModelRegistry.create` and before `createAgentSession`, a deterministic `arm()` after it (extensions register their own api providers during the call), `packagePaths` appended LAST to `additionalExtensionPaths`, and a `skillsOverride` that re-imposes protected-root skill precedence. Three new traps: **(g)** pi-ai is installed TWICE with separate module-level registries and pi-coding-agent uses the NESTED one, so a bare specifier binds the hoisted copy and meters nothing while reporting success — `import.meta.resolve` names the wrong path, and only a runtime mutation probe can decide it; **(h)** `resetApiProviders()` (what `AgentSession.reload()` calls) WIPES the registry, so registration goes through `modelRegistry.registerProvider` (which `refresh()` re-applies) plus a re-arm, and a wrapped entry is recognised by object identity because `refresh()` returns fresh objects; **(i)** skill precedence is decided by `skillsOverride`, NOT by path order — pi puts a staged package's skill paths first in `skillPaths` and `loadSkills` is first-path-wins, but the loader's declared `skillsOverride` runs on that result before anything is stored, and pi's public `loadSkillsFromDir` supplies the substitute, so `REQ-GLOBAL-PI-OVERLAY`'s "repo wins on conflict" is enforced rather than asserted. **INT-CONTAINER-RUNTIME-CONTRACT**: env gains `PI_PACKAGES` (conditional, fail-closed, `":"`-delimited container paths, omitted when empty) and `PI_OFFLINE=1` — flagged as the ONE env addition that is not opt-in, because it is a narrowing that makes pi's job-time `npm install` branch unreachable rather than merely unused; the `/opt/pi-global` sentence now names `packages/` as a fourth thing the overlay carries, and states that **the mount list itself is unchanged**. **INT-CONTAINER-JOB-INPUTS**: DELETED the `/job/pi/extensions/...` line — the materialiser only ever writes `APPEND_SYSTEM.md` and `skills/<name>/SKILL.md`, so it documented a path the worker never writes — with a note that the seam is kept deliberately (repo extensions are arbitrary merged-branch code and are not materialised), that it already yields a permanent unread `"path does not exist"` error on every job, and that this permanence is precisely why the staged-package existence check is scoped to package roots instead of surfacing pi's error list. **INT-TRIGGERS-FILE-CONTRACT**: `run.packages` (optional boolean) on all four `run` shapes with its own bullet mirroring `run.github`, and the cron byte-match acceptance extended for `packages` plus an explicit `PI_OFFLINE=1` env carve-out (same precedent as the cron `trigger:{id,pattern}` carve-out). **NEW INT-PI-PACKAGES-FILE-CONTRACT**: the `pi-packages.json` shape, the exact-version rule citing `CONST-PI-VERSION-PINNED`, the npm name charset, the `dir` sanitisation and uniqueness rule, the admin-name refusal, the `..`/absolute manifest refusal, the npm flag set with the reason for each, the staged layout, and `packages.json` as the never-throwing worker/doctor read model. The install target travels as the exec's **`cwd`**, not `--prefix`, so argv carries **no filesystem path at all** — recorded as a load-bearing safety property, because it is what makes the win32 `shell: true` (required since Node 18.20.2 refuses to spawn `npm.cmd` without one) safe: everything left in argv is a literal flag or a pre-validated `name@version`. **INT-RUNNER-EXIT-CODE-PROTOCOL**: the eight new `tokens` telemetry keys, restating that none of them feeds classification, plus a row for a process-wide breach mid-fanout (exit `2` / `token_budget`, deliberately the same row — one flag, one code). **INT-RUN-HISTORY-FILE-CONTRACT**: the widened `tokens` object, still additive and nullable-as-a-whole, noting `parseExitTokens` and `buildRecord` are unchanged and that `recordTokenSpend` now charges process-wide spend. |
 | 2026-07-27 | Trigger context (issue #49): INT-CONTAINER-JOB-INPUTS — `/job/event.json` is now written for EVERY job kind, not only github. Local jobs get one of three `source`-discriminated shapes (`cron` with `trigger:{id,pattern}`, `scheduledFor`, and `previousRunAt`; `manual`; `chain`), each carrying the folder **basename** only (the full host path embeds the operator's OS account name and `/job` is agent-readable) plus the folder's HEAD `sha`. GitHub jobs gain `comment:{body,author_association}` for comment-triggered jobs — INT-WEBHOOK-PAYLOAD-SUBSET is UNCHANGED, both fields were already in its list; this is the first time they leave the receiver, still data-by-placement per CONST-ISSUE-TEXT-IS-DATA and never in worker logs or the run record — and a HARNESS-COMPUTED `matched:{index,type,label\|phrase\|action}` naming the raw triggers.json entry that fired (the filter's own decision record, not a payload field; never enters the prompt). `sender.login` deleted from event.json as written-but-never-populated — the subset extracts `sender.id` only, so the list is unchanged there too. INT-TRIGGERS-FILE-CONTRACT: the cron byte-match acceptance gains its one carve-out — scheduler `data` now carries a cron-only `trigger:{id,pattern}`, since `pattern` exists nowhere else at job time. INT-RUN-HISTORY-FILE-CONTRACT: the per-job `.json` files double as the `previousRunAt` lookup source — a read-only, filename-keyed scan, explicitly not a query surface, bounded by `PI_LOG_RETENTION_DAYS`. |
 | 2026-07-27 | Closed the gh CLI gaps (issue #50): INT-TRIGGERS-FILE-CONTRACT's cron `run` gains an optional boolean `github` — absent/false = no token (the zero-GitHub default), `true` = the worker mints the SAME per-job token the GitHub path mints; a non-boolean value is refused at load, and `GITHUB_AUTH_SOURCE=app` refuses at mint time, since an installation token is per-repo and a local job has no repo to scope it to. INT-CONTAINER-RUNTIME-CONTRACT: the minted value is now injected as BOTH `GITHUB_TOKEN` and `GH_TOKEN` (gh prefers `GH_TOKEN`; mirroring forecloses precedence surprises), and both names are refused in the `PI_FORWARD_ENV` allowlist at config load — a forwarded operator token would otherwise silently override the minted one. Documented the `source:gh` trade-off next to `CONST-TOKEN-SCOPED-PER-JOB`: per-job scoping is the App path's property (a fine-grained PAT approximates it for a single owner); `gh` hands the operator's full-scope login to every token-carrying job, `doctor` names the actual scopes, and the operator's `~/.config/gh` is never mounted into a container. |
 | 2026-07-22 | Unified triggers (issue #20 + `pull_request` triggers): replaced INT-SCHEDULES-FILE-CONTRACT with **INT-TRIGGERS-FILE-CONTRACT** — one `triggers.json` of `{ on, run }` entries via `PI_TRIGGERS_FILE`, read by both worker (`on.type:cron`) and receiver (`label`/`comment`/`pull_request`), with the `on × run` diagonal enforced fail-loud at load. Expanded INT-WEBHOOK-PAYLOAD-SUBSET to consume the `pull_request` event and its fields (`number`/`title`/`body`/`author_association`/`labels[].name`/`head.{ref,sha,repo.full_name}`/`base.ref`) plus `issue.pull_request` as a presence marker — `head`/`base` are attacker-controlled DATA, never a clone ref. Amended INT-CONTAINER-JOB-INPUTS: `/job/event.json` now carries an `issue` OR a `pull_request` body per the job-data `target` discriminator. See `DES-TRIGGERS-UNIFIED-FILE`, `DES-PR-TRIGGER-ROUTES-TO-FLOW`. |

@@ -12,12 +12,19 @@
  * the App path's per-repo short-lived tokens (CONST-TOKEN-SCOPED-PER-JOB) — so doctor names the scopes it
  * carries; and gh is preflighted inside the job image, since a token that works host-side but not
  * in-container fails jobs mid-run, not at submit. Token values travel via the spawn env only, never argv.
+ *
+ * The staged-packages checks (REQ-GLOBAL-PI-OVERLAY, INT-TRIGGERS-FILE-CONTRACT) exist because every way
+ * that feature breaks is SILENT: a trigger sets `run.packages: true`, nothing is staged, PI_PACKAGES is
+ * never emitted, and the flow runs without the tools it was written for -- then exits 0. Doctor is the only
+ * place that sees the staged set and its arming state at once, so it is where those become visible.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
-import { findLiteralSecret } from "./import-pi.mjs";
+import { findLiteralSecret, ADMIN_RE } from "./import-pi.mjs";
+import { PACKAGES_SUBDIR, readStageManifest } from "./packages.mjs";
+import { parseTriggers } from "./triggers.mjs";
 
 const NODE_FLOOR = [22, 19]; // pi's engine floor (22.19.0)
 
@@ -171,6 +178,10 @@ export async function runDoctor(env = process.env, deps = {}) {
 		fix: authFromPi ? `run \`pi login\` with an API key for ${provider}, or set ${keys[0]} in .env` : `set ${keys[0]} in .env`,
 	});
 
+	// Counted once: it drives the ARMED/dormant pair inside the overlay block AND the two "armed but nothing
+	// to load" checks -- one for a staged-package-less overlay, one for no overlay at all.
+	const armedTriggers = countPackageTriggers(env, fileExists);
+
 	// Global pi overlay (REQ-GLOBAL-PI-OVERLAY), only when configured. The overlay is mounted :ro into an
 	// adversarial-input container, so the load-bearing checks are that it holds NO credential.
 	const overlay = env.PI_GLOBAL_PI_DIR;
@@ -211,7 +222,66 @@ export async function runDoctor(env = process.env, deps = {}) {
 					checks.push({ ok: true, label: "Overlay extensions present but dormant (PI_GLOBAL_ALLOW_EXTENSIONS unset)" });
 				}
 			}
+
+			// Staged pi packages (REQ-GLOBAL-PI-OVERLAY): pinned third-party code the operator staged with
+			// `import-pi --with-packages`, armed per trigger with `run.packages: true`. Keyed on the dir the
+			// same way the extensions pair above is, so a deployment that stages none prints nothing here.
+			const packagesDir = join(overlay, PACKAGES_SUBDIR);
+			if (fileExists(packagesDir)) {
+				const manifest = readStageManifest({ globalPiDir: overlay, readFile: (p) => readFileSync(p, "utf8"), fileExists });
+				if (!manifest) {
+					checks.push({
+						ok: false,
+						label: `Staged packages manifest readable (${PACKAGES_SUBDIR}/packages.json)`,
+						fix: "re-run `pi-dispatch import-pi --with-packages` -- without the manifest nothing knows what is staged, so no package is ever loaded",
+					});
+				} else {
+					// A manifest entry whose dir is gone loads nothing, and pi reports no error for a package
+					// it was never told about -- the stage is only as real as the dirs behind the names.
+					const missing = manifest.packages.filter((p) => !fileExists(join(packagesDir, p.dir))).map((p) => p.name);
+					checks.push({
+						ok: missing.length === 0,
+						label: `Staged packages present (${manifest.packages.map((p) => `${p.name}@${p.version}`).join(", ")})`,
+						fix: `staged dir missing for ${missing.join(", ")} -- re-run \`pi-dispatch import-pi --with-packages\` to restage`,
+					});
+					// The admin extension's twin, and blocked for the same reason import-pi blocks that one.
+					const admin = manifest.packages.filter((p) => ADMIN_RE.test(p.name) || ADMIN_RE.test(p.dir)).map((p) => p.name);
+					if (admin.length > 0) {
+						checks.push({
+							ok: false,
+							label: `Staged package looks like the dispatch admin (${admin.join(", ")})`,
+							fix: "remove it from the overlay -- a package that can enqueue paid jobs from INSIDE a job container is a recursion vector",
+						});
+					}
+				}
+				if (armedTriggers > 0) {
+					checks.push({
+						ok: false,
+						warn: true,
+						label: `Staged packages ARMED on ${armedTriggers} trigger(s) (run.packages: true)`,
+						fix: "they run third-party code against adversarial input with open egress -- vet each, and keep every version exactly pinned",
+					});
+				} else {
+					checks.push({ ok: true, label: "Staged packages present but dormant (no trigger sets run.packages: true)" });
+				}
+			} else if (armedTriggers > 0) {
+				// The silently-package-less job: the flag is set, nothing is staged, PI_PACKAGES is never
+				// emitted, and the flow runs WITHOUT the tools it was written for -- on a clean exit 0.
+				checks.push({
+					ok: false,
+					label: `${armedTriggers} trigger(s) set run.packages: true but nothing is staged in ${packagesDir}`,
+					fix: "declare them in pi-packages.json and run `pi-dispatch import-pi --with-packages`, or drop run.packages from the trigger -- otherwise the flow runs without its tools and still exits 0",
+				});
+			}
 		}
+	} else if (armedTriggers > 0) {
+		// Same silent failure one level up: the staged set lives INSIDE the overlay, so no overlay means the
+		// packages are not mounted at all, however carefully they were staged.
+		checks.push({
+			ok: false,
+			label: `${armedTriggers} trigger(s) set run.packages: true but PI_GLOBAL_PI_DIR is unset`,
+			fix: "set PI_GLOBAL_PI_DIR -- staged packages live inside the overlay and are mounted with it, so with no overlay there is nothing to load",
+		});
 	}
 
 	let failed = false;
@@ -234,6 +304,25 @@ function nodeCheck(version) {
 		label: `Node ≥ ${NODE_FLOOR[0]}.${NODE_FLOOR[1]} (have ${version})`,
 		fix: `upgrade Node to ${NODE_FLOOR[0]}.${NODE_FLOOR[1]} or newer`,
 	};
+}
+
+/**
+ * How many triggers arm the staged packages (`run.packages: true`, INT-TRIGGERS-FILE-CONTRACT)? Parsed with
+ * the SHARED `parseTriggers`, so doctor counts exactly the entries the worker and receiver will act on --
+ * a truthy `"true"` string is rejected there and therefore never counted as armed here.
+ *
+ * Swallows ANY error to 0 -- a missing, unreadable, or malformed triggers file already fails LOUD at worker
+ * boot (config.mjs, schedules.mjs), so re-reporting the parse failure here would only bury doctor's own
+ * findings under a second copy of a diagnosis the operator already gets.
+ */
+function countPackageTriggers(env, fileExists) {
+	try {
+		const path = env.PI_TRIGGERS_FILE; // config.mjs's own default is null -- unset means no triggers at all
+		if (!path || !fileExists(path)) return 0;
+		return parseTriggers(readFileSync(path, "utf8"), path).filter((t) => t.run.packages === true).length;
+	} catch {
+		return 0;
+	}
 }
 
 /** Resolve a spawned command's exit code; null means it could not be launched (e.g. not on PATH). */

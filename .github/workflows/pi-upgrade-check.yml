@@ -22,6 +22,7 @@ on:
       - "receiver/**"
       - "guardrails/**"
       - "package.json"
+      - "pi-packages.example.json"
       - ".github/workflows/pi-upgrade-check.yml"
   pull_request:
     paths:
@@ -30,6 +31,7 @@ on:
       - "receiver/**"
       - "guardrails/**"
       - "package.json"
+      - "pi-packages.example.json"
       - ".github/workflows/pi-upgrade-check.yml"
   schedule:
     # Weekly: pi ships breaking changes between minors and its HEAD moved within 24h of this
@@ -62,6 +64,24 @@ jobs:
             exit 1
           fi
           echo "OK: base pinned by digest"
+
+      - name: The example pi-packages.json pins exact versions
+        run: |
+          # Third-party pi packages an operator stages into the global overlay are pinned by the SAME
+          # reasoning as pi itself (CONST-PI-VERSION-PINNED, INT-PI-PACKAGES-FILE-CONTRACT). The grep
+          # above is deliberately NOT extended to them: the operator's real pi-packages.json lives on
+          # their host, not in this repo, so there is nothing here to grep. The REAL enforcement is
+          # import-pi's load-time refusal (EXACT_VERSION_RE in worker/src/packages.mjs), which stages
+          # nothing at all when a version is a range, a tag, or a wildcard. This step only keeps the
+          # EXAMPLE we ship honest -- an example carrying "^1.4.2" would teach the failure mode the
+          # refusal exists to prevent.
+          bad=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' pi-packages.example.json \
+                | grep -vE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?"' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::pi-packages.example.json carries a non-exact version: $bad"
+            exit 1
+          fi
+          echo "OK: example package pins are exact"
 
   no-automatic-merge:
     name: no automatic merge (CONST-MERGE-NEVER-AUTOMATIC)
@@ -179,6 +199,93 @@ jobs:
         run: |
           docker run --rm --entrypoint grep pi-job:ci -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
             || { echo "::error::Guardrails sentinel missing from /opt/pi-dispatch/HARD_RULES.md"; exit 1; }
+
+      # --- INT-CONTAINER-JOB-INPUTS / REQ-GLOBAL-PI-OVERLAY ---
+      # A staged package that did not mount must be refused BEFORE any spend. This is the one failure
+      # that pi will not report for us: it SKIPS a local package source that does not resolve -- no
+      # error, no diagnostic -- so an unmounted package otherwise runs the flow to a clean exit 0
+      # without the tools it was written for, and reports success for work it could not have done.
+      #
+      # NO --entrypoint here, deliberately: the assertion is about the RUNNER, which is the entrypoint.
+      # The exit code alone would be vacuous (a missing /job/prompt.md is also exit 2), so the message
+      # is asserted too -- and the second run is the differential that proves the packages check fires
+      # FIRST, before the prompt is even read.
+      - name: A staged package path that did not mount is refused pre-spend (exit 2)
+        run: |
+          run_runner() {
+            docker run --rm --network none \
+              -e PI_PROVIDER=anthropic -e PI_MODEL=claude-sonnet-4-5-20250929 -e PI_MAX_TURNS=1 "$@" \
+              pi-job:ci 2>&1
+          }
+          set +e
+          out=$(run_runner -e PI_PACKAGES=/opt/pi-global/packages/definitely-not-mounted)
+          code=$?
+          set -e
+          echo "$out"
+          [ "$code" = "2" ] || { echo "::error::PI_PACKAGES pointing at a missing dir exited $code, want 2 (policy, not retried)."; exit 1; }
+          echo "$out" | grep -q "staged package path does not exist" \
+            || { echo "::error::exit 2 came from something other than the staged-package check -- the assertion is vacuous."; exit 1; }
+          # Differential: with PI_PACKAGES unset the SAME invocation dies later, on the missing prompt.
+          # That is what shows the packages check runs before the job inputs are read, i.e. pre-spend.
+          set +e
+          out2=$(run_runner)
+          code2=$?
+          set -e
+          [ "$code2" = "2" ] || { echo "::error::control run exited $code2, want 2"; exit 1; }
+          echo "$out2" | grep -q "missing job input" \
+            || { echo "::error::control run did not fail on the prompt -- the ordering claim is unproven."; exit 1; }
+          echo "OK: staged-package refusal precedes the job-input read"
+
+      # --- INT-CONTAINER-RUNTIME-CONTRACT (PI_OFFLINE=1) ---
+      # pi's resolver shells out to a REAL `npm install` for any npm:/git: source unless offline mode
+      # is on, and ~/.pi/agent IS writable in the container -- so without this flag an unresolved
+      # source is a live network install of third-party code at agent runtime. With it,
+      # resolvePackageSources takes the `installMissing() -> false -> continue` branch: a clean skip.
+      #
+      # ONLY the PI_OFFLINE=1 half is asserted, on purpose. The obvious negative half (same run with
+      # the variable unset, expecting failure) would be VACUOUS here: under `--network none` that run
+      # fails because the network is off, not because pi refused, so a green would be asserting that
+      # docker's --network none works. Distinguishing the two would mean asserting on npm's retry
+      # timing or its error text, neither of which is a contract we can pin. The other direction --
+      # unset, WITH a network -- is exactly the live third-party install this flag exists to prevent,
+      # so it is not something to run in CI either. The real enforcement is that the worker sets
+      # PI_OFFLINE=1 on every job and the runner re-asserts it in-process before the loader is built.
+      - name: "PI_OFFLINE=1 turns an unresolvable npm: source into a clean skip"
+        run: |
+          PROBE='import { DefaultResourceLoader, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+          const loader = new DefaultResourceLoader({
+            cwd: "/tmp", agentDir: getAgentDir(), settingsManager: SettingsManager.inMemory({}),
+            noContextFiles: true, noSkills: true, noExtensions: true,
+            additionalExtensionPaths: ["npm:@pi-dispatch/definitely-does-not-exist"],
+          });
+          await loader.reload();
+          const n = loader.getExtensions().extensions.length;
+          if (n !== 0) { console.error("expected 0 extensions from an unresolvable npm: source, got " + n); process.exit(1); }
+          console.log("OK: offline skip, nothing installed");'
+          docker run --rm --network none -e PI_OFFLINE=1 -e PROBE="$PROBE" \
+            --entrypoint sh pi-job:ci -c 'cd /app && node --input-type=module -e "$PROBE"' \
+            || { echo "::error::PI_OFFLINE=1 did not make an unresolvable npm: source a clean skip -- pi may have tried to install at load time."; exit 1; }
+
+      # --- DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY (trap (g) in INT-SDK-SESSION-OPTIONS) ---
+      # pi-ai is installed TWICE with separate module-level api-provider registries, and
+      # pi-coding-agent uses the NESTED copy -- which is why a bare `import "@earendil-works/pi-ai"`
+      # from runner code registers, reports success, and meters nothing. The meter does not DEPEND on
+      # this layout: it probes each candidate at runtime and accepts whichever registry the
+      # ModelRegistry actually mutates, so a future npm dedupe would still work. This step exists so
+      # such a dedupe fails LOUDLY here, next to the explanation, instead of silently invalidating the
+      # trap the spec and the runner's comments are written around.
+      - name: pi-ai is installed twice, and a bare specifier resolves to the wrong copy
+        run: |
+          docker run --rm --entrypoint sh pi-job:ci -c '
+            nested=/app/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js
+            test -f "$nested" || { echo "no nested pi-ai copy at $nested"; exit 1; }
+            cd /app
+            bare=$(node --input-type=module -e "process.stdout.write(import.meta.resolve(\"@earendil-works/pi-ai/compat\"))") || exit 1
+            case "$bare" in
+              *"pi-coding-agent/node_modules"*) echo "a bare specifier now resolves to the nested copy: $bare"; exit 1 ;;
+            esac
+            echo "OK: nested=$nested bare=$bare"
+          ' || { echo "::error::The dual pi-ai layout changed. The usage meter probes at runtime and still works either way, but INT-SDK-SESSION-OPTIONS trap (g) and the runner comments are written around this layout -- re-verify them before relaxing this step."; exit 1; }
 
       # --- DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS / REQ-FRONTEND-VISUAL-VERIFY ---
       # Root-installed Chromium lands in /root/.cache/ms-playwright, invisible to the non-root user

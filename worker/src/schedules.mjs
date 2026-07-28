@@ -44,12 +44,14 @@ function normalizeCronSchedule({ on, run }, path, existsSync) {
 
 	// Absent provider/model/maxTurns stay absent (undefined) so the value resolves at job start against the
 	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). data key order matches
-	// queue.mjs -- the shape the processor's runJob consumes. `github` (the opt-in token flag,
-	// INT-TRIGGERS-FILE-CONTRACT) rides along the same way: undefined drops out at JSON serialization, so
-	// an unflagged schedule stays byte-identical to today's. `trigger` is the one cron-only field: it is
-	// carried into the local `/job/event.json` (INT-CONTAINER-JOB-INPUTS) so a scheduled job can name its
-	// own trigger; the INT-TRIGGERS-FILE-CONTRACT byte-match acceptance is amended for exactly this field.
-	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, trigger: { id: on.id, pattern: on.pattern } };
+	// queue.mjs -- the shape the processor's runJob consumes. The two per-trigger opt-ins ride along the
+	// same way and are kept adjacent: `github` (the scoped token flag) and `packages` (load the operator-
+	// staged pi packages, INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY). Undefined drops out at JSON
+	// serialization, so an unflagged schedule stays byte-identical to today's. `trigger` is the one
+	// cron-only field: it is carried into the local `/job/event.json` (INT-CONTAINER-JOB-INPUTS) so a
+	// scheduled job can name its own trigger; the INT-TRIGGERS-FILE-CONTRACT byte-match acceptance is
+	// amended for exactly this field.
+	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages: run.packages, trigger: { id: on.id, pattern: on.pattern } };
 	// Retention only; the deterministic repeat:<id>:<millis> jobId supplies dedup, so no jobId here, and
 	// scheduler jobs are not retried (DES-CRON-VIA-BULLMQ-SCHEDULER) so no attempts/backoff.
 	const opts = { removeOnComplete: { age: 24 * 3600 }, removeOnFail: { age: 7 * 24 * 3600 } };

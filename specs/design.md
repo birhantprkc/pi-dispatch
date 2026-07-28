@@ -781,6 +781,80 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `CONST-ISSUE-TEXT-IS-DATA`, `CONST-MERGE-NEVER-AUTOMATIC`, `INT-CONTAINER-JOB-INPUTS`,
   `DES-PERSONA-VIA-APPEND-SYSTEM-MD`, `DES-OPERATOR-GLOBAL-OVERLAY`, `DES-PANEL-SEPARATE-FROM-RECEIVER`
 
+## DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY
+
+- **Decision**: Meter token usage **process-wide**, at pi-ai's **module-level api-provider registry** — not
+  on an `AgentSession`'s event bus. The runner wraps every registered api id with a `{ streamSimple }` that
+  dispatches exactly as compat would and then *observes* the returned stream (`stream.result()` is a
+  memoised promise resolved from the terminal event, so awaiting it accounts for a call **without consuming
+  it**; the stream object is returned untouched, no proxy, so identity and `instanceof` still work
+  downstream). Registration goes **through `modelRegistry.registerProvider`**, so `ModelRegistry.refresh()`
+  re-applies it, plus an unref'd re-arm interval and a deterministic `arm()` after `createAgentSession`.
+  `options.sessionId` gives the root/other attribution for free. The `subscribe()` per-turn accumulator
+  (`attachTokenBudget`) survives as the **fallback**, attached only when the meter could not install, so
+  exactly one accumulator is ever live.
+- **Why**: The bus is **per instance** and no event carries a session id, so a subagent session an extension
+  spawns is invisible to it — a 16-wide fanout registers as roughly **one** turn, and both the cap and the
+  run record then understate spend on exactly the most expensive jobs. The registry is the one choke point
+  every in-process session funnels through: pi-coding-agent's session calls compat's `streamSimple`, compat
+  resolves the provider for `model.api` out of that registry, and root and subagent alike pass through it.
+  Metering there counts **calls** rather than turns, which is the honest unit anyway — a turn is a bundle of
+  calls whose count we do not control. Two properties fall out for free and are worth naming: per-session
+  attribution (so `otherTotal > 0` **is** the evidence of subagent spend), and a **forward brake** that the
+  bus could never give — `session.abort()` is voluntary and does not propagate to a child, whereas after a
+  breach every subsequent call by any session is answered with a synthetic aborted stream before it reaches
+  a provider. The cap stays structurally **lagging** (`OQ-010`) either way; `REQ-JOB-TIMEOUT-30M` is still
+  the ultimate backstop.
+- **Rejected**:
+  - *Keep the `subscribe()`-only meter* — the mechanism this replaces. It is correct about the session it
+    subscribed to and blind to every other one, which is the whole defect; it stays as the fallback so a
+    job still gets totals when the registry cannot be reached.
+  - *`session.getSessionStats()`* — the cumulative as-billed total is **session-scoped**, so it has exactly
+    the blind spot the bus has, with the added cost of being a poll rather than a hook.
+  - *Parse the provider SSE stream (an `undici` interceptor or a fetch shim)* — would reimplement usage
+    extraction for ~30 provider wire formats, break silently whenever one changes a field name, and be
+    wrong by construction for any provider that does not go through the intercepted transport. It is also
+    the exact reinvention `no-reimplementing-pi` forbids: pi already parses usage and hands it to us.
+  - *An `after_provider_response` extension hook* — an extension handler is registered on **an**
+    `AgentSession`'s own extension runtime, so it inherits the same per-instance scope that disqualifies
+    the bus, and it would place the harness's accounting **inside** the untrusted extension surface the
+    meter exists to watch.
+  - *Patch or vendor pi* — a monkey-patch of `dist/` turns `CONST-PI-VERSION-PINNED`'s "upgrading is one
+    version string" into "upgrading is a fork". The registry is a supported, exported seam; use it.
+- **Must handle** (each verified by runtime probe, none by reading source — this is the part that bites):
+  - **Two module instances.** pi-ai is installed twice (hoisted, and nested under pi-coding-agent) with
+    **separate** module-level registries, and pi-coding-agent uses the nested one. A bare-specifier import
+    from runner code binds the hoisted copy and is a **silent no-op** — it registers, reports success, and
+    counts nothing — and `import.meta.resolve` reports the wrong path convincingly. Acceptance is decided
+    **only** by a mutation probe: register an inert provider through the `ModelRegistry`, then ask the
+    candidate module whether it can see it. The probe is never unregistered, because
+    `unregisterProvider` → `refresh()` → `resetApiProviders()` would wipe every wrapper.
+  - **`resetApiProviders()` wipes the registry.** It is what `AgentSession.reload()` calls, so the meter
+    cannot be install-once. Registering through the `ModelRegistry` covers the `refresh()` path (it
+    re-applies stored configs); the unref'd interval covers the bare-reset path, which re-applies nothing.
+    That leaves a **re-arm gap** — a call landing between a wipe and the next poll is unmetered, and the
+    only symptom is a total that reads like a cheap job — so the count of displaced api ids, the number
+    armed, and the poll interval are reported at teardown, which is the only evidence such a window existed.
+  - **Displacement, in both directions.** An extension may register its own provider for an api id after we
+    armed, and `refresh()` re-applies our stored config as a **fresh** object — so a wrapper chain can form
+    that `arm()` cannot tell from a third party's override. Wrapped entries are therefore tracked by
+    **object identity**, one provider name per api id (so a re-arm upserts rather than piles up), and every
+    observed stream is remembered in a `WeakSet` — every link of such a chain hands us the **same** stream
+    object, which makes a double count impossible rather than merely unlikely.
+  - **Builtin-auth fidelity.** Overriding a builtin api id flips compat's `shouldUseBuiltinModels` to
+    false, so compat stops consulting its own model catalog and calls us instead. The wrapper therefore
+    reproduces that branch against the catalog loaded as a **sibling of the accepted compat module** (never
+    by specifier — that would reopen the two-instance trap): 2 of the 35 builtin providers substitute
+    baseUrl placeholders and inject headers in that layer, and bypassing it breaks exactly those. If the
+    catalog cannot be loaded the meter degrades to delegating to the registry entry — still metering, and
+    correct for the other 33. **Both silent degradations are reported on the install line** rather than
+    hidden behind a bare "ok": whether the catalog loaded (and why not), and whether a pre-dispatch brake
+    exists at all — the latter alongside whether the job is capped, since an uncapped job has no brake by
+    design and `capped` without a brake is the alarm.
+- **Traces to**: `REQ-TOKEN-ACCOUNTING-AND-CAPS`, `REQ-RUNNER-TURN-BUDGET`, `CONST-BUDGET-BEFORE-TOKENS`,
+  `CONST-PI-VERSION-PINNED`, `INT-SDK-SESSION-OPTIONS`, `INT-RUNNER-EXIT-CODE-PROTOCOL`,
+  `INT-RUN-HISTORY-FILE-CONTRACT`, `OQ-010`, `OQ-011`
+
 ## DES-OPERATOR-GLOBAL-OVERLAY
 
 - **Decision**: Reuse an operator's existing host `pi` setup across every job through a single **global
@@ -791,12 +865,49 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   A host-side `pi-dispatch import-pi` stages the **credential-free** subset of `~/.pi/agent` and `doctor`
   re-verifies it. Extensions are a separate, armed opt-in (`--with-extensions` + `PI_GLOBAL_ALLOW_EXTENSIONS`),
   with the admin extension hard-blocked. A runtime **mount**, not a rebuild, so it works with the pulled image.
+  The overlay carries a fourth thing: **operator-staged pi packages** at `packages/<dir>/`, installed on the
+  host by `import-pi --with-packages` from an exact-pinned `pi-packages.json` and handed to the runner as
+  `PI_PACKAGES` — absolute container paths, appended **last** to `additionalExtensionPaths`, and only for a
+  trigger that set `run.packages: true`.
 - **Why**: Four trust tiers, each refining but never removing the one above — baked floor (immutable) →
   operator overlay (deploy-time, operator-authored) → per-repo `.pi/` (trusted-by-merge) → adversarial input.
   The overlay sits at the operator's own trust level, which is why it may carry a persona (unlike the
   admin-editable settings overlay) yet must stay `:ro` and credential-free (it rides into an adversarial-input
   container: `CONST-TOKEN-SCOPED-PER-JOB`). Skills are **first-path-wins** in pi, so listing the repo path
   first makes repo skills override global ones — the "project refines global" semantics operators expect.
+  **The packages tier is a fifth tier inside tier 2, and it is gated four times, not two.** Overlay
+  extensions are the operator's *own* code and are doubly gated (copied under a flag, loaded under another);
+  a staged package is *someone else's* code, so it adds an exact version pin at declaration time and a
+  **per-trigger** arming that no env flag can express — a deployment can run one flow with a package and
+  every other flow without it. That fourth gate is finer-grained than the extensions gate on purpose:
+  arming is per capability-consumer, not per host. Staging happens on the **host** because pi resolves a
+  non-`npm:`/`git:` spec as a **local path**, in place, with no install, no network and no writes — which is
+  the only shape that loads under `PI_OFFLINE=1` inside a container with adversarial input.
+  **The finding, and where it is actually fixed: on the raw load a staged skill beats the repo's.** pi
+  builds `skillPaths` as `mergePaths(cliEnabledSkills, additionalSkillPaths)` — the **package-contributed
+  paths first**, ours after — and `loadSkills` is first-path-wins, so a package's `deploy` is the one pi
+  keeps and the repo's is dropped to a `{type:"collision"}` diagnostic nothing reads. That would **invert**
+  `REQ-GLOBAL-PI-OVERLAY`'s documented "repo wins on conflict", and **path order cannot fix it**:
+  `additionalSkillPaths` cannot be placed ahead of the package paths. (Ordering *does* work for extensions,
+  which is why the package paths are listed last there.)
+  **The ordering is pi's; the result is ours.** `DefaultResourceLoaderOptions.skillsOverride` is a declared
+  option on the pinned loader, invoked with `{skills, diagnostics}` the moment `loadSkills` returns and
+  before the loader stores anything — so precedence is re-imposed on the *result*: any kept skill under a
+  package root whose name also exists under `/job/pi/skills` or `/opt/pi-global/skills` is replaced by the
+  protected one, protected roots consulted in order so the repo still beats the overlay. The substitute is
+  produced by pi's own public `loadSkillsFromDir` with `source: "path"` — the loader that `loadSkills` would
+  itself have used — rather than by parsing `SKILL.md` here, which would be a second, divergent reader of a
+  format we do not own. This is not a workaround for a missing lever; **it is the lever**, and using it is
+  what makes the requirement true rather than merely asserted.
+  **So a name collision is reported, not refused.** An earlier draft of this entry refused the job on the
+  grounds that there was no reordering lever; that premise was **false**, and refusing a conflict we have
+  already resolved the documented way would have cost an operator a run for nothing. What survives is the
+  *visibility* half: pi's unmodified collision diagnostic is read after load and logged (the winning root,
+  never a file path), because a package whose flow was written against a procedure that is not the one now
+  running may quietly do less than it claims — and the operator should learn that from a log line rather
+  than from behaviour. That detector doubles as the tripwire on the pin: a future pi that reorders
+  `skillPaths` so the repo already wins makes it go quiet at exactly the moment the override becomes a
+  no-op.
 - **Rejected**:
   - *Copy `~/.pi` wholesale* — drags `auth.json` and MCP-credentialed extensions into the box; and pi's
     `noSkills/noExtensions/noContextFiles` mean host-global *discovery* is off anyway, so most of it is inert.
@@ -804,8 +915,26 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     delivers the same content without a rebuild.
   - *Load overlay extensions by default* — arbitrary code against adversarial input with open egress; arming
     it must be a second, explicit decision, and the admin extension must never be among them.
+  - *A separate `/opt/pi-packages:ro` mount for staged packages* — it would buy nothing the overlay does not
+    already carry, and it would cost an amendment to `CONST-ISOLATION-CONTAINER-PER-JOB`, whose acceptance
+    **enumerates** the mounts a job may see. Widening a constitutional enumeration for zero new capability
+    is the wrong trade; `packages/` rides the mount that already exists, and the mount list is unchanged.
+  - *A third env flag (`PI_GLOBAL_ALLOW_PACKAGES=1`) to arm them* — redundant and coarser than what ships.
+    Four gates already stand between an npm package and a job, and the fourth (`run.packages` per trigger)
+    is **finer** than any env flag could be: an env flag arms the whole deployment, which is precisely the
+    granularity a third-party-code switch should not have.
+  - *Route packages through pi's own `settings.packages`* — that is the supported path for an interactive
+    pi, and taking it would mean giving the runner a `SettingsManager` that reads a project file. The
+    runner uses `SettingsManager.inMemory()` **deliberately**, so a serviced project's `.pi/settings.json`
+    can never override our spend controls (`INT-SDK-SESSION-OPTIONS`); re-opening that to carry a package
+    list would trade a real protection for a cosmetic one.
+  - *`npm:` sources resolved in-container* — a live network install of third-party code, at agent runtime,
+    inside an adversarial-input container, on **every** run, into a writable `~/.pi/agent`. `PI_OFFLINE=1`
+    exists to make that branch unreachable rather than merely unused.
 - **Traces to**: `REQ-GLOBAL-PI-OVERLAY`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SDK-SESSION-OPTIONS`,
-  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`
+  `INT-PI-PACKAGES-FILE-CONTRACT`, `INT-TRIGGERS-FILE-CONTRACT`, `INT-CONTAINER-JOB-INPUTS`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`, `CONST-PI-VERSION-PINNED`,
+  `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`
 
 ## DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS
 
@@ -950,4 +1079,5 @@ a tunnel.
 | 2026-07-22 | `DES-JOB-OUTBOX-CHAINING` records how the agent learns the outbox protocol: a **separate baked persona file** (`guardrails/OUTBOX_PROTOCOL.md`, immutable `chmod a-w`), composed into `appendSystemPromptOverride` **only when `/outbox` is mounted** (a github job is never billed for it) and evaluated once at loader build per `CONST-PERSONA-IN-CACHED-PREFIX`; kept out of `HARD_RULES.md` (the always-billed safety floor) and framed as documentation — the caps and `ai-trigger` gate are host-enforced, the persona controls nothing. |
 | 2026-07-22 | Coherence fix: reworded the `DES-ADMIN-VIA-PI-EXTENSION` `Decision` line — "reads plus `pause`/`resume` only" now reads "reads, `pause`/`resume`, and the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's second injection residual (every settings write stays operator-typed). |
 | 2026-07-22 | `DES-ADMIN-VIA-PI-EXTENSION` dashboard amended to three in-component views — LIST (framed monochrome panel with unified TRIGGERS pane + `↑↓` runs selection), RUN_DETAIL (PII-free `.json` fields), and LIVE_TAIL — in one self-refreshing overlay. LIVE_TAIL renders raw `.log` bytes through an injected `deps.tailLog` seam whose `fs` read lives in `index.ts`, preserving the overlay-only `.log` boundary (never a tool result, never model context); USED_API stays the three pi members, `tailLog` being an internal `custom`-seam dependency, not a pi member. |
+| 2026-07-28 | Issue #58. Added **`DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY`**: token usage is metered at pi-ai's module-level api-provider registry — the one choke point every in-process session shares — instead of on a per-instance `AgentSession` bus that cannot see a subagent fanout, with the `subscribe()` accumulator kept as the fallback. Records the rejected alternatives (the subscribe-only meter, `getSessionStats`, undici/SSE parsing, an `after_provider_response` extension hook, patching pi) and the four things any implementation must handle, all found by runtime probe rather than by reading source: the dual pi-ai module instance, `resetApiProviders()` wiping raw registrations, wrapper displacement in both directions (identity tracking + a `WeakSet` of observed streams), and builtin-auth fidelity through the sibling-loaded fallback catalog. `DES-OPERATOR-GLOBAL-OVERLAY` amended: the overlay gains a **packages tier** (host-staged, exact-pinned, per-trigger armed, appended last to `additionalExtensionPaths`) and records the skill-ordering finding — pi puts package skill paths FIRST and `loadSkills` is first-path-wins, so on the raw load a staged skill beats the repo's, which would invert this entry's own "repo wins on conflict". Path order cannot fix it, but `DefaultResourceLoaderOptions.skillsOverride` (a declared option on the pinned loader, plus the public `loadSkillsFromDir`) can and does: precedence is re-imposed on the loaded result, repo before overlay before package, so the requirement holds by enforcement. **Correction on the way in**: an earlier draft of this row and entry said there was "no reordering lever" and resolved the finding by refusing the job — the premise was false and the refusal is gone; what remains is the collision *report* (visibility, and the tripwire that goes quiet if a future pi reorders `skillPaths`). Four new Rejected entries: a separate `/opt/pi-packages:ro` mount (would amend `CONST-ISOLATION-CONTAINER-PER-JOB`'s enumerated acceptance for no capability the overlay lacks), a third env arming flag (redundant, and coarser than the per-trigger gate), routing packages through pi's `settings.packages` (would re-open the `SettingsManager.inMemory` protection), and `npm:` sources resolved in-container (a live network install of third-party code in an adversarial-input container, every run). |
 | 2026-07-23 | `DES-ADMIN-VIA-PI-EXTENSION` amended for **AI-operable, confirm-gated writes**: the model-callable surface gains `dispatch_triggers` (read) and the write tools `dispatch_set` + `dispatch_trigger_add`/`_edit`/`_delete`, each routed through `confirmedWrite` — applied only after an operator approves a `ctx.ui.confirm` showing the concrete before/after, refused (writing nothing) when `ctx.hasUI` is false. Adds a **third named injection residual** bounded by that human confirm rather than by structure; supersedes the "every settings write is operator-typed, never a model tool" clause. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged — the confirm is the human approval, and both write paths reach the same validated/atomic `writeTriggers`/`writeSettings`. Extension also ships an `operate-pi-dispatch` skill (advertised via `resources_discover`) recommending how to use the gates. `USED_API` gains `on`. Companion `requirements.md`/`constitution.md` amendments land with it. |

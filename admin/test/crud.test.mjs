@@ -99,6 +99,18 @@ test("editTrigger: updates the flow in place", async () => {
   assert.equal(read(path).triggers[0].run.flow, "newflow");
 });
 
+test("editTrigger: an existing run.packages opt-in survives the write round-trip", async () => {
+  // The admin re-serializes and re-validates the WHOLE file on every edit, so a field it has no dialog for
+  // is exactly the field a round-trip could silently drop. `packages` is security-relevant (it decides
+  // whether the job loads third-party code, REQ-GLOBAL-PI-OVERLAY), so losing it would quietly change what
+  // a reviewed trigger does -- and re-adding it would need another human approval.
+  const path = tmpTriggers({ triggers: [{ on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "old", packages: true } }] });
+  await handleDashboardAction({ action: "editTrigger", index: 0 }, { triggersPath: path }, { ui: mockUi({ input: ["newflow"] }) });
+  const t = read(path).triggers[0];
+  assert.equal(t.run.flow, "newflow", "the edited field changed");
+  assert.equal(t.run.packages, true, "the untouched opt-in survived the round-trip");
+});
+
 test("deleteTrigger: removes on confirm, no-ops on decline", async () => {
   const two = { triggers: [{ on: { type: "label", any: ["a"] }, run: { kind: "github", flow: "f1" } }, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "f2" } }] };
   const path = tmpTriggers(two);

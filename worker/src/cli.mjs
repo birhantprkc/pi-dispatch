@@ -8,10 +8,11 @@ import { gitDirty } from "./git-dirty.mjs";
 
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
-  pi-dispatch init         scaffold .env + triggers.json + pause-windows.json in this folder
+  pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json here
   pi-dispatch doctor       preflight Docker, Valkey, the job image, and your provider key
   pi-dispatch import-pi    stage your host pi setup (models/skills/persona) into a global overlay
-                           [--with-extensions] [--from <agentDir>] [--to <overlayDir>]
+                           [--with-extensions] [--with-packages] [--packages-file <path>]
+                           [--from <agentDir>] [--to <overlayDir>]
 
   pi-dispatch run <folder> --task "<what to do>" [--flow <name>]
                            [--provider <p>] [--model <m>] [--max-turns <n>] [--force]

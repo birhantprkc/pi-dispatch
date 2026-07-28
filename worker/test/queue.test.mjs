@@ -158,6 +158,38 @@ test("enqueueGitHubJob builds the github data shape and dedup opts (fake queue c
 	assert.ok(captured.opts.removeOnFail.age >= 30 * 24 * 3600, "fail retention >= 30d");
 });
 
+// The pi-packages opt-in (REQ-GLOBAL-PI-OVERLAY) rides the github path only: the receiver's filter resolves
+// it from the matched triggers.json entry and hands it over on the job. It is CONDITIONAL, mirroring
+// chainDepth/parentJobId -- an unflagged trigger's data must keep exactly the keys it has today, so the
+// absence case asserts the key is not merely undefined but not present at all. The cron path never reaches
+// enqueueLocalJob (schedules.mjs writes the scheduler data itself), so NON_CHAINED_KEYS above is unchanged.
+test("enqueueGitHubJob puts packages on data only when supplied, and never on an unflagged job", async () => {
+	const { enqueueGitHubJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+
+	const base = {
+		repo: "owner/repo",
+		target: { type: "issue", number: 7, title: "t", body: "b" },
+		flow: "frontend-fix",
+		trigger: { event: "issues", action: "labeled", deliveryId: "guid-pkg", sender: { id: 42 }, matched: { index: 2, type: "label", label: "bug" } },
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+	};
+
+	await enqueueGitHubJob(fakeQueue, { ...base, packages: true });
+	assert.equal(captured.data.packages, true);
+	assert.equal("packages" in captured.data.trigger, false, "an execution knob must not leak into the descriptive trigger");
+
+	await enqueueGitHubJob(fakeQueue, { ...base, packages: false });
+	assert.equal(captured.data.packages, false, "an explicit opt-out is carried, never coerced away");
+
+	await enqueueGitHubJob(fakeQueue, base);
+	assert.equal("packages" in captured.data, false, "an unflagged job's data keeps exactly today's keys");
+	assert.deepEqual(Object.keys(captured.data), ["kind", "repo", "target", "flow", "trigger", "provider", "model", "maxTurns"]);
+});
+
 // Integration against a real Valkey. Runs when VALKEY_TEST_URL is set (CI provides a service).
 const url = process.env.VALKEY_TEST_URL;
 const skip = url ? false : "VALKEY_TEST_URL not set; the queue integration test needs a Valkey";

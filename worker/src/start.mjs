@@ -9,6 +9,7 @@ import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
+import { containerPackagePaths, readStageManifest } from "./packages.mjs";
 import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
 import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
@@ -127,6 +128,7 @@ export async function startWorker(
 		makeLogSink: makeLogSinkFn = makeLogSink,
 		makeRecordWriter: makeRecordWriterFn = makeRecordWriter,
 		makeLogReaper: makeLogReaperFn = makeLogReaper,
+		makeRunContainer: makeRunContainerFn = makeRunContainer,
 	} = {},
 ) {
 	const config = loadConfig(env);
@@ -214,6 +216,15 @@ export async function startWorker(
 	// (CONST-RETRY-INFRA-ONLY). The processor calls it as the sole COMPLETED-path chain step.
 	const collectChain = makeCollectChain({ queue: runtimeQueue, config, log });
 
+	// REQ-GLOBAL-PI-OVERLAY staged packages: read the operator's stage manifest ONCE at boot. The staged set
+	// is deploy-time state under the :ro overlay -- identical for every job -- so a per-job re-read would buy
+	// nothing and put a filesystem read on the hot path. A missing or unreadable manifest yields [] plus one
+	// log line and NEVER a boot failure: a deployment that never opted into packages must not be blocked by
+	// it, and `pi-dispatch doctor` is what fails loud on a mismatch between the overlay and the triggers.
+	const stagedPackages = config.globalPiDir ? readStageManifest({ globalPiDir: config.globalPiDir }) : null;
+	const packagePaths = stagedPackages ? containerPackagePaths(stagedPackages) : [];
+	if (config.globalPiDir && !stagedPackages) log("packages_manifest_absent", { overlay: config.globalPiDir });
+
 	const worker = createWorkerFn({
 		connection: parseConnection(config.valkeyUrl),
 		concurrency: bootConcurrency,
@@ -226,12 +237,13 @@ export async function startWorker(
 		pauseUntil: (job, now) => pauseUntilMs(pauseWindows.current, job, now),
 		deps: {
 			collectChain,
-			runContainer: makeRunContainer({
+			runContainer: makeRunContainerFn({
 				image: config.jobImage,
 				hostEnv: env,
 				openJobLog,
 				globalPiDir: config.globalPiDir, // REQ-GLOBAL-PI-OVERLAY: :ro overlay mount when configured
 				allowGlobalExtensions: config.allowGlobalExtensions,
+				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; only a job with packages:true receives them
 				forwardEnv: config.forwardEnv,
 				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
 			}),
