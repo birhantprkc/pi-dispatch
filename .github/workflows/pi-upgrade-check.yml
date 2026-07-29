@@ -100,6 +100,24 @@ jobs:
           fi
           echo "OK: the example names only pi-job:latest"
 
+      - name: glab is pinned by version AND checksum
+        run: |
+          # `gh` installs from an apt channel and is this image's one unpinned dependency. A second CLI
+          # must not repeat that: an unattended upstream change would land inside a container holding a
+          # repo credential, which is CONST-PI-VERSION-PINNED's reasoning one layer out. The version and
+          # both per-architecture digests are literals in the Dockerfile, and this asserts they stay.
+          for name in GLAB_VERSION GLAB_SHA256_AMD64 GLAB_SHA256_ARM64; do
+            if ! grep -qE "^ARG ${name}=[0-9a-f.]+$" image/Dockerfile; then
+              echo "::error::${name} is missing or not a literal pin in image/Dockerfile."
+              exit 1
+            fi
+          done
+          if ! grep -q 'sha256sum -c -' image/Dockerfile; then
+            echo "::error::The glab download is not checksum-verified."
+            exit 1
+          fi
+          echo "OK: glab pinned by version and verified by checksum"
+
   no-automatic-merge:
     name: no automatic merge (CONST-MERGE-NEVER-AUTOMATIC)
     runs-on: ubuntu-latest
@@ -110,11 +128,15 @@ jobs:
         run: |
           # CONST-MERGE-NEVER-AUTOMATIC: "grep is the test". A match is a merge symbol reaching
           # the code — the human review step is the last line and is not negotiable.
-          if grep -rnE 'pulls\.merge|gh pr merge|mergePullRequest|merge_pull_request|[Aa]utoMerge|/pulls/.*/merge' worker/src image/runner receiver/src; then
+          #
+          # The pattern has TWO surfaces since GitLab landed (issue #42). A grep that still only knew
+          # GitHub's would pass while `PUT /projects/:id/merge_requests/:iid/merge` sat in the worker:
+          # the constraint would read as enforced and would not be.
+          if grep -rnE 'pulls\.merge|gh pr merge|mergePullRequest|merge_pull_request|[Aa]utoMerge|/pulls/.*/merge|glab mr merge|merge_requests/[^ ]*/merge|acceptMergeRequest' worker/src image/runner receiver/src; then
             echo "::error::Merge symbol found. CONST-MERGE-NEVER-AUTOMATIC forbids any merge call."
             exit 1
           fi
-          echo "OK: no merge symbols"
+          echo "OK: no merge symbols (both forges)"
 
   contract-tests:
     name: pinned assumptions still hold (offline, no API key)

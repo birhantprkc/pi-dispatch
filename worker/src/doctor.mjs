@@ -83,7 +83,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 	// image checks just below, and `optingOut`/`requiring` colour the staged-packages lines further down.
 	// `optingOut` counts the only value that withholds the staged set; `requiring` counts an explicit
 	// run.packages: true, which arms nothing any more but is still an operator statement of intent.
-	const { requiring, optingOut, images } = readTriggerFacts(env, fileExists);
+	const { requiring, optingOut, images, forges } = readTriggerFacts(env, fileExists);
 
 	// Only meaningful if docker itself responds; otherwise the image check is noise on top of a down daemon.
 	const imageCode = dockerCode === 0 ? await runCmd(spawn, "docker", ["image", "inspect", jobImage]) : null;
@@ -117,6 +117,32 @@ export async function runDoctor(env = process.env, deps = {}) {
 				warn: true,
 				label: `${img} does not appear to carry the pi-dispatch runner entrypoint`,
 				fix: "build your job image FROM this repo's image/Dockerfile so it keeps /entrypoint.sh -- an image without the runner can exit 0 without ever starting the agent, and the queue records that as success (docs/job-image.md)",
+			});
+		}
+	}
+
+	// GitLab, when the triggers file names it. WARNS rather than fails, matching the github auth checks
+	// below and for the same reason: a deployment can legitimately be mid-setup, and doctor's job is to say
+	// what will not work, not to refuse.
+	if (forges.includes("gitlab")) {
+		const token = env.GITLAB_TOKEN;
+		if (typeof token !== "string" || token.trim() === "") {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: "triggers.json has gitlab triggers but GITLAB_TOKEN is unset",
+				fix: "set GITLAB_TOKEN to a project or group access token with the `api` scope -- gitlab jobs cannot clone, comment, or resolve the actor's access level without it",
+			});
+		} else {
+			checks.push({ ok: true, label: `gitlab triggers configured (${env.GITLAB_URL ?? "https://gitlab.com"})` });
+			// The scope an operator cannot narrow. Said out loud because it is the one place GitLab is
+			// weaker than the github App path and an operator should know which trade they made
+			// (CONST-TOKEN-SCOPED-PER-JOB).
+			checks.push({
+				ok: true,
+				warn: true,
+				label: "a GitLab project access token needs the `api` scope to post notes, which grants full project API read/write",
+				fix: "scope the token to ONE project and rotate it on a schedule -- GitLab offers no contents-vs-issues split, and no short-expiry equivalent of a GitHub App token",
 			});
 		}
 	}
@@ -393,7 +419,7 @@ function nodeCheck(version) {
  * own findings under a second copy of a diagnosis the operator already gets.
  */
 function readTriggerFacts(env, fileExists) {
-	const none = { requiring: 0, optingOut: 0, images: [] };
+	const none = { requiring: 0, optingOut: 0, images: [], forges: [] };
 	try {
 		const path = env.PI_TRIGGERS_FILE; // config.mjs's own default is null -- unset means no triggers at all
 		if (!path || !fileExists(path)) return none;
@@ -402,6 +428,10 @@ function readTriggerFacts(env, fileExists) {
 			requiring: triggers.filter((t) => t.run.packages === true).length,
 			optingOut: triggers.filter((t) => t.run.packages === false).length,
 			images: [...new Set(triggers.map((t) => t.run.image).filter((i) => typeof i === "string"))].sort(),
+			// The forges this file actually needs credentials for. Read from the triggers rather than from
+			// the env, so the check answers "is what you configured enough for what you wrote" instead of
+			// "did you set some variables".
+			forges: [...new Set(triggers.map((t) => t.run.kind).filter((k) => k === "github" || k === "gitlab"))].sort(),
 		};
 	} catch {
 		return none;

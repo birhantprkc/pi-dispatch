@@ -110,7 +110,7 @@ test("postStatusComment: POSTs the comment with body === text, verbatim and unin
 
 	// Untrimmed, brace-laden, trigger-phrase-ish text: none of it may be touched by this module.
 	const text = "  Done @claude {please merge} \n";
-	await host.postStatusComment(REPO, 42, text, "tok");
+	await host.postStatusComment(REPO, { type: "issue", number: 42 }, text, "tok");
 
 	const calls = octokitFor.constructions[0].calls;
 	assert.equal(calls.length, 1);
@@ -154,7 +154,7 @@ test("constructs a FRESH Octokit per call, each bound to that call's token (neve
 	const host = makeGitHubHost({ octokitFor });
 
 	await host.resolveDefaultBranchSha(REPO, "tokenA");
-	await host.postStatusComment(REPO, 7, "hi", "tokenB");
+	await host.postStatusComment(REPO, { type: "issue", number: 7 }, "hi", "tokenB");
 
 	// One construction per method call, each carrying its own per-job token.
 	assert.equal(octokitFor.constructions.length, 2);

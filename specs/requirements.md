@@ -13,17 +13,20 @@ flow, supports frontend work with visual verification, and survives burst load w
 A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
 
 - **Targets**: a **local folder** on the operator's machine (edited in place — the primary self-hosted
-  use, needs only a provider key), or a **GitHub repo** (cloned, worked, opened as a PR — needs a GitHub
-  App).
+  use, needs only a provider key), or a **repository on a forge** — GitHub or GitLab — cloned, worked, and
+  opened as a pull or merge request. A forge target needs a credential for that forge
+  (`CONST-TOKEN-SCOPED-PER-JOB`): on GitHub `gh`, a fine-grained PAT or an App; on GitLab a project access
+  token. *(The old wording said a GitHub App was required. That has been false since `OQ-006` closed and
+  `CONST-TOKEN-SCOPED-PER-JOB` was made mechanism-neutral on 2026-07-17; corrected here.)*
 - **Triggers**: the **CLI** (operator-initiated, `DES-CLI-TRIGGER-FOR-LOCAL`; the admin extension operates
-  the queue and triggers no jobs except the gated `dispatch_run` enqueue), a **webhook** (GitHub issue
-  activity), or **cron** (a schedule).
+  the queue and triggers no jobs except the gated `dispatch_run` enqueue), a **webhook** (issue, comment
+  or pull/merge-request activity on a forge), or **cron** (a schedule).
 
 Everything below the trigger is identical **in shape**: budget check → `/job:ro` inputs → one container →
 the runner → an exit code — the same argv, the same isolation flags, the same env allowlist, the same
-mounts. What differs is authz (a label/collaborator gate for webhooks vs CLI access for
-local), the credential (a short-lived scoped token for GitHub jobs vs none for local), the completion signal
-(an issue comment vs the console, or the admin extension's runs view — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`),
+mounts. What differs is authz (a write-access gate for webhooks vs CLI access for
+local), the credential (a scoped per-forge token for forge jobs vs none for local), the completion signal
+(an issue comment or a GitLab note vs the console, or the admin extension's runs view — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`),
 and — since `run.image` — **which image that one container is**, which changes the toolchain inside the box
 and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
@@ -144,8 +147,10 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
 ## REQ-DEDUP-BY-DELIVERY-GUID
 
-- **Statement**: `jobId` shall be the `X-GitHub-Delivery` GUID, giving exactly-once semantics per
-  delivery **for as long as the job key is retained**. `removeOnComplete` / `removeOnFail` retention
+- **Statement**: `jobId` shall be the forge's own per-delivery id — GitHub's `X-GitHub-Delivery` GUID
+  (`gh-` prefixed), GitLab's `webhook-id` / `Idempotency-Key` (`gl-` prefixed) — giving exactly-once
+  semantics per delivery **for as long as the job key is retained**. The prefixes keep the two id spaces
+  disjoint, so a value that collided across forges could never suppress the other's job. `removeOnComplete` / `removeOnFail` retention
   shall therefore be set to meet or exceed GitHub's redelivery window.
 - **Why**: GitHub redelivers on timeout. A redelivered job is a second paid agent run **and** a second
   pull request on one issue — visible, embarrassing, and billed. The GUID rather than `repo#issue`
@@ -159,19 +164,36 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   `removeOnComplete` with a claim of exactly-once; GitHub retains deliveries for roughly 30 days and
   permits manual redelivery throughout, so days 8–30 were an unguarded gap. Retention is not
   housekeeping here — **it *is* the dedup window**, and shortening it silently shortens the guarantee.
+  **GitLab keeps `webhook-id` constant across its own retries**, which is exactly the property this
+  requirement needs, so the guarantee transfers unchanged — and so does the retention bound.
+  `Idempotency-Key` is the same value under its original name and requires **GitLab 17.4 or later**; an
+  older instance is **refused at the receiver with 400**, naming the version, rather than served on a key
+  synthesised from the payload. A synthesised key — object id plus action, say — is not stable across a
+  retry that changed nothing an operator can see, so it would dedup some redeliveries and bill for the
+  rest: a weaker guarantee wearing this requirement's name, which is worse than a clear refusal.
+  The **semantic** window's key gains a target-type discriminator on GitLab, where issues and merge
+  requests are separate per-project sequences: `project#5` and `project!5` are different objects that one
+  `repo#number` key would coalesce into a single window. On GitHub they share one sequence, which is why
+  its key never needed one — a fact about GitHub, not about forges.
 - **Evidence (upstream)**: `taskforcesh/bullmq @ v5.80.4 → src/commands/addStandardJob-9.lua:88-93`
   (`EXISTS jobIdKey` → `handleDuplicatedJob`; a duplicate add is a silent no-op, not a throw)
 - **Traces to**: `REQ-QUEUE-BURST-NO-DROP`, `CONST-RETRY-INFRA-ONLY`
-- **Acceptance**: Given the same delivery GUID twice **within the retention window**, the second add is
-  ignored and exactly one job runs. Given a redelivery after retention has expired, a new job runs — this
+- **Acceptance**: Given the same delivery id twice **within the retention window** — on either forge —
+  the second add is ignored and exactly one job runs. Given a GitLab delivery carrying neither
+  `webhook-id` nor `Idempotency-Key`, the receiver returns 400 and enqueues nothing. Given a GitLab issue
+  `#5` and a merge request `!5` in one project firing the same flow, both run. Given a redelivery after retention has expired, a new job runs — this
   is accepted and documented, not a defect, but it must be a *chosen* window rather than an inherited
   default.
 
 ## REQ-TRIGGER-AUTHOR-GATE
 
-- **Statement**: The receiver shall enqueue only for: allowlisted issue labels; comments whose
-  `author_association ∈ {OWNER, MEMBER, COLLABORATOR}` matching the trigger phrase; and `pull_request`
-  events whose approval gate is satisfied. Events sent by our own App identity shall be ignored. The label
+- **Statement**: The receiver shall enqueue only for: allowlisted issue labels; comments whose author
+  clears the forge's write-access gate and which match the trigger phrase; and pull/merge-request events
+  whose approval gate is satisfied. On **GitHub** the author gate is the payload's `author_association ∈
+  {OWNER, MEMBER, COLLABORATOR}`; on **GitLab** it is an API-resolved project `access_level >= 30`
+  (Developer), applied to **every** trigger type including labels, because a GitLab label is not an
+  approval (`CONST-TRIGGER-AUTHOR-GATE`). Events sent by our own identity — the App's bot user, the PAT
+  user, or the GitLab token's bot user — shall be ignored. The label
   allowlist is a `{any, all, none}` predicate over the label set: `any` is an OR requirement, `all` a
   stricter AND requirement, and `none` is **suppress-only** — it can never cause a trigger, only prevent
   one. A label rule (and a `labeled` PR rule) shall carry at least one positive selector (a non-empty
@@ -186,9 +208,20 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   requirement is what keeps a `none`-only rule — which would match every labeled event lacking the excluded
   labels, wider than a single-label OR — from ever loading. The PR auto-action author gate is
   load-bearing money control: without it, any fork PR opened by a stranger launches a paid agent run.
-- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`
+- **Where the GitLab lookup runs, and why it is not in the gate**: `filter.mjs` and `filter-gitlab.mjs`
+  import nothing side-effecting, do no I/O and never throw. That purity is what makes the
+  security-critical decision unit-testable without a server, a socket or a queue, so the access-level
+  lookup happens in the **receiver** — after verification, before the gate — and its result is passed in
+  as a plain number, occupying the slot `author_association` holds on the GitHub side. Its three outcomes
+  are deliberately not two: a level (including 0 for a determinate 404) goes to the gate; an
+  **indeterminate** lookup is a **503**, so GitLab redelivers and the stable `webhook-id` dedups the
+  retry. Answering 204 there would drop real work during an outage and look identical on the wire to a
+  stranger being correctly refused.
+- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`, `OQ-013`
 - **Acceptance**: Given `@pi fix this` with `author_association: NONE`, 204 and zero jobs. Given a
-  comment from our own App id, 204 and zero jobs. Given a flow rule with no positive selector (`none`
+  comment from our own App id, 204 and zero jobs. Given a GitLab issue opened by a Guest with the trigger
+  label already applied, 204 and zero jobs. Given a GitLab access lookup that could not complete, 503 and
+  zero jobs — never 204. Given a flow rule with no positive selector (`none`
   only, or empty), config load fails and the receiver does not boot. Given a `pull_request.opened` whose
   PR `author_association` is not a collaborator, 204 and zero jobs; given the same from a `COLLABORATOR`,
   exactly one job. Given a `pull_request.synchronize` whose `sender.id` is our own identity, 204 and zero
@@ -220,10 +253,10 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
 ## REQ-JOB-STATUS-COMMENTS
 
-- **Statement**: Each **GitHub-backed** job shall comment on its triggering issue at start, and on
-  completion or failure.
-- **Scope**: GitHub jobs only. A local-folder job has no issue to comment on; its equivalent is
-  `REQ-LOCAL-JOB-VISIBILITY`. Stated explicitly because the original requirement assumed every job is a
+- **Statement**: Each **forge-backed** job shall comment on its triggering issue, pull request or merge
+  request at start, and on completion or failure.
+- **Scope**: Forge-backed jobs (github, gitlab). A local-folder job has no issue to comment on; its
+  equivalent is `REQ-LOCAL-JOB-VISIBILITY`. Stated explicitly because the original requirement assumed every job is a
   GitHub issue — it is not.
 - **Why**: State must be visible where the human already is — the issue thread. An admin surface the
   operator must deliberately open (now the pi-extension session) does not change that; the issue thread is
@@ -231,25 +264,36 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   `CONST-PI-VERSION-PINNED`'s silent-no-op failure mode: if an upstream break makes every job a no-op,
   the queue still reports success — a missing completion comment is what a human would actually notice.
 - **Traces to**: `CONST-MERGE-NEVER-AUTOMATIC`, `CONST-PI-VERSION-PINNED`
-- **Acceptance**: Given any GitHub job reaching a terminal state, exactly one completion or failure
-  comment exists on the issue.
+- **Acceptance**: Given any forge-backed job reaching a terminal state, exactly one completion or failure
+  comment exists on the issue — posted through that forge's own endpoint, which on GitLab means the merge
+  request notes path for a merge-request target and the issue notes path for an issue.
 
 ## REQ-BRANCH-PROTECTION-PRECONDITION
 
-- **Statement**: The worker shall refuse a GitHub-backed job whose default branch is unprotected,
+- **Statement**: The worker shall refuse a **forge-backed** job whose default branch is unprotected,
   before reserving budget or starting a container.
-- **Scope**: GitHub jobs only. A local-folder job has no remote branch to protect.
+- **Scope**: Forge-backed jobs (github, gitlab). A local-folder job has no remote branch to protect.
 - **Why**: The per-job credential carries `contents:write`, which covers push **and** merge, so branch
   protection is the only technical barrier to a self-merge — the precondition is the operational
   backstop for `CONST-MERGE-NEVER-AUTOMATIC`. The check is consulted before any spend so a repo that
-  cannot satisfy it costs nothing: a determinate "no protection object" (a `404` from the protection
-  API) is a policy refusal, while any other error is retryable and must never be read as a silent
-  "unprotected" that would bypass the backstop.
+  cannot satisfy it costs nothing: a determinate "no protection" answer is a policy refusal, while any
+  other error is retryable and must never be read as a silent "unprotected" that would bypass the
+  backstop.
+  **How "determinate" is established is per forge, and is not transferable.** On GitHub it is a `404`
+  from the protection endpoint. GitLab has no such 404 to lean on, so the check reads the
+  `protected_branches` **list**, which answers `200` with `[]` — and `[]` is determinate where a 404 would
+  be indistinguishable from a project that does not exist or a token that cannot see it. The list is also
+  what makes **wildcard** protections work: GitLab rules may be patterns (`release/*`, `*`), and an
+  exact-name lookup would report a covered branch unprotected and refuse a job that should have run.
+  Issue #61 records the failure this ordering exists to avoid: carrying one forge's 404 semantics to
+  another made every branch report unprotected and silently disarmed the backstop.
 - **Traces to**: `CONST-MERGE-NEVER-AUTOMATIC`, `CONST-TOKEN-SCOPED-PER-JOB`, `CONST-BUDGET-BEFORE-TOKENS`
-- **Acceptance**: Given a GitHub job whose default branch has no protection, the worker returns a policy
-  refusal before `reserveBudget` and before any container starts — no budget slot is consumed, no
-  provider spend occurs, and a refusal comment is posted to the issue. A transient protection-API error
-  (non-`404`) is retried, not treated as unprotected.
+- **Acceptance**: Given a forge-backed job whose default branch has no protection, the worker returns a
+  policy refusal before `reserveBudget` and before any container starts — no budget slot is consumed, no
+  provider spend occurs, and a refusal comment is posted to the issue. A transient protection-API error is
+  retried, not treated as unprotected — on GitHub any non-`404`, on GitLab **any** non-200, since there is
+  no status there that may read as "unprotected". Given a GitLab default branch covered only by a wildcard
+  rule, the job is admitted.
 
 ## REQ-LOCAL-JOB-VISIBILITY
 
@@ -327,7 +371,7 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   `INT-RUN-HISTORY-FILE-CONTRACT`, `CONST-PI-VERSION-PINNED`
 - **Acceptance**: Given a job reaching a terminal state, a record keyed by its job id exists carrying the
   correct outcome and is present after a worker restart; the record contains no issue or comment body,
-  title, or username (`target` is `repo#issue` / `local:<basename>` only); the raw `logs/<jobId>.log`
+  title, or username (`target` is `repo#issue`, `project!iid` for a GitLab merge request, or `local:<basename>` — no other shape); the raw `logs/<jobId>.log`
   exists only when `PI_CAPTURE_JOB_LOGS` is set and is gitignored.
 
 ## REQ-ADMIN-VIA-PI-EXTENSION
@@ -706,3 +750,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). REQ-TOKEN-ACCOUNTING-AND-CAPS: accounting is now **process-wide** — the runner meters at pi-ai's module-level api-provider registry, the choke point every in-process session shares, and the `subscribe()` per-turn sum is the documented **fallback**, attached only when the meter could not install. Records the negative fact that forces it (the event bus is per `AgentSession` instance, `CreateAgentSessionOptions` has no parent/bus option, no event carries a `sessionId`, so a 16-wide fanout registers as ~one turn), the honest note that a plain job's `total` now reads **>=** today's because compaction/summarisation calls were never root `turn_end`s, what a breach actually stops (`session.abort()` does not propagate to children; the forward brake is the synthetic aborted stream for every later call by any session; the backstop stays REQ-JOB-TIMEOUT-30M), and the residual subprocess gap (OQ-011). Acceptance gains the two-concurrent-sessions, breach-mid-fanout and meter-unavailable clauses. REQ-RUNNER-TURN-BUDGET gains a **Scope**: root-session turns only — the same per-instance bus bounds it, and it does not claim otherwise. REQ-GLOBAL-PI-OVERLAY: the overlay now also carries `packages/` — operator-staged third-party pi packages, gated four times over (exact pin in `pi-packages.json`, host-side `--ignore-scripts` staging with an admin-name block, a per-trigger `run.packages` opt-in, and runner-side path validation plus skill-precedence enforcement through the loader's `skillsOverride` seam, which re-imposes this REQ's own "repo wins on conflict" over pi's package-paths-first ordering), with `PI_OFFLINE=1` on every job so a package source can never become a job-time install. |
 | 2026-07-22 | Added REQ-TOKEN-ACCOUNTING-AND-CAPS (issue #25, unblocked by OQ-010): per-job token/cost accounting in the run record + admin views; an optional in-run per-job token budget (`maxTokens`/`PI_MAX_TOKENS`, exits policy `token_budget`); and an optional daily token cap (`dailyTokenCap`/`PI_DAILY_TOKEN_CAP`) enforced **check-AFTER** — the deliberate asymmetry with `CONST-BUDGET-BEFORE-TOKENS`, which is unchanged (still job-count, still check-before). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list with `maxTokens`/`dailyTokenCap`; retargeted REQ-SPEND-CAPS-MULTI-WINDOW's OQ-010 forward-reference to the new REQ. |
 | 2026-07-29 | Issue #41. **REQ-UPSTREAM-CONTRACT-TESTS** gains a **scope boundary, not a new assertion**: "The image build shall assert every pinned assumption… No image publishes on a failed assertion" is a statement about **our** publish step, and after `run.image` a trigger may name an image this repo never built, whose build ran **no assertion at all**. Stated in the Statement and repeated in the Acceptance, with the residual registered as `OQ-012` rather than left as an implication of coverage; the bullet list is otherwise untouched and becomes the checklist an operator-built image should be held to (`docs/job-image.md`, and the `image` CI job made runnable against an arbitrary tag). **REQ-GLOBAL-PI-OVERLAY is UNCHANGED and was checked**: its "Works with the **pulled** prebuilt image — a runtime mount, not a rebuild" is still true and is now true of *any* conformant image, because the overlay is a mount; what it never covered, and still does not, is a **toolchain**, which is exactly the gap `run.image` fills. **Scope** amended: "Everything below the trigger is identical" was a live contradiction with a per-trigger image and now reads "identical **in shape** — the same argv, isolation flags, env allowlist and mounts", with **which image** added to the list of what differs. |
+| 2026-07-29 | Issue #42 (GitLab triggers). **Scope** de-GitHub-ified a second time (the 2026-07-16 row did it once): Targets was a closed two-member list and is now "a local folder, or a repository on a forge — GitHub or GitLab". **A pre-existing contradiction is fixed while in there and flagged inline rather than quietly**: Targets said a GitHub repo "needs a GitHub App", which has been false since `OQ-006` closed and `CONST-TOKEN-SCOPED-PER-JOB` was made mechanism-neutral on 2026-07-17. The authz and credential clauses generalise the same way ("a write-access gate", "a scoped per-forge token"). **REQ-DEDUP-BY-DELIVERY-GUID** amended: `jobId` is the forge's own per-delivery id, `gh-`/`gl-` prefixed so the two id spaces stay disjoint. GitLab's `webhook-id` (17.4+, originally `Idempotency-Key`) is **stable across its own retries**, which is exactly the property this REQ needs, so the guarantee and its retention bound transfer unchanged — and an instance too old for either header is **refused 400 naming the version** rather than served on a key synthesised from the payload, which would not be retry-stable and would therefore dedup some redeliveries and bill for the rest: a weaker guarantee wearing this REQ's name. The **semantic** window's key gains a target-type discriminator on GitLab, where issues and merge requests are separate per-project sequences and `project#5` / `project!5` are different objects; GitHub needs none because it shares one sequence, which is a fact about GitHub rather than about forges. **REQ-TRIGGER-AUTHOR-GATE** amended with the enforcement half of the constitution change, plus a new bullet stating **where the GitLab lookup runs and why it is not in the gate**: both filters import nothing side-effecting and never throw, and that purity is what makes the security-critical decision testable offline, so the access-level resolution happens in the receiver and arrives as a plain number. Its three outcomes are deliberately not two — a determinate level goes to the gate, an indeterminate lookup is a **503** so GitLab redelivers, because a 204 would drop real work during an outage while looking identical on the wire to a stranger being refused. **REQ-BRANCH-PROTECTION-PRECONDITION** amended where it mattered most: its load-bearing "a `404` is the determinate unprotected state" is **GitHub's fact and does not transfer**. GitLab has no such 404, so the check reads the `protected_branches` list — `200` with `[]` is determinate where a 404 would be indistinguishable from a missing project or a blind token — and that also makes **wildcard** protections work, which an exact-name lookup would report as unprotected, refusing a job that should have run. Issue #61 is cited for the failure this avoids: carrying one forge's 404 semantics to another made every branch report unprotected and silently disarmed the never-merge backstop. **REQ-JOB-STATUS-COMMENTS** Scope widened from "GitHub jobs only" to forge-backed jobs — the same class of correction its own Scope field already records having needed once. Enumerations opened in `REQ-GLOBAL-PI-OVERLAY` ("both job kinds" → every), `REQ-DURABLE-RUN-HISTORY` (the `target` grammar gains `project!iid`) and `REQ-SCOPED-PAUSE-WINDOWS` (a scope may be a multi-segment GitLab path). **REQ-QUEUE-BURST-NO-DROP** unchanged and checked: "deliveries" is forge-neutral in substance and the burst property is a queue property. **REQ-CRON-SCHEDULED-JOBS** unchanged and checked: its Acceptance rejects a non-`local` cron entry, and that stays true with a third kind — the reason sentence ("a scheduled trigger supplies no webhook delivery, issue number, title, or body") generalises to any forge rather than needing restatement. |

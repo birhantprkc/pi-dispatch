@@ -21,14 +21,24 @@ const skip = url ? false : "VALKEY_TEST_URL not set; receiver enqueue integratio
 
 const SECRET = "test-webhook-secret";
 const SELF_ID = 999;
+
+/**
+ * Rules are grouped PER FORGE at load (receiver/src/config.mjs), so the github gate reads
+ * `cfg.triggers.github`; `knownFlows` stays above the groups as the whole file's flow vocabulary.
+ * The fixture stays flat and is wrapped here, so regrouping never edits an assertion.
+ */
+function forgeTriggers({ knownFlows, ...group }) {
+	return { github: group, knownFlows };
+}
+
 const cfg = {
 	webhookSecret: SECRET,
-	triggers: {
+	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: null },
 		pullRequest: [],
 		knownFlows: new Set(["frontend-fix"]),
-	},
+	}),
 };
 
 /** GitHub's `X-Hub-Signature-256` shape, computed the same way GitHub computes it. */

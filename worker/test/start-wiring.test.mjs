@@ -31,7 +31,7 @@ function fakeHost(overrides = {}) {
 // Drive startWorker with injected fakes and capture the exact object handed to createWorker
 // (deps are nested under `deps`). No real Redis: createWorkerFn is faked. The real ioredis client
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
-async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, makeRunContainer, order } = {}) {
+async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitLabHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, makeRunContainer, order } = {}) {
 	const calls = [];
 	const registered = {};
 	const createWorkerFn = (arg) => {
@@ -106,6 +106,8 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 			makeLogReaper: logReaper,
 			makeRunContainer: runContainerFactory,
 			makeImagePreflight: (args) => (imagePreflightCalls.push(args), async () => ({ ok: true })),
+			...(makeGitLabAuth ? { makeGitLabAuth } : {}),
+			...(makeGitLabHost ? { makeGitLabHost } : {}),
 		});
 	} finally {
 		process.stdout.write = origWrite;
@@ -155,8 +157,15 @@ test("github configured: real mintToken and the host's isDefaultBranchProtected 
 	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 123, source: "gh" });
 	const { deps, logs } = await runStart({ makeAuth, makeHost: () => host });
 
-	assert.equal(await deps.mintToken("o/r"), "tok", "mintToken must be the real one (not the throwing fallback)");
-	assert.equal(deps.isDefaultBranchProtected, host.isDefaultBranchProtected, "isDefaultBranchProtected must be the host's");
+	const ghJob = { kind: "github", repo: "o/r" };
+	assert.equal(await deps.mintToken(ghJob), "tok", "mintToken must be the real one (not the throwing fallback)");
+	// Both deps now resolve the forge from the JOB rather than being bound to one host at wiring time, so
+	// the assertion is that they ROUTE to this host -- identity-equality would only prove the old binding.
+	let asked = null;
+	const routing = fakeHost({ isDefaultBranchProtected: async (ref) => ((asked = ref?.repo), true) });
+	const { deps: d2 } = await runStart({ makeAuth, makeHost: () => routing });
+	assert.equal(await d2.isDefaultBranchProtected(ghJob, "tok"), true);
+	assert.equal(asked, "o/r", "the github host must be asked about the job's own repo");
 	assert.equal(typeof deps.prepareWorkspace, "function");
 	assert.ok(
 		logs.some((l) => l.event === "self_identity" && l.id === 123 && l.source === "gh"),
@@ -189,7 +198,7 @@ test("auth unavailable: the worker still boots; mintToken fails github jobs clos
 	assert.ok(captured, "startWorker must still construct the worker (a local-only deployment boots)");
 	assert.ok(logs.some((l) => l.event === "github_auth_unavailable"), "a github_auth_unavailable log must be emitted");
 	await assert.rejects(
-		() => deps.mintToken("o/r"),
+		() => deps.mintToken({ kind: "github", repo: "o/r" }),
 		(err) => err?.piDispatchConfig === true,
 		"mintToken must reject with a .piDispatchConfig-tagged configError when auth is unavailable",
 	);
@@ -430,4 +439,41 @@ test("run-history: worker_started announces logsDir, captureJobLogs and logReten
 	assert.equal(started.logsDir, "/tmp/pi-logs", "worker_started must announce where records land");
 	assert.equal(started.captureJobLogs, true, "worker_started must announce the raw-log capture gate");
 	assert.equal(started.logRetentionDays, 7, "worker_started must announce the retention window");
+});
+
+test("a gitlab job routes to the gitlab forge's auth and host, never to github's", { skip }, async () => {
+	// The whole point of the forges map: two forges configured at once, and each job reaching its own.
+	const asked = { github: [], gitlab: [] };
+	const ghHost = fakeHost({ isDefaultBranchProtected: async (ref) => (asked.github.push(ref?.repo), true) });
+	const glHost = fakeHost({ isDefaultBranchProtected: async (ref) => (asked.gitlab.push(ref?.projectId), true) });
+	const { deps } = await runStart({
+		env: { GITLAB_TOKEN: "glpat-x" },
+		makeAuth: async () => ({ mintToken: async () => "gh-tok", selfId: 1, source: "gh" }),
+		makeHost: () => ghHost,
+		makeGitLabAuth: async () => ({ mintToken: async () => "gl-tok", selfId: 2, source: "pat" }),
+		makeGitLabHost: () => glHost,
+	});
+
+	const glJob = { kind: "gitlab", repo: "group/sub/proj", projectId: 42, target: { type: "issue", number: 5 } };
+	const ghJob = { kind: "github", repo: "o/r", target: { type: "issue", number: 7 } };
+
+	assert.equal(await deps.mintToken(glJob), "gl-tok", "a gitlab job must not be handed the github credential");
+	assert.equal(await deps.mintToken(ghJob), "gh-tok");
+
+	await deps.isDefaultBranchProtected(glJob, "gl-tok");
+	await deps.isDefaultBranchProtected(ghJob, "gh-tok");
+	assert.deepEqual(asked.gitlab, [42], "the gitlab host is keyed on the numeric project id");
+	assert.deepEqual(asked.github, ["o/r"], "and the github host on the repo path -- neither saw the other's job");
+});
+
+test("with no GITLAB_TOKEN there is no gitlab forge, and a gitlab job refuses at mint", { skip }, async () => {
+	const { deps } = await runStart({
+		makeAuth: async () => ({ mintToken: async () => "gh-tok", selfId: 1, source: "gh" }),
+		makeHost: () => fakeHost(),
+	});
+	await assert.rejects(
+		() => deps.mintToken({ kind: "gitlab", repo: "g/p", projectId: 1 }),
+		(e) => e.piDispatchConfig === true,
+		"an unconfigured forge refuses with a message, rather than running the job anonymously",
+	);
 });

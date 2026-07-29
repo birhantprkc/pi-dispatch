@@ -109,7 +109,7 @@ function resolveEnvName(provider, cred) {
  * `allowGlobalExtensions` defaults to TRUE here, matching loadConfig's default (REQ-GLOBAL-PI-OVERLAY): a
  * caller that says nothing gets the operator's staged setup, and only an explicit `false` withholds it.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, forgeKind, gitlabHost, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
 	// The provider credential(s), by pi's expected variable name(s) -- from the worker env, or (when
 	// PI_AUTH_FROM_PI is set and the env has none) host-side from pi's auth.json. Throws (config) if
 	// neither source yields one, which the processor turns into a pre-spend refusal.
@@ -158,15 +158,27 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
 	}
 
-	// GitHub-backed jobs, and local cron jobs that opted in via run.github. Other local-folder jobs
-	// have no token (CONST-TOKEN-SCOPED-PER-JOB). The mint goes into BOTH variables because the gh
-	// CLI prefers GH_TOKEN over GITHUB_TOKEN -- mirroring forecloses any precedence surprise inside
-	// the container. This assignment deliberately sits AFTER the PI_FORWARD_ENV loop so a forwarded
-	// name can never override the mint (and loadConfig refuses those names at load anyway).
+	// Forge-backed jobs, and local cron jobs that opted in via run.github. Other local-folder jobs have
+	// no token (CONST-TOKEN-SCOPED-PER-JOB). The mint goes into BOTH of its forge's variables because
+	// each CLI has its own preference -- gh prefers GH_TOKEN over GITHUB_TOKEN, glab prefers GITLAB_TOKEN
+	// -- and mirroring forecloses any precedence surprise inside the container.
+	//
+	// The token goes ONLY into its own forge's names. A GitLab credential exported as GITHUB_TOKEN would
+	// be sent by `gh` to github.com on the agent's first tab-complete: a working credential handed to the
+	// wrong host, which is how a scoped token stops being scoped.
+	//
+	// This assignment deliberately sits AFTER the PI_FORWARD_ENV loop so a forwarded name can never
+	// override the mint (and loadConfig refuses those names at load anyway).
 	// Absent token => absent variable, never an empty one.
 	if (githubToken) {
-		env.GITHUB_TOKEN = githubToken;
-		env.GH_TOKEN = githubToken;
+		if (forgeKind === "gitlab") {
+			env.GITLAB_TOKEN = githubToken;
+			env.GL_TOKEN = githubToken;
+			if (gitlabHost) env.GITLAB_HOST = gitlabHost;
+		} else {
+			env.GITHUB_TOKEN = githubToken;
+			env.GH_TOKEN = githubToken;
+		}
 	}
 
 	return env;

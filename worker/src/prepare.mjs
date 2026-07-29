@@ -2,15 +2,21 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { prepareGithubWorkspace } from "./prepare-github.mjs";
+import { gitlabRemoteUrl } from "./gitlab-host.mjs";
+import { buildGitLabPrompt } from "./gitlab-prompt.mjs";
 import { prepareLocalWorkspace } from "./prepare-local.mjs";
 
 /**
  * The `prepareWorkspace` dispatcher the processor injects. Creates a per-job dir under `jobsDir`
  * (holding the read-only /job inputs) and routes by job kind: local jobs go to `prepareLocalWorkspace`,
- * GitHub jobs to `prepareGithubWorkspace`.
+ * forge-backed jobs to the preparer registered for their kind.
  *
  * The `flow` becomes a prompt hint; the actual skill is provided by the project's materialised
  * .pi/skills.
+ *
+ * `forgeFor(job)` yields the `{ auth, host }` pair for that job's forge (start.mjs owns the map). The
+ * preparer is handed `host.resolveDefaultBranchSha` rather than the whole pair, so a preparer can only
+ * resolve a SHA -- it gets no minting capability and no comment surface it has no business holding.
  *
  * `findPreviousRun` (run-history's `makeFindPreviousRun`) feeds the cron event context below; the
  * default returns null so an unwired dispatcher (tests, a bare construction) still writes a complete
@@ -18,10 +24,12 @@ import { prepareLocalWorkspace } from "./prepare-local.mjs";
  */
 export function makePrepareWorkspace({
 	jobsDir,
-	resolveDefaultBranchSha,
+	forgeFor,
 	findPreviousRun = () => null,
 	prepareLocal = prepareLocalWorkspace,
-	prepareGithub = prepareGithubWorkspace,
+	// Keyed by `job.kind`, so a new forge is one entry rather than a new `if`. A kind with no entry falls
+	// through to the throw below, which is what makes an unrouted job loud instead of a silent no-op.
+	preparers = { github: prepareGithubWorkspace },
 }) {
 	mkdirSync(jobsDir, { recursive: true });
 	return async function prepareWorkspace(job, token, { queueJobId } = {}) {
@@ -38,8 +46,10 @@ export function makePrepareWorkspace({
 			const event = localEventContext(job, queueJobId, findPreviousRun);
 			return await prepareLocal({ folder: job.folder, task, jobDir, event });
 		}
-		if (job.kind === "github") {
-			return await prepareGithub(job, token, { jobDir, resolveDefaultBranchSha });
+		const prepare = preparers[job.kind];
+		if (prepare) {
+			const host = forgeFor?.(job)?.host;
+			return await prepare(job, token, { jobDir, resolveDefaultBranchSha: host?.resolveDefaultBranchSha });
 		}
 		throw new Error(`unknown job kind: ${job.kind}`);
 	};
@@ -81,4 +91,28 @@ function scheduledForMillis(queueJobId) {
 /** Remove a per-job dir after the run. The workspace (the operator's folder) is never touched here. */
 export async function cleanup(prepared) {
 	if (prepared?.jobDir) await rm(prepared.jobDir, { recursive: true, force: true });
+}
+
+/**
+ * The per-forge preparer map `makePrepareWorkspace` dispatches on.
+ *
+ * Both forges share `prepareGithubWorkspace`: the askpass helper, the hardening flags, the gone-SHA
+ * markers, the pinned detached checkout and the read-only event.json are facts about git and about this
+ * project, not about GitHub. Only two things differ, and both are injected -- where the clone comes from,
+ * and how the agent's envelope is phrased. A second copy of the clone path would be a second place to fix
+ * a clone bug, and the copy that did not get fixed would be the one nobody was looking at.
+ *
+ * Exported so the wiring is assertable: a gitlab job cloning from github.com is a silent failure -- the
+ * URL simply would not exist, or worse, would.
+ */
+export function makeForgePreparers({ gitlabApiUrl = null, prepareForge = prepareGithubWorkspace } = {}) {
+	return {
+		github: prepareForge,
+		gitlab: (job, token, opts) =>
+			prepareForge(job, token, {
+				...opts,
+				remoteUrlFor: (j) => gitlabRemoteUrl(gitlabApiUrl, j.repo),
+				buildPrompt: buildGitLabPrompt,
+			}),
+	};
 }

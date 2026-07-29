@@ -75,7 +75,7 @@ test("pat honours a custom patVar", async () => {
 		{ source: "pat", patVar: "MY_PAT" },
 		{ Octokit: FakeOctokit(USER_ROUTES), env: { MY_PAT: "ghp_custom" } },
 	);
-	assert.equal(await auth.mintToken("o/r"), "ghp_custom");
+	assert.equal(await auth.mintToken({ kind: "github", repo: "o/r" }), "ghp_custom");
 });
 
 test("pat empty env var is a config error (money hole: absent GITHUB_TOKEN runs anonymously)", async () => {
@@ -142,7 +142,7 @@ test("app happy: installation token minted, selfId is the bot-user id via the tw
 	assert.equal(auth.source, "app");
 	assert.equal(auth.selfId, 555123); // bot USER id, not the App id
 	assert.ok(Number.isInteger(auth.selfId));
-	assert.equal(await auth.mintToken("some-owner/some-repo"), "ghs_installtoken");
+	assert.equal(await auth.mintToken({ kind: "github", repo: "some-owner/some-repo" }), "ghs_installtoken");
 });
 
 test("app mint strips the owner: repositoryNames gets the bare repo name", async () => {
@@ -155,7 +155,7 @@ test("app mint strips the owner: repositoryNames gets the bare repo name", async
 			readFile: async () => "PEM",
 		},
 	);
-	await auth.mintToken("acme-corp/widgets");
+	await auth.mintToken({ kind: "github", repo: "acme-corp/widgets" });
 	assert.deepEqual(calls[0].repositoryNames, ["widgets"]);
 	assert.equal(calls[0].type, "installation");
 });
@@ -172,7 +172,7 @@ test("app mintToken with no repo (local run.github job) is a config error steeri
 	);
 	for (const repo of [undefined, ""]) {
 		await assert.rejects(
-			() => auth.mintToken(repo),
+			() => auth.mintToken({ kind: "github", repo }),
 			(e) => e.piDispatchConfig === true && /run\.github/.test(e.message),
 			`repo=${JSON.stringify(repo)}`,
 		);
@@ -211,32 +211,32 @@ test("app unreadable PEM is a config error", async () => {
 
 test("app mint 503 is a retryable InfraRetry", async () => {
 	const auth = await appAuthThrowing(httpError(503));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchRetry === true);
 });
 
 test("app mint 429 is a retryable InfraRetry", async () => {
 	const auth = await appAuthThrowing(httpError(429));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchRetry === true);
 });
 
 test("app mint 403 + retry-after (secondary rate limit) is a retryable InfraRetry", async () => {
 	const auth = await appAuthThrowing(httpError(403, { response: { headers: { "retry-after": "60" } } }));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchRetry === true);
 });
 
 test("app mint network fault (ENOTFOUND, no status) is a retryable InfraRetry", async () => {
 	const auth = await appAuthThrowing(Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" }));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchRetry === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchRetry === true);
 });
 
 test("app mint 401 (bad credentials) is a deterministic config error", async () => {
 	const auth = await appAuthThrowing(httpError(401));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchConfig === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchConfig === true);
 });
 
 test("app mint 404 (unknown installation) is a deterministic config error", async () => {
 	const auth = await appAuthThrowing(httpError(404));
-	await assert.rejects(() => auth.mintToken("o/r"), (e) => e.piDispatchConfig === true);
+	await assert.rejects(() => auth.mintToken({ kind: "github", repo: "o/r" }), (e) => e.piDispatchConfig === true);
 });
 
 /** Build an app auth whose mint call throws `error` (construction still succeeds via canned routes). */

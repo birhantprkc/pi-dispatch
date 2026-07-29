@@ -113,17 +113,22 @@ export async function prepareGithubWorkspace(
 		materialize = materializePiDir,
 		writeFile = writeFileSync,
 		mkdir = mkdirSync,
+		// How this forge names a clone URL, and how it phrases the agent's envelope. Injected rather than
+		// forked into a second copy of this function: everything else here -- the askpass helper, the
+		// hardening flags, the gone-SHA markers, the pinned detached checkout, the :ro event.json -- is
+		// git and this project, not GitHub, and a second copy is a second place to fix a clone bug.
+		remoteUrlFor = (j) => `https://github.com/${String(j.repo).split("/")[0]}/${String(j.repo).split("/")[1]}.git`,
+		buildPrompt = buildGithubPrompt,
 	} = {},
 ) {
 	// Fresh API resolve of the commit to clone at — never a webhook field, never the triggering branch.
-	const { sha } = await resolveDefaultBranchSha(job.repo, token);
+	const { sha } = await resolveDefaultBranchSha(job, token);
 
 	const workspace = join(jobDir, "workspace");
 	mkdir(workspace, { recursive: true });
 
-	// Split once. The remote URL is TOKENLESS; the credential comes from the askpass helper's env.
-	const [owner, name] = String(job.repo).split("/");
-	const remoteUrl = `https://github.com/${owner}/${name}.git`;
+	// The remote URL is TOKENLESS; the credential comes from the askpass helper's env, never from here.
+	const remoteUrl = remoteUrlFor(job);
 
 	const askpass = createAskpassHelper();
 	try {
@@ -152,7 +157,7 @@ export async function prepareGithubWorkspace(
 			if (isShaGone(error)) {
 				return { outcome: "policy", reason: "sha-gone" };
 			}
-			throw new InfraRetry(`prepare-github: fetch failed for ${owner}/${name}`, { cause: error });
+			throw new InfraRetry(`prepare-github: fetch failed for ${job.repo}`, { cause: error });
 		}
 
 		// .pi/ is read by object id from the pinned SHA — symlink/submodule/exec safe, no working tree.
@@ -161,7 +166,7 @@ export async function prepareGithubWorkspace(
 		// Issue text is DATA: it enters the USER prompt (buildGithubPrompt), never a system prompt.
 		writeFile(
 			join(jobDir, "prompt.md"),
-			buildGithubPrompt({ flow: job.flow, target: job.target, comment: job.trigger?.comment }),
+			buildPrompt({ flow: job.flow, target: job.target, comment: job.trigger?.comment }),
 			{ mode: 0o444 },
 		);
 

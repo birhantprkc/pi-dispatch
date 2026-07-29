@@ -33,7 +33,10 @@ import { InfraRetry } from "./processor.mjs";
  * Build the auth surface for `cfg = { source, patVar?, appId?, installationId?, privateKeyPath? }`.
  *
  * Returns `{ mintToken, selfId, source }`:
- *   - `mintToken(repo)` -> a non-empty token string (rejects, never returns empty).
+ *   - `mintToken(job)` -> a non-empty token string (rejects, never returns empty). It takes the whole
+ *     job, not a repo, because that is the shape every forge's auth can implement: each reads whatever
+ *     identifies the target on its own side (here `job.repo`) without the caller knowing which forge it
+ *     asked. A local `run.github` cron job carries no `repo`, which the App path refuses below.
  *   - `selfId` -> the acting identity's integer user id (resolved once here, for the bot-loop guard).
  *   - `source` -> the configured source, echoed back.
  *
@@ -83,8 +86,9 @@ export async function makeGitHubAuth(cfg, deps = {}) {
 		const octokit = new Octokit({ authStrategy: createAppAuth, auth });
 		const selfId = await resolveSelfId({ source: "app", octokit });
 
-		const mintToken = async (repo) => {
-			// A local run.github job passes no repo, and an installation token MUST be scoped to one
+		const mintToken = async (job) => {
+			const repo = job?.repo;
+			// A local run.github job carries no repo, and an installation token MUST be scoped to one
 			// (CONST-TOKEN-SCOPED-PER-JOB) -- refuse deterministically rather than mint broad.
 			if (!repo || !String(repo).trim()) {
 				throw configError(

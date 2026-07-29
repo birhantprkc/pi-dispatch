@@ -111,7 +111,7 @@ function buildPullRequestPrompt(flow, target, comment) {
  * treatment as the title/body (fenced, placed as data, CONST-ISSUE-TEXT-IS-DATA); when absent there is
  * no section and no heading for it.
  */
-function dataRegion(heading, noun, target, comment) {
+export function dataRegion(heading, noun, target, comment) {
 	const titleText = String(target?.title ?? "");
 	const bodyText = String(target?.body ?? "");
 	const named = comment
@@ -149,7 +149,7 @@ function fenceBlock(content) {
 }
 
 /** The number must be trustworthy; a positive integer is the only accepted issue/PR number. */
-function normalizeNumber(number) {
+export function normalizeNumber(number) {
 	const n = Number(number);
 	if (!Number.isInteger(n) || n <= 0) {
 		const error = new Error(`invalid target number (must be a positive integer): ${String(number)}`);

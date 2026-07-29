@@ -1,0 +1,209 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { filterGitLab, DEVELOPER } from "../src/filter-gitlab.mjs";
+import { parseGitLabSubset } from "../src/gitlab-subset.mjs";
+
+const SELF_ID = 999;
+const MEMBER = 7;
+
+const triggers = {
+	label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
+	comment: { index: 4, phrase: "@pi", defaultFlow: "triage" },
+	pullRequest: [
+		{ index: 6, actions: new Set(["update"]), predicate: { any: ["pi:review"] }, flow: "review" },
+		{ index: 8, actions: new Set(["open", "approved"]), predicate: {}, flow: "autoreview" },
+	],
+};
+const knownFlows = new Set(["frontend-fix", "triage", "review", "autoreview", "docs"]);
+
+const PROJECT = { id: 42, path_with_namespace: "group/sub/proj", default_branch: "main" };
+const label = (name) => ({ title: name });
+
+/** An `Issue Hook` payload. `changes` is how GitLab reports a label being added. */
+function issuePayload(over = {}) {
+	return {
+		object_kind: "issue",
+		user: { id: MEMBER, username: "dev" },
+		project: PROJECT,
+		object_attributes: { iid: 5, title: "T", description: "B", action: "update", labels: [label("pi:frontend")] },
+		changes: { labels: { previous: [], current: [label("pi:frontend")] } },
+		...over,
+	};
+}
+
+function mrPayload(over = {}) {
+	return {
+		object_kind: "merge_request",
+		user: { id: MEMBER, username: "dev" },
+		project: PROJECT,
+		object_attributes: { iid: 12, title: "MR", description: "D", action: "open", labels: [] },
+		...over,
+	};
+}
+
+function notePayload(over = {}) {
+	return {
+		object_kind: "note",
+		user: { id: MEMBER, username: "dev" },
+		project: PROJECT,
+		object_attributes: { action: "create", note: "@pi please", noteable_type: "Issue" },
+		issue: { iid: 5, title: "T", description: "B", labels: [] },
+		...over,
+	};
+}
+
+const run = (payload, { level = DEVELOPER, selfId = SELF_ID, delivery = "wh-1" } = {}) =>
+	filterGitLab(parseGitLabSubset(payload), triggers, knownFlows, selfId, level, delivery);
+
+// --- the label diff (the repeat-paid-run bug this design exists to prevent) ---
+
+test("adding an allowlisted label enqueues exactly the matched rule's flow", () => {
+	const r = run(issuePayload());
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.flow, "frontend-fix");
+	assert.deepEqual(r.job.trigger.matched, { index: 2, type: "label", label: "pi:frontend" });
+});
+
+test("a LATER update of an already-labelled issue enqueues NOTHING", () => {
+	// The whole reason the gate reads changes.labels instead of the current label set. GitLab has no
+	// `labeled` action: retitling, reassigning or re-milestoning an issue all arrive as `update` with the
+	// trigger label still present. Matching the current set would start a paid run on every one of them.
+	const retitled = issuePayload({
+		object_attributes: { iid: 5, title: "T2", description: "B", action: "update", labels: [label("pi:frontend")] },
+		changes: { title: { previous: "T", current: "T2" } },
+	});
+	const r = run(retitled);
+	assert.equal(r.enqueue, false);
+	assert.equal(r.reason, "no-label-change", "an update that moved no label must not re-fire the trigger");
+});
+
+test("REMOVING the allowlisted label never fires -- a diff is directional", () => {
+	const removed = issuePayload({
+		object_attributes: { iid: 5, title: "T", description: "B", action: "update", labels: [] },
+		changes: { labels: { previous: [label("pi:frontend")], current: [] } },
+	});
+	assert.equal(run(removed).enqueue, false, "un-labelling must never start a paid run");
+});
+
+test("a label added ALONGSIDE existing ones fires on the addition, not on the set", () => {
+	const added = issuePayload({
+		object_attributes: { iid: 5, title: "T", description: "B", action: "update", labels: [label("keep"), label("pi:frontend")] },
+		changes: { labels: { previous: [label("keep")], current: [label("keep"), label("pi:frontend")] } },
+	});
+	assert.equal(run(added).enqueue, true);
+});
+
+test("an issue OPENED already carrying the label fires -- there is no previous set to diff against", () => {
+	const opened = issuePayload({
+		object_attributes: { iid: 5, title: "T", description: "B", action: "open", labels: [label("pi:frontend")] },
+		changes: {},
+	});
+	assert.equal(run(opened).enqueue, true, "every label on a new issue arrived with it");
+});
+
+// --- the access gate ---
+
+test("a below-Developer actor is refused on EVERY trigger type, label included", () => {
+	// GitHub can treat a label as the approval because only collaborators can apply one. On GitLab a Guest
+	// can set labels on an issue they are creating, so the label proves nothing and the level is the gate.
+	for (const [name, payload] of [["issue", issuePayload()], ["merge_request", mrPayload()], ["note", notePayload()]]) {
+		for (const level of [0, 10, 20, 29]) {
+			const r = run(payload, { level });
+			assert.equal(r.enqueue, false, `${name} at access_level ${level} must not enqueue`);
+			assert.equal(r.reason, "author-not-allowed");
+		}
+	}
+});
+
+test("Developer, Maintainer and Owner all pass; a non-numeric level does not", () => {
+	for (const level of [30, 40, 50]) assert.equal(run(issuePayload(), { level }).enqueue, true, `access_level ${level} is at or above Developer`);
+	// Called directly, not through `run`, whose default would substitute a passing level for `undefined`
+	// and quietly turn this into an assertion about the helper.
+	for (const level of [undefined, null, "30", NaN]) {
+		const r = filterGitLab(parseGitLabSubset(issuePayload()), triggers, knownFlows, SELF_ID, level, "wh-x");
+		assert.equal(r.enqueue, false, `a ${JSON.stringify(level)} level must fail closed, never coerce`);
+		assert.equal(r.reason, "author-not-allowed");
+	}
+});
+
+test("the bot-loop guard runs BEFORE the access gate, so our own comment cannot recurse", () => {
+	// Under a project access token the harness IS a member and would clear the access gate -- so ordering
+	// is what stops the harness's own status comment from starting another job.
+	const r = run(notePayload({ user: { id: SELF_ID, username: "pi-bot" } }), { level: 50 });
+	assert.equal(r.enqueue, false);
+	assert.equal(r.reason, "self");
+});
+
+test("a missing user.id is refused before the self compare -- undefined must not fall through", () => {
+	const r = run(issuePayload({ user: {} }), { level: 50 });
+	assert.equal(r.reason, "missing-sender-id");
+});
+
+// --- routing ---
+
+test("a note on a merge request routes a pull_request target, not an issue", () => {
+	// Routing this wrong mints an issue branch for something that is already an MR: wrong work, no error,
+	// and it reads as a successful run.
+	const r = run(notePayload({
+		object_attributes: { action: "create", note: "@pi look", noteable_type: "MergeRequest" },
+		merge_request: { iid: 12, title: "MR", description: "D", labels: [] },
+	}));
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.target.type, "pull_request");
+	assert.equal(r.job.target.number, 12);
+});
+
+test("an unpredicated MR rule fires on its named actions; a predicated one still needs the label added", () => {
+	assert.equal(run(mrPayload()).job.flow, "autoreview", "action open matches the unpredicated rule");
+	assert.equal(run(mrPayload({ object_attributes: { iid: 12, title: "MR", description: "D", action: "approved", labels: [] } })).job.flow, "autoreview");
+
+	const labelled = mrPayload({
+		object_attributes: { iid: 12, title: "MR", description: "D", action: "update", labels: [label("pi:review")] },
+		changes: { labels: { previous: [], current: [label("pi:review")] } },
+	});
+	assert.equal(run(labelled).job.flow, "review");
+
+	const plainUpdate = mrPayload({ object_attributes: { iid: 12, title: "MR", description: "D", action: "update", labels: [label("pi:review")] } });
+	assert.equal(run(plainUpdate).enqueue, false, "an update that added no label must not match the label-gated rule");
+});
+
+test("a comment override names a known flow; an unknown one falls back to the default", () => {
+	assert.equal(run(notePayload({ object_attributes: { action: "create", note: "@pi docs", noteable_type: "Issue" } })).job.flow, "docs");
+	assert.equal(run(notePayload({ object_attributes: { action: "create", note: "@pi nonesuch", noteable_type: "Issue" } })).job.flow, "triage");
+});
+
+test("unhandled object kinds and actions drop with a reason, never silently", () => {
+	assert.equal(run({ ...issuePayload(), object_kind: "push" }).reason, "unhandled-event");
+	assert.equal(run(mrPayload({ object_attributes: { iid: 1, action: "merge", labels: [] } })).reason, "unhandled-event");
+	assert.equal(run(notePayload({ object_attributes: { action: "update", note: "@pi", noteable_type: "Issue" } })).reason, "unhandled-event");
+});
+
+// --- the job ---
+
+test("the job carries the numeric project id and the iid, and never the username", () => {
+	const r = run(issuePayload());
+	assert.equal(r.job.projectId, 42, "every GitLab API path takes the numeric id");
+	assert.equal(r.job.repo, "group/sub/proj", "the nested path survives intact -- it is a label, never split");
+	assert.equal(r.job.target.number, 5, "iid, not the global id");
+	assert.equal("username" in r.job.trigger.sender, false, "username is personal data with no downstream reader");
+	assert.equal(JSON.stringify(r.job).includes("dev"), false, "no part of the job may carry the actor's username");
+});
+
+test("packages and image ride the JOB from the matched rule, never inside trigger", () => {
+	const t = {
+		...triggers,
+		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", packages: false, image: "my-python:1.2.0" }],
+	};
+	const r = filterGitLab(parseGitLabSubset(issuePayload()), t, knownFlows, SELF_ID, DEVELOPER, "wh-9");
+	assert.equal(r.job.packages, false);
+	assert.equal(r.job.image, "my-python:1.2.0");
+	// `trigger` is copied verbatim into /job/event.json; an execution knob has no business describing the
+	// agent's own view of what fired it.
+	assert.equal("image" in r.job.trigger, false);
+	assert.equal("packages" in r.job.trigger, false);
+});
+
+test("an unflagged rule yields a job with no packages or image key at all", () => {
+	const r = run(issuePayload());
+	assert.deepEqual(Object.keys(r.job), ["repo", "projectId", "target", "flow", "trigger"]);
+});

@@ -1,16 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="pi-dispatch — run the pi coding agent as a self-hosted service">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="pi-dispatch — run the pi coding agent as a self-hosted service, triggered by cron, GitHub or GitLab">
   <rect x="1" y="1" width="1198" height="358" rx="18" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
 
   <!-- wordmark + tagline -->
   <text x="72" y="132" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="66" font-weight="700" fill="#58a6ff">pi-dispatch</text>
   <text x="75" y="182" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">Run the pi coding agent as a self-hosted service —</text>
-  <text x="75" y="214" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">on demand, on a cron, or on a GitHub issue.</text>
+  <text x="75" y="214" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">on demand, on a cron, or on a GitHub or GitLab issue.</text>
 
   <!-- differentiator chips -->
   <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17">
     <text x="75" y="278" fill="#3fb950">●</text><text x="95" y="278" fill="#8b949e">container-isolated</text>
     <text x="256" y="278" fill="#d6a531">●</text><text x="276" y="278" fill="#8b949e">spend-capped before tokens</text>
-    <text x="520" y="278" fill="#58a6ff">●</text><text x="540" y="278" fill="#8b949e">cron · GitHub · CLI</text>
+    <text x="520" y="278" fill="#58a6ff">●</text><text x="540" y="278" fill="#8b949e">cron · GitHub · GitLab · CLI</text>
   </g>
 
   <!-- mini /dispatch panel -->
@@ -27,12 +27,13 @@
       <rect x="62" y="100" width="196" height="15" rx="3" fill="#21262d"/>
       <rect x="62" y="100" width="80" height="15" rx="3" fill="#3fb950"/>
       <text x="270" y="112" fill="#8b949e">6/25</text>
-      <text x="24" y="150" fill="#58a6ff">cron</text>
-      <text x="92" y="150" fill="#c9d1d9">nightly</text>
-      <text x="168" y="150" fill="#6e7681">→</text>
-      <text x="188" y="150" fill="#c9d1d9">tidy</text>
+      <text x="24" y="150" fill="#58a6ff">label</text>
+      <text x="92" y="150" fill="#c9d1d9">pi:fix</text>
+      <text x="152" y="150" fill="#6e7681">→</text>
+      <text x="172" y="150" fill="#c9d1d9">fix</text>
+      <text x="212" y="150" fill="#58a6ff">[gitlab]</text>
       <text x="24" y="182" fill="#7ee787">✔ done</text>
-      <text x="112" y="182" fill="#8b949e">gh-a91f · frontend-fix · 54k</text>
+      <text x="112" y="182" fill="#8b949e">gl-7c21 · fix · 54k</text>
       <text x="24" y="210" fill="#6e7681">↑↓ select · ↵ open · a add · q quit</text>
     </g>
   </g>

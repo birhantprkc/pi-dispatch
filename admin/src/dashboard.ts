@@ -599,12 +599,16 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // running third-party code with open network egress renders identically to one that does not. Loading is
   // the default (`run.packages` is an opt-out), so the badge is present unless the trigger declined.
   // Amber, and appended AFTER the layout parts, so color stays post-layout.
+  // Which forge a webhook trigger listens to. Unmarked for github, so existing deployments render
+  // byte-identically; `accent` because, like a pinned model or a non-default image, it says "this entry
+  // departs from the deployment default" rather than "this entry is risky".
+  const forge = t?.forge && t.forge !== "github" ? " " + styler.fg("accent", `[${t.forge}]`) : "";
   const pkgs = t?.packages === true ? " " + styler.fg("warning", "[packages]") : "";
   // A non-default image, in `accent` rather than `warning`: amber is reserved for the risk badge (third-party
   // code), and an operator-built image is not third-party. `accent` is already this file's colour for "this
   // trigger overrides a deployment default" -- the same choice the pinned-model row makes below.
   const img = t?.image ? " " + styler.fg("accent", `[${t.image}]`) : "";
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}${img}`, inner, styler);
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${forge}${pkgs}${img}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
@@ -762,8 +766,11 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
     out.push(kv("folder", `${t.folder ?? "-"}`, "success"));
     out.push(kv("model", t.model ?? "deployment default", t.model ? "accent" : "dim"));
   } else {
-    out.push(kv("job", "github", "accent"));
-    out.push(kv("target", "the triggering repo#issue / PR", "accent"));
+    // The forge is read from the entry, never assumed: with two forges configured, "which one does this
+    // trigger listen to" is the first question the drill-in has to answer, and guessing github would be
+    // wrong for half the file.
+    out.push(kv("job", t.forge ?? "-", "accent"));
+    out.push(kv("target", t.forge === "gitlab" ? "the triggering project#issue / !MR" : "the triggering repo#issue / PR", "accent"));
     out.push(kv("model", "deployment default", "dim"));
   }
   // Same shape as the model row -- a per-trigger override of a deployment default -- and rendered on BOTH

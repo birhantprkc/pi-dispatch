@@ -19,6 +19,7 @@
  */
 
 import { Webhooks } from "@octokit/webhooks";
+import { isJsonContentType, readRawBody, respond } from "./http-body.mjs";
 
 /**
  * Thin wrapper delegating to `webhooks.verify(rawBody, signature)`. `rawBody` is the raw UTF-8
@@ -94,64 +95,4 @@ export function makeVerifiedHandler({ secret, bodyLimit = 2 * 1024 * 1024 }, onV
 			}
 		}
 	};
-}
-
-/** GitHub sends `application/json`; accept that media type ignoring any parameters and case. */
-function isJsonContentType(contentType) {
-	return String(contentType ?? "").split(";")[0].trim().toLowerCase() === "application/json";
-}
-
-/**
- * Collect the request stream into a Buffer, bounded by `limit`. Accumulation is checked on every
- * chunk so the buffer can never grow past the cap: exceeding it destroys the request and rejects
- * with `code: "E_PAYLOAD_TOO_LARGE"` rather than reading an unbounded body into memory.
- */
-function readRawBody(req, limit) {
-	return new Promise((resolve, reject) => {
-		const chunks = [];
-		let size = 0;
-		let settled = false;
-
-		const cleanup = () => {
-			req.removeListener("data", onData);
-			req.removeListener("end", onEnd);
-			req.removeListener("error", onError);
-		};
-		const onData = (chunk) => {
-			if (settled) return;
-			size += chunk.length;
-			if (size > limit) {
-				settled = true;
-				cleanup();
-				req.destroy();
-				const err = new Error("payload too large");
-				err.code = "E_PAYLOAD_TOO_LARGE";
-				reject(err);
-				return;
-			}
-			chunks.push(chunk);
-		};
-		const onEnd = () => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			resolve(Buffer.concat(chunks));
-		};
-		const onError = (err) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			reject(err);
-		};
-
-		req.on("data", onData);
-		req.on("end", onEnd);
-		req.on("error", onError);
-	});
-}
-
-/** Write a small JSON body with an explicit status. `writeHead` sets the status code on the response. */
-function respond(res, status, body) {
-	res.writeHead(status, { "content-type": "application/json" });
-	res.end(JSON.stringify(body));
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import { test } from "node:test";
-import { configError, globalExtensionsEnabled, loadConfig } from "../src/config.mjs";
+import { configError, globalExtensionsEnabled, loadConfig, loadGitLabAuth } from "../src/config.mjs";
 
 test("loads conservative defaults with an empty-ish env", () => {
 	const c = loadConfig({});
@@ -332,4 +332,25 @@ test("custom GITHUB_PAT_VAR reads the named env var for the PAT", () => {
 		() => loadConfig({ GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT_VAR: "MY_PAT" }),
 		(e) => e.piDispatchConfig === true,
 	);
+});
+
+test("PI_FORWARD_ENV refuses every minted token name, gitlab's included", () => {
+	// Forwarding one would override the per-job mint with a broader, longer-lived operator credential --
+	// silently, and in the direction that matters (CONST-TOKEN-SCOPED-PER-JOB).
+	for (const name of ["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"]) {
+		assert.throws(
+			() => loadConfig({ PI_FORWARD_ENV: `SOME_KEY,${name}` }),
+			(e) => e.piDispatchConfig === true && e.message.includes(name),
+			`${name} must be refused at load`,
+		);
+	}
+});
+
+test("loadGitLabAuth is null without a token, and refuses any source other than pat", () => {
+	assert.equal(loadGitLabAuth({}), null, "no token means no gitlab forge at all");
+	assert.deepEqual(loadGitLabAuth({ GITLAB_TOKEN: "glpat-x" }), { source: "pat", apiUrl: "https://gitlab.com", tokenVar: "GITLAB_TOKEN" });
+	assert.equal(loadGitLabAuth({ GITLAB_TOKEN: "glpat-x", GITLAB_URL: "https://gl.internal" }).apiUrl, "https://gl.internal");
+	// There is no stronger source to fall back to, so naming one is a mistake worth refusing rather than
+	// silently ignoring.
+	assert.throws(() => loadGitLabAuth({ GITLAB_TOKEN: "glpat-x", GITLAB_AUTH_SOURCE: "app" }), (e) => e.piDispatchConfig === true);
 });

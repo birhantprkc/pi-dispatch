@@ -45,7 +45,42 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
 		bind: env.RECEIVER_BIND ?? "0.0.0.0",
 		triggers: loadTriggers(env, readFile, fileExists),
 		github: loadGitHubAuth(env, fileExists),
+		gitlab: loadGitLabConfig(env),
 	};
+}
+
+/**
+ * The GitLab endpoint's configuration, or `null` when the deployment serves no GitLab -- in which case no
+ * `/gitlab` route exists at all, rather than one that answers 401. An endpoint that responds is an endpoint
+ * an operator can believe is armed.
+ *
+ * `GITLAB_WEBHOOK_MODE` is REQUIRED once any GitLab variable is set, and is not defaulted. The two modes
+ * are not equally strong -- `signature` is an HMAC over the body, `token` is a shared-secret compare that
+ * proves nothing about the body's integrity -- so which one a deployment runs must be a thing somebody
+ * chose and can be asked about, never a thing it fell into. Defaulting to the weaker one would silently
+ * downgrade every operator who did not know the field existed; defaulting to the stronger one would break
+ * every instance below GitLab 19.0.
+ */
+function loadGitLabConfig(env) {
+	const mode = env.GITLAB_WEBHOOK_MODE;
+	const secret = env.GITLAB_WEBHOOK_SECRET;
+	const token = env.GITLAB_TOKEN;
+	const apiUrl = env.GITLAB_URL ?? "https://gitlab.com";
+	if (!mode && !secret && !token) return null;
+
+	if (mode !== "signature" && mode !== "token") {
+		throw configError(`GITLAB_WEBHOOK_MODE must be "signature" (HMAC, GitLab 19.0+) or "token" (X-Gitlab-Token, any version); got ${JSON.stringify(mode)}`);
+	}
+	if (typeof secret !== "string" || secret.trim() === "") {
+		throw configError("GITLAB_WEBHOOK_SECRET is required; refusing to start a gitlab endpoint that cannot verify deliveries");
+	}
+	// The gate needs this token BEFORE any job runs: the actor's access level is what authorises a GitLab
+	// trigger at all (CONST-TRIGGER-AUTHOR-GATE), and without a token every lookup is indeterminate and
+	// every delivery 503s. Refusing at boot is the difference between one clear message and a redelivery loop.
+	if (typeof token !== "string" || token.trim() === "") {
+		throw configError("GITLAB_TOKEN is required for gitlab triggers -- the receiver resolves the actor's project access level before it may enqueue");
+	}
+	return { mode, secret, token, apiUrl };
 }
 
 /**
@@ -53,13 +88,19 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
  * the reviewed, committed source of truth for which events trigger which flow; a missing, unparseable, or
  * malformed file fails loud rather than degrading to an empty (silently trigger-nothing) allowlist.
  *
- * The shared `parseTriggers` validates the WHOLE file (including the on x run diagonal and cron entries the
- * worker owns); this loader keeps only the webhook types and groups them for the filter:
+ * The shared `parseTriggers` validates the WHOLE file (including the on x run matrix and cron entries the
+ * worker owns); this loader keeps only the webhook types and groups them PER FORGE, so `cfg.triggers` is
+ * `{ github: <group>, gitlab: <group>, knownFlows }` where each group is:
  *   - `label`:       ordered `{ index, predicate, flow, packages, image }` rules (first match wins in the filter).
  *   - `comment`:     the single `{ index, phrase, defaultFlow, packages, image }` (or null when no comment trigger is configured).
  *   - `pullRequest`: ordered `{ index, actions:Set, predicate, flow, packages, image }` rules.
- *   - `knownFlows`:  every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
- *                    unlisted flow.
+ * and `knownFlows` is every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
+ * unlisted flow.
+ *
+ * Grouping by forge FIRST is what keeps each forge's gate reading only its own rules: a GitLab delivery
+ * can never match a rule an operator wrote for GitHub, even when both name the same label. `knownFlows`
+ * stays shared deliberately -- a flow is a skill in a repo, not a property of the forge that asked for it,
+ * and the set exists to bound which names a comment may summon, which is the same bound either way.
  *
  * `packages` (load the operator-staged pi packages) and `image` (which container image the job runs in) are
  * the entry's per-trigger execution fields (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY). Both ride on
@@ -81,24 +122,29 @@ function loadTriggers(env, readFile, fileExists) {
 
 	const parsed = parseTriggers(readFile(path, "utf8"), path); // fail-loud
 
-	const label = [];
-	let comment = null;
-	const pullRequest = [];
+	// Every forge gets a group whether or not the file names it, so the filter can read
+	// `cfg.triggers[kind].label` without a presence check and an unconfigured forge simply matches nothing.
+	const groups = { github: emptyGroup(), gitlab: emptyGroup() };
 	const knownFlows = new Set();
 
 	for (const [index, { on, run }] of parsed.entries()) {
 		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it -- but it keeps its index
 		knownFlows.add(run.flow);
+		const group = groups[run.kind];
 		if (on.type === "label") {
-			label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
 		} else if (on.type === "comment") {
-			comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image }; // parseTriggers guarantees at most one
+			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image }; // parseTriggers guarantees at most one per forge
 		} else if (on.type === "pull_request") {
-			pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
 		}
 	}
 
-	return { label, comment, pullRequest, knownFlows };
+	return { ...groups, knownFlows };
+}
+
+function emptyGroup() {
+	return { label: [], comment: null, pullRequest: [] };
 }
 
 /** The triggers file path the receiver reads (env override or the committed deploy default). */

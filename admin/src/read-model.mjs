@@ -566,6 +566,12 @@ export function readTriggers({ triggersPath, fs = nodeFs }) {
  * default-image sentinel, matching this function's own `flow`/`model`/`phrase` convention, and anything that
  * is not a non-empty string reads as the default -- mirroring the worker's `job.image ?? config.jobImage`
  * rather than re-validating a value the loader already refused.
+ *
+ * `forge` -- which forge a webhook trigger listens to (issue #42) -- is carried on the three webhook kinds
+ * and is `null` on cron, which has no forge at all. It is `run.kind` VERBATIM rather than a validated enum:
+ * this normalizer is fail-soft by design (a viewer degrades, it never throws), and showing an operator the
+ * kind their file actually contains is more useful than mapping an unknown one onto a plausible default --
+ * the worker refuses to boot on it, and the panel saying so is how they find out why.
  */
 export function normalizeTriggerForDisplay(entry) {
   if (entry === null || typeof entry !== "object") return null;
@@ -575,6 +581,7 @@ export function normalizeTriggerForDisplay(entry) {
   const flow = typeof run.flow === "string" ? run.flow : null;
   const packages = run.packages !== false;
   const image = typeof run.image === "string" && run.image.trim() !== "" ? run.image : null;
+  const forge = typeof run.kind === "string" && run.kind.trim() !== "" ? run.kind : null;
   switch (on.type) {
     case "cron":
       return {
@@ -590,9 +597,9 @@ export function normalizeTriggerForDisplay(entry) {
         image,
       };
     case "label":
-      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image };
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image, forge };
     case "comment":
-      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image };
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image, forge };
     case "pull_request":
       return {
         type: "pull_request",
@@ -603,6 +610,7 @@ export function normalizeTriggerForDisplay(entry) {
         flow,
         packages,
         image,
+        forge,
       };
     default:
       return null;

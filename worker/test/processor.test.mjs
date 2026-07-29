@@ -25,7 +25,7 @@ function deps(overrides = {}) {
 		// fakeRedis stays valid; soft-hold is off unless a test sets it. Mirrors a default deployment.
 		caps: { day: 10, week: null, month: null },
 		softHoldPct: null,
-		mintToken: async (repo) => (calls.push(`mint:${repo}`), "tok"),
+		mintToken: async (job) => (calls.push(`mint:${job?.repo}`), "tok"),
 		isDefaultBranchProtected: async () => (calls.push("branch-check"), true),
 		prepareWorkspace: async () => (calls.push("prepare"), { workspaceDir: "/w", jobDir: "/j" }),
 		runContainer: async () => (calls.push("run-container"), { code: 0, aborted: false }),
@@ -169,14 +169,18 @@ test("a run.github local job mints with an UNDEFINED repo, skips the branch chec
 	const minted = [];
 	const tokens = { prepare: "unset", container: "unset" };
 	const { deps: d, calls } = deps({
-		mintToken: async (repo) => (minted.push(repo), "tok-local"),
+		mintToken: async (job) => (minted.push(job), "tok-local"),
 		prepareWorkspace: async (_job, token) => ((tokens.prepare = token), { workspaceDir: "/w", jobDir: "/j" }),
 		runContainer: async ({ token }) => ((tokens.container = token), { code: 0, aborted: false }),
 	});
 	const r = await runJob(flaggedLocalJob, d);
 	assert.equal(r.outcome, "completed");
-	assert.deepEqual(minted, [undefined], "mintToken is called exactly once, with no repo (a local job has none)");
-	assert.ok(!calls.includes("branch-check"), "no branch-protection check -- REQ-BRANCH-PROTECTION-PRECONDITION is github-jobs-only");
+	assert.equal(minted.length, 1, "mintToken is called exactly once");
+	// The App path refuses a repo-less mint (get-token.mjs) because an installation token must be scoped to
+	// one repo -- so what matters is that the job handed to the minter carries no repo, not that the
+	// argument itself is undefined.
+	assert.equal(minted[0]?.repo, undefined, "a local job carries no repo for the minter to scope to");
+	assert.ok(!calls.includes("branch-check"), "no branch-protection check -- REQ-BRANCH-PROTECTION-PRECONDITION is forge-jobs-only");
 	assert.equal(tokens.prepare, "tok-local", "the minted token reaches prepareWorkspace");
 	assert.equal(tokens.container, "tok-local", "the minted token reaches runContainer");
 });

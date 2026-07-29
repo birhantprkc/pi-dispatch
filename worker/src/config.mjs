@@ -74,11 +74,17 @@ function commaList(raw) {
 // PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs
 // sets GITHUB_TOKEN and GH_TOKEN from the per-job mint; forwarding either from the host would
 // silently swap which credential every job spends, so this fails loud here rather than per-job.
+// Every variable name env-allowlist.mjs assigns from a per-job mint. Forwarding one from the host would
+// override that mint with a broader, longer-lived operator credential -- silently, and in the direction
+// that matters. The list grows with each forge; it is the reason it is a set rather than two names.
+const MINTED_TOKEN_VARS = new Set(["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"]);
+
 function forwardEnvList(raw) {
 	const names = commaList(raw);
-	if (names.includes("GITHUB_TOKEN") || names.includes("GH_TOKEN")) {
+	const minted = names.filter((n) => MINTED_TOKEN_VARS.has(n));
+	if (minted.length > 0) {
 		throw configError(
-			"PI_FORWARD_ENV must not forward GITHUB_TOKEN or GH_TOKEN -- the worker mints a per-job token (CONST-TOKEN-SCOPED-PER-JOB) and a forwarded operator token would silently override it",
+			`PI_FORWARD_ENV must not forward ${minted.join(", ")} -- the worker mints a per-job token (CONST-TOKEN-SCOPED-PER-JOB) and a forwarded operator token would silently override it`,
 		);
 	}
 	return names;
@@ -167,6 +173,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		dispatchRunPerHour: nonNegativeInt(env, "PI_DISPATCH_RUN_PER_HOUR", 3), // DES-ADMIN-VIA-PI-EXTENSION; 0 = disable dispatch_run
 		dispatchRunRoots: delimitedList(env.PI_DISPATCH_RUN_ROOTS), // DES-AI-TRIGGER-FLOW-GATE: default [] fails closed — no folder passes, dispatch_run refuses everything
 		github: loadGitHubAuth(env, fileExists),
+		gitlab: loadGitLabAuth(env),
 	};
 }
 
@@ -227,4 +234,22 @@ export function defaultSettingsFile() {
 	// allowlist (no-broad-env-into-container). Exported so the admin extension resolves the same default
 	// without calling loadConfig, which throws on unrelated env problems.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/settings.json`.replace(/\\/g, "/");
+}
+
+/**
+ * The worker's GitLab auth config, or `null` when no GitLab is configured -- in which case the forge is
+ * simply absent from the map and a gitlab job refuses at mint time with a message naming what is missing.
+ *
+ * Only `pat` exists, and deliberately so: GitLab has no App equivalent, so there is no stronger source to
+ * offer and no choice to make. The variable is still named `GITLAB_AUTH_SOURCE` for symmetry with
+ * `GITHUB_AUTH_SOURCE`, so an operator reading .env.example finds the same shape on both sides.
+ */
+export function loadGitLabAuth(env) {
+	const token = env.GITLAB_TOKEN;
+	if (typeof token !== "string" || token.trim() === "") return null;
+	const source = env.GITLAB_AUTH_SOURCE ?? "pat";
+	if (source !== "pat") {
+		throw configError(`GITLAB_AUTH_SOURCE must be "pat" (got ${JSON.stringify(source)}) -- GitLab has no App equivalent, so there is no other source`);
+	}
+	return { source, apiUrl: env.GITLAB_URL ?? "https://gitlab.com", tokenVar: "GITLAB_TOKEN" };
 }

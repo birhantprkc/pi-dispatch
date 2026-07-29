@@ -197,7 +197,8 @@ that always fires is one nobody reads.
 
 ## CONST-MERGE-NEVER-AUTOMATIC
 
-- **Statement**: The harness shall never merge a pull request. Not on green CI, not on any condition.
+- **Statement**: The harness shall never merge a pull request or a merge request. Not on green CI, not
+  on a passing pipeline, not on any condition.
 - **Why**: Injection is expected, not hypothetical — the issue body will eventually say *"ignore your
   instructions."* Human review is what bounds a successful injection to one wasted budget and one
   garbage PR. Rejected alternative — "auto-merge when tests pass": **the tests live in the same
@@ -205,39 +206,72 @@ that always fires is one nobody reads.
   check. Remove this constraint and injection escalates from nuisance to supply-chain compromise of
   every serviced repo.
 - **Traces to**: `REQ-JOB-STATUS-COMMENTS`
-- **Acceptance**: No code path calls a merge API. Grep is the test.
+- **Acceptance**: No code path calls a merge API — neither GitHub's `PUT /pulls/{n}/merge` nor GitLab's
+  `PUT /projects/:id/merge_requests/:iid/merge`. Grep is the test, and it now has two surfaces.
 
 ## CONST-TRIGGER-AUTHOR-GATE
 
-- **Statement**: Only an allowlisted label, a comment from `author_association ∈ {OWNER, MEMBER,
-  COLLABORATOR}`, or a `pull_request` event whose approval gate is satisfied, shall start a job. For a
-  `pull_request`: **labeling** (`action: labeled`) is gated by the label allowlist — a collaborator-applied
-  label is the approval, exactly as for an issue; **auto actions** (`opened`, `synchronize`, `reopened`)
-  are gated by the PR `author_association ∈ {OWNER, MEMBER, COLLABORATOR}`, so a fork or external PR never
-  auto-fires and must be triggered by a collaborator's label or comment.
-- **Why**: Only collaborators can apply labels — therefore **the label is the human approval step**, not
-  a routing hint. A stranger's issue sits until a maintainer labels it, and that pause is the design, not
-  latency to be optimised away. The PR auto-action author gate is the same principle: an *ungated*
-  auto-trigger on `pull_request.opened` is an unbounded paid agent run started by whoever opens a fork PR —
-  the exact spend-and-run vector this gate exists to close — so it is hard-coded in the filter, never a
-  config toggle. Together with `CONST-HMAC-OVER-RAW-BODY` this is the entire "who can spend our money and
-  run our agent" gate.
-- **Traces to**: `REQ-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`
+- **Statement**: A job shall start from a webhook only on the say-so of an actor with **write access or
+  above to the target repository**, established by whatever mechanism that forge offers.
+  **GitHub**: an allowlisted label, a comment from `author_association ∈ {OWNER, MEMBER, COLLABORATOR}`,
+  or a `pull_request` event whose approval gate is satisfied. For a `pull_request`: **labeling**
+  (`action: labeled`) is gated by the label allowlist — a collaborator-applied label is the approval,
+  exactly as for an issue; **auto actions** (`opened`, `synchronize`, `reopened`) are gated by the PR
+  `author_association`, so a fork or external PR never auto-fires.
+  **GitLab**: the actor's project `access_level` is resolved from the API (`members/all`, so
+  group-inherited access counts) and must be **>= 30 (Developer)** — for *every* trigger type, labels
+  included.
+- **Why**: On GitHub, only collaborators can apply labels — therefore **the label is the human approval
+  step**, not a routing hint. A stranger's issue sits until a maintainer labels it, and that pause is the
+  design, not latency to be optimised away. The PR auto-action author gate is the same principle: an
+  *ungated* auto-trigger on `pull_request.opened` is an unbounded paid agent run started by whoever opens
+  a fork PR — the exact spend-and-run vector this gate exists to close — so it is hard-coded in the
+  filter, never a config toggle. Together with `CONST-HMAC-OVER-RAW-BODY` this is the entire "who can
+  spend our money and run our agent" gate.
+  **On GitLab that premise is false, and the gate is stronger to compensate.** The label-implies-approval
+  reasoning above fails three independent ways there: the minimum role for label management has differed
+  across versions, Ultimate's **custom roles** let an operator grant it at any level, and a **Guest can
+  set labels on an issue at creation** — so a stranger can open an issue already carrying the trigger
+  label. A GitLab label therefore proves nothing on its own, and the resolved access level is the gate for
+  every trigger type rather than only for comments. The cost is a network call the GitHub path does not
+  need; it is paid in the receiver, before the pure gate, so the gate stays offline-testable
+  (`REQ-TRIGGER-AUTHOR-GATE`). The residual — that this gate now depends on a lookup that can fail, and on
+  a role table that varies by version and edition — is `OQ-013`, recorded rather than glossed.
+- **Traces to**: `REQ-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`, `OQ-013`
 - **Acceptance**: Given `@pi fix this` from `author_association: NONE`, the receiver returns 204 and
   enqueues nothing. Given a `pull_request.opened` whose PR `author_association` is `NONE` (a fork PR), the
   receiver returns 204 and enqueues nothing; given the same from a `COLLABORATOR`, exactly one job runs.
+  Given a GitLab issue labelled with an allowlisted label by an actor whose resolved `access_level` is
+  below 30, the receiver returns 204 and enqueues nothing; given the same from a Developer, exactly one job
+  runs. Given a GitLab delivery whose access lookup could not be completed, the receiver returns **503**
+  (redeliverable), never 204 — indeterminate is not denied.
 
 ## CONST-HMAC-OVER-RAW-BODY
 
-- **Statement**: `X-Hub-Signature-256` shall be verified with a timing-safe comparison against the
-  **raw** request body, before any field of that body is read.
+- **Statement**: A webhook shall be verified against the **raw** request body, with a timing-safe
+  comparison, **before any field of that body is read**. Each source declares which mechanism it uses and
+  exactly that one is applied: GitHub's `X-Hub-Signature-256` HMAC; GitLab's `webhook-signature` HMAC over
+  the Standard Webhooks message `{webhook-id}.{webhook-timestamp}.{body}` (19.0+), or its `X-Gitlab-Token`
+  shared-secret compare. The mechanism is **never negotiated from the request** — a delivery carrying a
+  different mechanism's header is refused even when that header is correct.
 - **Why**: `express.json()` reserializes the body, which breaks the HMAC — verification after parsing
   either always fails or, worse, gets quietly skipped to make things work. `timingSafeEqual` rather than
   `===` denies a timing oracle. Without this the endpoint accepts forged events from anyone who learns
   the URL, and **every downstream gate collapses**: the label allowlist and the author check would be
   reading fields from a body nobody authenticated.
-- **Traces to**: `INT-WEBHOOK-PAYLOAD-SUBSET`, `CONST-TRIGGER-AUTHOR-GATE`
-- **Acceptance**: Given a body with a valid signature for *different* bytes, the receiver returns 401.
+  **The ID outlives its literal wording, deliberately.** `X-Gitlab-Token` is not an HMAC and covers no
+  bytes: it proves the sender knew a secret and says nothing about whether the body arrived as it was
+  sent. It is admitted because most self-hosted GitLab instances cannot yet do better, and it is admitted
+  **named** rather than silently — an operator on token mode has a weaker gate than one on either HMAC,
+  and `docs/gitlab.md` says so where they choose. What does NOT vary is the ordering: raw bytes, then
+  verify, then parse. That is the part every downstream gate depends on, and it holds for every source.
+  Auto-negotiation is refused for the obvious reason: it would let the sender choose which gate it faced,
+  and a sender who can choose picks the weakest one available.
+- **Traces to**: `INT-WEBHOOK-PAYLOAD-SUBSET`, `INT-GITLAB-PAYLOAD-SUBSET`, `CONST-TRIGGER-AUTHOR-GATE`
+- **Acceptance**: Given a body with a valid signature for *different* bytes, the receiver returns 401 —
+  for GitHub, and for GitLab in signature mode. Given a delivery presenting a correct `X-Gitlab-Token` to
+  an endpoint configured for `signature`, the receiver returns 401. A receiver configured with no
+  verification mechanism for a source does not serve that source at all.
 
 ## CONST-BUDGET-BEFORE-TOKENS
 
@@ -349,6 +383,15 @@ that always fires is one nobody reads.
   long-lived classic PAT does not** and shall not enter a container. The App path remains strictly
   stronger on the token axis and is **mandatory for multi-tenant** deployments — a fine-grained PAT is
   per-account and cannot isolate mutually-distrusting owners.
+  **GitLab has no path that satisfies all of them, and this is stated rather than implied.** A **project**
+  access token is repo-scoped, host-held, env-injected and not merge-capable in practice — but it is
+  neither *minimally-permissioned* (`api` is the narrowest scope that can post a note, and it grants full
+  project API read/write; GitLab offers no contents-vs-issues split) nor *short-lived* (the operator mints
+  it by hand with a date-granular expiry). It is admitted as an **operator obligation** on the same terms
+  as the GitHub `gh`/`pat` sources, which carry the same gap; what differs is that GitHub has a stronger
+  path available and GitLab does not. A **group** access token is broader still and reaches every project
+  in the group — it is the GitLab equivalent of the broad classic PAT this constraint excludes, and it
+  should not be used where a project token will do.
 - **Why**: The credential's short **expiry** — not its capabilities — is the blast-radius bound for the
   case where an injected agent exfiltrates its environment, which is a *when*, not an *if*. A broad,
   long-lived classic PAT makes one successful injection permanent and multi-repo, which is why it is
@@ -361,7 +404,10 @@ that always fires is one nobody reads.
   env-injected and never written to `/workspace`, `.git/config`, argv, or logs; no acceptance clause
   mandates a specific expiry duration. (b) **Operator obligation** — a single-owner deployment must
   supply a repo-scoped, minimally-permissioned, short-expiry fine-grained PAT (or use the App); a broad
-  or long-lived classic PAT is non-conformant. Multi-tenant deployments must use the App.
+  or long-lived classic PAT is non-conformant. Multi-tenant deployments must use the App. A GitLab
+  deployment must supply a **project**-scoped token, narrowed to the one project it services, and rotate
+  it — the expiry bound this constraint names as the blast-radius limit is the operator's to enforce
+  there, because no GitLab mechanism enforces it for them.
 
 ## CONST-PI-VERSION-PINNED
 
@@ -405,3 +451,4 @@ that always fires is one nobody reads.
 | 2026-07-28 | `CONST-NO-CONTEXT-FILES-MANDATORY` **REVERSED**, not refined — the serious one on this table. The constraint as written (discovery off "unconditionally, for every repository, without exception") no longer holds: the runner sets `noContextFiles: false` and `noExtensions: false`, so a serviced repo's `AGENTS.md` and `.pi/extensions` load natively. **The justification is the constraint's own premise being half wrong.** It reasoned about "anyone who can land a PR", but `/workspace` is never a PR head — `prepare-github.mjs` resolves the **base repo's default-branch SHA**, fetches that one commit and checks it out detached, and a PR's `head`/`base` are data in `event.json`, never a clone ref. The real population is anyone who can **land a commit on the default branch**: already the trust boundary for `CONST-MERGE-NEVER-AUTOMATIC`, branch protection, and the `.pi/` this harness materialises and obeys. The stated accepted cost — losing the repo's legitimate conventions — was being paid to exclude a population already trusted one layer down. **What that population gains is stated in the entry rather than glossed**: previously they could supply prompt text; now they can execute code in job containers with the job token and open egress, bounded by `CONST-ISOLATION-CONTAINER-PER-JOB` and `CONST-TOKEN-SCOPED-PER-JOB` and no longer by this constraint. `noSkills` **stays `true`** for a mechanical reason (discovery double-registers every repo skill and, being first-path-wins with the discovered copy first, demotes the pinned-SHA read-only mount to a collision diagnostic), and a new `extensionsOverride` recursion guard drops admin-like extensions because this repo ships `.pi/extensions/dispatch.ts` and the operator services this repo. Statement, Why, Traces and Acceptance rewritten (the Acceptance is now the exact inverse: the sentinel that had to appear nowhere must now appear, as a context file and not in the append block); the original `Evidence (upstream)` lines are **preserved unchanged** — they were always accurate about pi and still are — and a pinned-artifact block is added for the trust default and the two merge branches that the reversal now depends on. Two caveats carry the negative-fact discipline forward: a **multi-tenant** deployment must turn discovery back off, and the knob is an edit to two literals in `buildResourceLoader` plus an image rebuild, **not** `PI_GLOBAL_ALLOW_EXTENSIONS` and not any env var. `CONST-ISSUE-TEXT-IS-DATA` is **UNCHANGED and was checked rather than forgotten**: webhook issue/PR/comment text is still DATA in the user prompt — only repo *files* changed status, and that distinction is what is left of the safety story. |
 | 2026-07-23 | No statement change. Recording that the admin surface's new **confirm-gated write tools** (`dispatch_set`, `dispatch_trigger_add`/`_edit`/`_delete`; see `DES-ADMIN-VIA-PI-EXTENSION` / `REQ-ADMIN-VIA-PI-EXTENSION`) **preserve** both `CONST-BUDGET-BEFORE-TOKENS` and `CONST-TRIGGER-AUTHOR-GATE`. `CONST-BUDGET-BEFORE-TOKENS` governs *ordering* (the cap is still checked-and-incremented before the container/provider call, worker-side) — a confirmed `dispatch_set` changes the cap's *value*, under an operator's approval, exactly as the operator-typed `/dispatch set` already did; it does not relax the ordering. `CONST-TRIGGER-AUTHOR-GATE` governs *webhook* events (who may start a job from GitHub activity) — a confirmed `dispatch_trigger_*` edits a locally-configured `triggers.json` entry with the operator's confirm as the human approval, and does not touch the webhook author/label gate. The gate is a `ctx.ui.confirm` the model cannot self-answer, fail-closed when no interactive operator is present. |
 | 2026-07-29 | Issue #41 (per-trigger `run.image`). `CONST-PI-VERSION-PINNED` is **NOT extended**: exactly one clause was added to its Acceptance recording that an **operator-built** job image named by a trigger's `run.image` carries its own pi version, is pinned by the same reasoning, and — **unlike** the operator-staged package clause added for #58 — is enforced **nowhere**, because there is no stage-time refusal and no artifact in this repo to grep. What this repo can do it does (`docs/job-image.md` states the pin first; the `image` CI job runs against any tag); what it cannot do is `OQ-012` rather than an implication of coverage. Statement, Why and Evidence untouched; the constraint still governs **the image this repo builds**. `CONST-ISOLATION-CONTAINER-PER-JOB` is **UNCHANGED, and was checked rather than forgotten**: its Acceptance enumerates **mounts**, and a per-trigger tag plus `--pull=never` adds none — and it survives not by luck but by construction, since every isolation flag is applied by the **worker's argv** (`ISOLATION_FLAGS` in `worker/src/docker-run.mjs`), never by anything an image contains, so a foreign image cannot weaken `--cap-drop=ALL`, `no-new-privileges`, the limits, or the mount set. What does become operator-chosen is the box's **contents**, which is `CONST-PI-VERSION-PINNED`'s and `OQ-012`'s scope. `CONST-NO-CONTEXT-FILES-MANDATORY` is likewise unchanged but newly **per-image**: its negative fact — the discovery off-switch is a two-line edit plus a rebuild — now means a multi-tenant deployment must re-make that carve-out **in every image it names**, recorded in `INT-CONTAINER-RUNTIME-CONTRACT`'s conformance bullet and in `SECURITY.md` rather than by reopening this entry. `CONST-RETRY-INFRA-ONLY` unchanged: a missing image is **config, not infra** — retrying never makes a misspelled tag appear — so the preflight refuses as a policy outcome, the same class as `settings-overlay-invalid`. |
+| 2026-07-29 | Issue #42 (GitLab triggers). `CONST-HMAC-OVER-RAW-BODY` **amended, and keeps its ID though the name no longer describes every case it governs** — the `CONST-NO-CONTEXT-FILES-MANDATORY` precedent, and the same reasoning: the *decision* generalised, the *address* did not. The Statement moves from the literal `X-Hub-Signature-256` to "the mechanism the source declares, applied to the raw body before any field is read", covering GitHub's HMAC, GitLab's Standard-Webhooks HMAC over `{webhook-id}.{webhook-timestamp}.{body}` (19.0+), and GitLab's `X-Gitlab-Token` compare. That last one **is not an HMAC and covers no bytes**, which the Why says in those words: it proves the sender knew a secret and nothing about the body's integrity, and it is admitted named rather than silently because most self-hosted instances cannot yet do better. What does not vary is the ordering — raw bytes, verify, then parse — and that is the part every downstream gate depends on. Auto-negotiation is **refused**: a sender able to choose which gate it faced would choose the weakest, so the mode is config-declared and a delivery carrying the other mode's header is refused even when correct. `CONST-TRIGGER-AUTHOR-GATE` **amended, and this is a security finding rather than a wording change**: its central rationale — *"only collaborators can apply labels — therefore the label is the human approval step"* — is **false on GitLab** three independent ways (the minimum role for label management has moved across versions, Ultimate custom roles can grant it at any level, and a **Guest can set labels on an issue at creation**, so a stranger can open an issue already carrying the trigger label). The gate becomes "write access or above, established by whatever mechanism the forge offers", with GitHub's payload-carried `author_association` and GitLab's API-resolved `access_level >= 30` as the two mechanisms — and on GitLab it covers **every** trigger type, labels included, where on GitHub the label carries the comment case's weight by itself. The Acceptance gains the Guest-labelled and indeterminate-lookup clauses; the residual (a gate that now depends on a lookup that can fail, and on a role table that varies by version and edition) is `OQ-013`. `CONST-TOKEN-SCOPED-PER-JOB` **amended, one paragraph, stating a gap rather than closing one**: a GitLab **project** access token is repo-scoped, host-held, env-injected and not merge-capable, but is neither minimally-permissioned (`api` is the narrowest scope that can post a note; GitLab offers no contents-vs-issues split) nor short-lived (hand-minted, date-granular expiry). It is admitted on the same operator-obligation terms as the shipped `gh`/`pat` GitHub sources, which carry the identical gap — so this is an **inherited** exception, not a new class; what differs is that GitHub has a stronger path and GitLab has none. A **group** access token is named as the GitLab analogue of the broad classic PAT this constraint already excludes. `CONST-MERGE-NEVER-AUTOMATIC` amended in the nouns only: merge requests are covered, and "grep is the test" now has two surfaces (`PUT /pulls/{n}/merge`, `PUT /projects/:id/merge_requests/:iid/merge`). `CONST-ISSUE-TEXT-IS-DATA` is **UNCHANGED and was checked rather than forgotten**: it is enforced by *placement*, and GitLab issue/note/merge-request text sits below the same delimiter in the same user prompt — `gitlab-prompt.mjs` reuses `github-prompt.mjs`'s own `dataRegion` rather than reimplementing it, so there is no second placement rule that could drift. `CONST-ISOLATION-CONTAINER-PER-JOB` likewise unchanged and checked: its Acceptance enumerates **mounts**, and a gitlab job adds none — it takes the same four, and like a github job it gets no `/outbox` (`DES-JOB-OUTBOX-CHAINING`, `OQ-009`). `CONST-BUDGET-BEFORE-TOKENS` and `CONST-RETRY-INFRA-ONLY` unchanged: the ordering and the retry classification are forge-blind, and the one new indeterminate case — an access lookup that could not complete — is answered with a **503 at the receiver**, before a job exists at all, rather than by a retry classification inside the worker. |

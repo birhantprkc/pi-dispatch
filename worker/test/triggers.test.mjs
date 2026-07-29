@@ -326,3 +326,90 @@ test("a mixed file of all four types validates and preserves order", () => {
 	assert.equal(result.length, 5);
 	assert.deepEqual(result.map((t) => t.on.type), ["cron", "label", "comment", "pull_request", "pull_request"]);
 });
+
+// --- the forge a webhook trigger names (issue #42) ---
+
+const GL_LABEL = { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "gitlab", flow: "frontend-fix" } };
+const GL_COMMENT = { on: { type: "comment", phrase: "@pi" }, run: { kind: "gitlab", flow: "fix" } };
+const GL_MR = { on: { type: "pull_request", action: ["open", "update"] }, run: { kind: "gitlab", flow: "review" } };
+
+test("a webhook trigger may name gitlab, and the kind survives onto the normalized run", () => {
+	for (const entry of [GL_LABEL, GL_COMMENT, GL_MR]) {
+		const [t] = parse([entry]);
+		assert.equal(t.run.kind, "gitlab", `${entry.on.type}: the forge the operator named must be the forge that is stored`);
+	}
+});
+
+test("the on x run matrix still refuses local for a webhook type, and any forge for cron", () => {
+	for (const entry of [LABEL, COMMENT, PR_LABELED]) {
+		assert.throws(
+			() => parse([{ ...entry, run: { ...entry.run, kind: "local" } }]),
+			isConfigError,
+			`${entry.on.type}: a webhook trigger is adversarial input and must never produce a local run`,
+		);
+	}
+	// A cron trigger carries no delivery id, number, title or body -- true of every forge, not just github.
+	assert.throws(() => parse([{ ...CRON, run: { ...CRON.run, kind: "gitlab" } }]), isConfigError);
+	assert.throws(() => parse([{ ...CRON, run: { ...CRON.run, kind: "github" } }]), isConfigError);
+});
+
+test("an unknown forge is refused, and the message names every kind that IS allowed", () => {
+	assert.throws(
+		() => parse([{ ...LABEL, run: { ...LABEL.run, kind: "bitbucket" } }]),
+		(e) => isConfigError(e) && e.message.includes("local|github|gitlab"),
+	);
+});
+
+test("pull_request actions are validated against the vocabulary of the forge the entry names", () => {
+	// The sharp case: neither word is malformed, each is simply the OTHER forge's. Left unrefused, the
+	// trigger loads clean and then never matches an event -- a silently dead trigger, not an error.
+	assert.throws(
+		() => parse([{ on: { type: "pull_request", action: ["synchronize"] }, run: { kind: "gitlab", flow: "review" } }]),
+		(e) => isConfigError(e) && e.message.includes("gitlab") && e.message.includes("open|update|reopen|approved"),
+		"a github action word on a gitlab trigger must refuse at load",
+	);
+	assert.throws(
+		() => parse([{ on: { type: "pull_request", action: ["update"] }, run: { kind: "github", flow: "review" } }]),
+		(e) => isConfigError(e) && e.message.includes("github") && e.message.includes("labeled|opened|synchronize|reopened"),
+		"a gitlab action word on a github trigger must refuse at load",
+	);
+});
+
+test("gitlab merge-request actions load, including the one with no github counterpart", () => {
+	const [t] = parse([{ on: { type: "pull_request", action: ["open", "update", "reopen", "approved"] }, run: { kind: "gitlab", flow: "review" } }]);
+	assert.deepEqual(t.on.action, ["open", "update", "reopen", "approved"]);
+});
+
+test("a label trigger needs a positive selector on EVERY forge -- a none-only rule fires on any label change", () => {
+	for (const kind of ["github", "gitlab"]) {
+		assert.throws(
+			() => parse([{ on: { type: "label", none: ["blocked"] }, run: { kind, flow: "fix" } }]),
+			isConfigError,
+			`${kind}: a none-only label rule matches every labelling event, which is wider than an allowlist`,
+		);
+	}
+});
+
+test("an unpredicated gitlab MR rule loads, where an unpredicated github `labeled` rule does not", () => {
+	// Not an inconsistency: a github `labeled` rule has ONLY its predicate as the approval gate, so a rule
+	// without one is ungated. Every gitlab trigger is additionally gated on the actor's resolved access
+	// level, so there is no ungated case for the predicate to have to close.
+	assert.doesNotThrow(() => parse([GL_MR]));
+	assert.throws(() => parse([{ on: { type: "pull_request", action: ["labeled"] }, run: { kind: "github", flow: "review" } }]), isConfigError);
+});
+
+test("the one-comment-trigger cap is PER FORGE: two of a kind refuse, one of each is fine", () => {
+	assert.doesNotThrow(() => parse([COMMENT, GL_COMMENT]), "a deployment serving both forges may answer @pi on each");
+	for (const [a, b] of [[COMMENT, COMMENT], [GL_COMMENT, GL_COMMENT]]) {
+		assert.throws(
+			() => parse([a, b]),
+			(e) => isConfigError(e) && e.message.includes(a.run.kind),
+			`two ${a.run.kind} comment triggers are ambiguous -- the receiver holds one per forge, so the second would be unreachable`,
+		);
+	}
+});
+
+test("a mixed-forge file validates and preserves order, and each entry keeps its own forge", () => {
+	const result = parse([CRON, LABEL, GL_LABEL, COMMENT, GL_COMMENT, PR_LABELED, GL_MR]);
+	assert.deepEqual(result.map((t) => t.run.kind), ["local", "github", "gitlab", "github", "gitlab", "github", "gitlab"]);
+});
