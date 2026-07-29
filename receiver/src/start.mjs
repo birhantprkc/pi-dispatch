@@ -26,6 +26,8 @@ import { dirname, basename } from "node:path";
 import { loadReceiverConfig, triggersFilePath, reloadTriggers } from "./config.mjs";
 import { makeReceiver } from "./receiver.mjs";
 import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
+import { resolveGitLabSelfId } from "@pi-dispatch/worker/gitlab-identity";
+import { makeResolveAccessLevel } from "./gitlab-members.mjs";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { parseConnection } from "@pi-dispatch/worker/connection";
 
@@ -35,7 +37,13 @@ import { parseConnection } from "@pi-dispatch/worker/connection";
  */
 export async function startReceiver(
 	env = process.env,
-	{ makeAuth = makeGitHubAuth, makeQueueFn = makeQueue, createServer = http.createServer } = {},
+	{
+		makeAuth = makeGitHubAuth,
+		makeQueueFn = makeQueue,
+		createServer = http.createServer,
+		resolveGitLabSelfId: resolveSelfIdFn = resolveGitLabSelfId,
+		makeResolveAccessLevel: makeResolveAccessLevelFn = makeResolveAccessLevel,
+	} = {},
 ) {
 	// Single-object log line: `makeReceiver` calls `log?.({ event, ... })`, so the sink takes ONE object.
 	const log = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -52,7 +60,22 @@ export async function startReceiver(
 	// restart, not give up on a transient disconnect.
 	const queue = makeQueueFn(parseConnection(cfg.valkeyUrl));
 
-	const handler = makeReceiver({ queue, selfId, cfg, log });
+	// The GitLab arm, when configured. Its identity resolution is HARD-FAIL for the same reason github's
+	// is: without a selfId the bot-loop guard cannot run, and a receiver that listens without it turns the
+	// harness's own status comment into another paid job.
+	let gitlab = null;
+	if (cfg.gitlab) {
+		const gitlabSelfId = await resolveSelfIdFn({ apiUrl: cfg.gitlab.apiUrl, token: cfg.gitlab.token });
+		log({ event: "self_identity", forge: "gitlab", id: gitlabSelfId, mode: cfg.gitlab.mode });
+		gitlab = {
+			mode: cfg.gitlab.mode,
+			secret: cfg.gitlab.secret,
+			selfId: gitlabSelfId,
+			resolveAccessLevel: makeResolveAccessLevelFn({ apiUrl: cfg.gitlab.apiUrl, token: cfg.gitlab.token }),
+		};
+	}
+
+	const handler = makeReceiver({ queue, selfId, cfg, log, gitlab });
 	const server = createServer(handler);
 	server.listen(cfg.port, cfg.bind, () =>
 		log({ event: "receiver_started", port: cfg.port, bind: cfg.bind, valkey: cfg.valkeyUrl }),

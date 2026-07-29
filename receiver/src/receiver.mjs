@@ -19,7 +19,10 @@
 
 import { makeVerifiedHandler } from "./verify.mjs";
 import { filter } from "./filter.mjs";
-import { enqueueGitHubJob } from "@pi-dispatch/worker/queue";
+import { enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
+import { filterGitLab } from "./filter-gitlab.mjs";
+import { parseGitLabSubset } from "./gitlab-subset.mjs";
+import { makeGitLabVerifiedHandler } from "./verify-gitlab.mjs";
 
 /** Write a small JSON body with an explicit status; a 204 carries no body. verify's `respond` is private. */
 function respond(res, status, obj) {
@@ -71,11 +74,46 @@ export function parseSubset(payload) {
 }
 
 /**
- * Build the receiver's `node:http` handler. Returns `makeVerifiedHandler`'s handler directly, so the
- * receiver only ever sees an already-verified request. `onVerified` owns parse, filter, enqueue, and
- * response; a good signature is the sole precondition D2 guarantees before it runs.
+ * Build the receiver's `node:http` handler.
+ *
+ * ROUTING BY PATH, not by header (issue #42). Each forge gets its own path, and with it its own secret and
+ * its own trust regime, decided before a byte of the body is read. Discriminating on headers instead would
+ * hand that choice to the sender: Forgejo emits `X-GitHub-*` on every delivery, so header-sniffing cannot
+ * even tell two forges apart reliably, and a request that could select which gate it faced would always
+ * select the weakest one available.
+ *
+ * `/` stays mapped to GitHub. Existing deployments configured their webhook URL before any path existed,
+ * and silently 404-ing them would look exactly like the harness being down.
+ *
+ * A forge with no configuration gets no route at all -- not a route that answers 401. An endpoint that
+ * responds to an unconfigured forge is an endpoint an operator can believe is armed.
  */
-export function makeReceiver({ queue, selfId, cfg, log }) {
+export function makeReceiver({ queue, selfId, cfg, log, gitlab = null }) {
+	const github = makeGitHubHandler({ queue, selfId, cfg, log });
+	const gitlabHandler = gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null;
+
+	return async function receiverHandler(req, res) {
+		const path = pathOf(req.url);
+		if (path === "/gitlab") {
+			if (!gitlabHandler) return respond(res, 404, { error: "gitlab webhooks are not configured" });
+			return await gitlabHandler(req, res);
+		}
+		return await github(req, res);
+	};
+}
+
+/** The path portion of a request URL, without query or trailing slash. Never throws on a malformed URL. */
+function pathOf(url) {
+	const raw = String(url ?? "/").split("?")[0];
+	return raw.length > 1 && raw.endsWith("/") ? raw.slice(0, -1) : raw;
+}
+
+/**
+ * The GitHub arm. Returns `makeVerifiedHandler`'s handler directly, so it only ever sees an already-verified
+ * request. `onVerified` owns parse, filter, enqueue, and response; a good signature is the sole
+ * precondition D2 guarantees before it runs.
+ */
+function makeGitHubHandler({ queue, selfId, cfg, log }) {
 	return makeVerifiedHandler({ secret: cfg.webhookSecret }, async ({ rawBody, event, delivery }, res) => {
 		let subset;
 		try {
@@ -99,6 +137,57 @@ export function makeReceiver({ queue, selfId, cfg, log }) {
 		}
 
 		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.target.type}#${result.job.target.number}`, flow: result.job.flow });
+		return respond(res, 202, { status: "queued" });
+	});
+}
+
+/**
+ * The GitLab arm. Same shape as the GitHub one -- verify, project, gate, enqueue, respond -- with one step
+ * the GitHub path does not need: the actor's project access level is RESOLVED here, between verification
+ * and the gate, because GitLab puts no `author_association` in the payload (gitlab-members.mjs).
+ *
+ * That resolution is a network call, and its three outcomes are deliberately not two:
+ *   - a level (including 0 for a determinate non-member) is handed to the gate, which decides;
+ *   - an INDETERMINATE lookup is a 503, so GitLab redelivers and the stable `webhook-id` dedups the
+ *     retry. Answering 204 would drop real work during an outage, and it would look on the wire exactly
+ *     like a stranger being correctly refused.
+ * The lookup runs only for events that could still fire -- after verification, and after the payload has
+ * been projected -- so an unauthenticated flood cannot make this project call GitLab at all.
+ */
+function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAccessLevel, now }) {
+	return makeGitLabVerifiedHandler({ mode, secret, ...(now ? { now } : {}) }, async ({ rawBody, delivery }, res) => {
+		let subset;
+		try {
+			subset = parseGitLabSubset(JSON.parse(rawBody));
+		} catch {
+			return respond(res, 400, { error: "invalid-json" });
+		}
+
+		const resolved = await resolveAccessLevel(subset.project?.id, subset.user?.id);
+		if (resolved.indeterminate) {
+			// The reason names the lookup, never the actor -- `user.username` is personal data and exists
+			// only to have been asked about (no-pii-in-logs).
+			log?.({ event: "gitlab_access_lookup_failed", delivery, reason: resolved.indeterminate });
+			return respond(res, 503, { error: "access-lookup-failed" });
+		}
+
+		const result = filterGitLab(subset, cfg.triggers?.gitlab, cfg.triggers?.knownFlows, selfId, resolved.level, delivery);
+		if (!result.enqueue) {
+			log?.({ event: "dropped", delivery, reason: result.reason });
+			return respond(res, 204);
+		}
+
+		try {
+			await enqueueGitLabJob(queue, result.job);
+		} catch (err) {
+			log?.({ event: "enqueue_failed", delivery, reason: err?.message });
+			return respond(res, 503, { error: "enqueue-failed" }); // GitLab redelivers; dedup by webhook-id coalesces
+		}
+
+		// `!` for a merge request, `#` for an issue -- GitLab's own notation, and the same discrimination
+		// the semantic dedup key makes, because the two are separate number sequences.
+		const sep = result.job.target.type === "pull_request" ? "!" : "#";
+		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.repo}${sep}${result.job.target.number}`, flow: result.job.flow });
 		return respond(res, 202, { status: "queued" });
 	});
 }

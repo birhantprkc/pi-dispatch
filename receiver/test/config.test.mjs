@@ -271,3 +271,39 @@ test("a forge the file never mentions still gets an empty group -- the gate need
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
 	assert.deepEqual(c.triggers.gitlab, { label: [], comment: null, pullRequest: [] });
 });
+
+// --- the gitlab endpoint's configuration (issue #42) ---
+
+const glEnv = { WEBHOOK_SECRET: "shh", GITLAB_WEBHOOK_MODE: "token", GITLAB_WEBHOOK_SECRET: "gl-secret", GITLAB_TOKEN: "glpat-x" };
+
+test("no gitlab variables at all -> cfg.gitlab is null, and no /gitlab route exists", () => {
+  const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
+  assert.equal(c.gitlab, null, "an endpoint that answers is an endpoint an operator can believe is armed");
+});
+
+test("a complete gitlab config loads, defaulting only the instance URL", () => {
+  const c = loadReceiverConfig(glEnv, validTriggers);
+  assert.deepEqual(c.gitlab, { mode: "token", secret: "gl-secret", token: "glpat-x", apiUrl: "https://gitlab.com" });
+  assert.equal(loadReceiverConfig({ ...glEnv, GITLAB_URL: "https://gl.internal" }, validTriggers).gitlab.apiUrl, "https://gl.internal");
+});
+
+test("GITLAB_WEBHOOK_MODE is required and never defaulted -- the two modes are not equally strong", () => {
+  // Defaulting to `token` would silently downgrade an operator who did not know the field existed;
+  // defaulting to `signature` would break every instance below GitLab 19.0. So it must be chosen.
+  for (const mode of [undefined, "", "hmac", "signature-v1"]) {
+    assert.throws(
+      () => loadReceiverConfig({ ...glEnv, GITLAB_WEBHOOK_MODE: mode }, validTriggers),
+      (e) => e.piDispatchConfig === true,
+      `mode ${JSON.stringify(mode)} must refuse at boot`,
+    );
+  }
+  assert.doesNotThrow(() => loadReceiverConfig({ ...glEnv, GITLAB_WEBHOOK_MODE: "signature" }, validTriggers));
+});
+
+test("a partially-configured gitlab endpoint refuses at boot rather than half-arming", () => {
+  // Each of these would produce an endpoint that accepts nothing, or one that 503s every delivery
+  // because it can never resolve an access level. One clear message beats a redelivery loop.
+  assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_WEBHOOK_SECRET: undefined }, validTriggers), (e) => e.piDispatchConfig === true);
+  assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_TOKEN: undefined }, validTriggers), (e) => e.piDispatchConfig === true);
+  assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_TOKEN: "   " }, validTriggers), (e) => e.piDispatchConfig === true);
+});

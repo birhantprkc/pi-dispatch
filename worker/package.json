@@ -21,6 +21,7 @@
     "./packages": "./src/packages.mjs",
     "./pause-windows": "./src/pause-windows.mjs",
     "./identity": "./src/identity.mjs",
+    "./gitlab-identity": "./src/gitlab-identity.mjs",
     "./get-token": "./src/get-token.mjs",
     "./runtime-settings": "./src/runtime-settings.mjs",
     "./run-history": "./src/run-history.mjs",

@@ -45,7 +45,42 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
 		bind: env.RECEIVER_BIND ?? "0.0.0.0",
 		triggers: loadTriggers(env, readFile, fileExists),
 		github: loadGitHubAuth(env, fileExists),
+		gitlab: loadGitLabConfig(env),
 	};
+}
+
+/**
+ * The GitLab endpoint's configuration, or `null` when the deployment serves no GitLab -- in which case no
+ * `/gitlab` route exists at all, rather than one that answers 401. An endpoint that responds is an endpoint
+ * an operator can believe is armed.
+ *
+ * `GITLAB_WEBHOOK_MODE` is REQUIRED once any GitLab variable is set, and is not defaulted. The two modes
+ * are not equally strong -- `signature` is an HMAC over the body, `token` is a shared-secret compare that
+ * proves nothing about the body's integrity -- so which one a deployment runs must be a thing somebody
+ * chose and can be asked about, never a thing it fell into. Defaulting to the weaker one would silently
+ * downgrade every operator who did not know the field existed; defaulting to the stronger one would break
+ * every instance below GitLab 19.0.
+ */
+function loadGitLabConfig(env) {
+	const mode = env.GITLAB_WEBHOOK_MODE;
+	const secret = env.GITLAB_WEBHOOK_SECRET;
+	const token = env.GITLAB_TOKEN;
+	const apiUrl = env.GITLAB_URL ?? "https://gitlab.com";
+	if (!mode && !secret && !token) return null;
+
+	if (mode !== "signature" && mode !== "token") {
+		throw configError(`GITLAB_WEBHOOK_MODE must be "signature" (HMAC, GitLab 19.0+) or "token" (X-Gitlab-Token, any version); got ${JSON.stringify(mode)}`);
+	}
+	if (typeof secret !== "string" || secret.trim() === "") {
+		throw configError("GITLAB_WEBHOOK_SECRET is required; refusing to start a gitlab endpoint that cannot verify deliveries");
+	}
+	// The gate needs this token BEFORE any job runs: the actor's access level is what authorises a GitLab
+	// trigger at all (CONST-TRIGGER-AUTHOR-GATE), and without a token every lookup is indeterminate and
+	// every delivery 503s. Refusing at boot is the difference between one clear message and a redelivery loop.
+	if (typeof token !== "string" || token.trim() === "") {
+		throw configError("GITLAB_TOKEN is required for gitlab triggers -- the receiver resolves the actor's project access level before it may enqueue");
+	}
+	return { mode, secret, token, apiUrl };
 }
 
 /**

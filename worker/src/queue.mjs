@@ -1,8 +1,8 @@
 import { Queue } from "bullmq";
-import { chainedJobId, localJobId, deliveryJobId } from "./job-id.mjs";
+import { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId } from "./job-id.mjs";
 
 export const QUEUE = "pi-jobs";
-export { chainedJobId, localJobId, deliveryJobId };
+export { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId };
 
 export function makeQueue(connection) {
 	return new Queue(QUEUE, { connection });
@@ -57,7 +57,8 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  * `target` is the discriminated subject of the job -- `{ type:"issue"|"pull_request", number, title,
  * body, ... }` -- built by the receiver's filter from the INT-WEBHOOK-PAYLOAD-SUBSET fields. Its `number`
  * keys the semantic dedup window; GitHub issues and PRs share one per-repo number sequence, so the key is
- * collision-free without encoding the type.
+ * collision-free without encoding the type. That is a fact about GitHub, not about forges -- see
+ * `enqueueGitLabJob`, where they are separate sequences and the type has to be in the key.
  *
  * Two dedup layers, ADDITIVE and independent:
  *   - `jobId` (the delivery GUID) is exact-per-delivery: a redelivered webhook resolves to the same
@@ -77,6 +78,37 @@ export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, pro
 	await queue.add("github", data, {
 		jobId,
 		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
+		attempts: 2,
+		backoff: { type: "exponential", delay: 60_000 },
+		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above
+		removeOnFail: { age: 31 * 24 * 3600 },
+	});
+	return jobId;
+}
+
+/**
+ * Enqueue a GitLab-triggered job. Structurally the twin of `enqueueGitHubJob` -- same two additive dedup
+ * layers, same retention, same retry policy -- with two deliberate differences.
+ *
+ * `projectId` rides the data because every GitLab API path the worker needs takes the numeric project id.
+ * A GitLab project path is `group/subgroup/project` with no fixed segment count, so the `owner/name` split
+ * the GitHub path uses does not merely fail on one, it SUCCEEDS wrongly: both halves come back non-empty
+ * and the project silently becomes its own parent group. Carrying the id sidesteps the grammar entirely;
+ * `repo` stays as the human-readable label for logs, run history and pause-window scopes.
+ *
+ * The semantic dedup key encodes the TARGET TYPE, which the GitHub key does not need to. GitLab numbers
+ * issues and merge requests in separate per-project sequences, so issue #5 and merge request !5 are
+ * different objects that would collide on `project#5:flow` -- one of them silently coalescing into the
+ * other's 10-minute window and never running. The separator is GitLab's own notation: `#` for an issue,
+ * `!` for a merge request.
+ */
+export async function enqueueGitLabJob(queue, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image }) {
+	const jobId = gitlabDeliveryJobId(trigger.deliveryId);
+	const data = { kind: "gitlab", repo, projectId, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }) };
+	const sep = target.type === "pull_request" ? "!" : "#";
+	await queue.add("gitlab", data, {
+		jobId,
+		deduplication: { id: `${repo}${sep}${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
 		attempts: 2,
 		backoff: { type: "exponential", delay: 60_000 },
 		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above

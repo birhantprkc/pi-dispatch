@@ -29,6 +29,7 @@
  * `selfId` is the numeric id of whichever identity posts as the harness (the App's bot user, or the PAT
  * user); `deliveryId` is the `X-GitHub-Delivery` GUID, carried into the job for downstream dedup.
  */
+import { escapeRegExp, firstMatchingRule, labelSet, matchedLabel, matchesRule } from "./predicate.mjs";
 
 const AUTHOR_ALLOWLIST = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const LABEL_ACTIONS = new Set(["opened", "labeled", "reopened"]);
@@ -206,54 +207,4 @@ function buildPrTarget(pr) {
 	if (pr.head) target.head = { ref: pr.head.ref, sha: pr.head.sha, repo: pr.head.repo?.full_name };
 	if (pr.base) target.base = { ref: pr.base.ref };
 	return target;
-}
-
-/** The set of label names present on an issue/PR; non-string names are dropped. */
-function labelSet(labels) {
-	const arr = Array.isArray(labels) ? labels : [];
-	return new Set(arr.map((l) => l?.name).filter((n) => typeof n === "string"));
-}
-
-/** First rule (in file order) whose predicate matches `L`, or undefined. The rule carries its raw-file `index`. */
-function firstMatchingRule(rules, L) {
-	for (const rule of rules ?? []) {
-		if (matchesRule(L, rule.predicate)) return rule;
-	}
-	return undefined;
-}
-
-/**
- * The label that satisfied a matched rule's positive selector, for `trigger.matched.label`: the first
- * `any` entry present in `L`, else `all[0]` (all ⊆ L holds whenever the rule matched, so membership is
- * guaranteed), else null. Deterministic in rule order -- honest about WHICH label opened the gate, not
- * merely that one did.
- */
-function matchedLabel(L, predicate) {
-	const anyHit = (predicate?.any ?? []).find((x) => L.has(x));
-	if (anyHit !== undefined) return anyHit;
-	return predicate?.all?.[0] ?? null;
-}
-
-/**
- * Per-rule label predicate over the label set `L`:
- *   (any empty OR L∩any ≠ ∅) AND (all ⊆ L) AND (L∩none = ∅).
- * An empty `any` is vacuously true, so the `all`/`none` clauses carry the requirement; the loader
- * guarantees at least one positive selector where the predicate is the approval gate (label triggers and
- * `labeled` PR triggers), so a validated approval rule can never match every event. Reads only its
- * arguments and never throws -- the gate's purity extends here, and the defensive `?? []` covers a rule
- * the loader has already validated.
- */
-function matchesRule(L, rule) {
-	const any = rule?.any ?? [];
-	const all = rule?.all ?? [];
-	const none = rule?.none ?? [];
-	if (any.length > 0 && !any.some((x) => L.has(x))) return false;
-	if (!all.every((x) => L.has(x))) return false;
-	if (none.some((x) => L.has(x))) return false;
-	return true;
-}
-
-/** Escape a literal string for safe embedding in a RegExp -- the trigger phrase is config, not a pattern. */
-function escapeRegExp(literal) {
-	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

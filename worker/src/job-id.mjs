@@ -53,3 +53,19 @@ export function deliveryJobId(guid) {
 	}
 	return `gh-${guid}`;
 }
+
+/**
+ * The same thing for a GitLab-triggered job: the `webhook-id` (or its older name `Idempotency-Key`),
+ * prefixed `gl-`. GitLab keeps that value CONSTANT across its own retries, which is the exact property
+ * REQ-DEDUP-BY-DELIVERY-GUID needs, so the guarantee is the same one -- and retention-bounded in the same
+ * way.
+ *
+ * The prefix is not decoration: it keeps the two forges' id spaces disjoint, so a GitLab delivery id that
+ * happened to collide with a GitHub GUID could never silently suppress the other forge's job.
+ */
+export function gitlabDeliveryJobId(id) {
+	if (typeof id !== "string" || id === "") {
+		throw configError("gitlabDeliveryJobId requires a non-empty webhook-id / Idempotency-Key");
+	}
+	return `gl-${id}`;
+}
