@@ -53,13 +53,19 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
  * the reviewed, committed source of truth for which events trigger which flow; a missing, unparseable, or
  * malformed file fails loud rather than degrading to an empty (silently trigger-nothing) allowlist.
  *
- * The shared `parseTriggers` validates the WHOLE file (including the on x run diagonal and cron entries the
- * worker owns); this loader keeps only the webhook types and groups them for the filter:
+ * The shared `parseTriggers` validates the WHOLE file (including the on x run matrix and cron entries the
+ * worker owns); this loader keeps only the webhook types and groups them PER FORGE, so `cfg.triggers` is
+ * `{ github: <group>, gitlab: <group>, knownFlows }` where each group is:
  *   - `label`:       ordered `{ index, predicate, flow, packages, image }` rules (first match wins in the filter).
  *   - `comment`:     the single `{ index, phrase, defaultFlow, packages, image }` (or null when no comment trigger is configured).
  *   - `pullRequest`: ordered `{ index, actions:Set, predicate, flow, packages, image }` rules.
- *   - `knownFlows`:  every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
- *                    unlisted flow.
+ * and `knownFlows` is every webhook `run.flow`, so a comment's `<phrase> <flow>` override cannot summon an
+ * unlisted flow.
+ *
+ * Grouping by forge FIRST is what keeps each forge's gate reading only its own rules: a GitLab delivery
+ * can never match a rule an operator wrote for GitHub, even when both name the same label. `knownFlows`
+ * stays shared deliberately -- a flow is a skill in a repo, not a property of the forge that asked for it,
+ * and the set exists to bound which names a comment may summon, which is the same bound either way.
  *
  * `packages` (load the operator-staged pi packages) and `image` (which container image the job runs in) are
  * the entry's per-trigger execution fields (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY). Both ride on
@@ -81,24 +87,29 @@ function loadTriggers(env, readFile, fileExists) {
 
 	const parsed = parseTriggers(readFile(path, "utf8"), path); // fail-loud
 
-	const label = [];
-	let comment = null;
-	const pullRequest = [];
+	// Every forge gets a group whether or not the file names it, so the filter can read
+	// `cfg.triggers[kind].label` without a presence check and an unconfigured forge simply matches nothing.
+	const groups = { github: emptyGroup(), gitlab: emptyGroup() };
 	const knownFlows = new Set();
 
 	for (const [index, { on, run }] of parsed.entries()) {
 		if (on.type === "cron") continue; // the worker owns cron; the receiver never fires it -- but it keeps its index
 		knownFlows.add(run.flow);
+		const group = groups[run.kind];
 		if (on.type === "label") {
-			label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
 		} else if (on.type === "comment") {
-			comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image }; // parseTriggers guarantees at most one
+			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image }; // parseTriggers guarantees at most one per forge
 		} else if (on.type === "pull_request") {
-			pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
 		}
 	}
 
-	return { label, comment, pullRequest, knownFlows };
+	return { ...groups, knownFlows };
+}
+
+function emptyGroup() {
+	return { label: [], comment: null, pullRequest: [] };
 }
 
 /** The triggers file path the receiver reads (env override or the committed deploy default). */

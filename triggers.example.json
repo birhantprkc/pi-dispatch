@@ -4,6 +4,10 @@
     { "on": { "type": "label", "any": ["pi:frontend"] }, "run": { "kind": "github", "flow": "frontend-fix", "packages": false } },
     { "on": { "type": "comment", "phrase": "@pi" }, "run": { "kind": "github", "flow": "fix" } },
     { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } },
-    { "on": { "type": "pull_request", "action": ["opened", "synchronize"] }, "run": { "kind": "github", "flow": "review" } }
+    { "on": { "type": "pull_request", "action": ["opened", "synchronize"] }, "run": { "kind": "github", "flow": "review" } },
+
+    { "on": { "type": "label", "any": ["pi:frontend"] }, "run": { "kind": "gitlab", "flow": "frontend-fix" } },
+    { "on": { "type": "comment", "phrase": "@pi" }, "run": { "kind": "gitlab", "flow": "fix" } },
+    { "on": { "type": "pull_request", "action": ["open", "update"] }, "run": { "kind": "gitlab", "flow": "review" } }
   ]
 }

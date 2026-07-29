@@ -1,14 +1,21 @@
 /**
  * Shared trigger-file schema + validator (issue #20). One `triggers.json` of `{ on, run }` entries is
  * the single reviewed source of standing triggers for BOTH services: the worker owns `on.type:"cron"`
- * (local jobs), the receiver owns the webhook types (`label|comment|pull_request` -> github jobs). Each
+ * (local jobs), the receiver owns the webhook types (`label|comment|pull_request` -> a forge job). Each
  * service validates the WHOLE file, then selects the `on.type` it owns, so a malformed file fails both
  * identically and the two cannot drift.
  *
- * The on x run diagonal IS the trust boundary (DES-TRIGGERS-UNIFIED-FILE): a cron trigger carries no
- * webhook delivery GUID, issue/PR number, title, or body, so it can only produce a `local` run; a webhook
- * trigger is adversarial input and always produces a `github` run. Off-diagonal is rejected fail-loud at
- * load, exactly as the old schedules loader refused a `kind:"github"` schedule.
+ * The on x run MATRIX is the trust boundary (DES-TRIGGERS-UNIFIED-FILE): a cron trigger carries no
+ * webhook delivery id, issue/PR number, title, or body, so it can only produce a `local` run; a webhook
+ * trigger is adversarial input and always produces a FORGE run, never a local one. Off-matrix is
+ * rejected fail-loud at load, exactly as the old schedules loader refused a `kind:"github"` schedule.
+ *
+ * Which forge is `run.kind` (issue #42): the `on.type` vocabulary is shared, because a label is a label
+ * and a comment is a comment on every forge, while the ACTION vocabulary is not -- GitHub says
+ * `opened`/`synchronize`, GitLab says `open`/`update`. So actions are validated against the vocabulary of
+ * whichever forge the entry names. That refusal matters more than it looks: an action word from the wrong
+ * forge does not crash anything downstream, it simply never matches an event, and the trigger silently
+ * never fires. Refusing it at load is what turns a silent no-op into a message.
  *
  * Pure and fs-free (mirrors job-id.mjs): takes the file TEXT, returns a normalized array, throws
  * `configError` on any problem. Folder existence (fs-dependent) is layered on by the worker, not here.
@@ -19,8 +26,23 @@
 import { configError } from "./config.mjs";
 
 const ON_TYPES = new Set(["cron", "label", "comment", "pull_request"]);
-const RUN_KINDS = new Set(["local", "github"]);
-const PR_ACTIONS = new Set(["labeled", "opened", "synchronize", "reopened"]);
+const RUN_KINDS = new Set(["local", "github", "gitlab"]);
+// The kinds a webhook trigger may produce. `local` is deliberately absent -- that is the matrix.
+const FORGE_KINDS = new Set(["github", "gitlab"]);
+
+/**
+ * The `pull_request` action vocabulary, per forge, in each forge's OWN words -- so an operator writes
+ * what their forge's documentation says and can grep for it there.
+ *
+ * GitLab has no `labeled`: adding a label to a merge request arrives as `update` carrying a
+ * `changes.labels` diff, and `open`/`reopen` are its spellings of `opened`/`reopened`. `approved` has no
+ * GitHub counterpart at all and is a genuinely useful gate (a member approved the MR). `merge` and
+ * `close` are omitted on purpose: a job started by a merge or a close has nothing left to act on.
+ */
+const PR_ACTIONS = {
+	github: new Set(["labeled", "opened", "synchronize", "reopened"]),
+	gitlab: new Set(["open", "update", "reopen", "approved"]),
+};
 
 // A cron id flows into BullMQ's deterministic `repeat:<id>:<nextMillis>` jobId, so a `:` corrupts that
 // parse; the charset also excludes `:` and the dedicated check names the reason.
@@ -48,7 +70,7 @@ export function parseTriggers(text, path) {
 		throw configError(`triggers file must have a "triggers" array: ${path}`);
 	}
 
-	const state = { seenCronIds: new Set(), commentCount: 0 };
+	const state = { seenCronIds: new Set(), commentCounts: {} };
 	return entries.map((entry, index) => normalizeTrigger(entry, index, path, state));
 }
 
@@ -69,18 +91,18 @@ function normalizeTrigger(entry, index, path, state) {
 		throw configError(`${at}: on.type must be one of cron|label|comment|pull_request (got ${JSON.stringify(on.type)}): ${path}`);
 	}
 	if (!RUN_KINDS.has(run.kind)) {
-		throw configError(`${at}: run.kind must be one of local|github (got ${JSON.stringify(run.kind)}): ${path}`);
+		throw configError(`${at}: run.kind must be one of local|github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 
-	// The on x run diagonal -- the trust boundary, fail-loud (mirrors the old schedules kind:github refusal).
+	// The on x run matrix -- the trust boundary, fail-loud (mirrors the old schedules kind:github refusal).
 	if (on.type === "cron") {
 		if (run.kind !== "local") {
 			throw configError(`${at}: a cron trigger has no webhook delivery, issue/PR number, title, or body; run.kind must be "local" (got ${JSON.stringify(run.kind)}): ${path}`);
 		}
 		return normalizeCron(on, run, index, path, state);
 	}
-	if (run.kind !== "github") {
-		throw configError(`${at}: a ${on.type} trigger produces a github job; run.kind must be "github" (got ${JSON.stringify(run.kind)}): ${path}`);
+	if (!FORGE_KINDS.has(run.kind)) {
+		throw configError(`${at}: a ${on.type} trigger is webhook-driven and produces a forge job; run.kind must be one of github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 	if (on.type === "label") return normalizeLabel(on, run, index, path);
 	if (on.type === "comment") return normalizeComment(on, run, index, path, state);
@@ -245,7 +267,7 @@ function normalizeLabel(on, run, index, path) {
 	}
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow, packages, image } };
+	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: run.kind, flow: run.flow, packages, image } };
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -256,13 +278,16 @@ function normalizeComment(on, run, index, path, state) {
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: comment trigger run.flow (the default flow) must be a non-empty string: ${path}`);
 	}
-	state.commentCount += 1;
-	if (state.commentCount > 1) {
-		throw configError(`${at}: at most one comment trigger is allowed: ${path}`);
+	// At most one comment trigger PER FORGE. The cap exists because the receiver holds one comment rule
+	// per forge and a second would be silently unreachable -- so it is a cap on ambiguity, not on count,
+	// and a deployment serving GitHub and GitLab is entitled to the same `@pi` phrase on each.
+	state.commentCounts[run.kind] = (state.commentCounts[run.kind] ?? 0) + 1;
+	if (state.commentCounts[run.kind] > 1) {
+		throw configError(`${at}: at most one ${run.kind} comment trigger is allowed: ${path}`);
 	}
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow, packages, image } };
+	return { on: { type: "comment", phrase: on.phrase }, run: { kind: run.kind, flow: run.flow, packages, image } };
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -272,9 +297,13 @@ function normalizePullRequest(on, run, index, path) {
 	if (!Array.isArray(actions) || actions.length === 0) {
 		throw configError(`${at}: pull_request on.action must be a non-empty array: ${path}`);
 	}
+	// Validated against THIS entry's forge, in that forge's own words. A GitHub word on a GitLab trigger
+	// (or the reverse) is refused here rather than left to never match at run time.
+	const allowed = PR_ACTIONS[run.kind];
+	const expected = [...allowed].join("|");
 	for (const a of actions) {
-		if (!PR_ACTIONS.has(a)) {
-			throw configError(`${at}: pull_request on.action has an unsupported action ${JSON.stringify(a)} (expected labeled|opened|synchronize|reopened): ${path}`);
+		if (!allowed.has(a)) {
+			throw configError(`${at}: pull_request on.action has an unsupported ${run.kind} action ${JSON.stringify(a)} (expected ${expected}): ${path}`);
 		}
 	}
 
@@ -282,7 +311,12 @@ function normalizePullRequest(on, run, index, path) {
 	// approval), so it MUST carry a positive selector -- exactly as a label trigger does. Auto actions
 	// (opened/synchronize/reopened) are gated by author_association in the filter, so a predicate is
 	// optional there and only narrows scope when present.
-	const requirePositive = actions.includes("labeled");
+	//
+	// GitLab has no `labeled` action and therefore no rule to attach this to: a label added to a merge
+	// request arrives as `update`. It needs none, because EVERY gitlab trigger is gated on the actor's
+	// resolved access level (CONST-TRIGGER-AUTHOR-GATE) rather than on the label alone -- so an
+	// unpredicated gitlab MR rule is gated, where an unpredicated `labeled` github rule would not be.
+	const requirePositive = run.kind === "github" && actions.includes("labeled");
 	const predicate = validatePredicate(on, index, path, requirePositive);
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
@@ -291,6 +325,6 @@ function normalizePullRequest(on, run, index, path) {
 	const image = validateImageRef(run, at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
-		run: { kind: "github", flow: run.flow, packages, image },
+		run: { kind: run.kind, flow: run.flow, packages, image },
 	};
 }

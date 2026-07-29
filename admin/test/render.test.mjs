@@ -229,3 +229,17 @@ test("renderSettingsView lists all ten keys, unset ones marked", () => {
 test("renderSettingsView surfaces invalid overlays", () => {
   assert.match(renderSettingsView({ path: "/s", invalid: "dailyCap must be an integer >= 1" }), /invalid/);
 });
+
+test("a non-github forge is badged in the LIST line, and a github one renders byte-identically", () => {
+  const gh = { type: "label", any: ["pi:fix"], all: [], none: [], flow: "fix", packages: false, image: null, forge: "github" };
+  const gl = { ...gh, forge: "gitlab" };
+
+  // Byte identity is the assertion, not a regex: the whole point is that an existing deployment's panel
+  // does not move, and a comparison against the forge-less record proves it exactly.
+  const show = (t) => renderTriggers({ schedulers: [], triggers: { triggers: [t] } });
+  const { forge: _drop, ...noForge } = gh;
+  assert.equal(show(gh), show(noForge), "a github trigger must render exactly as it did before the field existed");
+
+  assert.ok(show(gl).includes("[gitlab]"), "a gitlab trigger must say so -- two forges can select the same label");
+  assert.ok(!show(gh).includes("[github]"), "github is the unmarked default");
+});

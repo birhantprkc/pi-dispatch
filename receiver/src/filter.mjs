@@ -47,14 +47,17 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 	}
 
 	// (2) Route on event + action -> resolve { flow, target } or a drop reason.
+	// Only the GITHUB rule group is ever read here: rules are grouped per forge at load
+	// (receiver/src/config.mjs), so a rule an operator wrote for another forge is not merely unmatched,
+	// it is unreachable from this gate.
 	const action = subset.action;
-	const triggers = cfg?.triggers ?? {};
+	const triggers = cfg?.triggers?.github ?? {};
 	let resolved;
 
 	if (eventName === "issues" && LABEL_ACTIONS.has(action)) {
 		resolved = routeIssueLabel(subset, triggers);
 	} else if (eventName === "issue_comment" && action === "created") {
-		resolved = routeComment(subset, triggers);
+		resolved = routeComment(subset, triggers, cfg?.triggers?.knownFlows);
 	} else if (eventName === "pull_request" && PR_ACTIONS.has(action)) {
 		resolved = routePullRequest(subset, triggers, action);
 	} else {
@@ -112,8 +115,13 @@ function routeIssueLabel(subset, triggers) {
 	};
 }
 
-/** Comment path: author_association is the approval gate (no label event to carry it). */
-function routeComment(subset, triggers) {
+/**
+ * Comment path: author_association is the approval gate (no label event to carry it).
+ *
+ * `knownFlows` is passed separately because it is NOT a per-forge rule -- it is the whole file's flow
+ * vocabulary, and it bounds which names a comment may summon rather than which rules may match.
+ */
+function routeComment(subset, triggers, knownFlows) {
 	if (!AUTHOR_ALLOWLIST.has(subset.comment?.author_association)) {
 		return { enqueue: false, reason: "author-not-allowed" };
 	}
@@ -126,7 +134,7 @@ function routeComment(subset, triggers) {
 	// known flow name, so a comment cannot summon an unlisted flow.
 	let flow = triggers.comment?.defaultFlow;
 	const match = body.match(new RegExp(escapeRegExp(phrase) + "\\s+(\\S+)"));
-	if (match && triggers.knownFlows?.has(match[1])) {
+	if (match && knownFlows?.has(match[1])) {
 		flow = match[1];
 	}
 	if (flow === null || flow === undefined || flow === "") {

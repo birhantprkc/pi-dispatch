@@ -378,9 +378,9 @@ test("readTriggers normalizes each on.type into its discriminated display record
   // Every entry omits `run.packages`, and packages is an OPT-OUT -- so all four normalize to `true`.
   assert.deepEqual(res.triggers, [
     { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: true, image: null },
-    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: true, image: null },
-    { type: "comment", phrase: "@pi", flow: "fix", packages: true, image: null },
-    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: true, image: null },
+    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: true, image: null, forge: "github" },
+    { type: "comment", phrase: "@pi", flow: "fix", packages: true, image: null, forge: "github" },
+    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: true, image: null, forge: "github" },
   ]);
 });
 
@@ -445,7 +445,7 @@ test("readTriggers skips an entry that is not a usable { on, run } object (viewe
     }),
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
-  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true, image: null }]);
+  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true, image: null, forge: "github" }]);
 });
 
 test("readTriggers returns { invalid } when there is no triggers array", () => {
@@ -966,4 +966,21 @@ test("enqueueDispatchRun never writes task text to any log line (PII discipline)
     Object.assign(console, orig);
   }
   assert.ok(!captured.some((line) => line.includes(marker)), "task text must never reach a log line");
+});
+
+test("normalizeTriggerForDisplay carries the forge a webhook trigger names, and null on cron", () => {
+  const gl = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "gitlab", flow: "fix" } });
+  assert.equal(gl.forge, "gitlab");
+  const gh = normalizeTriggerForDisplay({ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } });
+  assert.equal(gh.forge, "github");
+  // A cron trigger carries no `forge` key at all -- not "local", and not null-as-a-value. The field
+  // answers "which forge does this listen to", and cron listens to none; inventing an answer would make
+  // the cron record claim a fact it does not have.
+  const cron = normalizeTriggerForDisplay({ on: { type: "cron", id: "n", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/p", flow: "tidy" } });
+  assert.equal("forge" in cron, false, "a cron trigger has no forge to report");
+
+  // Fail-soft, not re-validating: an unknown kind is shown as written. The worker refuses to boot on it,
+  // and the panel echoing the operator's own value is how they see WHY.
+  const odd = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "bitbucket", flow: "fix" } });
+  assert.equal(odd.forge, "bitbucket");
 });

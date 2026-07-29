@@ -144,6 +144,10 @@ export function renderTriggers({ schedulers, triggers } = {}) {
 /**
  * One trigger's display line, discriminated on `type`. A null field reads as "-".
  *
+ * A webhook trigger listening to a forge other than github names it. GitHub is unmarked, so an existing
+ * deployment's lines are byte-identical -- but the marker is not cosmetic: two rules can select the same
+ * label on two forges, and which one a line describes is otherwise unreadable.
+ *
  * A trigger that loads the operator-staged third-party pi packages carries a trailing `[packages]` marker:
  * it must never read the same as one that does not. Loading is the DEFAULT (`run.packages` is an opt-out),
  * so the marker is the common case once the operator has staged anything, and its absence means the trigger
@@ -156,19 +160,20 @@ export function renderTriggers({ schedulers, triggers } = {}) {
  */
 function triggerLine(t) {
   const flow = t?.flow ?? "-";
+  const forge = t?.forge && t.forge !== "github" ? `  [${t.forge}]` : "";
   const pkgs = t?.packages === true ? "  [packages]" : "";
   const img = t?.image ? `  [image ${t.image}]` : "";
   switch (t?.type) {
     case "cron":
-      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}${pkgs}${img}`;
+      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}${forge}${pkgs}${img}`;
     case "label":
-      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}${pkgs}${img}`;
+      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}${forge}${pkgs}${img}`;
     case "comment":
-      return `comment  "${t.phrase ?? "-"}" → ${flow}${pkgs}${img}`;
+      return `comment  "${t.phrase ?? "-"}" → ${flow}${forge}${pkgs}${img}`;
     case "pull_request": {
       const clauses = ruleClauses(t);
       const action = `action[${(t.action ?? []).join(",")}]`;
-      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}${pkgs}${img}`;
+      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}${forge}${pkgs}${img}`;
     }
     default:
       return "(unknown trigger)";

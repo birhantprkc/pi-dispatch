@@ -2,11 +2,24 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { filter } from "../src/filter.mjs";
 
+/**
+ * Wrap a flat trigger group in the shape `loadReceiverConfig` now produces: rules are grouped PER FORGE
+ * (receiver/src/config.mjs), so the github gate reads `cfg.triggers.github`, while `knownFlows` stays
+ * above the groups because it is the whole file's flow vocabulary and not one forge's rules.
+ *
+ * The fixtures below stay written flat and are wrapped here, so regrouping the config never edits an
+ * assertion -- what these tests pin is the JOB the gate emits, and that is unchanged.
+ */
+function forgeCfg(flat) {
+	const { knownFlows, ...group } = flat.triggers;
+	return { triggers: { github: group, knownFlows } };
+}
+
 // The grouped webhook triggers, mirroring loadReceiverConfig's `cfg.triggers` shape (label rules, the
 // single comment trigger, pull_request rules, and the knownFlows set for comment `<phrase> <flow>` overrides).
 // Rule `index` values are deliberately NON-CONTIGUOUS: the filter must pass the loader's raw-file index
 // through to `trigger.matched.index` verbatim, never recompute a position of its own.
-const cfg = {
+const cfgRaw = {
 	triggers: {
 		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 4, phrase: "@pi", defaultFlow: "triage" },
@@ -14,9 +27,10 @@ const cfg = {
 		knownFlows: new Set(["frontend-fix", "triage"]),
 	},
 };
+const cfg = forgeCfg(cfgRaw);
 // A richer label allowlist exercising every predicate clause: any-of-many, a required `all`, exclusion
 // `none`, and a second flow to prove first-match-in-file-order and single-clause routing.
-const matrixCfg = {
+const matrixCfgRaw = {
 	triggers: {
 		label: [
 			{ index: 2, predicate: { any: ["ai-fix", "urgent-fix"], all: ["triaged"], none: ["blocked", "wontfix"] }, flow: "fix" },
@@ -27,8 +41,9 @@ const matrixCfg = {
 		knownFlows: new Set(["fix", "review", "triage"]),
 	},
 };
+const matrixCfg = forgeCfg(matrixCfgRaw);
 // Pull-request triggers: a labeled rule (predicate = approval) and an auto rule (author gate = approval).
-const prCfg = {
+const prCfgRaw = {
 	triggers: {
 		label: [],
 		comment: { index: 1, phrase: "@pi", defaultFlow: "triage" },
@@ -39,6 +54,7 @@ const prCfg = {
 		knownFlows: new Set(["review", "autoreview", "triage"]),
 	},
 };
+const prCfg = forgeCfg(prCfgRaw);
 const SELF_ID = 999;
 
 /** A well-formed `issue_comment.created` subset, overridable per case. */
@@ -217,14 +233,14 @@ test("matched reports the WINNING rule's raw-file index and the any-hit label, p
 
 test("a rule matched via an `all`-only predicate reports all[0] as the matched label", () => {
 	// No `any` clause: the positive selector is `all`, and all ⊆ L on a match guarantees membership.
-	const allOnlyCfg = {
+	const allOnlyCfg = forgeCfg({
 		triggers: {
 			label: [{ index: 9, predicate: { all: ["triaged", "approved"] }, flow: "fix" }],
 			comment: null,
 			pullRequest: [],
 			knownFlows: new Set(["fix"]),
 		},
-	};
+	});
 	const r = filter("issues", labeledSubset(["approved", "triaged"]), allOnlyCfg, SELF_ID, "d-mi3");
 	assert.equal(r.enqueue, true);
 	assert.deepEqual(r.job.trigger.matched, { index: 9, type: "label", label: "triaged" });
@@ -233,7 +249,7 @@ test("a rule matched via an `all`-only predicate reports all[0] as the matched l
 // -- comment path ---------------------------------------------------------------------------------
 
 test("comment with the phrase but no defaultFlow and no @pi <flow> is dropped as no-flow", () => {
-	const noDefault = { triggers: { ...cfg.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } };
+	const noDefault = forgeCfg({ triggers: { ...cfgRaw.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } });
 	const subset = commentSubset({ comment: { author_association: "MEMBER", body: "@pi please help" } });
 	const r = filter("issue_comment", subset, noDefault, SELF_ID, "d-noflow");
 	assert.equal(r.enqueue, false);
@@ -241,7 +257,7 @@ test("comment with the phrase but no defaultFlow and no @pi <flow> is dropped as
 });
 
 test("an explicit `@pi <flow>` names a known flow value and enqueues even with defaultFlow null", () => {
-	const noDefault = { triggers: { ...cfg.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } };
+	const noDefault = forgeCfg({ triggers: { ...cfgRaw.triggers, comment: { index: 4, phrase: "@pi", defaultFlow: null } } });
 	const subset = commentSubset({ comment: { author_association: "COLLABORATOR", body: "@pi frontend-fix please" } });
 	const r = filter("issue_comment", subset, noDefault, SELF_ID, "d-explicit");
 	assert.equal(r.enqueue, true);
@@ -367,7 +383,7 @@ test("an unsupported PR action (closed) is dropped as unhandled-event", () => {
 
 // The flag rides on the RULE, so these configs deliberately disagree between rules: the filter must read it
 // off whichever rule actually matched. Indices stay non-contiguous, as above.
-const pkgCfg = {
+const pkgCfgRaw = {
 	triggers: {
 		label: [
 			{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", packages: true },
@@ -381,6 +397,7 @@ const pkgCfg = {
 		knownFlows: new Set(["frontend-fix", "docs", "triage", "review", "autoreview"]),
 	},
 };
+const pkgCfg = forgeCfg(pkgCfgRaw);
 
 test("a matched label/comment/PR rule with packages: true puts packages on the JOB", () => {
 	const labeled = filter("issues", issuesSubset(), pkgCfg, SELF_ID, "d-pkg-label");
@@ -429,7 +446,7 @@ test("an UNFLAGGED rule yields a job whose keys are exactly today's four -- byte
 
 // -- the per-trigger job image (issue #41) --------------------------------------------------------
 
-const imgCfg = {
+const imgCfgRaw = {
 	triggers: {
 		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", image: "node-playwright:1.4.0" }],
 		comment: { index: 4, phrase: "@pi", defaultFlow: "triage", image: "my-python:1.2.0" },
@@ -437,6 +454,7 @@ const imgCfg = {
 		knownFlows: new Set(["frontend-fix", "triage", "review"]),
 	},
 };
+const imgCfg = forgeCfg(imgCfgRaw);
 
 test("a matched label/comment/PR rule with an image puts image on the JOB", () => {
 	const labeled = filter("issues", labeledSubset(["pi:frontend"]), imgCfg, SELF_ID, "d-img-label");
@@ -465,7 +483,7 @@ test("image is a job-level execution knob and NEVER reaches trigger -- it must n
 });
 
 test("an unflagged rule yields a job with no image key at all -- byte-identical to today's", () => {
-	const noImg = { triggers: { ...imgCfg.triggers, label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }] } };
+	const noImg = forgeCfg({ triggers: { ...imgCfgRaw.triggers, label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }] } });
 	const labeled = filter("issues", labeledSubset(["pi:frontend"]), noImg, SELF_ID, "d-img-none");
 	assert.deepEqual(Object.keys(labeled.job), ["repo", "target", "flow", "trigger"]);
 });
@@ -473,7 +491,7 @@ test("an unflagged rule yields a job with no image key at all -- byte-identical 
 test("image comes from the FIRST matching rule when two rules name different images", () => {
 	// The sharp case: not flag-vs-no-flag but image-A-vs-image-B. Picking the wrong one runs the whole job
 	// in a toolchain the matched flow was not written for.
-	const bothCfg = {
+	const bothCfg = forgeCfg({
 		triggers: {
 			label: [
 				{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", image: "node-playwright:1.4.0" },
@@ -483,12 +501,12 @@ test("image comes from the FIRST matching rule when two rules name different ima
 			pullRequest: [],
 			knownFlows: new Set(["frontend-fix", "docs"]),
 		},
-	};
+	});
 	const first = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), bothCfg, SELF_ID, "d-img-first");
 	assert.equal(first.job.flow, "frontend-fix");
 	assert.equal(first.job.image, "node-playwright:1.4.0", "the image belongs to the rule that actually matched");
 
-	const reversed = { triggers: { ...bothCfg.triggers, label: [...bothCfg.triggers.label].reverse() } };
+	const reversed = forgeCfg({ triggers: { ...bothCfg.triggers.github, label: [...bothCfg.triggers.github.label].reverse(), knownFlows: bothCfg.triggers.knownFlows } });
 	const second = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), reversed, SELF_ID, "d-img-second");
 	assert.equal(second.job.flow, "docs");
 	assert.equal(second.job.image, "my-python:1.2.0");
@@ -497,7 +515,7 @@ test("image comes from the FIRST matching rule when two rules name different ima
 test("packages comes from the FIRST matching rule when two rules differ, exactly like flow", () => {
 	// One event, both label rules eligible; file order decides, so the flag cannot be picked up from a
 	// later rule that merely happens to also match.
-	const bothCfg = {
+	const bothCfg = forgeCfg({
 		triggers: {
 			label: [
 				{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" },
@@ -507,14 +525,14 @@ test("packages comes from the FIRST matching rule when two rules differ, exactly
 			pullRequest: [],
 			knownFlows: new Set(["frontend-fix", "docs"]),
 		},
-	};
+	});
 	const first = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), bothCfg, SELF_ID, "d-firstwins");
 	assert.equal(first.enqueue, true);
 	assert.equal(first.job.flow, "frontend-fix", "the first rule in file order wins");
 	assert.equal("packages" in first.job, false, "the loser's flag must not bleed onto the job");
 
 	// Reverse the file order: now the flagged rule is first and its flag is the one that applies.
-	const reversed = { triggers: { ...bothCfg.triggers, label: [...bothCfg.triggers.label].reverse() } };
+	const reversed = forgeCfg({ triggers: { ...bothCfg.triggers.github, label: [...bothCfg.triggers.github.label].reverse(), knownFlows: bothCfg.triggers.knownFlows } });
 	const second = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), reversed, SELF_ID, "d-firstwins2");
 	assert.equal(second.job.flow, "docs");
 	assert.equal(second.job.packages, true);

@@ -61,13 +61,15 @@ const read = (path) => JSON.parse(readFileSync(path, "utf8"));
 
 test("addTrigger: kind-first dialogs write a validated label trigger (live-reloadable)", async () => {
   const path = tmpTriggers({ triggers: [] });
-  const ui = mockUi({ select: ["label"], input: ["pi:fix urgent", "frontend-fix"] });
+  // The label form now prompts forge first, then labels + flow.
+  const ui = mockUi({ select: ["label"], input: ["github", "pi:fix urgent", "frontend-fix"] });
   await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui });
   const w = read(path);
   assert.equal(w.triggers.length, 1);
   assert.equal(w.triggers[0].on.type, "label");
   assert.deepEqual(w.triggers[0].on.any, ["pi:fix", "urgent"]);
   assert.equal(w.triggers[0].run.flow, "frontend-fix");
+  assert.equal(w.triggers[0].run.kind, "github");
   assert.ok(ui.notes.some((n) => /added \(live\)/.test(n.m)), "a live-added notice is shown");
 });
 
@@ -352,4 +354,28 @@ test("managePauses: Edit re-prompts fields (blank keeps) and updates the picked 
   assert.equal(w.from, "22:00", "kept");
   assert.equal(w.tz, "Europe/Amsterdam", "kept");
   assert.ok(ui.notes.some((n) => /updated \(live\)/.test(n.m)), "a live-updated notice is shown");
+});
+
+test("addTrigger: a gitlab label trigger writes run.kind gitlab and passes the shared validator", async () => {
+  const path = tmpTriggers({ triggers: [] });
+  const ui = mockUi({ select: ["label"], input: ["gitlab", "pi:fix", "frontend-fix"] });
+  await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui });
+  const w = read(path);
+  assert.equal(w.triggers.length, 1, "the write must survive parseTriggers -- writeTriggers validates before it lands");
+  assert.equal(w.triggers[0].run.kind, "gitlab");
+});
+
+test("addTrigger: a gitlab MR trigger's action words are gitlab's, and github's are refused at the write", async () => {
+  const path = tmpTriggers({ triggers: [] });
+  const ok = mockUi({ select: ["pull_request"], input: ["gitlab", "open update", "", "review"] });
+  await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path }, { ui: ok });
+  assert.deepEqual(read(path).triggers[0].on.action, ["open", "update"]);
+
+  // The dialog passes the operator's word through rather than correcting it, so the shared validator is
+  // what refuses -- a silent rewrite to a valid-looking word would arm a trigger they did not ask for.
+  const path2 = tmpTriggers({ triggers: [] });
+  const bad = mockUi({ select: ["pull_request"], input: ["gitlab", "synchronize", "", "review"] });
+  await handleDashboardAction({ action: "addTrigger" }, { triggersPath: path2 }, { ui: bad });
+  assert.equal(read(path2).triggers.length, 0, "a github action word on a gitlab trigger must not be written");
+  assert.ok(bad.notes.some((n) => /rejected/.test(n.m)), "and the operator is told why");
 });

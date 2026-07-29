@@ -35,30 +35,30 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 	assert.equal(c.port, 3000);
 
 	// label rules, in file order; each carries its raw-file index (the rule's identity for matched.index).
-	assert.equal(c.triggers.label.length, 1);
-	assert.equal(c.triggers.label[0].index, 0);
-	assert.equal(c.triggers.label[0].flow, "frontend-fix");
-	assert.deepEqual(c.triggers.label[0].predicate.any, ["pi:frontend"]);
+	assert.equal(c.triggers.github.label.length, 1);
+	assert.equal(c.triggers.github.label[0].index, 0);
+	assert.equal(c.triggers.github.label[0].flow, "frontend-fix");
+	assert.deepEqual(c.triggers.github.label[0].predicate.any, ["pi:frontend"]);
 
 	// the single comment trigger. `packages` is asserted present-and-undefined: the grouper builds the key
 	// by construction and this whole-object deepEqual (assert/strict) counts an own undefined-valued key.
-	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined, image: undefined });
+	assert.deepEqual(c.triggers.github.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined, image: undefined });
 
 	// pull_request rules: actions is a Set, predicate carries the label selectors.
-	assert.equal(c.triggers.pullRequest.length, 1);
-	assert.equal(c.triggers.pullRequest[0].index, 2);
-	assert.equal(c.triggers.pullRequest[0].flow, "review");
-	assert.ok(c.triggers.pullRequest[0].actions.has("labeled"));
-	assert.deepEqual(c.triggers.pullRequest[0].predicate.any, ["pi:review"]);
+	assert.equal(c.triggers.github.pullRequest.length, 1);
+	assert.equal(c.triggers.github.pullRequest[0].index, 2);
+	assert.equal(c.triggers.github.pullRequest[0].flow, "review");
+	assert.ok(c.triggers.github.pullRequest[0].actions.has("labeled"));
+	assert.deepEqual(c.triggers.github.pullRequest[0].predicate.any, ["pi:review"]);
 
 	// knownFlows spans every webhook flow (the comment `<phrase> <flow>` override allowlist).
 	assert.deepEqual([...c.triggers.knownFlows].sort(), ["frontend-fix", "review", "triage"]);
 });
 
-test("no comment trigger in the file -> c.triggers.comment is null (comment path disabled)", () => {
+test("no comment trigger in the file -> c.triggers.github.comment is null (comment path disabled)", () => {
 	const json = JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:x"] }, run: { kind: "github", flow: "fix" } }] });
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
-	assert.equal(c.triggers.comment, null);
+	assert.equal(c.triggers.github.comment, null);
 });
 
 test("cron triggers in the shared file are validated but ignored by the receiver's groups", () => {
@@ -69,9 +69,9 @@ test("cron triggers in the shared file are validated but ignored by the receiver
 		],
 	});
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
-	assert.equal(c.triggers.label.length, 1);
-	assert.equal(c.triggers.pullRequest.length, 0);
-	assert.equal(c.triggers.comment, null);
+	assert.equal(c.triggers.github.label.length, 1);
+	assert.equal(c.triggers.github.pullRequest.length, 0);
+	assert.equal(c.triggers.github.comment, null);
 });
 
 test("rule indices are RAW file positions -- a leading cron entry still occupies index 0", () => {
@@ -86,9 +86,9 @@ test("rule indices are RAW file positions -- a leading cron entry still occupies
 		],
 	});
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
-	assert.equal(c.triggers.label[0].index, 1);
-	assert.equal(c.triggers.comment.index, 2);
-	assert.equal(c.triggers.pullRequest[0].index, 3);
+	assert.equal(c.triggers.github.label[0].index, 1);
+	assert.equal(c.triggers.github.comment.index, 2);
+	assert.equal(c.triggers.github.pullRequest[0].index, 3);
 });
 
 // -- the per-trigger pi-packages opt-in (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -------
@@ -105,10 +105,10 @@ test("each grouped webhook rule carries its own run.packages flag through to the
 		],
 	});
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
-	assert.equal(c.triggers.label[0].packages, true);
-	assert.equal(c.triggers.comment.packages, true);
-	assert.equal(c.triggers.pullRequest[0].packages, false, "an explicit opt-out is grouped as false, never dropped");
-	assert.equal(c.triggers.label[1].packages, undefined, "an unflagged rule in the same file stays unflagged");
+	assert.equal(c.triggers.github.label[0].packages, true);
+	assert.equal(c.triggers.github.comment.packages, true);
+	assert.equal(c.triggers.github.pullRequest[0].packages, false, "an explicit opt-out is grouped as false, never dropped");
+	assert.equal(c.triggers.github.label[1].packages, undefined, "an unflagged rule in the same file stays unflagged");
 });
 
 test("each grouped webhook rule carries its own run.image through to the filter", () => {
@@ -124,17 +124,17 @@ test("each grouped webhook rule carries its own run.image through to the filter"
 		],
 	});
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
-	assert.equal(c.triggers.label[0].image, "node-playwright:1.4.0");
-	assert.equal(c.triggers.comment.image, "my-python:1.2.0");
-	assert.equal(c.triggers.pullRequest[0].image, "reviewer:2.0");
-	assert.equal(c.triggers.label[1].image, undefined, "an unflagged rule in the same file runs the deployment default");
+	assert.equal(c.triggers.github.label[0].image, "node-playwright:1.4.0");
+	assert.equal(c.triggers.github.comment.image, "my-python:1.2.0");
+	assert.equal(c.triggers.github.pullRequest[0].image, "reviewer:2.0");
+	assert.equal(c.triggers.github.label[1].image, undefined, "an unflagged rule in the same file runs the deployment default");
 });
 
 test("an unflagged triggers file groups packages as undefined on every rule -- the no-third-party-code default", () => {
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
-	assert.equal(c.triggers.label[0].packages, undefined);
-	assert.equal(c.triggers.comment.packages, undefined);
-	assert.equal(c.triggers.pullRequest[0].packages, undefined);
+	assert.equal(c.triggers.github.label[0].packages, undefined);
+	assert.equal(c.triggers.github.comment.packages, undefined);
+	assert.equal(c.triggers.github.pullRequest[0].packages, undefined);
 });
 
 test("RECEIVER_PORT and RECEIVER_BIND overrides are honored", () => {
@@ -209,8 +209,8 @@ test("reloadTriggers swaps cfg.triggers in place from the new file (live, no res
 	const json = JSON.stringify({ triggers: [{ on: { type: "label", any: ["new"] }, run: { kind: "github", flow: "new-flow" } }] });
 	const res = reloadTriggers({}, cfg, { fileExists: () => true, readFile: () => json });
 	assert.deepEqual(res, { ok: true });
-	assert.equal(cfg.triggers.label[0].flow, "new-flow");
-	assert.deepEqual(cfg.triggers.label[0].predicate.any, ["new"]);
+	assert.equal(cfg.triggers.github.label[0].flow, "new-flow");
+	assert.deepEqual(cfg.triggers.github.label[0].predicate.any, ["new"]);
 });
 
 test("reloadTriggers keeps the running triggers when the new file is invalid (never crash a live receiver)", () => {
@@ -227,4 +227,47 @@ test("reloadTriggers keeps the running triggers when the file goes missing", () 
 	const res = reloadTriggers({}, cfg, { fileExists: () => false, readFile: () => "" });
 	assert.ok(res.invalid);
 	assert.equal(cfg.triggers, original);
+});
+
+// --- per-forge rule grouping (issue #42) ---
+
+const MIXED_JSON = JSON.stringify({
+	triggers: [
+		{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix" } },
+		{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "gitlab", flow: "gl-fix" } },
+		{ on: { type: "comment", phrase: "@pi" }, run: { kind: "gitlab", flow: "gl-triage" } },
+		{ on: { type: "pull_request", action: ["open"] }, run: { kind: "gitlab", flow: "gl-review" } },
+	],
+});
+
+test("rules are grouped per forge -- an identically-labelled rule lands on ONE forge, not both", () => {
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => MIXED_JSON });
+
+	// Both rules select `pi:frontend`. Grouping is what stops a github delivery from matching the gitlab
+	// rule (and running the wrong flow against the wrong forge) purely because the labels coincide.
+	assert.equal(c.triggers.github.label.length, 1);
+	assert.equal(c.triggers.github.label[0].flow, "frontend-fix");
+	assert.equal(c.triggers.gitlab.label.length, 1);
+	assert.equal(c.triggers.gitlab.label[0].flow, "gl-fix");
+
+	assert.equal(c.triggers.github.comment, null, "the file's only comment trigger is gitlab's");
+	assert.equal(c.triggers.gitlab.comment.phrase, "@pi");
+	assert.equal(c.triggers.github.pullRequest.length, 0);
+	assert.equal(c.triggers.gitlab.pullRequest[0].flow, "gl-review");
+
+	// The raw file index stays the rule's identity across forges -- it is what makes a run explainable
+	// back to the exact entry that fired it, so the two groups must not restart their own numbering.
+	assert.deepEqual(
+		[c.triggers.github.label[0].index, c.triggers.gitlab.label[0].index, c.triggers.gitlab.comment.index, c.triggers.gitlab.pullRequest[0].index],
+		[0, 1, 2, 3],
+	);
+
+	// knownFlows is the whole file's vocabulary, not one forge's: it bounds which names a comment may
+	// summon, and that bound is the same question regardless of which forge asked.
+	assert.deepEqual([...c.triggers.knownFlows].sort(), ["frontend-fix", "gl-fix", "gl-review", "gl-triage"]);
+});
+
+test("a forge the file never mentions still gets an empty group -- the gate needs no presence check", () => {
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
+	assert.deepEqual(c.triggers.gitlab, { label: [], comment: null, pullRequest: [] });
 });

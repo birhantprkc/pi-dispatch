@@ -307,12 +307,15 @@ function registerTools(pi: ExtensionAPI): void {
       "id, pattern, `folder` (absolute host path the job runs in), `flow`, and `task` (the prompt text handed to " +
       "the agent), and may set optional model/provider/maxTurns for that schedule (omit = deployment default). " +
       "label needs labels[]+flow; comment needs phrase+flow; pull_request needs action[] (+ optional labels[]) + " +
-      "flow. For github triggers the repo and the task come from the triggering issue/PR event — set only the " +
-      "match + flow — and they run under the deployment default model.",
+      "flow. Webhook triggers take an optional `forge` = github (default) | gitlab, which also decides which " +
+      "action words pull_request accepts: github is labeled|opened|synchronize|reopened, gitlab is " +
+      "open|update|reopen|approved. For webhook triggers the repo and the task come from the triggering " +
+      "issue/PR event — set only the match + flow — and they run under the deployment default model.",
     executionMode: "sequential",
     parameters: Type.Object({
       kind: Type.String(),
       flow: Type.String(),
+      forge: Type.Optional(Type.String()),
       id: Type.Optional(Type.String()),
       pattern: Type.Optional(Type.String()),
       folder: Type.Optional(Type.String()),
@@ -556,10 +559,20 @@ function triggerList(paths: any): any[] {
 
 /**
  * Build one `{ on, run }` trigger entry from a kind + fields. The single source of truth for the on x run
- * diagonal (cron -> local, every webhook kind -> github): the impossible combination is absent by
- * construction, mirroring the worker's load-time diagonal. Shared by the add-trigger dialog and the
+ * matrix (cron -> local, every webhook kind -> a forge): the impossible combination is absent by
+ * construction, mirroring the worker's load-time matrix. Shared by the add-trigger dialog and the
  * `dispatch_trigger_add` tool, so both produce identical shapes. `labels`/`action` accept either an array
  * (tool params) or a space-separated string (dialog input) via `asWords`. Returns null for an unknown kind.
+ *
+ * `f.forge` selects which forge a webhook trigger listens to, defaulting to github so every existing call
+ * site -- and every existing entry this rewrites -- is unchanged. It is offered on BOTH paths, unlike
+ * `run.image`, and the difference is deliberate: an image is a capability the model would gain (choose the
+ * container and you choose the pi version, the guardrail floor and the loader posture), whereas a forge is
+ * one it already has -- a model that can add a github trigger can already arm a paid run, and naming
+ * gitlab instead does not widen that. Both remain gated by the same operator confirm.
+ *
+ * An unrecognised forge is passed through rather than corrected, so `parseTriggers` refuses it fail-loud at
+ * the write. Silently rewriting a typo to github would arm a trigger on a forge the operator did not name.
  */
 function buildTriggerEntry(kind: string, f: any): any {
   if (kind === "cron") {
@@ -576,13 +589,14 @@ function buildTriggerEntry(kind: string, f: any): any {
     if (maxTurns !== undefined) run.maxTurns = maxTurns;
     return { on: { type: "cron", id: f.id, pattern: f.pattern }, run };
   }
-  if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: { kind: "github", flow: f.flow } };
-  if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: { kind: "github", flow: f.flow } };
+  const forge = optStr(f.forge) ?? "github";
+  if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: { kind: forge, flow: f.flow } };
+  if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: { kind: forge, flow: f.flow } };
   if (kind === "pull_request") {
     const on: any = { type: "pull_request", action: asWords(f.action) };
     const any = asWords(f.labels ?? f.any);
     if (any.length > 0) on.any = any;
-    return { on, run: { kind: "github", flow: f.flow } };
+    return { on, run: { kind: forge, flow: f.flow } };
   }
   return null;
 }
@@ -908,26 +922,35 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
     if (maxTurns === undefined) return;
     entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task, model, provider, maxTurns });
   } else if (kind === "label") {
-    // github triggers run against the triggering repo, and the issue/PR text is the task — neither is set here.
-    const labels = await ui.input("labels — space-separated, any-of (a collaborator applies one to fire)", "pi:fix");
+    // Webhook triggers run against the triggering repo, and the issue/PR text is the task — neither is set here.
+    const forge = await ui.input("forge — github or gitlab", "github");
+    if (forge === undefined) return;
+    const labels = await ui.input("labels — space-separated, any-of (a project member applies one to fire)", "pi:fix");
     if (labels === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the issue text is the task)", "fix");
     if (flow === undefined) return;
-    entry = buildTriggerEntry("label", { labels, flow });
+    entry = buildTriggerEntry("label", { labels, flow, forge });
   } else if (kind === "comment") {
+    const forge = await ui.input("forge — github or gitlab", "github");
+    if (forge === undefined) return;
     const phrase = await ui.input("trigger phrase — a comment containing this fires the flow (e.g. @pi)", "@pi");
     if (phrase === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the comment/issue text is the task)", "fix");
     if (flow === undefined) return;
-    entry = buildTriggerEntry("comment", { phrase, flow });
+    entry = buildTriggerEntry("comment", { phrase, flow, forge });
   } else {
-    const action = await ui.input("PR actions — space-separated: labeled opened synchronize reopened", "labeled");
+    const forge = await ui.input("forge — github or gitlab", "github");
+    if (forge === undefined) return;
+    // The action vocabulary is the forge's own, and a word from the wrong one is refused at the write --
+    // so the prompt names the right set rather than offering a union that half-works.
+    const actionHint = forge === "gitlab" ? "open update reopen approved" : "labeled opened synchronize reopened";
+    const action = await ui.input(`MR/PR actions — space-separated: ${actionHint}`, forge === "gitlab" ? "update" : "labeled");
     if (action === undefined) return;
     const labels = await ui.input("labels for 'labeled' — space-separated (blank for the auto actions)", "pi:review");
     if (labels === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the PR text is the task)", "review");
     if (flow === undefined) return;
-    entry = buildTriggerEntry("pull_request", { action, labels, flow });
+    entry = buildTriggerEntry("pull_request", { action, labels, flow, forge });
   }
   const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (list: any[]) => [...list, entry] });
   notify?.(res.ok ? `trigger added (live) — ${kind} → ${entry.run.flow}` : `add rejected: ${res.invalid}`, res.ok ? "info" : "error");
