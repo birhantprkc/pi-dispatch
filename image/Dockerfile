@@ -47,9 +47,9 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
 # block above, which tracks an apt channel and is this image's one unpinned dependency. Repeating that for
 # a second CLI would double the surface where an unattended upstream change lands inside a container that
 # holds a repo credential (CONST-PI-VERSION-PINNED's reasoning, one layer out).
-ARG GLAB_VERSION=1.73.1
-ARG GLAB_SHA256_AMD64=52f7cdd2b80f8f5f8e8b10304859fbb37cb9379b340e78f2245ddb4ea9308240
-ARG GLAB_SHA256_ARM64=e772084244337c38bf6fa73e931383b7fadb777f85817e60c29489af751cef25
+ARG GLAB_VERSION=1.110.0
+ARG GLAB_SHA256_AMD64=978485e47c90b5c7d33638944838f28ddc5cb6833f01c9a0a80011a27d2766e3
+ARG GLAB_SHA256_ARM64=0d5e7d75d9e1380827c2bb815d05b2835b0dbee18fceac123fd9f77e730c9ef2
 RUN set -eu; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -63,6 +63,13 @@ RUN set -eu; \
     install -m 0755 /tmp/bin/glab /usr/local/bin/glab; \
     rm -rf /tmp/glab.tgz /tmp/bin; \
     glab --version
+
+# glab checks for a newer release on invocation. Off, for two reasons that both matter here: it is an
+# outbound call from a container running adversarial input (OQ-004), and its notice lands in the agent's
+# own stdout, where a flow parsing command output has to know to ignore it. The pin is this repo's to
+# move in a commit, not the container's to discover at run time (CONST-PI-VERSION-PINNED's reasoning).
+ENV GLAB_CHECK_UPDATE=false
+ENV GLAB_SEND_TELEMETRY=false
 
 # engine-strict is set explicitly because npm reads it from $HOME/.npmrc and
 # $PREFIX/etc/npmrc but NEVER from a project .npmrc for installs outside a project root.
