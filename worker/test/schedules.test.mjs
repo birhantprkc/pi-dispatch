@@ -81,6 +81,7 @@ test("a valid cron trigger normalizes to the scheduler shape; omitted provider/m
 		// construction. Asserting it honestly pins the real shape -- the key exists, the flag does not --
 		// and JSON serialization still drops it, so the upserted schedule stays byte-identical to today's.
 		packages: undefined,
+		image: undefined,
 		// The cron-only field carried into the local /job/event.json (INT-CONTAINER-JOB-INPUTS).
 		trigger: { id: "nightly-tidy", pattern: "0 3 * * *" },
 	});
@@ -120,6 +121,18 @@ test("run.packages: true flows into the scheduler data (the pi-packages opt-in r
 test("an unflagged cron trigger's data.packages is undefined -- no third-party code by default", () => {
 	const [s] = load([CRON]);
 	assert.equal(s.data.packages, undefined);
+});
+
+test("run.image flows into the scheduler data -- the toolchain reaches the job template", () => {
+	const [s] = load([{ ...CRON, run: { ...CRON.run, image: "my-python:1.2.0" } }]);
+	assert.equal(s.data.image, "my-python:1.2.0");
+});
+
+test("an unflagged cron trigger's data.image is undefined -- the deployment default is resolved at job start", () => {
+	// Writing PI_JOB_IMAGE in here would freeze today's default into every stored repeatable, so an operator
+	// changing the deployment image would silently keep running the old one on every existing schedule.
+	const [s] = load([CRON]);
+	assert.equal(s.data.image, undefined);
 });
 
 test("github and packages reach the scheduler data independently -- neither opt-in implies the other", () => {

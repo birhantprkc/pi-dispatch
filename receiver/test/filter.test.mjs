@@ -427,6 +427,73 @@ test("an UNFLAGGED rule yields a job whose keys are exactly today's four -- byte
 	assert.deepEqual(Object.keys(legacy.job), ["repo", "target", "flow", "trigger"]);
 });
 
+// -- the per-trigger job image (issue #41) --------------------------------------------------------
+
+const imgCfg = {
+	triggers: {
+		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", image: "node-playwright:1.4.0" }],
+		comment: { index: 4, phrase: "@pi", defaultFlow: "triage", image: "my-python:1.2.0" },
+		pullRequest: [{ index: 3, actions: new Set(["labeled"]), predicate: { any: ["pi:review"] }, flow: "review", image: "reviewer:2.0" }],
+		knownFlows: new Set(["frontend-fix", "triage", "review"]),
+	},
+};
+
+test("a matched label/comment/PR rule with an image puts image on the JOB", () => {
+	const labeled = filter("issues", labeledSubset(["pi:frontend"]), imgCfg, SELF_ID, "d-img-label");
+	assert.equal(labeled.job.image, "node-playwright:1.4.0");
+
+	const commented = filter("issue_comment", commentSubset("@pi"), imgCfg, SELF_ID, "d-img-comment");
+	assert.equal(commented.job.image, "my-python:1.2.0");
+
+	const pr = filter("pull_request", prSubset({ action: "labeled", labels: ["pi:review"] }), imgCfg, SELF_ID, "d-img-pr");
+	assert.equal(pr.job.image, "reviewer:2.0");
+});
+
+test("image is a job-level execution knob and NEVER reaches trigger -- it must not land in /job/event.json", () => {
+	// `trigger` is copied verbatim into the container's event.json. Which image the harness chose is not
+	// something the agent's view of its own trigger should describe, and putting it there would make an
+	// execution decision look like webhook context.
+	for (const [event, subset, delivery] of [
+		["issues", labeledSubset(["pi:frontend"]), "d-img-t1"],
+		["issue_comment", commentSubset("@pi"), "d-img-t2"],
+		["pull_request", prSubset({ action: "labeled", labels: ["pi:review"] }), "d-img-t3"],
+	]) {
+		const r = filter(event, subset, imgCfg, SELF_ID, delivery);
+		assert.ok(r.job.image, `${event}: the job carries it`);
+		assert.equal("image" in r.job.trigger, false, `${event}: image must not sit inside trigger`);
+	}
+});
+
+test("an unflagged rule yields a job with no image key at all -- byte-identical to today's", () => {
+	const noImg = { triggers: { ...imgCfg.triggers, label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }] } };
+	const labeled = filter("issues", labeledSubset(["pi:frontend"]), noImg, SELF_ID, "d-img-none");
+	assert.deepEqual(Object.keys(labeled.job), ["repo", "target", "flow", "trigger"]);
+});
+
+test("image comes from the FIRST matching rule when two rules name different images", () => {
+	// The sharp case: not flag-vs-no-flag but image-A-vs-image-B. Picking the wrong one runs the whole job
+	// in a toolchain the matched flow was not written for.
+	const bothCfg = {
+		triggers: {
+			label: [
+				{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", image: "node-playwright:1.4.0" },
+				{ index: 5, predicate: { any: ["pi:docs"] }, flow: "docs", image: "my-python:1.2.0" },
+			],
+			comment: null,
+			pullRequest: [],
+			knownFlows: new Set(["frontend-fix", "docs"]),
+		},
+	};
+	const first = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), bothCfg, SELF_ID, "d-img-first");
+	assert.equal(first.job.flow, "frontend-fix");
+	assert.equal(first.job.image, "node-playwright:1.4.0", "the image belongs to the rule that actually matched");
+
+	const reversed = { triggers: { ...bothCfg.triggers, label: [...bothCfg.triggers.label].reverse() } };
+	const second = filter("issues", labeledSubset(["pi:frontend", "pi:docs"]), reversed, SELF_ID, "d-img-second");
+	assert.equal(second.job.flow, "docs");
+	assert.equal(second.job.image, "my-python:1.2.0");
+});
+
 test("packages comes from the FIRST matching rule when two rules differ, exactly like flow", () => {
 	// One event, both label rules eligible; file order decides, so the flag cannot be picked up from a
 	// later rule that merely happens to also match.

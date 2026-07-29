@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { buildDockerRunArgs } from "./docker-run.mjs";
 import { buildContainerEnv } from "./env-allowlist.mjs";
+import { resolveJobImage } from "./image-preflight.mjs";
 import { InfraRetry } from "./processor.mjs";
 
 /**
@@ -25,7 +26,7 @@ import { InfraRetry } from "./processor.mjs";
  * worker's event log and the `.json` status record stay id-only.
  */
 export function makeRunContainer({
-	image,
+	image, // the DEPLOYMENT default (PI_JOB_IMAGE); a trigger's own run.image overrides it per job
 	hostEnv = process.env,
 	onOutput = (c) => process.stdout.write(c),
 	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null }) }),
@@ -64,7 +65,11 @@ export function makeRunContainer({
 		});
 
 		const args = buildDockerRunArgs({
-			image,
+			// Same split as packagePaths above: the per-job value off `job`, the deployment value off the closure,
+			// so a trigger can name its own toolchain (INT-TRIGGERS-FILE-CONTRACT). Resolved through the SAME
+			// function the pre-spend preflight uses (image-preflight.mjs), so the tag that was checked is the tag
+			// that runs -- one answer by construction, not two call sites that happen to agree.
+			image: resolveJobImage(job, image),
 			env,
 			jobDir: prepared.jobDir,
 			workspace: prepared.workspace,

@@ -190,6 +190,46 @@ test("enqueueGitHubJob puts packages on data only when supplied, and never on an
 	assert.deepEqual(Object.keys(captured.data), ["kind", "repo", "target", "flow", "trigger", "provider", "model", "maxTurns"]);
 });
 
+// The per-trigger job image (issue #41) rides BOTH paths, and on both it is CONDITIONAL for the same reason
+// packages is: an unflagged trigger's data must keep exactly the keys it has today.
+test("enqueueLocalJob puts image on data only when supplied", async () => {
+	const { enqueueLocalJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+	const base = { folder: "/proj", flow: "tidy", task: "t", provider: "anthropic", model: "m", maxTurns: 5, now: new Date("2026-07-16T12:00:00Z") };
+
+	await enqueueLocalJob(fakeQueue, { ...base, image: "my-python:1.2.0" });
+	assert.equal(captured.data.image, "my-python:1.2.0");
+
+	await enqueueLocalJob(fakeQueue, base);
+	assert.equal("image" in captured.data, false, "an imageless job's data keeps exactly today's keys");
+	assert.deepEqual(Object.keys(captured.data), NON_CHAINED_KEYS);
+});
+
+test("enqueueGitHubJob puts image on data only when supplied, and never inside the descriptive trigger", async () => {
+	const { enqueueGitHubJob } = await import("../src/queue.mjs");
+	let captured;
+	const fakeQueue = { add: (name, data, opts) => ((captured = { name, data, opts }), { id: opts.jobId }) };
+
+	const base = {
+		repo: "owner/repo",
+		target: { type: "issue", number: 7, title: "t", body: "b" },
+		flow: "frontend-fix",
+		trigger: { event: "issues", action: "labeled", deliveryId: "guid-img", sender: { id: 42 }, matched: { index: 2, type: "label", label: "bug" } },
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+	};
+
+	await enqueueGitHubJob(fakeQueue, { ...base, image: "node-playwright:1.4.0" });
+	assert.equal(captured.data.image, "node-playwright:1.4.0");
+	assert.equal("image" in captured.data.trigger, false, "trigger is copied verbatim into /job/event.json -- an execution knob has no business there");
+
+	await enqueueGitHubJob(fakeQueue, base);
+	assert.equal("image" in captured.data, false);
+	assert.deepEqual(Object.keys(captured.data), ["kind", "repo", "target", "flow", "trigger", "provider", "model", "maxTurns"]);
+});
+
 // Integration against a real Valkey. Runs when VALKEY_TEST_URL is set (CI provides a service).
 const url = process.env.VALKEY_TEST_URL;
 const skip = url ? false : "VALKEY_TEST_URL not set; the queue integration test needs a Valkey";

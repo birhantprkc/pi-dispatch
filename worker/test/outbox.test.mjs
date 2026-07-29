@@ -108,6 +108,40 @@ test("happy path: one valid request enqueues one child on the parent's folder", 
 	assert.equal(args.jobId, chainedJobId({ parentJobId: "parent-1", flow: "ok", task: "do it" }));
 });
 
+test("a chained child inherits the PARENT'S image, and never the request file's", async () => {
+	// A chained child runs the parent's OWN folder, so it needs the parent's toolchain by definition -- unlike
+	// provider/model, where a fallback still runs the flow. A child in the wrong image cannot find its tools,
+	// writes a plausible report and exits 0: success as far as the queue can tell.
+	//
+	// And the agent must not get to choose it. `req` is agent-authored; INT-OUTBOX-CONTRACT reads explicit
+	// properties off it and never spreads it, exactly as it does for folder and depth.
+	const fs = makeFakeFs({ files: { "request-1.json": { content: req({ flow: "ok", task: "do it", image: "evil:latest" }) } } });
+	const cap = makeCapture();
+	const gate = makeGate();
+	const collect = makeCollectChain({ queue: cap.queue, enqueue: cap.enqueue, readFlowGate: gate.gate, config: { chainMaxPerJob: 2, chainDepthMax: 1 }, fs });
+
+	const parent = localJob();
+	parent.data = { ...parent.data, image: "my-python:1.2.0" };
+	await collect({ job: parent, prepared: PREPARED });
+
+	const { args } = cap.enqueued[0];
+	assert.equal(args.image, "my-python:1.2.0", "the child inherits the parent's toolchain");
+	assert.notEqual(args.image, "evil:latest", "the agent cannot choose its child's image");
+	// Identity stays (parent, flow, task): folding the image in would let a triggers.json edit fan out a
+	// duplicate PAID child from a retried parent.
+	assert.equal(args.jobId, chainedJobId({ parentJobId: "parent-1", flow: "ok", task: "do it" }));
+});
+
+test("a parent with no image chains a child whose data carries none either", async () => {
+	const fs = makeFakeFs({ files: { "request-1.json": { content: req({ flow: "ok", task: "do it" }) } } });
+	const cap = makeCapture();
+	const gate = makeGate();
+	const collect = makeCollectChain({ queue: cap.queue, enqueue: cap.enqueue, readFlowGate: gate.gate, config: { chainMaxPerJob: 2, chainDepthMax: 1 }, fs });
+
+	await collect({ job: localJob(), prepared: PREPARED });
+	assert.equal(cap.enqueued[0].args.image, undefined, "byte-identical to a pre-issue chain");
+});
+
 test("count cap: files beyond chainMaxPerJob are dropped and never read", async () => {
 	const fs = makeFakeFs({
 		files: {

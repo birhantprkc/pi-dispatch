@@ -23,6 +23,7 @@ on:
       - "guardrails/**"
       - "package.json"
       - "pi-packages.example.json"
+      - "triggers.example.json"
       - ".github/workflows/pi-upgrade-check.yml"
   pull_request:
     paths:
@@ -32,12 +33,18 @@ on:
       - "guardrails/**"
       - "package.json"
       - "pi-packages.example.json"
+      - "triggers.example.json"
       - ".github/workflows/pi-upgrade-check.yml"
   schedule:
     # Weekly: pi ships breaking changes between minors and its HEAD moved within 24h of this
     # project's design being written. A pin that is never exercised rots silently.
     - cron: "0 6 * * 1"
   workflow_dispatch:
+    inputs:
+      image:
+        description: "Run the image job's assertions against an EXISTING tag instead of building one (docs/job-image.md). Leave blank to build from image/Dockerfile."
+        required: false
+        default: ""
 
 jobs:
   version-pin:
@@ -82,6 +89,21 @@ jobs:
             exit 1
           fi
           echo "OK: example package pins are exact"
+
+      - name: The example triggers.json names only an image this repo produces
+        run: |
+          # Same reasoning again, and the same honest limit. A trigger's run.image is operator data
+          # (INT-TRIGGERS-FILE-CONTRACT): the real file lives on the operator's host, so there is nothing
+          # here to grep, and the REAL enforcement is parseTriggers' load-time refusal plus the worker's
+          # pre-spend `docker image inspect`. This step only keeps the EXAMPLE we ship honest -- an example
+          # naming "my-python:latest" would teach a tag nobody has, and turn a first run into a refusal.
+          bad=$(grep -oE '"image"[[:space:]]*:[[:space:]]*"[^"]*"' triggers.example.json \
+                | grep -vE '"image"[[:space:]]*:[[:space:]]*"pi-job:latest"' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::triggers.example.json names an image this repo does not produce: $bad"
+            exit 1
+          fi
+          echo "OK: the example names only pi-job:latest"
 
   no-automatic-merge:
     name: no automatic merge (CONST-MERGE-NEVER-AUTOMATIC)
@@ -144,11 +166,36 @@ jobs:
   image:
     name: the job image holds its contract
     runs-on: ubuntu-latest
+    # The tag every assertion below runs against. Default: the one this job builds. A workflow_dispatch
+    # `image` input replaces it and skips the build, which is what makes this job the executable form of
+    # docs/job-image.md's conformance checklist -- an operator can point it at an image they built for
+    # run.image (INT-TRIGGERS-FILE-CONTRACT) instead of taking the list on faith.
+    #
+    # Steps are labelled CORE or RUNNER, and the line matters. CORE is what ANY conformant image must pass.
+    # RUNNER asserts properties of the runner THIS repo ships -- our exact refusal strings, our loader, a
+    # path under /app that a foreign image need not have. That distinction is exactly the difference between
+    # "conformant" and "built from this repo", which docs/job-image.md and OQ-012 both have to draw.
+    env:
+      IMAGE_REF: ${{ github.event.inputs.image || 'pi-job:ci' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Build
+        if: ${{ !github.event.inputs.image }}
         run: docker build -f image/Dockerfile -t pi-job:ci .
+
+      # --- CORE: nothing may make docker fetch an image (INT-CONTAINER-RUNTIME-CONTRACT) ---
+      # The argv-side proof is the frozen-intent deepEqual in worker/test/docker-run.test.mjs, which runs in
+      # contract-tests. THIS step asserts docker's own behaviour, and exists only because a flag an older
+      # docker accepts and silently disregards looks identical to a working one -- the exact silent class
+      # this workflow is for. Same register as the PI_OFFLINE probe further down.
+      - name: "CORE: --pull=never is honoured, not silently ignored"
+        run: |
+          if docker run --rm --pull=never pi-dispatch-definitely-not-present:ci true 2>/dev/null; then
+            echo "::error::docker ran an absent image under --pull=never -- the flag is being ignored."
+            exit 1
+          fi
+          echo "OK: --pull=never refuses an image that is not local"
 
       # --- INT-SDK-SESSION-OPTIONS ---
       # `pi --mode print` does not exist: --mode accepts text|json|rpc, and --print/-p is a separate
@@ -156,32 +203,32 @@ jobs:
       # contract test that costs money is a contract test that gets disabled.
       # --entrypoint is required: ENTRYPOINT is the runner and ignores CMD, so `docker run img pi ...`
       # would silently run the runner instead of pi and the assertion would test nothing.
-      - name: pi -p is still a flag
-        run: docker run --rm --entrypoint pi pi-job:ci -p --help >/dev/null
+      - name: "CORE: pi -p is still a flag"
+        run: docker run --rm --entrypoint pi "$IMAGE_REF" -p --help >/dev/null
 
       # --- CONST-ISOLATION-CONTAINER-PER-JOB ---
       # --cap-drop=ALL is the enforcement surface. Read the effective capability set directly rather
       # than install libcap just to ask.
-      - name: No capabilities under --cap-drop=ALL
+      - name: "CORE: no capabilities under --cap-drop=ALL"
         run: |
           caps=$(docker run --rm --cap-drop=ALL --security-opt no-new-privileges \
-                   --entrypoint sh pi-job:ci -c 'grep ^CapEff /proc/self/status' | awk '{print $2}')
+                   --entrypoint sh "$IMAGE_REF" -c 'grep ^CapEff /proc/self/status' | awk '{print $2}')
           [ "$caps" = "0000000000000000" ] || { echo "::error::Container retains capabilities: $caps"; exit 1; }
           echo "OK: CapEff=$caps"
 
-      - name: Runs as a non-root user
+      - name: "CORE: runs as a non-root user"
         run: |
-          uid=$(docker run --rm --entrypoint id pi-job:ci -u)
+          uid=$(docker run --rm --entrypoint id "$IMAGE_REF" -u)
           [ "$uid" != "0" ] || { echo "::error::Job container runs as root."; exit 1; }
 
       # --- INT-CONTAINER-JOB-INPUTS ---
       # /job:ro is what makes CONST-ISSUE-TEXT-IS-DATA enforceable by filesystem permission rather
       # than by asking nicely. It is a security boundary, so assert the kernel enforces it.
-      - name: /job is genuinely read-only from inside
+      - name: "CORE: /job is genuinely read-only from inside"
         run: |
           mkdir -p fixture/pi
           echo "x" > fixture/pi/APPEND_SYSTEM.md
-          if docker run --rm --cap-drop=ALL -v "$PWD/fixture:/job:ro" --entrypoint sh pi-job:ci \
+          if docker run --rm --cap-drop=ALL -v "$PWD/fixture:/job:ro" --entrypoint sh "$IMAGE_REF" \
                -c 'echo pwned > /job/pi/APPEND_SYSTEM.md' 2>/dev/null; then
             echo "::error::/job is writable. The agent can rewrite its own instructions."
             exit 1
@@ -192,12 +239,12 @@ jobs:
       # pi lazily creates ~/.pi/agent and writes auth.json on the FIRST credential operation. If the
       # dir is root-owned the job dies EACCES at runtime, on a path nothing in the Dockerfile hints
       # at. COPY --chown does not fix it (it skips auto-created parents), so assert the real thing.
-      - name: The agent dir is writable by the runtime user
-        run: docker run --rm --entrypoint sh pi-job:ci -c 'touch "$HOME/.pi/agent/auth.json" && rm "$HOME/.pi/agent/auth.json"'
+      - name: "CORE: the agent dir is writable by the runtime user"
+        run: docker run --rm --entrypoint sh "$IMAGE_REF" -c 'touch "$HOME/.pi/agent/auth.json" && rm "$HOME/.pi/agent/auth.json"'
 
-      - name: The guardrails are baked where the runner reads them
+      - name: "CORE: the guardrails are baked where the runner reads them"
         run: |
-          docker run --rm --entrypoint grep pi-job:ci -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
+          docker run --rm --entrypoint grep "$IMAGE_REF" -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
             || { echo "::error::Guardrails sentinel missing from /opt/pi-dispatch/HARD_RULES.md"; exit 1; }
 
       # --- INT-CONTAINER-JOB-INPUTS / REQ-GLOBAL-PI-OVERLAY ---
@@ -210,12 +257,12 @@ jobs:
       # The exit code alone would be vacuous (a missing /job/prompt.md is also exit 2), so the message
       # is asserted too -- and the second run is the differential that proves the packages check fires
       # FIRST, before the prompt is even read.
-      - name: A staged package path that did not mount is refused pre-spend (exit 2)
+      - name: "RUNNER: a staged package path that did not mount is refused pre-spend (exit 2)"
         run: |
           run_runner() {
             docker run --rm --network none \
               -e PI_PROVIDER=anthropic -e PI_MODEL=claude-sonnet-4-5-20250929 -e PI_MAX_TURNS=1 "$@" \
-              pi-job:ci 2>&1
+              "$IMAGE_REF" 2>&1
           }
           set +e
           out=$(run_runner -e PI_PACKAGES=/opt/pi-global/packages/definitely-not-mounted)
@@ -265,7 +312,7 @@ jobs:
       # and would silently stop being the thing under test the day either changed. So the assertion is
       # a DIFFERENCE against the same loader without the npm: source: whatever discovery contributes,
       # it contributes to both, and only the unresolvable source can move the number.
-      - name: "PI_OFFLINE=1 turns an unresolvable npm: source into a clean skip"
+      - name: "RUNNER: PI_OFFLINE=1 turns an unresolvable npm: source into a clean skip"
         run: |
           PROBE='import { DefaultResourceLoader, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
           const build = (additionalExtensionPaths) => new DefaultResourceLoader({
@@ -279,7 +326,7 @@ jobs:
           if (withSource !== baseline) { console.error("the unresolvable npm: source changed the loaded set: " + baseline + " -> " + withSource); process.exit(1); }
           console.log("OK: offline skip, nothing installed (loaded " + baseline + " either way)");'
           docker run --rm --network none -e PI_OFFLINE=1 -e PROBE="$PROBE" \
-            --entrypoint sh pi-job:ci -c 'cd /app && node --input-type=module -e "$PROBE"' \
+            --entrypoint sh "$IMAGE_REF" -c 'cd /app && node --input-type=module -e "$PROBE"' \
             || { echo "::error::PI_OFFLINE=1 did not make an unresolvable npm: source a clean skip -- pi may have tried to install at load time."; exit 1; }
 
       # --- DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY (trap (g) in INT-SDK-SESSION-OPTIONS) ---
@@ -303,7 +350,7 @@ jobs:
       # unresolvable candidate instead of throwing. No `cd /app`: the import is an absolute file:// URL
       # and resolvePiAiCompat resolves from usage-meter.mjs's own URL, which is what lets the real runner
       # work from cwd=/workspace.
-      - name: The meter's resolver offers pi-coding-agent's nested pi-ai first, inside the image
+      - name: "RUNNER: the meter's resolver offers pi-coding-agent's nested pi-ai first, inside the image"
         run: |
           PROBE='import { existsSync } from "node:fs";
           import { fileURLToPath } from "node:url";
@@ -318,7 +365,7 @@ jobs:
           }
           console.log("OK: " + candidates.length + " candidate(s), nested first, compat surface intact");'
           docker run --rm --network none -e PROBE="$PROBE" \
-            --entrypoint sh pi-job:ci -c 'node --input-type=module -e "$PROBE"' \
+            --entrypoint sh "$IMAGE_REF" -c 'node --input-type=module -e "$PROBE"' \
             || { echo "::error::The usage meter no longer offers pi-coding-agent's NESTED pi-ai first in this image. That copy owns the module-level api-provider registry every session dispatches through, so it is the only one worth metering; installProcessUsageMeter still DECIDES by runtime mutation probe and would fall back, so this step is about the ORDER and the surface, not the decision. If the layout moved, re-verify in this order: resolvePiAiCompat's nested-path derivation in image/runner/src/usage-meter.mjs, the compat exports the probe and the wrapper call (getApiProvider/getApiProviders/registerApiProvider/resetApiProviders, createAssistantMessageEventStream), trap (g) in specs/interfaces.md, and image/runner/test/pinned-api.test.mjs -- which pins the dual-copy layout in contract-tests, where the worker's hoisted pi-ai is installed too."; exit 1; }
 
       # --- DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS / REQ-FRONTEND-VISUAL-VERIFY ---
@@ -344,11 +391,11 @@ jobs:
       #  - The page is passed via env, not a bind mount: mounts are the one thing that behaves
       #    differently across host OSes, and this must not depend on that.
       # Both directions verified locally: a dead server makes the marker absent and the step fails.
-      - name: Chromium renders a real page as non-root
+      - name: "CORE: Chromium renders a real page as non-root"
         run: |
           docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
             -e PAGE='<html><body style="background:#f00"><h1 style="color:#fff">RENDER-CHECK-MARKER</h1></body></html>' \
-            --entrypoint sh pi-job:ci -c \
+            --entrypoint sh "$IMAGE_REF" -c \
             'node -e "require(\"http\").createServer((_,r)=>{r.writeHead(200,{\"content-type\":\"text/html\"});r.end(process.env.PAGE)}).listen(8099)" & sleep 1;
              playwright-cli open http://localhost:8099 >/dev/null 2>&1;
              playwright-cli snapshot 2>&1 | grep -q RENDER-CHECK-MARKER || { echo "page did not load — chromium could not navigate/render"; exit 1; };
@@ -359,8 +406,8 @@ jobs:
       # Fonts: a weaker, independent check. The render diff above already catches a totally blank
       # page; this catches "fonts package silently dropped" specifically. Neither proves LEGIBILITY
       # (that needs OCR, which is not worth it here) -- honest about what it does and does not show.
-      - name: Fonts are installed
+      - name: "CORE: fonts are installed"
         run: |
-          n=$(docker run --rm --entrypoint sh pi-job:ci -c 'fc-list | wc -l')
+          n=$(docker run --rm --entrypoint sh "$IMAGE_REF" -c 'fc-list | wc -l')
           [ "$n" -gt 0 ] || { echo "::error::No fonts. Chromium renders tofu; REQ-FRONTEND-VISUAL-VERIFY degraded."; exit 1; }
           echo "OK: $n fonts"

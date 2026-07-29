@@ -51,6 +51,7 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | A serviced repo's `.pi/` on the **default branch** | **Maintainer-level** | It is read into the system prompt, from a pinned SHA, on purpose — same trust as `.github/workflows/`. Only someone who can merge can change it. |
 | A serviced repo's contents on **any other branch** | **None** | A fork PR can contain anything. Never read for instructions. |
 | A local folder's `.pi/` | **Whatever can write that folder** | No merge gate, no reviewer, no history |
+| The job image (`PI_JOB_IMAGE`, or a trigger's `run.image`) | **Operator — the same trust as baking it** | It *is* the code every job executes: the pi version, the runner and its exit codes, the guardrail floor, the loader's discovery posture and the non-root user all come from it. Nothing here verifies an image this project did not build. The isolation flags are applied by the worker's argv and hold for **any** image; the **contents** do not. |
 | The job container | **None** — it is the untrusted side | It runs the agent |
 | A job container's `/outbox` request file | **None** — agent-authored | The container's **only** signal channel back to the host; validated host-side before anything is enqueued |
 | Receiver, worker, queue, admin extension | Trusted | They never execute agent-authored content — the admin extension feeds only PII-free, fixed-enum run records to the model; raw container output stays in the overlay viewer |
@@ -123,7 +124,9 @@ Stated openly rather than discovered later:
   not from stranger to insider.
   **If you service repositories you do not control, turn this off.** There is no environment variable
   for it, deliberately: it is a two-line change in `image/runner/src/loader.mjs` (`buildResourceLoader`
-  sets `noContextFiles` and `noExtensions` to `false`; set both to `true`) plus an image rebuild.
+  sets `noContextFiles` and `noExtensions` to `false`; set both to `true`) plus a rebuild **of every image
+  you run** — with per-trigger `run.image`, this posture is per-image, so flipping it in one image does not
+  flip it in another.
   `PI_GLOBAL_ALLOW_EXTENSIONS` is **not** this switch — it governs your own overlay's extensions and does
   not touch what the workspace discovers.
   One recursion case is closed rather than left to you: an extension that looks like this project's own
@@ -132,6 +135,19 @@ Stated openly rather than discovered later:
   honest limit is that the file has already been imported by the time it is dropped; the container is
   what bounds that. A side effect worth knowing: if a repo you service ships its own extension
   registering a `dispatch_*` tool, it will be dropped in job containers. The drop is logged; rename it.
+- **A job image this project did not build is not verified, and per-trigger images make that reachable per
+  flow.** A trigger's `run.image` names the container its jobs run in; absent, they run `PI_JOB_IMAGE`.
+  Whichever it is, the *isolation* holds — `--cap-drop=ALL`, non-root, `/job` read-only, the closed env
+  allowlist and the four mounts are all built by the worker's `docker run` argv, so nothing an image contains
+  can weaken them. What is **not** checked is the image's contents, and every way that can be wrong fails
+  **silently**: absent guardrails at `/opt/pi-dispatch/HARD_RULES.md` remove the safety floor with no error;
+  a stale pi turns jobs into no-ops that report success; wrong exit codes make the queue pay to retry work
+  that can never succeed; and the loader flags above are **per image**, so a multi-tenant deployment that
+  turned discovery off in one image has **not** turned it off in another. What bounds it: only an operator
+  editing `triggers.json` can name an image (no tool parameter, no panel key, no settings-overlay key), and
+  jobs run with `--pull=never` behind a pre-spend presence check, so the only images that can run are ones
+  you built or pulled onto that host yourself. `docs/job-image.md` is the conformance checklist; `OQ-012` in
+  `specs/open-questions.md` is the honest statement of what nothing here can check.
 - **Local-folder jobs have no gate and no undo.** No merge, no reviewer, no pull request to decline. The
   bar for writing the agent's standing instructions drops from "can merge to default" to "can write a
   file in that folder" — which includes anything you ever downloaded into it. If the folder is not under
@@ -229,6 +245,15 @@ Stated openly rather than discovered later:
   dormant. Any other value than `0` or `1` is refused at boot rather than guessed — a typo must not
   silently leave extensions loading. Never place the admin extension in the overlay (it can enqueue paid
   jobs — a recursion vector; `import-pi` blocks it).
+- **Every image you name in `triggers.json` is production code, and you are its build gate.** Pull or build
+  it yourself on the machine running the worker — jobs launch with `--pull=never`, so nothing is ever fetched
+  at job time and a name this host does not have is refused before the job costs anything. Hold it to the
+  conformance checklist in `docs/job-image.md` (non-root with a writable agent dir, the runner as entrypoint,
+  the exit-code protocol, the pinned pi version, root-owned guardrails, fonts, the loader posture), and run
+  the `image` CI job against your own tag. `PI_JOB_IMAGE` and each `run.image` are **separate security
+  postures**, not one: a carve-out you made in one image is not inherited by another. `pi-dispatch doctor`
+  lists every image your triggers name and warns when one's entrypoint does not look like the runner — that
+  is presence and a hint, never conformance.
 - **Staged pi packages are third-party code you are choosing to run against adversarial input.** They live
   inside the same overlay and pass four gates: an **exact** version in `pi-packages.json` (a floating
   range turns a silent upstream release into every queued job becoming a no-op that still reports success),

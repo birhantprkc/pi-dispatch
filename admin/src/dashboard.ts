@@ -600,7 +600,11 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // the default (`run.packages` is an opt-out), so the badge is present unless the trigger declined.
   // Amber, and appended AFTER the layout parts, so color stays post-layout.
   const pkgs = t?.packages === true ? " " + styler.fg("warning", "[packages]") : "";
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}`, inner, styler);
+  // A non-default image, in `accent` rather than `warning`: amber is reserved for the risk badge (third-party
+  // code), and an operator-built image is not third-party. `accent` is already this file's colour for "this
+  // trigger overrides a deployment default" -- the same choice the pinned-model row makes below.
+  const img = t?.image ? " " + styler.fg("accent", `[${t.image}]`) : "";
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}${img}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
@@ -762,6 +766,11 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
     out.push(kv("target", "the triggering repo#issue / PR", "accent"));
     out.push(kv("model", "deployment default", "dim"));
   }
+  // Same shape as the model row -- a per-trigger override of a deployment default -- and rendered on BOTH
+  // branches, because unlike model, all four kinds can carry an image. The dim "deployment default" is
+  // deliberate rather than an omitted row: a missing row would read as "I don't know", this reads as
+  // "I checked". Which image runs is which code runs, so it is not a fact to leave implicit.
+  out.push(kv("image", t.image ?? "deployment default", t.image ? "accent" : "dim"));
 
   // TRUST MODEL — who authorizes it, how it dedups, which service owns it.
   blank();

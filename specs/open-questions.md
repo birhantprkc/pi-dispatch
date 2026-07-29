@@ -286,6 +286,52 @@ a question at all and does not belong in a register. It became `REQ-UPSTREAM-CON
 because a prose checklist depends on a maintainer reading it at 11pm during an upgrade, and a failing
 build does not.
 
+## OQ-012 — An operator-built job image is outside every gate this repo has
+
+- **Status**: **ACCEPTED RISK** — *wants explicit ratification*
+- **Position**: A trigger's `run.image` (`INT-TRIGGERS-FILE-CONTRACT`) may name an image this repo did not
+  build, did not assert, and cannot inspect. Such an image carries **its own pi version**
+  (`CONST-PI-VERSION-PINNED` cannot reach it), **its own runner and exit-code behaviour**
+  (`INT-RUNNER-EXIT-CODE-PROTOCOL`), **its own guardrails floor or none** (nothing requires
+  `/opt/pi-dispatch/HARD_RULES.md` to exist or to be root-owned), **its own loader posture**
+  (`CONST-NO-CONTEXT-FILES-MANDATORY`'s discovery switch is a source edit plus a rebuild, i.e. **per image**
+  — a deployment that turned discovery off for multi-tenancy in one image has not turned it off in another),
+  and its own baked env. `REQ-UPSTREAM-CONTRACT-TESTS`' *"No image publishes on a failed assertion"* is a
+  statement about **our** publish step; an operator's image publishes on none.
+- **Why it is a risk row and not a constraint**: there is no mechanism in this repo that can gate it. The
+  worker drives the local `docker` CLI (`DES-WORKER-ON-HOST`) and can learn that a tag **exists**; existence
+  is not conformance, and every non-conformance on the list above fails **silently** — a stale pi makes jobs
+  no-ops that report success; an absent guardrails file removes the safety floor with no error; wrong exit
+  codes make the queue pay to retry work that can never succeed; a flipped loader flag changes the security
+  posture with no signal. A constraint that ships unenforced corrodes the ones that are enforced, which is
+  the same reasoning that put `OQ-004` here.
+- **What bounds it meanwhile**: the isolation surface is the **worker's argv**, not the image's —
+  `--cap-drop=ALL`, `no-new-privileges`, the memory/cpu/pids/shm limits and the four mounts hold for any
+  image, so a non-conformant image is a **worse agent**, not a wider blast radius; `run.image` is writable
+  only by an operator editing a reviewed file (no tool parameter, no panel key, no overlay key, and no env
+  allowlist to misconfigure — `DES-PER-TRIGGER-JOB-IMAGE`); the pre-spend `docker image inspect` plus
+  `--pull=never` mean the only images that can run are ones the operator themselves built or pulled onto
+  that host; and `PI_JOB_IMAGE` remains the default, so the risk exists only for deployments that opted in.
+- **What detection ships today**: presence, and only presence. The worker's preflight and `pi-dispatch
+  doctor` check that every image named across `triggers.json` (plus `PI_JOB_IMAGE`) resolves locally and
+  refuse/report by name; doctor additionally **warns** when a named image's entrypoint does not look like
+  the runner. Neither inspects the image's contents. Naming a conformance verdict that had not been computed
+  would be worse than reporting none — the same honesty as `OQ-011`'s child-process sampler.
+- **What would close it**: the conformance suite made runnable against an arbitrary tag (the parameterised
+  `image` CI job, documented in `docs/job-image.md`) **plus** a worker-side gate at job start. The honest
+  difficulty is that the cheap version of the gate does not work: a required OCI label proves **intent**, not
+  conformance, because an image can assert any label it likes. The only non-lying check is *running* the
+  assertions, which costs a container start per distinct image — cacheable per image ID, but a real cost and
+  a real complication, and not worth building before anyone runs a second image.
+- **Related risks**: `OQ-004` (unrestricted egress) and `OQ-011` (unmetered `pi` subprocess) — both
+  unchanged by this entry, and both now additionally **per-image**, since an operator's image could ship
+  neither the meter nor `PI_OFFLINE`'s in-process re-assertion.
+- **Needs**: maintainer ratification that shipping per-trigger images with presence-only verification is
+  acceptable, given that every image nameable is one the operator built or pulled themselves onto the host
+  running the worker.
+
+---
+
 ## Known gap
 
 `DESIGN.md`'s header records "50 claims adversarially verified: 48 confirmed, **2 refuted**". Only one
@@ -311,3 +357,4 @@ adversarial passes did.
 | 2026-07-22 | Added OQ-010 — spike #21 closed **YES**: pinned pi `0.80.7` emits per-turn token usage on the `subscribe()` stream (nested `event.message.usage`), verified against the npm artifact. Records the lagging-control constraint and unblocks a follow-up for the token-cap chain. |
 | 2026-07-28 | Issue #58. **OQ-010 scope-corrected in place** (kept, not rewritten): its CLOSED answer was **root-session-scoped** and never said so — `subscribe()` delivers one instance's events, `CreateAgentSessionOptions` has no parent/shared-bus option, and no event carries a `sessionId`, so a subagent fanout emits nothing on the parent's bus and registers as ~one turn. The answer to the question asked is unchanged; the gap was the question's reach. Accounting moved to pi-ai's module-level api-provider registry with the bus sum kept as the fallback, and `REQ-RUNNER-TURN-BUDGET` is now explicitly bounded to root-session turns by the same fact. Added **OQ-011** (`ACCEPTED RISK — wants explicit ratification`): a staged package that spawns a **`pi` subprocess** is invisible to any in-process hook — pi's own SDK example does exactly that — so its tokens miss the exit line and the daily counter. Records what detection ships today (Linux `/proc` child sampling, diagnostic only, logged at teardown), what bounds it meanwhile, and that it closes **with** `OQ-004`, because reading usage off a subprocess needs TLS termination and therefore the same container-level proxy. |
 | 2026-07-22 | OQ-010 **Unblocks** retargeted: the #25 follow-up landed as `REQ-TOKEN-ACCOUNTING-AND-CAPS` (per-job token/cost accounting + optional in-run per-job token budget + optional check-after daily token cap). The recorded lagging-control constraint is what shapes that REQ's asymmetry with `CONST-BUDGET-BEFORE-TOKENS`. |
+| 2026-07-29 | Issue #41. Added **OQ-012** (`ACCEPTED RISK — wants explicit ratification`): an operator-built job image named by a trigger's `run.image` is outside `REQ-UPSTREAM-CONTRACT-TESTS` — its own pi version, its own runner and exit codes, its own guardrails floor, its own **per-image** loader posture — and nothing in this repo can gate it. Records what bounds it (the isolation surface is the worker's argv, not the image's, so a non-conformant image is a **worse agent**, not a wider blast radius; an operator-only edit path; preflight + `--pull=never` mean only locally-present images run), what detection ships (presence of every named image in the preflight and `doctor`, plus an entrypoint **warning** — **not** conformance), and why the cheap close does not work: an OCI label proves intent, not conformance, and only running the assertions is non-lying. `OQ-004` and `OQ-011` unchanged, and noted as now additionally per-image. |

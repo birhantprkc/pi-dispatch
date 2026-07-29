@@ -559,6 +559,13 @@ export function readTriggers({ triggersPath, fs = nodeFs }) {
  * The display MIRRORS the worker rather than re-validating. `parseTriggers` refuses a non-boolean fail-loud
  * at load, so a string "false" never reaches this function; a display that "failed closed" on it would be
  * inventing a state the system cannot be in, and would disagree with the job that actually runs.
+ *
+ * `image` -- the trigger's own container image (INT-TRIGGERS-FILE-CONTRACT, issue #41) -- is carried on all
+ * four kinds for the same reason and shown for a sharper one: which image a job runs IS which code it runs
+ * (the pi version, the runner, the guardrail floor and the loader posture all come from it). `null` is the
+ * default-image sentinel, matching this function's own `flow`/`model`/`phrase` convention, and anything that
+ * is not a non-empty string reads as the default -- mirroring the worker's `job.image ?? config.jobImage`
+ * rather than re-validating a value the loader already refused.
  */
 export function normalizeTriggerForDisplay(entry) {
   if (entry === null || typeof entry !== "object") return null;
@@ -567,6 +574,7 @@ export function normalizeTriggerForDisplay(entry) {
   const run = entry.run !== null && typeof entry.run === "object" ? entry.run : {};
   const flow = typeof run.flow === "string" ? run.flow : null;
   const packages = run.packages !== false;
+  const image = typeof run.image === "string" && run.image.trim() !== "" ? run.image : null;
   switch (on.type) {
     case "cron":
       return {
@@ -579,11 +587,12 @@ export function normalizeTriggerForDisplay(entry) {
         // deployment default. Surfaced so the drill-in shows which schedules pin their own model.
         model: typeof run.model === "string" ? run.model : null,
         packages,
+        image,
       };
     case "label":
-      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages };
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image };
     case "comment":
-      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages };
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image };
     case "pull_request":
       return {
         type: "pull_request",
@@ -593,6 +602,7 @@ export function normalizeTriggerForDisplay(entry) {
         none: normalizeSelector(on.none),
         flow,
         packages,
+        image,
       };
     default:
       return null;

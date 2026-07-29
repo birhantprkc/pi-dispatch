@@ -265,3 +265,19 @@ test("never-started: the sink is still closed (best-effort teardown) and the rej
 	);
 	assert.equal(sink.closeCalls, 1, "the never-started path still closes the sink");
 });
+
+test("a job's own image overrides the deployment default in the argv, and an imageless job runs the default", { skip }, async () => {
+	// The image is the FINAL argv positional, so at(-1) is the whole assertion.
+	const override = await argvFor({ ...JOB, image: "my-python:1.2.0" });
+	assert.equal(override.at(-1), "my-python:1.2.0", "a trigger's run.image reaches docker");
+
+	const fallback = await argvFor(JOB);
+	assert.equal(fallback.at(-1), "pi-job:x", "an unflagged trigger runs the deployment default");
+});
+
+test("the argv can never fetch an image -- --pull=never rides every run, whichever image", { skip }, async () => {
+	for (const job of [JOB, { ...JOB, image: "my-python:1.2.0" }]) {
+		const args = await argvFor(job);
+		assert.ok(args.includes("--pull=never"), "a per-trigger image name must not become a registry pull");
+	}
+});

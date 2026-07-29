@@ -54,10 +54,10 @@ test("a non-object entry / on / run is a config error", () => {
 
 // --- cron (ported from schedules.test.mjs) ---
 
-test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github/packages pass through absent", () => {
+test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github/packages/image pass through absent", () => {
 	const [t] = parse([CRON]);
 	assert.deepEqual(t.on, { type: "cron", id: "nightly-tidy", pattern: "0 3 * * *" });
-	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined, packages: undefined });
+	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined, packages: undefined, image: undefined });
 });
 
 test("cron entry-level provider/model/maxTurns pass through verbatim", () => {
@@ -124,7 +124,7 @@ test("cron missing folder / flow / task is a config error", () => {
 
 test("a valid label trigger normalizes", () => {
 	const [t] = parse([LABEL]);
-	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix", packages: undefined } });
+	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix", packages: undefined, image: undefined } });
 });
 
 test("label trigger with no positive selector (none-only) is a config error", () => {
@@ -144,7 +144,7 @@ test("label trigger missing run.flow is a config error", () => {
 
 test("a valid comment trigger normalizes", () => {
 	const [t] = parse([COMMENT]);
-	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: undefined } });
+	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: undefined, image: undefined } });
 });
 
 test("comment trigger missing phrase or flow is a config error", () => {
@@ -160,7 +160,7 @@ test("a second comment trigger is a config error (at most one)", () => {
 
 test("a valid labeled PR trigger normalizes with its predicate", () => {
 	const [t] = parse([PR_LABELED]);
-	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review", packages: undefined } });
+	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review", packages: undefined, image: undefined } });
 });
 
 test("a labeled PR trigger with no positive selector is a config error", () => {
@@ -236,6 +236,74 @@ test('run.packages that is not strictly boolean ("true", "false", 1, null, {}) i
 				`${kind} must refuse packages=${JSON.stringify(bad)}`,
 			);
 		}
+	}
+});
+
+// --- run.image (issue #41): which container image this trigger's jobs run in ---
+
+test("run.image survives normalization on all four trigger kinds", () => {
+	// All four, not cron only: a toolchain is a capability of the FLOW, and a label/comment/PR trigger runs
+	// the flows a cron trigger runs.
+	for (const { kind, entry } of KINDS) {
+		const [t] = parse([withRun(entry, { image: "my-python:1.2.0" })]);
+		assert.equal(t.run.image, "my-python:1.2.0", `${kind} must carry its own image`);
+	}
+});
+
+test("run.image absent stays absent (undefined) on all four kinds -- the deployment default is resolved by the worker", () => {
+	for (const { kind, entry } of KINDS) {
+		const [t] = parse([entry]);
+		assert.equal(t.run.image, undefined, `${kind} must not freeze PI_JOB_IMAGE into the file`);
+	}
+});
+
+test("run.image that is not a non-empty string is a config error naming the trigger, on all four kinds", () => {
+	for (const { kind, entry, mentions } of KINDS) {
+		for (const bad of ["", "   ", 1, null, true, {}, []]) {
+			assert.throws(
+				() => parse([withRun(entry, { image: bad })]),
+				(e) => isConfigError(e) && e.message.includes(mentions) && /run\.image/.test(e.message),
+				`${kind} must refuse image=${JSON.stringify(bad)}`,
+			);
+		}
+	}
+});
+
+test("run.image with surrounding whitespace is REFUSED rather than trimmed", () => {
+	// The file is the reviewed artifact: silently trimming would make it disagree with what runs, and the
+	// operator diffs the file, not the argv. Its own message, separate from the empty case -- they are
+	// different mistakes with different fixes.
+	assert.throws(
+		() => parse([withRun(CRON, { image: " pi-job:latest " })]),
+		(e) => isConfigError(e) && /whitespace/.test(e.message),
+	);
+});
+
+test('run.image starting with "-" is refused -- it would land where docker parses a flag', () => {
+	// The image is the final argv positional. A leading dash is the one value that stops docker-run.mjs's
+	// explicit-array argv from being injection-free by inspection.
+	assert.throws(
+		() => parse([withRun(CRON, { image: "--privileged" })]),
+		(e) => isConfigError(e) && /run\.image/.test(e.message) && /flag/.test(e.message),
+	);
+});
+
+test("a plausible-but-unbuildable image reference is ACCEPTED -- shape is docker's business, existence is the preflight's", () => {
+	// This test exists to PIN the decision not to regex the OCI reference grammar. A regex would refuse the
+	// rarer half of the problem (a malformed name) while missing the common half (a well-formed name for an
+	// image nobody built), and an over-strict one would take the worker down at boot for a valid deployment.
+	// A future contributor cannot "tighten" this without deleting an explicit assertion.
+	for (const ref of ["registry.internal:5000/team/img:1.2", "ghcr.io/org/img@sha256:abc", "pi-job:latest", "img", "foo:", "localhost:5000/x"]) {
+		const [t] = parse([withRun(CRON, { image: ref })]);
+		assert.equal(t.run.image, ref, `${ref} is docker's to judge, not ours`);
+	}
+});
+
+test("run.image and run.packages are independent on all four kinds", () => {
+	for (const { kind, entry } of KINDS) {
+		const [t] = parse([withRun(entry, { image: "my-python:1.2.0", packages: false })]);
+		assert.equal(t.run.image, "my-python:1.2.0", `${kind}: declining packages must not cost the image`);
+		assert.equal(t.run.packages, false, `${kind}: naming an image must not re-arm the packages`);
 	}
 });
 

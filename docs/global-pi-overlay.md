@@ -3,7 +3,9 @@
 If you already run `pi`, you have a configured `~/.pi/agent`: custom models, global skills, a global persona.
 Point pi-dispatch at a **credential-free copy** of it and every job gets it — **layered under each repo's own
 `.pi/`**, so a repo can still override or add on top. It works with the **pulled** prebuilt image: this is a
-read-only mount, not an image rebuild.
+read-only mount, not an image rebuild — and the same is true of a per-trigger image (`run.image`), because
+any conformant image gets the overlay. What the overlay cannot deliver is a **toolchain** (apt packages, a
+language runtime, system libraries); that is what [job-image.md](job-image.md) is for.
 
 ## Enable it
 
@@ -25,7 +27,7 @@ Four tiers, most-trusted first; each refines but never removes the one above:
 
 | Tier | Source | Trust | Mutable? |
 |---|---|---|---|
-| 1. Safety floor | baked `HARD_RULES.md` | image, root-owned | no (immutable) |
+| 1. Safety floor | baked `HARD_RULES.md` (from **whichever image the trigger names** — `run.image`) | image, root-owned | no (immutable) |
 | 2a. **Global overlay** | `PI_GLOBAL_PI_DIR` → `/opt/pi-global:ro` | **operator, deploy-time** | re-run `import-pi` |
 | 2b. **Staged packages** | `<overlay>/packages/<dir>` — per-trigger opt-out | **third-party**, operator-pinned | re-run `import-pi --with-packages` |
 | 3. Per-repo `.pi/` | repo's committed `.pi/` (default-branch SHA) | trusted-by-merge | per PR |

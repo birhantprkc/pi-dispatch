@@ -66,6 +66,20 @@ test("run enqueues against a real Valkey (VALKEY_TEST_URL) and prints the job id
 	assert.equal(code, 0, "a clean enqueue against a real Valkey returns 0");
 });
 
+test("run --image enqueues against a real Valkey (the operator-at-the-terminal path for a per-trigger image)", { skip: process.env.VALKEY_TEST_URL ? false : "needs VALKEY_TEST_URL" }, async () => {
+	// The CLI is the operator-trusted path -- same class as the existing free-form --provider/--model -- and
+	// it is what lets an operator see the preflight refusal once, deliberately, instead of discovering it at
+	// 03:00 from a cron tick.
+	const dir = gitRepo({ dirty: false });
+	const code = await main(["run", dir, "--task", "tidy", "--image", "my-python:1.2.0", "--force"], { VALKEY_URL: process.env.VALKEY_TEST_URL });
+	assert.equal(code, 0, "an explicit --image is a clean enqueue");
+
+	// `--image ""` must collapse to absent: a falsy string would reach buildDockerRunArgs and throw there,
+	// AFTER a budget slot was reserved.
+	const blank = await main(["run", dir, "--task", "tidy", "--image", "", "--force"], { VALKEY_URL: process.env.VALKEY_TEST_URL });
+	assert.equal(blank, 0, "a blank --image resolves the deployment default rather than failing mid-job");
+});
+
 test("run fails FAST (does not hang) when Valkey is unreachable", { skip: needsDeps }, async () => {
 	// The whole point of failFast: a one-shot enqueue against a down Valkey must error in seconds,
 	// not hang forever on ioredis's null retry policy. Port 1 is closed.

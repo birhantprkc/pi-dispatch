@@ -373,6 +373,35 @@ test("TRIGGER_DETAIL says so when a trigger loads packages but the overlay stage
   assert.match(detail, /packages loaded · \(none staged in the overlay\)/, "loading with nothing staged is stated, not blank");
 });
 
+// --- the per-trigger job image (issue #41): which image a job runs is which code it runs ---
+
+const imgSnap = (image) => ({
+  ...SNAPSHOT,
+  runs: [],
+  activeJobId: null,
+  triggers: { triggers: [{ type: "label", any: ["bug"], all: [], none: [], flow: "fix", packages: false, image }] },
+  stagedPackages: { stagedAt: null, packages: [] },
+});
+
+test("the LIST badges a non-default image, and a default-image row is byte-identical", async () => {
+  const named = await openTrigger(imgSnap("my-python:1.2.0"));
+  assert.match(named.list, /bug → github fix \[my-python:1\.2\.0\]/, "the row names the image, not merely that there is one");
+
+  // Appended last with an empty suffix, so a deployment using no per-trigger images renders exactly as it
+  // did before the feature existed -- the whole framed panel, byte for byte.
+  const plain = await openTrigger(imgSnap(null));
+  assert.doesNotMatch(plain.list, /\[my-python/);
+  assert.equal(plain.list, await openTrigger(imgSnap(undefined)).then((r) => r.list), "no image and an absent image render identically");
+});
+
+test("TRIGGER_DETAIL states the image on BOTH branches -- a dim default means 'I checked', not 'I don't know'", async () => {
+  const named = await openTrigger(imgSnap("my-python:1.2.0"));
+  assert.match(named.detail, /image\s+my-python:1\.2\.0/);
+
+  const plain = await openTrigger(imgSnap(null));
+  assert.match(plain.detail, /image\s+deployment default/, "an omitted row would read as unknown; this reads as checked");
+});
+
 test("Enter on a run opens its detail dump, and Esc backs out to the list without quitting", async () => {
   let closed = 0;
   const comp = makeDashboard({

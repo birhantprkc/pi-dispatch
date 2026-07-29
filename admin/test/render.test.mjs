@@ -173,6 +173,30 @@ test("renderTriggers marks a packages-loading trigger and leaves a declining one
   assert.equal(all.split("[packages]").length - 1, 3, "label, comment and pull_request each show the marker");
 });
 
+test("renderTriggers shows a non-default image, and a default-image line is byte-identical", () => {
+  const cron = (image) => ({ type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", packages: false, image });
+  const named = renderTriggers({ schedulers: [], triggers: { triggers: [cron("my-python:1.2.0")] } });
+  assert.match(named, /\[image my-python:1\.2\.0\]/, "which image a job runs is which code it runs, so the row says it");
+
+  // The suffix is empty and appended last, so a deployment using no per-trigger images renders exactly as
+  // it did before the feature existed.
+  const plain = renderTriggers({ schedulers: [], triggers: { triggers: [cron(null)] } });
+  assert.doesNotMatch(plain, /\[image/);
+
+  // All four kinds carry it.
+  const all = renderTriggers({
+    schedulers: [],
+    triggers: {
+      triggers: [
+        { type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", image: "a:1" },
+        { type: "comment", phrase: "@pi", flow: "fix", image: "b:1" },
+        { type: "pull_request", action: ["labeled"], any: [], all: [], none: [], flow: "review", image: "c:1" },
+      ],
+    },
+  });
+  assert.equal(all.split("[image ").length - 1, 3, "label, comment and pull_request each show their image");
+});
+
 test("renderTriggers degrades on no schedulers and a missing triggers file", () => {
   const out = renderTriggers({ schedulers: [], triggers: { missing: true } });
   assert.match(out, /none configured/);

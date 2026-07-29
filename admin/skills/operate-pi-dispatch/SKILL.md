@@ -76,3 +76,26 @@ cannot, and that it is an edit they make to `triggers.json` (and to their overla
 attempt it through `dispatch_trigger_edit`, do not write the triggers file by another route, and do not treat
 the missing parameter as a bug to work around. Reporting which triggers load the staged set and explaining
 the change they would make is the whole of your part.
+
+## The job image — `run.image`, and why you cannot set it
+
+A trigger may carry `run.image`: the container image that trigger's jobs run in. Absent means the
+deployment default (`PI_JOB_IMAGE`). It exists so one flow can have a Python toolchain and another Node +
+Playwright, without one image carrying the union of both.
+
+Report it when asked, and be precise about what it does and does not decide. **Which image a job runs is
+which code it runs** — the pi version, the runner, the guardrail floor and the loader's discovery posture
+all come from the image. What it does *not* decide is what the container may do: `--cap-drop=ALL`, the
+non-root user, the read-only `/job` and the closed env allowlist are built by the worker for every image
+alike. The panel shows the tag in the trigger list and states it in the drill-in either way.
+
+**You cannot change it, in either direction.** `dispatch_trigger_add` and `dispatch_trigger_edit` have **no
+`image` parameter**, `dispatch_run` has none, and there is no allowlist for you to consult — because there
+is nothing model-callable to bound. Naming an image is an operator edit to the reviewed `triggers.json`,
+exactly like `run.packages`.
+
+So if a user asks you to point a trigger at a different image, or to build one: **say plainly that you
+cannot, and that it is an edit they make to `triggers.json` themselves.** Do not route around it via
+`dispatch_trigger_edit`, which changes the flow only. Two useful things you *can* say: the image must be
+built or pulled on the worker's own host, because jobs run with `--pull=never` and nothing is fetched at
+job time; and `pi-dispatch doctor` lists every image their triggers name and flags one that is missing.
