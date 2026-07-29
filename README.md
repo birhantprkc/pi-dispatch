@@ -543,6 +543,10 @@ Three things differ from the GitHub arm, and each is a correctness matter rather
 - **GitLab 17.4 or later.** Dedup uses GitLab's own retry-stable delivery id. An older instance is refused
   with a clear 400 rather than run on a key that would only half-dedup.
 
+**Self-hosted works** — set `GITLAB_URL` and everything follows it, including `GITLAB_HOST` inside the job
+container. A private CA needs `NODE_EXTRA_CA_CERTS` on the host and the cert in your job image; a
+certificate failure names itself in the log rather than reporting a bare "fetch failed".
+
 Full setup, the `api`-scope trade-off, and what is not supported: [`docs/gitlab.md`](docs/gitlab.md).
 
 ## How it compares

@@ -25,6 +25,8 @@
  * The username is never sent, logged or returned; the lookup is by numeric user id.
  */
 
+import { fetchFailureReason } from "@pi-dispatch/worker/gitlab-identity";
+
 /** GitLab's API path prefix. `apiUrl` is the instance root, e.g. `https://gitlab.com`. */
 const API_PREFIX = "/api/v4";
 
@@ -46,7 +48,7 @@ export function makeResolveAccessLevel({ apiUrl, token, fetchFn = fetch }) {
 		try {
 			res = await fetchFn(url, { headers: { "PRIVATE-TOKEN": token }, redirect: "error" });
 		} catch (err) {
-			return { indeterminate: err?.message ?? "network error" };
+			return { indeterminate: fetchFailureReason(err) };
 		}
 		if (res.status === 404) {
 			// GitLab's documented answer for "this user is not a member of this project", including via any

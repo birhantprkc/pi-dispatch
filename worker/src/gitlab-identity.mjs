@@ -27,7 +27,7 @@ export async function resolveGitLabSelfId({ apiUrl, token, fetchFn = fetch }) {
 	try {
 		res = await fetchFn(url, { headers: { "PRIVATE-TOKEN": token }, redirect: "error" });
 	} catch (err) {
-		throw configError(`gitlab identity: GET /user failed (${err?.message ?? "network error"})`);
+		throw configError(`gitlab identity: GET /user failed (${fetchFailureReason(err)})`);
 	}
 	if (!res.ok) {
 		// The status alone, never the body: an error body can echo the token back.
@@ -43,4 +43,19 @@ export async function resolveGitLabSelfId({ apiUrl, token, fetchFn = fetch }) {
 		throw configError("gitlab identity: GET /user returned no integer id");
 	}
 	return body.id;
+}
+
+/**
+ * A fetch rejection's real reason. Node's `fetch` rejects with the bare string "fetch failed" and puts the
+ * actual cause underneath -- so the single commonest self-hosted GitLab misconfiguration, a private CA the
+ * host does not trust, reports nothing an operator can act on. Unwrapping turns that into
+ * "self-signed certificate in certificate chain", which names the fix (NODE_EXTRA_CA_CERTS).
+ */
+export function fetchFailureReason(err) {
+	const parts = [];
+	for (let e = err, depth = 0; e && depth < 4; e = e.cause, depth++) {
+		const m = typeof e?.message === "string" ? e.message : null;
+		if (m && !parts.includes(m)) parts.push(m);
+	}
+	return parts.join(": ") || "network error";
 }

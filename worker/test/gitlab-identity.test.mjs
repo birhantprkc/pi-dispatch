@@ -42,3 +42,32 @@ test("an error body is never echoed -- only the status reaches the message", asy
 		(e) => e.piDispatchConfig === true && !e.message.includes("glpat-SECRET"),
 	);
 });
+
+test("fetchFailureReason unwraps the cause chain, so a private-CA failure names itself", async () => {
+	const { fetchFailureReason } = await import("../src/gitlab-identity.mjs");
+	// Node's fetch rejects with the bare string "fetch failed" and hides the real reason underneath. For a
+	// self-hosted GitLab behind a private CA -- the commonest misconfiguration there is -- the unwrapped
+	// message is the difference between a diagnosis and a shrug.
+	const wrapped = new TypeError("fetch failed", { cause: new Error("self-signed certificate") });
+	assert.equal(fetchFailureReason(wrapped), "fetch failed: self-signed certificate");
+
+	// Deeper chains, duplicates, and a bare error all stay readable.
+	assert.equal(fetchFailureReason(new Error("a", { cause: new Error("b", { cause: new Error("c") }) })), "a: b: c");
+	assert.equal(fetchFailureReason(new Error("x", { cause: new Error("x") })), "x");
+	assert.equal(fetchFailureReason(new Error("boom")), "boom");
+	assert.equal(fetchFailureReason(undefined), "network error");
+	// A cycle must not hang the caller.
+	const a = new Error("loop"); a.cause = a;
+	assert.equal(fetchFailureReason(a), "loop");
+});
+
+test("a private-CA instance reports the cert problem, not a bare 'fetch failed'", async () => {
+	await assert.rejects(
+		() => resolveGitLabSelfId({
+			apiUrl: "https://gl.internal",
+			token: "glpat-x",
+			fetchFn: async () => { throw new TypeError("fetch failed", { cause: new Error("unable to verify the first certificate") }); },
+		}),
+		(e) => e.piDispatchConfig === true && e.message.includes("unable to verify the first certificate"),
+	);
+});

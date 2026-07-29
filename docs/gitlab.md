@@ -64,6 +64,42 @@ pick the weaker one.
 
 **4. Check it.** `pi-dispatch doctor` reports whether the token is set when your triggers name GitLab.
 
+## Self-hosted instances
+
+Set `GITLAB_URL` to your instance root and everything follows it — the receiver's verification and member
+lookup, the worker's API calls and clone URL, and `GITLAB_HOST` inside the job container so `glab` talks to
+your instance rather than gitlab.com. Nothing is hardcoded to gitlab.com; that value is only the default.
+
+```bash
+GITLAB_URL=https://gitlab.internal.example.com
+```
+
+Two things are worth knowing before you point it at a private instance.
+
+**A private CA needs to be trusted, in two places.** The worker and receiver run on the host, so a CA that
+your OS trusts is not automatically one Node trusts:
+
+```bash
+NODE_EXTRA_CA_CERTS=/etc/ssl/certs/your-internal-ca.pem
+```
+
+Without it, every call fails and the log names the reason — `fetch failed: self-signed certificate`, or
+`unable to verify the first certificate`. That message is the diagnosis; if you see it, this is what it
+means.
+
+The **job container** is a separate trust store: `git clone` and `glab` run inside it, so the CA has to be
+in the image. Add it to your own image (`docs/job-image.md`) — a `COPY` of the cert into
+`/usr/local/share/ca-certificates/` plus `update-ca-certificates`. The stock image trusts only the public
+roots.
+
+**Redirects are refused, not followed.** If `GITLAB_URL` is `http://…` and your instance redirects to
+HTTPS, calls fail rather than silently following — a redirect is somewhere to send a credential, and
+following one is how a token ends up at a host you did not name. Set `GITLAB_URL` to the final URL.
+
+Plain `http://` does work if that is genuinely what you run. It sends the token in the clear on every API
+call and every clone, so it is only reasonable on a trusted network, and it is not what the isolation
+model assumes elsewhere.
+
 ## Minimum GitLab version: 17.4
 
 pi-dispatch dedups redeliveries on GitLab's own `webhook-id` (called `Idempotency-Key` before 19.0), which

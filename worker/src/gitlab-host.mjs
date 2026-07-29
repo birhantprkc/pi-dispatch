@@ -25,6 +25,7 @@
 
 import { configError } from "./config.mjs";
 import { InfraRetry } from "./processor.mjs";
+import { fetchFailureReason } from "./gitlab-identity.mjs";
 
 const API_PREFIX = "/api/v4";
 
@@ -38,7 +39,7 @@ export function makeGitLabHost({ apiUrl = "https://gitlab.com", fetchFn = fetch 
 		try {
 			res = await fetchFn(`${root}${path}`, { headers: { "PRIVATE-TOKEN": token }, redirect: "error" });
 		} catch (err) {
-			throw new InfraRetry(`gitlab-host: GET ${path} failed (${err?.message ?? "network error"})`);
+			throw new InfraRetry(`gitlab-host: GET ${path} failed (${fetchFailureReason(err)})`);
 		}
 		if (res.status === 404 && notFound !== undefined) return notFound;
 		if (!res.ok) {
@@ -121,7 +122,7 @@ export function makeGitLabHost({ apiUrl = "https://gitlab.com", fetchFn = fetch 
 				redirect: "error",
 			});
 		} catch (err) {
-			throw new InfraRetry(`gitlab-host: POST ${path} failed (${err?.message ?? "network error"})`);
+			throw new InfraRetry(`gitlab-host: POST ${path} failed (${fetchFailureReason(err)})`);
 		}
 		if (!res.ok) {
 			throw new InfraRetry(`gitlab-host: POST ${path} returned ${res.status}`);

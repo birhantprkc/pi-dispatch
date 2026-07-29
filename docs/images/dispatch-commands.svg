@@ -28,5 +28,5 @@
   <text x="16" y="407" xml:space="preserve" fill="#c9d1d9" font-size="13" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">  label  any[pi:backend] → backend-fix</text>
   <text x="16" y="426" xml:space="preserve" fill="#c9d1d9" font-size="13" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">  comment  "@pi" → fix</text>
   <text x="16" y="445" xml:space="preserve" fill="#c9d1d9" font-size="13" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">  pull_request  action[labeled] any[pi:review] → review</text>
-  <text x="16" y="464" xml:space="preserve" fill="#c9d1d9" font-size="13" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">  pull_request  action[opened,synchronize] → review</text>
+  <text x="16" y="464" xml:space="preserve" fill="#c9d1d9" font-size="13" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">  pull_request  action[open,update] → review  [gitlab]</text>
 </svg>
