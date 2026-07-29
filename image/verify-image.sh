@@ -49,6 +49,15 @@ docker run --rm --entrypoint pi "$IMAGE_REF" -p --help >/dev/null 2>&1 \
 	|| fail "pi is not on PATH, or -p is no longer a flag. The image must carry the pinned pi (CONST-PI-VERSION-PINNED); a stale or absent pi makes jobs no-ops that still report success."
 ok "pi is present and -p is still a flag"
 
+# The two forge CLIs the job envelopes instruct the agent to use. Each is only meaningful for jobs on its
+# own forge, but a MISSING one fails the same silent way: the agent follows an envelope naming a command
+# that is not there, reports what went wrong in prose, and exits 0.
+for cli in gh glab; do
+	docker run --rm --entrypoint "$cli" "$IMAGE_REF" --version >/dev/null 2>&1 \
+		|| fail "$cli is not on PATH. A ${cli}-driven job envelope cannot publish its work, and the failure looks like a completed run."
+	ok "$cli is present"
+done
+
 # --cap-drop=ALL is CONST-ISOLATION-CONTAINER-PER-JOB's enforcement surface. Read the effective capability
 # set directly rather than install libcap just to ask.
 caps=$(docker run --rm --cap-drop=ALL --security-opt no-new-privileges \

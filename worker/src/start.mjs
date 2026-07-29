@@ -7,11 +7,13 @@ import { makeRedisClient, parseConnection } from "./connection.mjs";
 import { reconcile, reloadSchedules } from "./cron.mjs";
 import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
+import { makeGitLabAuth } from "./gitlab-auth.mjs";
+import { makeGitLabHost } from "./gitlab-host.mjs";
 import { makeImagePreflight } from "./image-preflight.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
 import { containerPackagePaths, readStageManifest } from "./packages.mjs";
-import { cleanup, makePrepareWorkspace } from "./prepare.mjs";
+import { cleanup, makeForgePreparers, makePrepareWorkspace } from "./prepare.mjs";
 import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
@@ -136,6 +138,8 @@ export async function startWorker(
 		makeLogReaper: makeLogReaperFn = makeLogReaper,
 		makeRunContainer: makeRunContainerFn = makeRunContainer,
 		makeImagePreflight: makeImagePreflightFn = makeImagePreflight,
+		makeGitLabAuth: makeGitLabAuthFn = makeGitLabAuth,
+		makeGitLabHost: makeGitLabHostFn = makeGitLabHost,
 	} = {},
 ) {
 	const config = loadConfig(env);
@@ -166,6 +170,18 @@ export async function startWorker(
 		log("self_identity", { kind: "github", id: forges.github.auth.selfId, source: forges.github.auth.source });
 	} catch (err) {
 		log("github_auth_unavailable", { kind: "github", reason: err?.message });
+	}
+	// GitLab joins the same map on the same best-effort terms. It appears only when configured: a forge
+	// with no entry refuses its jobs at mint time with a message naming what is missing, which is a better
+	// answer than an entry that exists and cannot authenticate.
+	if (config.gitlab) {
+		forges.gitlab = { auth: null, host: makeGitLabHostFn({ apiUrl: config.gitlab.apiUrl }) };
+		try {
+			forges.gitlab.auth = await makeGitLabAuthFn(config.gitlab);
+			log("self_identity", { kind: "gitlab", id: forges.gitlab.auth.selfId, source: forges.gitlab.auth.source });
+		} catch (err) {
+			log("gitlab_auth_unavailable", { kind: "gitlab", reason: err?.message });
+		}
 	}
 
 	/** The `{ auth, host }` pair a job's kind names, or `undefined` for a local job (which has no forge). */
@@ -272,10 +288,12 @@ export async function startWorker(
 				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; every job receives them unless its trigger set packages:false
 				forwardEnv: config.forwardEnv,
 				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
+				gitlabHost: config.gitlab?.apiUrl ?? null, // so `glab` in a gitlab job's container talks to the right instance
 			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				forgeFor,
+				preparers: makeForgePreparers({ gitlabApiUrl: config.gitlab?.apiUrl ?? null }),
 				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
 				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
 				findPreviousRun: makeFindPreviousRun({ logsDir: config.logsDir }),
@@ -289,7 +307,7 @@ export async function startWorker(
 				if (forge?.auth) {
 					try {
 						const token = await forge.auth.mintToken(job);
-						await forge.host.postStatusComment(job.repo, job.target, text, token);
+						await forge.host.postStatusComment(job, job.target, text, token);
 					} catch (err) {
 						log("comment_failed", { jobId: job?.id, reason: err?.message });
 					}
@@ -320,7 +338,7 @@ export async function startWorker(
 			isDefaultBranchProtected: async (job, token) => {
 				const host = forgeFor(job)?.host;
 				if (!host) throw configError(`no forge host is configured for job kind ${JSON.stringify(job?.kind)}`);
-				return await host.isDefaultBranchProtected(job.repo, token);
+				return await host.isDefaultBranchProtected(job, token);
 			},
 		},
 	});

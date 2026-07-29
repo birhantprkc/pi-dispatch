@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { makePrepareWorkspace } from "../src/prepare.mjs";
+import { makeForgePreparers, makePrepareWorkspace } from "../src/prepare.mjs";
 
 /** A fresh real jobsDir under os.tmpdir, plus a cleanup fn — mkdtempSync(join(jobsDir,"job-")) needs it real. */
 function withJobsDir() {
@@ -191,4 +191,24 @@ test("throws on an unknown job kind", async () => {
 	} finally {
 		cleanup();
 	}
+});
+
+test("makeForgePreparers hands the gitlab arm a GitLab clone URL and the glab envelope", async () => {
+	// A gitlab job cloning from github.com is a silent failure: the URL either does not exist, or -- worse
+	// -- does, and the job runs against a stranger's repository and reports success.
+	const seen = [];
+	const preparers = makeForgePreparers({
+		gitlabApiUrl: "https://gl.internal",
+		prepareForge: async (job, _token, opts) => (seen.push({ kind: job.kind, url: opts.remoteUrlFor?.(job), prompt: opts.buildPrompt }), { ok: true }),
+	});
+
+	await preparers.gitlab({ kind: "gitlab", repo: "group/sub/proj", flow: "fix", target: { type: "issue", number: 3 } }, "tok", { jobDir: "/j" });
+	assert.equal(seen[0].url, "https://gl.internal/group/sub/proj.git");
+	assert.ok(seen[0].prompt({ flow: "fix", target: { type: "issue", number: 3 } }).includes("glab"), "and the envelope must speak glab, not gh");
+
+	// The github arm is the bare preparer: no URL builder and no prompt override, so it keeps its own
+	// defaults and stays byte-identical to before the map existed.
+	await preparers.github({ kind: "github", repo: "o/r" }, "tok", { jobDir: "/j" });
+	assert.equal(seen[1].url, undefined);
+	assert.equal(seen[1].prompt, undefined);
 });

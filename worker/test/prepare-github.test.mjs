@@ -76,8 +76,10 @@ function harness({ git, materializeRecord = [] } = {}) {
 		deps: {
 			jobDir,
 			git,
-			resolveDefaultBranchSha: async (repo, token) => {
-				shaCalls.push({ repo, token });
+			resolveDefaultBranchSha: async (ref, token) => {
+				// The preparer hands the JOB through, so each forge's host reads whatever identifies the
+				// target on its own side (github: repo; gitlab: the numeric project id).
+				shaCalls.push({ repo: ref?.repo, token });
 				return { branch: "main", sha: SHA };
 			},
 			materialize: fakeMaterialize(materializeRecord),

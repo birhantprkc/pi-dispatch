@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { prepareGithubWorkspace } from "./prepare-github.mjs";
+import { gitlabRemoteUrl } from "./gitlab-host.mjs";
+import { buildGitLabPrompt } from "./gitlab-prompt.mjs";
 import { prepareLocalWorkspace } from "./prepare-local.mjs";
 
 /**
@@ -89,4 +91,28 @@ function scheduledForMillis(queueJobId) {
 /** Remove a per-job dir after the run. The workspace (the operator's folder) is never touched here. */
 export async function cleanup(prepared) {
 	if (prepared?.jobDir) await rm(prepared.jobDir, { recursive: true, force: true });
+}
+
+/**
+ * The per-forge preparer map `makePrepareWorkspace` dispatches on.
+ *
+ * Both forges share `prepareGithubWorkspace`: the askpass helper, the hardening flags, the gone-SHA
+ * markers, the pinned detached checkout and the read-only event.json are facts about git and about this
+ * project, not about GitHub. Only two things differ, and both are injected -- where the clone comes from,
+ * and how the agent's envelope is phrased. A second copy of the clone path would be a second place to fix
+ * a clone bug, and the copy that did not get fixed would be the one nobody was looking at.
+ *
+ * Exported so the wiring is assertable: a gitlab job cloning from github.com is a silent failure -- the
+ * URL simply would not exist, or worse, would.
+ */
+export function makeForgePreparers({ gitlabApiUrl = null, prepareForge = prepareGithubWorkspace } = {}) {
+	return {
+		github: prepareForge,
+		gitlab: (job, token, opts) =>
+			prepareForge(job, token, {
+				...opts,
+				remoteUrlFor: (j) => gitlabRemoteUrl(gitlabApiUrl, j.repo),
+				buildPrompt: buildGitLabPrompt,
+			}),
+	};
 }

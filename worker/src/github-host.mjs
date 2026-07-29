@@ -110,8 +110,16 @@ export function makeGitHubHost({ octokitFor = (token) => new Octokit({ auth: tok
 	return { resolveDefaultBranchSha, isDefaultBranchProtected, postStatusComment };
 }
 
-/** Split `"owner/name"` into `[owner, name]`, throwing configError unless both parts are non-empty. */
-function splitRepo(repo) {
+/**
+ * Split `"owner/name"` into `[owner, name]`, throwing configError unless both parts are non-empty.
+ *
+ * Accepts the job itself or a bare `"owner/name"`. Taking the job is what lets every forge's host expose
+ * the same three signatures while reading whatever identifies a target on its own side -- GitLab's takes
+ * the numeric project id off the same object, because its `group/subgroup/project` paths have no fixed
+ * segment count and this split would pass on one while silently naming the parent group.
+ */
+function splitRepo(ref) {
+	const repo = typeof ref === "object" && ref !== null ? ref.repo : ref;
 	const [owner, name] = String(repo ?? "").split("/");
 	if (!owner || !name) {
 		throw configError(`github-host: malformed repo: ${JSON.stringify(repo)} (expected "owner/name")`);

@@ -40,6 +40,30 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# glab, the GitLab CLI, for gitlab jobs (issue #42). `gh` speaks the GitHub API and nothing else, so a
+# gitlab job following the github envelope fails at its first `gh pr create` on every run.
+#
+# Pinned to an exact version AND verified against a per-architecture sha256 -- deliberately unlike the `gh`
+# block above, which tracks an apt channel and is this image's one unpinned dependency. Repeating that for
+# a second CLI would double the surface where an unattended upstream change lands inside a container that
+# holds a repo credential (CONST-PI-VERSION-PINNED's reasoning, one layer out).
+ARG GLAB_VERSION=1.73.1
+ARG GLAB_SHA256_AMD64=52f7cdd2b80f8f5f8e8b10304859fbb37cb9379b340e78f2245ddb4ea9308240
+ARG GLAB_SHA256_ARM64=e772084244337c38bf6fa73e931383b7fadb777f85817e60c29489af751cef25
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$GLAB_SHA256_AMD64" ;; \
+      arm64) sha="$GLAB_SHA256_ARM64" ;; \
+      *) echo "glab: unsupported architecture $arch" >&2; exit 1 ;; \
+    esac; \
+    wget -nv -O /tmp/glab.tgz "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${arch}.tar.gz"; \
+    echo "${sha}  /tmp/glab.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/glab.tgz -C /tmp bin/glab; \
+    install -m 0755 /tmp/bin/glab /usr/local/bin/glab; \
+    rm -rf /tmp/glab.tgz /tmp/bin; \
+    glab --version
+
 # engine-strict is set explicitly because npm reads it from $HOME/.npmrc and
 # $PREFIX/etc/npmrc but NEVER from a project .npmrc for installs outside a project root.
 # Without this the node-floor guard silently does not cover the install that matters most.

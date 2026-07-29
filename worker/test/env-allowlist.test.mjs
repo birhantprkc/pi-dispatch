@@ -229,3 +229,53 @@ test("without PI_AUTH_FROM_PI, a missing env key still refuses and auth.json is 
 		(e) => e.piDispatchConfig === true,
 	);
 });
+
+test("a gitlab job's token lands in GITLAB_TOKEN/GL_TOKEN and NEVER in the github names", () => {
+	// A GitLab credential exported as GITHUB_TOKEN would be sent by `gh` to github.com on the agent's
+	// first invocation: a working credential handed to the wrong host, which is how a scoped token stops
+	// being scoped.
+	const env = buildContainerEnv({
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+		jobId: "j1",
+		githubToken: "glpat-secret",
+		forgeKind: "gitlab",
+		gitlabHost: "https://gl.internal",
+		hostEnv: { ANTHROPIC_API_KEY: "k" },
+	});
+	assert.equal(env.GITLAB_TOKEN, "glpat-secret");
+	assert.equal(env.GL_TOKEN, "glpat-secret", "glab prefers GL_TOKEN; mirroring forecloses a precedence surprise");
+	assert.equal(env.GITLAB_HOST, "https://gl.internal", "so glab talks to the operator's instance, not gitlab.com");
+	assert.equal("GITHUB_TOKEN" in env, false);
+	assert.equal("GH_TOKEN" in env, false);
+});
+
+test("a github job is unchanged: the github names only, and no gitlab ones", () => {
+	const env = buildContainerEnv({
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+		jobId: "j1",
+		githubToken: "ghs_x",
+		forgeKind: "github",
+		hostEnv: { ANTHROPIC_API_KEY: "k" },
+	});
+	assert.equal(env.GITHUB_TOKEN, "ghs_x");
+	assert.equal(env.GH_TOKEN, "ghs_x");
+	for (const name of ["GITLAB_TOKEN", "GL_TOKEN", "GITLAB_HOST"]) assert.equal(name in env, false);
+});
+
+test("a local run.github job still gets the github names -- the opt-in names github explicitly", () => {
+	const env = buildContainerEnv({
+		provider: "anthropic",
+		model: "m",
+		maxTurns: 5,
+		jobId: "j1",
+		githubToken: "ghs_x",
+		forgeKind: "local",
+		hostEnv: { ANTHROPIC_API_KEY: "k" },
+	});
+	assert.equal(env.GH_TOKEN, "ghs_x");
+	assert.equal("GITLAB_TOKEN" in env, false);
+});
