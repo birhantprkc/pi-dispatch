@@ -39,7 +39,7 @@
     "skills": [
       "./skills"
     ],
-    "image": "https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png"
+    "image": "https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png?v=0.3.0"
   },
   "scripts": {
     "build": "node build.mjs",

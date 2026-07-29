@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.png" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+  <img src="docs/images/banner.png?v=0.3.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
 </p>
 
 # pi-dispatch
@@ -8,9 +8,9 @@
 cron schedule, or by a GitHub or GitLab issue, comment or pull/merge request — in a container you control, with a durable queue, a
 spend cap, and a live admin panel.**
 
-![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
+![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.3.0)
 
-![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg)
+![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg?v=0.3.0)
 
 pi has no job queue, no concurrency control, no spend limit, and — by its own README — no permission
 system. **pi-dispatch is exactly that missing operational layer, and nothing else.**
