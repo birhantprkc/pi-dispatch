@@ -548,11 +548,24 @@ export function readTriggers({ triggersPath, fs = nodeFs }) {
  * Normalize one `{ on, run }` entry into its display record, or `null` when it is not usable. Exported for
  * the display tests; `readTriggers` is the only production caller.
  *
- * `packages` -- the trigger's `run.packages: true` opt-in to load the operator-staged third-party pi
- * packages (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -- is carried on ALL FOUR kinds: a trigger
- * that runs third-party code with open network egress must not render identically to one that does not.
- * Anything other than a literal `true` reads as unarmed, so a malformed value fails closed in the display
- * exactly as it does in the worker's validator.
+ * `packages` -- whether the trigger loads the operator-staged third-party pi packages
+ * (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -- is carried on ALL FOUR kinds: a trigger that runs
+ * third-party code with open network egress must not render identically to one that does not. It is an
+ * opt-OUT, so `!== false`: absent and `true` both load, and only an explicit `false` withholds. The
+ * `=== true` this replaced was the display half of a polarity that flipped in the worker and did not flip
+ * here, and it was silent in exactly the wrong direction -- the commonest loading trigger is one that omits
+ * the flag entirely, and it rendered with no marker at all.
+ *
+ * The display MIRRORS the worker rather than re-validating. `parseTriggers` refuses a non-boolean fail-loud
+ * at load, so a string "false" never reaches this function; a display that "failed closed" on it would be
+ * inventing a state the system cannot be in, and would disagree with the job that actually runs.
+ *
+ * `image` -- the trigger's own container image (INT-TRIGGERS-FILE-CONTRACT, issue #41) -- is carried on all
+ * four kinds for the same reason and shown for a sharper one: which image a job runs IS which code it runs
+ * (the pi version, the runner, the guardrail floor and the loader posture all come from it). `null` is the
+ * default-image sentinel, matching this function's own `flow`/`model`/`phrase` convention, and anything that
+ * is not a non-empty string reads as the default -- mirroring the worker's `job.image ?? config.jobImage`
+ * rather than re-validating a value the loader already refused.
  */
 export function normalizeTriggerForDisplay(entry) {
   if (entry === null || typeof entry !== "object") return null;
@@ -560,7 +573,8 @@ export function normalizeTriggerForDisplay(entry) {
   if (on === null || typeof on !== "object") return null;
   const run = entry.run !== null && typeof entry.run === "object" ? entry.run : {};
   const flow = typeof run.flow === "string" ? run.flow : null;
-  const packages = run.packages === true;
+  const packages = run.packages !== false;
+  const image = typeof run.image === "string" && run.image.trim() !== "" ? run.image : null;
   switch (on.type) {
     case "cron":
       return {
@@ -573,11 +587,12 @@ export function normalizeTriggerForDisplay(entry) {
         // deployment default. Surfaced so the drill-in shows which schedules pin their own model.
         model: typeof run.model === "string" ? run.model : null,
         packages,
+        image,
       };
     case "label":
-      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages };
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image };
     case "comment":
-      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages };
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image };
     case "pull_request":
       return {
         type: "pull_request",
@@ -587,6 +602,7 @@ export function normalizeTriggerForDisplay(entry) {
         none: normalizeSelector(on.none),
         flow,
         packages,
+        image,
       };
     default:
       return null;

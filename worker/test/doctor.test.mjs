@@ -151,14 +151,73 @@ function overlay({ auth = false, models, extensions = false, packages, packagesN
 // Doctor counts armed triggers with the SHARED parseTriggers, so the fixture must write a file that really
 // validates — a stub `{triggers:[{run:{packages:true}}]}` would be swallowed by the never-throw guard and
 // silently count 0, making every ARMED assertion pass for the wrong reason.
-function triggersFile(packages) {
+function triggersFile(packages, image) {
 	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-")), "triggers.json");
-	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", ...(packages === undefined ? {} : { packages }) };
+	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", ...(packages === undefined ? {} : { packages }), ...(image === undefined ? {} : { image }) };
 	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run }] }));
 	return path;
 }
 const overlayEnv = (dir, extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_GLOBAL_PI_DIR: dir, ...extra });
 const overlayDeps = (out) => ({ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" });
+
+// -- per-trigger job images (issue #41): presence is the only thing this project can check ------------
+
+const imgEnv = (extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", ...extra });
+const imgDeps = (out, plan, calls) => ({ out, cwd: tmpdir(), spawn: fakeSpawn(plan, calls), probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0" });
+// The runner entrypoint probe reads --format={{json .Config.Entrypoint}}; this is a conformant answer.
+const RUNNER_ENTRYPOINT = { code: 0, output: '["/entrypoint.sh"]\n' };
+
+test("doctor: a deployment with no run.image anywhere prints no extra image line at all", async () => {
+	// The non-adopter byte-identity guard: one image, one line, exactly as before the feature existed.
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile() }), imgDeps(out, green));
+	assert.doesNotMatch(text(), /Trigger job image/);
+	assert.match(text(), /Job image present \(pi-job:latest\)/);
+});
+
+test("doctor: a trigger naming the deployment default adds no second line", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile(undefined, "pi-job:latest") }), imgDeps(out, green));
+	assert.doesNotMatch(text(), /Trigger job image/, "the default is already checked once; twice is noise");
+});
+
+test("doctor: a trigger image that is absent FAILS, and the fix says the worker never fetches it", async () => {
+	// With --pull=never nothing will pull it at job time, so this line is the only warning that arrives
+	// before the trigger fires.
+	const { out, text } = capture();
+	const plan = { "docker info": 0, "docker image inspect pi-job:latest": 0, "docker image inspect my-python:1.2.0": 1, "docker image": 0 };
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile(undefined, "my-python:1.2.0") }), imgDeps(out, plan));
+	assert.equal(code, 1, "a trigger that can never run is a hard failure, not a warning");
+	assert.match(text(), /✗ Trigger job image present \(my-python:1\.2\.0\)/);
+	assert.match(text(), /--pull=never/, "the fix names why waiting will not help");
+});
+
+test("doctor: a trigger image present but without the runner entrypoint WARNS, never fails", async () => {
+	// An image without the runner can exit 0 without ever starting the agent, and the queue records that as
+	// success. But an operator may legitimately wrap the entrypoint, so ✗ is not ours to claim.
+	const { out, text } = capture();
+	const plan = { "docker info": 0, "docker image inspect --format": { code: 0, output: '["/bin/sh"]\n' }, "docker image": 0 };
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile(undefined, "my-python:1.2.0") }), imgDeps(out, plan));
+	assert.equal(code, 0, "warn, never fail");
+	assert.match(text(), /⚠ my-python:1\.2\.0 does not appear to carry the pi-dispatch runner entrypoint/);
+	assert.match(text(), /docs\/job-image\.md/);
+});
+
+test("doctor: a conformant trigger image passes both checks silently", async () => {
+	const { out, text } = capture();
+	const plan = { "docker info": 0, "docker image inspect --format": RUNNER_ENTRYPOINT, "docker image": 0 };
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile(undefined, "my-python:1.2.0") }), imgDeps(out, plan));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ Trigger job image present \(my-python:1\.2\.0\)/);
+	assert.doesNotMatch(text(), /does not appear to carry/);
+});
+
+test("doctor: no per-trigger image probes on top of a down daemon", async () => {
+	const calls = [];
+	const { out } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile(undefined, "my-python:1.2.0") }), imgDeps(out, { "docker info": 1 }, calls));
+	assert.ok(!calls.some((c) => c.args.join(" ").includes("my-python:1.2.0")), "an image check is noise on top of a down daemon");
+});
 
 test("doctor: a set-but-missing overlay dir fails", async () => {
 	const { out, text } = capture();

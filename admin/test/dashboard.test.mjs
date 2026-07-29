@@ -310,10 +310,10 @@ test("the TRIGGERS section unifies the label allowlist with the schedulers block
   assert.match(out, /bug → github fix/, "the label trigger row: match → target flow");
 });
 
-// --- staged packages (REQ-GLOBAL-PI-OVERLAY): which triggers arm the operator's third-party code ---
+// --- staged packages (REQ-GLOBAL-PI-OVERLAY): which triggers load the operator's third-party code ---
 
-/** A one-trigger snapshot: `packages` is the trigger's arming, `staged` the overlay's manifest read. */
-const armedSnap = (packages, staged = { stagedAt: null, packages: [] }) => ({
+/** A one-trigger snapshot: `packages` is the trigger's normalized flag, `staged` the overlay's manifest read. */
+const pkgSnap = (packages, staged = { stagedAt: null, packages: [] }) => ({
   ...SNAPSHOT,
   runs: [],
   activeJobId: null,
@@ -332,17 +332,19 @@ const openTrigger = async (snap) => {
   return { list, detail };
 };
 
-test("the LIST badges an armed trigger, and leaves an unarmed one unmarked", async () => {
-  const armed = await openTrigger(armedSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2"] }));
-  assert.match(armed.list, /bug → github fix \[packages\]/, "an armed trigger row says it loads staged packages");
+test("the LIST badges a packages-loading trigger, and leaves a declining one unmarked", async () => {
+  // `true` is what a trigger that OMITS run.packages normalizes to -- the opt-out default, and the case that
+  // used to render bare.
+  const loading = await openTrigger(pkgSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2"] }));
+  assert.match(loading.list, /bug → github fix \[packages\]/, "a loading trigger row says it loads staged packages");
 
-  const plain = await openTrigger(armedSnap(false));
-  assert.doesNotMatch(plain.list, /\[packages\]/, "a trigger that loads no third-party code is unmarked");
+  const plain = await openTrigger(pkgSnap(false));
+  assert.doesNotMatch(plain.list, /\[packages\]/, "a trigger that declined third-party code is unmarked");
 });
 
-test("the armed badge is colored post-layout: the badged row still measures exactly `inner` cols", async () => {
+test("the packages badge is colored post-layout: the badged row still measures exactly `inner` cols", async () => {
   const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
-  const snap = armedSnap(true, { stagedAt: null, packages: ["pi-web-search@1.4.2"] });
+  const snap = pkgSnap(true, { stagedAt: null, packages: ["pi-web-search@1.4.2"] });
   const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, theme, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
   await flush();
   const lines = comp.render(80);
@@ -353,22 +355,51 @@ test("the armed badge is colored post-layout: the badged row still measures exac
   }
 });
 
-test("TRIGGER_DETAIL's trust model names the staged packages and warns, only for an armed trigger", async () => {
-  const armed = await openTrigger(armedSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2", "pi-jira@0.9.0"] }));
-  assert.match(armed.detail, /TRUST MODEL/, "the armed lines join the per-kind trust model");
-  assert.match(armed.detail, /collaborator's label/, "the static per-kind trust model still renders");
-  assert.match(armed.detail, /packages armed · pi-web-search@1\.4\.2 · pi-jira@0\.9\.0/, "the staged names+versions");
-  assert.match(armed.detail, /third-party code on adversarial input, open network egress/, "the one-line consequence");
+test("TRIGGER_DETAIL's trust model names the staged packages and warns, unless the trigger declined", async () => {
+  const loading = await openTrigger(pkgSnap(true, { stagedAt: "2026-07-27T10:00:00.000Z", packages: ["pi-web-search@1.4.2", "pi-jira@0.9.0"] }));
+  assert.match(loading.detail, /TRUST MODEL/, "the packages lines join the per-kind trust model");
+  assert.match(loading.detail, /collaborator's label/, "the static per-kind trust model still renders");
+  assert.match(loading.detail, /packages loaded · pi-web-search@1\.4\.2 · pi-jira@0\.9\.0/, "the staged names+versions");
+  assert.match(loading.detail, /third-party code on adversarial input, open network egress/, "the one-line consequence");
 
-  const plain = await openTrigger(armedSnap(false, { stagedAt: null, packages: ["pi-web-search@1.4.2"] }));
+  const plain = await openTrigger(pkgSnap(false, { stagedAt: null, packages: ["pi-web-search@1.4.2"] }));
   assert.match(plain.detail, /TRUST MODEL/);
-  assert.doesNotMatch(plain.detail, /packages armed/, "an unarmed trigger loads none of them, staged or not");
+  assert.doesNotMatch(plain.detail, /packages loaded/, "a declining trigger loads none of them, staged or not");
   assert.doesNotMatch(plain.detail, /open network egress/);
 });
 
-test("TRIGGER_DETAIL says so when a trigger is armed but the overlay stages nothing", async () => {
-  const { detail } = await openTrigger(armedSnap(true, { stagedAt: null, packages: [] }));
-  assert.match(detail, /packages armed · \(none staged in the overlay\)/, "armed with nothing staged is stated, not blank");
+test("TRIGGER_DETAIL says so when a trigger loads packages but the overlay stages nothing", async () => {
+  const { detail } = await openTrigger(pkgSnap(true, { stagedAt: null, packages: [] }));
+  assert.match(detail, /packages loaded · \(none staged in the overlay\)/, "loading with nothing staged is stated, not blank");
+});
+
+// --- the per-trigger job image (issue #41): which image a job runs is which code it runs ---
+
+const imgSnap = (image) => ({
+  ...SNAPSHOT,
+  runs: [],
+  activeJobId: null,
+  triggers: { triggers: [{ type: "label", any: ["bug"], all: [], none: [], flow: "fix", packages: false, image }] },
+  stagedPackages: { stagedAt: null, packages: [] },
+});
+
+test("the LIST badges a non-default image, and a default-image row is byte-identical", async () => {
+  const named = await openTrigger(imgSnap("my-python:1.2.0"));
+  assert.match(named.list, /bug → github fix \[my-python:1\.2\.0\]/, "the row names the image, not merely that there is one");
+
+  // Appended last with an empty suffix, so a deployment using no per-trigger images renders exactly as it
+  // did before the feature existed -- the whole framed panel, byte for byte.
+  const plain = await openTrigger(imgSnap(null));
+  assert.doesNotMatch(plain.list, /\[my-python/);
+  assert.equal(plain.list, await openTrigger(imgSnap(undefined)).then((r) => r.list), "no image and an absent image render identically");
+});
+
+test("TRIGGER_DETAIL states the image on BOTH branches -- a dim default means 'I checked', not 'I don't know'", async () => {
+  const named = await openTrigger(imgSnap("my-python:1.2.0"));
+  assert.match(named.detail, /image\s+my-python:1\.2\.0/);
+
+  const plain = await openTrigger(imgSnap(null));
+  assert.match(plain.detail, /image\s+deployment default/, "an omitted row would read as unknown; this reads as checked");
 });
 
 test("Enter on a run opens its detail dump, and Esc backs out to the list without quitting", async () => {

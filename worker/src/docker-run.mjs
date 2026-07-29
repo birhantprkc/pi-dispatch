@@ -19,6 +19,15 @@ export const CONTAINER_GLOBAL_PI_DIR = "/opt/pi-global";
 
 /** The fixed isolation flags. Not configurable -- these ARE the boundary. */
 export const ISOLATION_FLAGS = [
+	// The image must ALREADY be on this host. `docker run` defaults to --pull=missing, so an unknown name is
+	// a registry FETCH: a typo in the operator's image config would otherwise pull and execute a stranger's
+	// image under a name that looks like theirs. Every other flag here bounds what a chosen image may DO;
+	// this one bounds which image is chosen at all, which is why it leads. The same make-it-unreachable move
+	// PI_OFFLINE=1 makes one layer up, and it costs nothing the documented flow was using: the README's
+	// install step is an explicit `docker pull && docker tag`, and `pi-job:latest` is a local-only tag with
+	// no registry behind it. A readable diagnosis is the preflight's job (image-preflight.mjs); this is the
+	// part that cannot be raced.
+	"--pull=never",
 	"--rm", // ephemeral: gone after the run
 	"--init", // reap zombies (Chromium spawns many); node is PID 1 and does not reap
 	"--cap-drop=ALL", // pi would otherwise inherit the launching user's capabilities

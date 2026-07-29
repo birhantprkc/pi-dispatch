@@ -42,7 +42,7 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 
 	// the single comment trigger. `packages` is asserted present-and-undefined: the grouper builds the key
 	// by construction and this whole-object deepEqual (assert/strict) counts an own undefined-valued key.
-	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined });
+	assert.deepEqual(c.triggers.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined, image: undefined });
 
 	// pull_request rules: actions is a Set, predicate carries the label selectors.
 	assert.equal(c.triggers.pullRequest.length, 1);
@@ -109,6 +109,25 @@ test("each grouped webhook rule carries its own run.packages flag through to the
 	assert.equal(c.triggers.comment.packages, true);
 	assert.equal(c.triggers.pullRequest[0].packages, false, "an explicit opt-out is grouped as false, never dropped");
 	assert.equal(c.triggers.label[1].packages, undefined, "an unflagged rule in the same file stays unflagged");
+});
+
+test("each grouped webhook rule carries its own run.image through to the filter", () => {
+	// Deliberately MIXED. `image` rides on the RULE for a sharper reason than packages: two rules in one file
+	// may name DIFFERENT images, and grouping a file-wide value would run the wrong toolchain for whichever
+	// rule lost.
+	const json = JSON.stringify({
+		triggers: [
+			{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix", image: "node-playwright:1.4.0" } },
+			{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "triage", image: "my-python:1.2.0" } },
+			{ on: { type: "pull_request", action: ["labeled"], any: ["pi:review"] }, run: { kind: "github", flow: "review", image: "reviewer:2.0" } },
+			{ on: { type: "label", any: ["pi:docs"] }, run: { kind: "github", flow: "docs" } },
+		],
+	});
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
+	assert.equal(c.triggers.label[0].image, "node-playwright:1.4.0");
+	assert.equal(c.triggers.comment.image, "my-python:1.2.0");
+	assert.equal(c.triggers.pullRequest[0].image, "reviewer:2.0");
+	assert.equal(c.triggers.label[1].image, undefined, "an unflagged rule in the same file runs the deployment default");
 });
 
 test("an unflagged triggers file groups packages as undefined on every rule -- the no-third-party-code default", () => {

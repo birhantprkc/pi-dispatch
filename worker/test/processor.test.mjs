@@ -428,3 +428,72 @@ test("a Redis failure while recording token spend never fails a completed, paid 
 	const r = await runJob(ghJob, d);
 	assert.equal(r.outcome, "completed", "money is already spent -- a counter blip must not turn success into failure");
 });
+
+// --- the job image (issue #41): a host that cannot run the image must not pay to find out ---
+
+test("a missing job image refuses BEFORE mint, prepare and reserveBudget -- nothing spent, no slot burned", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({ redis, imagePreflight: async () => ({ missing: "my-python:1.2.0" }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "job-image-missing");
+	assert.equal(r.budgetReserved, false);
+	assert.deepEqual([r.exitCode, r.turns, r.tokens], [null, null, null], "refused pre-container: no exit, turn or token count exists");
+	// This gate outranks every other because it needs no credential, no network and no repo -- so a host
+	// missing its image never mints a token it will not use or clones a repo it will not read.
+	assert.ok(!calls.some((c) => c.startsWith("mint:")), "no credential is minted for a job that cannot run");
+	assert.ok(!calls.includes("prepare"), "no clone");
+	assert.ok(!calls.includes("run-container"), "no container");
+	assert.equal(redis.incrCalls, 0, "reserveBudget never reached -- a misspelled tag must not burn a cap slot");
+	assert.ok(
+		calls.some((c) => c.startsWith("comment:")),
+		"the operator is told, by name, which image is missing",
+	);
+});
+
+test("a missing job image is RETURNED, never thrown -- retrying cannot make a misspelled tag appear", async () => {
+	// Throwing would make BullMQ retry and burn a SECOND slot on a determinate config fault. This is the
+	// same policy-not-infra call CONST-RETRY-INFRA-ONLY makes for settings-overlay-invalid.
+	const { deps: d } = deps({ imagePreflight: async () => ({ missing: "nope:1" }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy", "a determinate refusal returns");
+});
+
+test("an unreachable docker daemon at preflight THROWS InfraRetry (transient), not a policy refusal", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({ redis, imagePreflight: async () => ({ unavailable: "pi-job:latest" }) });
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) => e instanceof InfraRetry && e.reason === "container-never-started",
+		"a daemon blip must be retried, not turned into a permanent refusal of a job whose image is fine",
+	);
+	assert.equal(redis.incrCalls, 0, "and it still burns no slot");
+	assert.ok(!calls.includes("run-container"));
+});
+
+test("docker exits 125/126/127 throw container-never-started and RELEASE the slot", async () => {
+	// docker never handed control to the runner in any of the three, so nothing was spent. These used to
+	// fall to the unknown-exit branch, which KEPT the slot and retried -- burning a second one.
+	for (const code of [125, 126, 127]) {
+		const redis = fakeRedis();
+		const { deps: d } = deps({ redis, runContainer: async () => ({ code, aborted: false }) });
+		await assert.rejects(
+			() => runJob(ghJob, d),
+			(e) => e instanceof InfraRetry && e.reason === "container-never-started" && e.budgetReserved === false,
+			`exit ${code} means the container never ran`,
+		);
+		assert.equal(redis.decrCalls, 1, `exit ${code} gives the slot back exactly once`);
+	}
+});
+
+test("an unrecognised container exit still falls to the unknown-exit InfraRetry and KEEPS its slot", async () => {
+	// Pins that the 125/126/127 case NARROWED `default:` rather than replacing it: a code we did not foresee
+	// means the container may well have run and spent, so its slot stays reserved.
+	const redis = fakeRedis();
+	const { deps: d } = deps({ redis, runContainer: async () => ({ code: 42, aborted: false }) });
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) => e instanceof InfraRetry && /unknown container exit 42/.test(e.message) && e.budgetReserved === true,
+	);
+	assert.equal(redis.decrCalls, 0, "an unknown exit is not assumed to have spent nothing");
+});

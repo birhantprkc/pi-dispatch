@@ -148,8 +148,21 @@ export function makeCollectChain({ queue, enqueue = enqueueLocalJob, readFlowGat
 					folder: prepared.workspace,
 					flow,
 					task,
+					// The child runs the parent's OWN folder, so it needs the parent's toolchain by definition -- and
+					// this is where `image` differs from provider/model, which are deliberately NOT inherited. A
+					// fallback provider still runs the flow; a fallback IMAGE gives a child that cannot find its tools,
+					// writes a plausible report and exits 0, which is the queue-reports-success failure class arriving
+					// by the back door. Read off `job.data` -- the parent's own validated job data -- and NEVER off
+					// `req`: the agent cannot choose its child's image any more than it can choose its folder or depth
+					// (INT-OUTBOX-CONTRACT's explicit-property-reads rule). Undefined stays undefined, so a parent with
+					// no image chains a child whose data is byte-identical to today's.
+					image: job.data?.image,
 					chainDepth: childDepth,
 					parentJobId: job.id,
+					// chainedJobId deliberately does NOT take the image: the child's identity is (parent, flow, task).
+					// Folding the image in would let an operator's triggers.json edit fan out a duplicate paid child
+					// from a retried parent. The image is derived from the parent's own data, so it is already stable
+					// across that parent's retries.
 					jobId: chainedJobId({ parentJobId: job.id, flow, task }),
 				});
 				enqueued++;

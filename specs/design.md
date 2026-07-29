@@ -306,6 +306,82 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   (unnecessary — the one-way worker dependency already exists).
 - **Traces to**: `INT-TRIGGERS-FILE-CONTRACT`, `REQ-CRON-SCHEDULED-JOBS`, `REQ-TRIGGER-AUTHOR-GATE`
 
+## DES-PER-TRIGGER-JOB-IMAGE
+
+- **Decision**: The job image is resolved **per job** — `job.image ?? PI_JOB_IMAGE` — from an optional
+  `run.image` on all four trigger kinds. `PI_JOB_IMAGE` remains the deployment default and the only value a
+  deployment needs. The field is operator-authored in the reviewed `triggers.json` and is reachable from
+  **no** model-callable tool, **no** panel key, and **not** the settings overlay. A named image must be
+  present on the host: a pre-spend `docker image inspect` refuses the job before `reserveBudget` with a
+  policy reason, and `--pull=never` joins `ISOLATION_FLAGS`.
+- **Why**:
+  - *The toolchain is a property of the flow, not of the deployment.* Verbatim the `run.packages` argument:
+    a flow needing a Python toolchain and one needing Node + Playwright belong to the same deployment, and
+    one image means the **union** of every toolchain in one tag, growing monotonically, with nothing ever
+    removable because some other flow might need it. And a label/comment/PR trigger runs the same flows a
+    cron trigger does — hence all four kinds, not cron only.
+  - *It changes what is in the box, never what the box can do.* The argv is built by the worker:
+    `ISOLATION_FLAGS` + the closed env map + the four mounts, none of them influenced by the image.
+    `--cap-drop=ALL` bounds *what runs*; the image decides *which code runs*.
+    `CONST-ISOLATION-CONTAINER-PER-JOB`'s enumerated acceptance is untouched, and was checked rather than
+    assumed.
+  - *The trust class is the file, not the field.* An operator who can edit `triggers.json` can already point
+    a cron trigger at any folder on the host and run any flow in it. "…and in this image" does not cross a
+    boundary they were on the far side of. `REQ-GLOBAL-PI-OVERLAY` already names this class: *"operator
+    deploy-time config — the same trust class as baking the image"*.
+  - *Two mechanisms for a missing image, doing different jobs.* The preflight is readable, pre-spend and
+    non-retryable — a bare docker failure would read as infra and `CONST-RETRY-INFRA-ONLY` would have the
+    queue pay for the retry (it did: exit 125 fell through as "unknown container exit", kept the slot, and
+    burned a second one on the retry). `--pull=never` takes the registry out of the picture entirely.
+    Neither is sufficient alone: the check is raceable, the flag is silent.
+  - *What this deliberately does not do: verify the image.* `INT-CONTAINER-RUNTIME-CONTRACT` states the
+    checklist, `docs/job-image.md` is its operator form, the check is the operator's, and the residual is
+    `OQ-012` rather than a claim.
+- **Rejected**:
+  - ***`PI_JOB_IMAGE_ALLOWLIST`, mirroring `PI_DISPATCH_RUN_ROOTS`*** — **there is nothing model-callable to
+    bound.** `PI_DISPATCH_RUN_ROOTS` exists because `dispatch_run` takes a folder *from the model*; an
+    allowlist is what converts a model-supplied path into a bounded one. `run.image` is never model-supplied:
+    no tool parameter, no panel key, one writer — an operator editing a reviewed file. An allowlist over a
+    field only an operator can write is a second operator-authored file constraining the first: its only
+    failure mode is refusing the operator's own edit, its only success mode is redundancy, and its *presence*
+    would advertise a threat model this design forecloses. **If a future tool ever takes an image parameter,
+    the allowlist arrives with that tool, and this row is the reason it must.**
+  - *`image` as a runtime settings overlay key (`dispatch_set`)* — that is the admin-editable runtime channel,
+    bendable by a prompt injection in the operator's session behind a confirm. Changing *which code every
+    subsequent job executes* from that channel is strictly worse than changing the daily cap, which
+    `DES-RUNTIME-SETTINGS-FILE-OVERLAY` already treats as needing an operator confirm.
+  - *An `image` parameter on `dispatch_trigger_add`/`_edit`* — same channel, one level down. A confirm reading
+    "add trigger with image `my-python:latest`" gives the operator no way to distinguish a benign tag from a
+    hostile lookalike; the property that makes `folder` confirmable (it names a path the operator recognises)
+    does not transfer to a ref that may be a registry, tag, digest, or typosquat. `run.packages` set the
+    precedent and it is followed exactly.
+  - ***A flow-declared image, read from the serviced repo*** — the sharpest rejection here.
+    `.pi/skills/<flow>/SKILL.md` is **merge-gated, not operator-authored**, so this would hand anyone who can
+    land a commit on a serviced repo's default branch the choice of container. That population can already
+    execute code **inside** a job container (`CONST-NO-CONTEXT-FILES-MANDATORY`, as amended) — but choosing
+    the container is different in kind: it hands them the loader flags, the guardrail floor, the pinned pi
+    version and the non-root user, i.e. **every property `SECURITY.md` names as what bounds them**.
+    `DES-AI-TRIGGER-FLOW-GATE` reads a **boolean** from that file, at a pinned SHA, precisely because a
+    boolean is all it is willing to take from there. An image reference is not a boolean.
+  - *A second mount, or pulling the image at job time* — the mount list is a constitutional enumeration and
+    widening it for zero new capability is the trade `DES-OPERATOR-GLOBAL-OVERLAY` already refused for staged
+    packages. A job-time pull is worse: a network fetch of executable code, at job time, keyed on a name that
+    just became per-trigger data — the shape `PI_OFFLINE=1` exists to make unreachable one layer up. Hence
+    `--pull=never`.
+  - *Keep baking every flow's toolchain into the one image* — the status quo and the fat-image trap.
+    **`DES-OPERATOR-GLOBAL-OVERLAY`'s "Bake the overlay into the image" rejection still stands and is not
+    re-opened**: models, skills, persona and staged packages ride a `:ro` mount and need no rebuild, and
+    nothing that was a mount becomes a bake here. What `run.image` admits is the case that rejection never
+    covered — a **toolchain** (apt packages, language runtimes, system libraries), which a read-only mount
+    cannot deliver at all, and for which "build your own" was always the answer the README gave. **The
+    boundary: overlay = pi *configuration*, one copy per deployment, mounted; image = the *operating system*
+    the flow needs, per flow, built.** The pulled prebuilt image stays the default and the only thing a
+    deployment needs.
+- **Traces to**: `INT-TRIGGERS-FILE-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`,
+  `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-PI-VERSION-PINNED`, `CONST-RETRY-INFRA-ONLY`,
+  `REQ-UPSTREAM-CONTRACT-TESTS`, `DES-RUNTIME-SETTINGS-FILE-OVERLAY`, `DES-OPERATOR-GLOBAL-OVERLAY`,
+  `OQ-012`
+
 ## DES-PR-TRIGGER-ROUTES-TO-FLOW
 
 - **Decision**: A `pull_request` trigger **routes the event to the configured flow**; the harness does not
@@ -637,6 +713,17 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     a named limitation, not a defect.
   - *Per-message env mutation* — configuration is boot-only by design for identity keys (`valkeyUrl`,
     `jobImage`, auth); those stay env-only and out of the overlay.
+    **Still rejected, and `run.image` is not an exception to it** (`DES-PER-TRIGGER-JOB-IMAGE`). A trigger
+    may name its own job image, but `image` is **not** an overlay key, `dispatch_set` cannot set one, and the
+    key list is **unchanged**. The two are different trust classes, and this entry already says which one it
+    bounds: this overlay is the **admin-editable runtime** channel — the one an admin-surface compromise or a
+    prompt injection in the operator's session can bend, which is exactly why the *"may never carry persona
+    or hard rules"* bar above is scoped to it and explicitly not to deploy-time operator config.
+    `triggers.json` is the other kind: operator-authored, reviewed, diffable, git-trackable, in the trust
+    class `REQ-GLOBAL-PI-OVERLAY` names as *"operator deploy-time config — the same trust class as baking the
+    image"*. Naming an image there **is literally that act**, per flow instead of per deployment.
+    `PI_JOB_IMAGE` survives unchanged as the deployment default and stays env-only. What moved is that a
+    **reviewed file** may override it per trigger; not that a **runtime knob** may.
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`,
   `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`, `DES-WORKER-ON-HOST`
 
@@ -1100,3 +1187,4 @@ a tunnel.
 | 2026-07-22 | `DES-ADMIN-VIA-PI-EXTENSION` dashboard amended to three in-component views — LIST (framed monochrome panel with unified TRIGGERS pane + `↑↓` runs selection), RUN_DETAIL (PII-free `.json` fields), and LIVE_TAIL — in one self-refreshing overlay. LIVE_TAIL renders raw `.log` bytes through an injected `deps.tailLog` seam whose `fs` read lives in `index.ts`, preserving the overlay-only `.log` boundary (never a tool result, never model context); USED_API stays the three pi members, `tailLog` being an internal `custom`-seam dependency, not a pi member. |
 | 2026-07-28 | Issue #58. Added **`DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY`**: token usage is metered at pi-ai's module-level api-provider registry — the one choke point every in-process session shares — instead of on a per-instance `AgentSession` bus that cannot see a subagent fanout, with the `subscribe()` accumulator kept as the fallback. Records the rejected alternatives (the subscribe-only meter, `getSessionStats`, undici/SSE parsing, an `after_provider_response` extension hook, patching pi) and the four things any implementation must handle, all found by runtime probe rather than by reading source: the dual pi-ai module instance, `resetApiProviders()` wiping raw registrations, wrapper displacement in both directions (identity tracking + a `WeakSet` of observed streams), and builtin-auth fidelity through the sibling-loaded fallback catalog. `DES-OPERATOR-GLOBAL-OVERLAY` amended: the overlay gains a **packages tier** (host-staged, exact-pinned, per-trigger armed, appended last to `additionalExtensionPaths`) and records the skill-ordering finding — pi puts package skill paths FIRST and `loadSkills` is first-path-wins, so on the raw load a staged skill beats the repo's, which would invert this entry's own "repo wins on conflict". Path order cannot fix it, but `DefaultResourceLoaderOptions.skillsOverride` (a declared option on the pinned loader, plus the public `loadSkillsFromDir`) can and does: precedence is re-imposed on the loaded result, repo before overlay before package, so the requirement holds by enforcement. **Correction on the way in**: an earlier draft of this row and entry said there was "no reordering lever" and resolved the finding by refusing the job — the premise was false and the refusal is gone; what remains is the collision *report* (visibility, and the tripwire that goes quiet if a future pi reorders `skillPaths`). Four new Rejected entries: a separate `/opt/pi-packages:ro` mount (would amend `CONST-ISOLATION-CONTAINER-PER-JOB`'s enumerated acceptance for no capability the overlay lacks), a third env arming flag (redundant, and coarser than the per-trigger gate), routing packages through pi's `settings.packages` (would re-open the `SettingsManager.inMemory` protection), and `npm:` sources resolved in-container (a live network install of third-party code in an adversarial-input container, every run). |
 | 2026-07-23 | `DES-ADMIN-VIA-PI-EXTENSION` amended for **AI-operable, confirm-gated writes**: the model-callable surface gains `dispatch_triggers` (read) and the write tools `dispatch_set` + `dispatch_trigger_add`/`_edit`/`_delete`, each routed through `confirmedWrite` — applied only after an operator approves a `ctx.ui.confirm` showing the concrete before/after, refused (writing nothing) when `ctx.hasUI` is false. Adds a **third named injection residual** bounded by that human confirm rather than by structure; supersedes the "every settings write is operator-typed, never a model tool" clause. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged — the confirm is the human approval, and both write paths reach the same validated/atomic `writeTriggers`/`writeSettings`. Extension also ships an `operate-pi-dispatch` skill (advertised via `resources_discover`) recommending how to use the gates. `USED_API` gains `on`. Companion `requirements.md`/`constitution.md` amendments land with it. |
+| 2026-07-29 | Issue #41. Added **`DES-PER-TRIGGER-JOB-IMAGE`**: the job image resolves per job (`job.image ?? PI_JOB_IMAGE`) from an optional operator-authored `run.image`, present on no model-callable tool, no panel key and not the settings overlay; a missing tag is refused pre-spend by `docker image inspect` and `--pull=never` joins `ISOLATION_FLAGS`. Rejected, with reasons on the record: **`PI_JOB_IMAGE_ALLOWLIST`** (the issue floats it — rejected because there is **nothing model-callable to bound**; `PI_DISPATCH_RUN_ROOTS` exists to bound a **model-supplied** folder, and an allowlist over a field only an operator can write can only refuse the operator's own edit while advertising a threat model this design forecloses — it arrives **with** the first tool that ever takes an image parameter, and that row is why it must); `image` in the runtime settings overlay; an `image` parameter on `dispatch_trigger_add`/`_edit`; **a flow-declared image read from the serviced repo** (the issue's second option — rejected hardest: that file is merge-gated, not operator-authored, and `DES-AI-TRIGGER-FLOW-GATE` takes only a **boolean** from it precisely because an image ref would hand that population the loader flags, the guardrail floor, the pinned pi version and the non-root user); a second mount or a job-time pull; and keeping every toolchain baked into one image. **`DES-RUNTIME-SETTINGS-FILE-OVERLAY` is amended, not reversed**: its *Per-message env mutation* rejection stands verbatim and `image` is **not** an exception to it — the overlay key list is unchanged and `dispatch_set` cannot set an image. The distinction is stated where it was previously only implied: that overlay is the **admin-editable runtime** channel (which is why its "never persona or hard rules" bar is scoped to it), while `triggers.json` is reviewed deploy-time operator config in the trust class `REQ-GLOBAL-PI-OVERLAY` calls *"the same trust class as baking the image"*. **`DES-OPERATOR-GLOBAL-OVERLAY`'s "Bake the overlay into the image" rejection is UNCHANGED and was checked**: nothing that was a mount becomes a bake, the overlay still rides `:ro` into whichever image runs, and the boundary is now written down — overlay = pi *configuration*, mounted, one per deployment; image = the *operating system* a flow needs, built, per flow. |

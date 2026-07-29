@@ -79,6 +79,12 @@ export async function runDoctor(env = process.env, deps = {}) {
 		fix: dockerCode === null ? "install Docker — `docker` was not found on PATH" : "start Docker (the daemon is not responding)",
 	});
 
+	// Read once, used twice, so the triggers file is parsed a single time: `images` drives the per-trigger
+	// image checks just below, and `optingOut`/`requiring` colour the staged-packages lines further down.
+	// `optingOut` counts the only value that withholds the staged set; `requiring` counts an explicit
+	// run.packages: true, which arms nothing any more but is still an operator statement of intent.
+	const { requiring, optingOut, images } = readTriggerFacts(env, fileExists);
+
 	// Only meaningful if docker itself responds; otherwise the image check is noise on top of a down daemon.
 	const imageCode = dockerCode === 0 ? await runCmd(spawn, "docker", ["image", "inspect", jobImage]) : null;
 	checks.push({
@@ -86,6 +92,34 @@ export async function runDoctor(env = process.env, deps = {}) {
 		label: `Job image present (${jobImage})`,
 		fix: "docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest  (or build image/Dockerfile)",
 	});
+
+	// Issue #41: every DISTINCT image a trigger names in run.image, minus the deployment default already
+	// checked above. Two silent-failure modes, and both used to be impossible because there was one image.
+	//   1. the image was never built -- a job that refuses pre-spend at 03:00 in a log nobody is reading, and
+	//      with --pull=never nothing will fetch it either, so this line is the only warning that arrives first.
+	//   2. the image is present but is not a pi-job image. An entrypoint that is not the runner either exits
+	//      126/127 or, worse, runs whatever it does have and exits 0 -- a job the queue records as COMPLETED
+	//      that never started the agent. Warn, never fail: an operator MAY legitimately ship a wrapper
+	//      entrypoint that execs the runner, and a ✗ here is reserved for certainties.
+	// A deployment with no run.image anywhere adds no lines at all, so its output is byte-identical.
+	for (const img of dockerCode === 0 ? images.filter((i) => i !== jobImage) : []) {
+		const code = await runCmd(spawn, "docker", ["image", "inspect", img]);
+		checks.push({
+			ok: code === 0,
+			label: `Trigger job image present (${img})`,
+			fix: `docker pull ${img} (or build it) -- a trigger names it in run.image, and jobs run with --pull=never, so the worker never fetches it at job time`,
+		});
+		if (code !== 0) continue;
+		const entry = await runCmdCapture(spawn, "docker", ["image", "inspect", "--format={{json .Config.Entrypoint}}", img]);
+		if (entry.code === 0 && !entry.output.includes("entrypoint.sh")) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `${img} does not appear to carry the pi-dispatch runner entrypoint`,
+				fix: "build your job image FROM this repo's image/Dockerfile so it keeps /entrypoint.sh -- an image without the runner can exit 0 without ever starting the agent, and the queue records that as success (docs/job-image.md)",
+			});
+		}
+	}
 
 	// The default source `gh` mints job tokens from the operator's gh login, so the FULL-scope login token
 	// reaches every token-carrying job container — the opposite of the App path's per-repo short-lived
@@ -140,7 +174,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 				const probe = await runCmdCapture(
 					spawn,
 					"docker",
-					["run", "--rm", "-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "--entrypoint", "gh", jobImage, "auth", "status"],
+					["run", "--rm", "--pull=never", "-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "--entrypoint", "gh", jobImage, "auth", "status"],
 					{ env: { ...env, GH_TOKEN: token, GITHUB_TOKEN: token } },
 				);
 				checks.push({
@@ -186,10 +220,6 @@ export async function runDoctor(env = process.env, deps = {}) {
 		fix: authFromPi ? `run \`pi login\` with an API key for ${provider}, or set ${keys[0]} in .env` : `set ${keys[0]} in .env`,
 	});
 
-	// Counted once: `optingOut` colours the "what will load" line inside the overlay block, `requiring` drives
-	// the two "required but nothing to load" failures -- one for a staged-package-less overlay, one for no
-	// overlay at all.
-	const { requiring, optingOut } = countPackageTriggers(env, fileExists);
 
 	// REQ-GLOBAL-PI-OVERLAY: read the extensions opt-out through the WORKER's own parser, so doctor reports
 	// the exact posture the worker will boot with and refuses the exact values it refuses. Checked with or
@@ -347,6 +377,10 @@ function nodeCheck(version) {
 /**
  * What does the trigger file say about the staged packages (INT-TRIGGERS-FILE-CONTRACT)?
  *
+ * `images` is the sorted set of distinct `run.image` values across the file (issue #41), so doctor can check
+ * that every image a trigger names is actually on this host -- with `--pull=never` nothing will fetch one at
+ * job time, so this is the only warning that arrives BEFORE the trigger fires at 03:00.
+ *
  * `optingOut` counts `run.packages: false` -- the only thing that now withholds the staged set from a job.
  * `requiring` counts explicit `run.packages: true`, which arms nothing any more but is still an operator
  * asserting "this flow needs those packages"; that assertion is what makes an empty stage a hard failure.
@@ -358,8 +392,8 @@ function nodeCheck(version) {
  * worker boot (config.mjs, schedules.mjs), so re-reporting the parse failure here would only bury doctor's
  * own findings under a second copy of a diagnosis the operator already gets.
  */
-function countPackageTriggers(env, fileExists) {
-	const none = { requiring: 0, optingOut: 0 };
+function readTriggerFacts(env, fileExists) {
+	const none = { requiring: 0, optingOut: 0, images: [] };
 	try {
 		const path = env.PI_TRIGGERS_FILE; // config.mjs's own default is null -- unset means no triggers at all
 		if (!path || !fileExists(path)) return none;
@@ -367,6 +401,7 @@ function countPackageTriggers(env, fileExists) {
 		return {
 			requiring: triggers.filter((t) => t.run.packages === true).length,
 			optingOut: triggers.filter((t) => t.run.packages === false).length,
+			images: [...new Set(triggers.map((t) => t.run.image).filter((i) => typeof i === "string"))].sort(),
 		};
 	} catch {
 		return none;

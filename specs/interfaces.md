@@ -227,6 +227,15 @@ Evidence convention as in `constitution.md`.
   checkout. The dual layout is pinned where it is true — `image/runner/test/pinned-api.test.mjs`, in the
   contract-tests job's full workspace install — and the image job asserts the invariant instead, by calling
   `resolvePiAiCompat` inside the built container.
+  **Which job image, now that there can be more than one.** The two-environment framing above is *dev
+  checkout* vs *the job image*, and the second is now a **class**: a trigger may name an operator-built
+  image (`INT-TRIGGERS-FILE-CONTRACT`). Everything asserted here about `image/runner/package.json` — pi-ai
+  nested, never declared, therefore the only copy — holds for **an image built from this repo's
+  `image/Dockerfile`**. An image assembled another way could have pi-ai hoisted, deduped, or present twice,
+  and these layout claims would simply not describe it. **That costs nothing, and it is the point of the
+  invariant**: the runner never reads the layout, it registers through `modelRegistry.registerProvider` and
+  lets the runtime probe decide. What does **not** survive is the *assertion*: the `image` CI job proves the
+  property for the tag it builds; for a foreign image nothing in this repo proves anything (`OQ-012`).
 
   **(h) `resetApiProviders()` WIPES the registry, so a raw registration cannot be install-once.** It is
   what `AgentSession.reload()` calls. Registering through `modelRegistry.registerProvider` is what makes
@@ -617,9 +626,47 @@ Evidence convention as in `constitution.md`.
 **worker → docker daemon.**
 
 - **Contract**:
-  - Flags: `--rm --init --cap-drop=ALL --security-opt no-new-privileges --memory=4g --cpus=2
+  - **Which image — and why this contract is now a checklist rather than a description.** This contract is
+    written against *an* image, never against `pi-job:latest`, and until now that was true by accident:
+    there was exactly one image and this repo built it. The worker resolves the tag **per job**
+    (`job.image ?? PI_JOB_IMAGE`; `INT-TRIGGERS-FILE-CONTRACT`, `DES-PER-TRIGGER-JOB-IMAGE`), so everything
+    below is **the conformance checklist any image must satisfy to be nameable in `run.image`**. Each item
+    is something the worker *assumes and does not verify at run time*, and — the reason this list exists at
+    all — **every one of them fails silently or late**: a non-root runtime user with a **writable
+    `~/.pi/agent`** (else EACCES on pi's first credential write, inside the container, at run time, on a
+    path no Dockerfile hints at); an `ENTRYPOINT` that is the runner and honours
+    `INT-RUNNER-EXIT-CODE-PROTOCOL` (an entrypoint that exits Node's default `1` on a policy failure makes
+    the queue pay to retry a job that can never succeed); the **pinned pi version**
+    (`CONST-PI-VERSION-PINNED` — a stale pi is the silent-no-op-that-reports-success failure class); the
+    baked env facts (`PLAYWRIGHT_BROWSERS_PATH`, `PLAYWRIGHT_MCP_BROWSER`, `PLAYWRIGHT_MCP_SANDBOX`) for any
+    flow doing frontend work; **root-owned, agent-unwritable guardrails** at
+    `/opt/pi-dispatch/HARD_RULES.md` (an agent that can rewrite its own safety floor has none); fonts
+    (absent is silent — plausible screenshots containing no legible text); and the **loader posture** in
+    `image/runner/src/loader.mjs`, which `CONST-NO-CONTEXT-FILES-MANDATORY` records is switchable only by a
+    two-line source edit plus an image rebuild — i.e. **the security posture is per-image**, so a
+    deployment that turned discovery off for multi-tenancy in one image **has not turned it off in
+    another**, and that carve-out must be re-made in every image it names. `docs/job-image.md` is the
+    operator-facing form of this list; the `image` CI job is its executable form; `OQ-012` is the honest
+    statement that nothing in this repo enforces it.
+  - Flags: `--pull=never --rm --init --cap-drop=ALL --security-opt no-new-privileges --memory=4g --cpus=2
     --pids-limit=512 --shm-size=1g`
   - User: non-root
+  - **`--pull=never`.** `docker run` defaults to `--pull=missing`, which makes an unrecognised image name a
+    **registry fetch**: a typo in the operator's image config would pull and execute a stranger's image under
+    a name that looks like theirs. `never` makes that branch **unreachable rather than merely unlikely** --
+    the same move `PI_OFFLINE=1` makes one layer up (pi's job-time `npm install`), for the same reason and
+    with the same shape: a narrowing the whole fleet gets, not a per-job capability. Every other flag in this
+    list bounds what a chosen image may **do**; this one bounds **which image is chosen at all**, which is
+    why it leads. It costs nothing the documented flow was using: the install step in `README.md` is an
+    explicit `docker pull && docker tag`, `pi-job:latest` is a local-only tag with no registry behind it, and
+    `pi-dispatch doctor` already checks presence. The affected case is an operator who set `PI_JOB_IMAGE` to
+    a registry ref and relied on the first job pulling it; they now get a **pre-spend refusal naming the
+    image** instead of a multi-minute pull inside a container whose 30-minute kill timer is already running,
+    charged to a budget slot. That readable refusal is the **preflight's** job -- a `docker image inspect`
+    before `reserveBudget` (`worker/src/image-preflight.mjs`), returning `policy` with reason
+    `job-image-missing` rather than throwing, because retrying never makes a misspelled tag appear
+    (`CONST-RETRY-INFRA-ONLY`). The two are not redundant: the check is readable but raceable, the flag is
+    unraceable but silent.
   - **`--shm-size=1g`, and explicitly NOT `--ipc=host`.** Playwright's docs say verbatim: *"Using
     `--ipc=host` is recommended when using Chromium. Without it, Chromium can run out of memory and
     crash."* **We deliberately diverge.** `--ipc=host` shares the **host's IPC namespace** with a
@@ -778,7 +825,11 @@ Evidence convention as in `constitution.md`.
 - **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`,
   `DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS`
 - **Acceptance**: Chromium launches as the non-root user; `capsh --print` inside the container shows no
-  capabilities.
+  capabilities. **Both hold for every image nameable in `run.image`, not only the one this repo builds** —
+  for this repo's image the assertion is the `image` CI job; for an operator-built image it is the
+  operator's to run against their own tag (`docs/job-image.md`), and the residual is `OQ-012`. Given a
+  `run.image` naming an image absent from the host, `docker run` is never reached: the pre-spend inspect
+  refuses first and `--pull=never` forecloses the fetch.
 
 ## INT-WEBHOOK-PAYLOAD-SUBSET
 
@@ -833,14 +884,18 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
       "run": { "kind": "local", "folder": "<absolute HOST path, must exist>", "flow": "<flow name>",
                "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
                "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional>,
-               "github": <optional boolean>, "packages": <optional boolean> } },
+               "github": <optional boolean>, "packages": <optional boolean>,
+               "image": "<optional: docker image ref; absent = PI_JOB_IMAGE>" } },
     { "on": { "type": "label", "any": [...], "all": [...], "none": [...] },
-      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean> } },
+      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean>,
+               "image": "<optional>" } },
     { "on": { "type": "comment", "phrase": "<trigger phrase>" },       // at most one
-      "run": { "kind": "github", "flow": "<default flow>", "packages": <optional boolean> } },
+      "run": { "kind": "github", "flow": "<default flow>", "packages": <optional boolean>,
+               "image": "<optional>" } },
     { "on": { "type": "pull_request", "action": ["labeled"|"opened"|"synchronize"|"reopened", ...],
               "any": [...], "all": [...], "none": [...] },
-      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean> } } ] }
+      "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean>,
+               "image": "<optional>" } } ] }
   ```
 - **The on × run diagonal is the trust boundary, enforced fail-loud at load**: `cron ⟹ run.kind:"local"`;
   every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind:"github"`. Off-diagonal throws a
@@ -867,6 +922,43 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   because a staged package is a **capability of the flow**, and a label/comment/PR trigger runs the same
   flows a cron trigger does. With nothing staged the flag emits nothing at all, which is a silent no-op by
   construction — `doctor` is where that becomes visible.
+- **`run.image` (ALL FOUR trigger kinds, optional non-empty string) — a selector, not an arming**: absent
+  = the deployment default `PI_JOB_IMAGE`; present = the Docker image this trigger's job containers run in.
+  It is **pure passthrough** in exactly the sense `provider`/`model`/`maxTurns` are (**Why**, below):
+  omitted → absent from the emitted job data → resolved at job start as `job.image ?? PI_JOB_IMAGE`. Absent
+  therefore never means "off"; it means "the deployment's". It is carried on all four kinds for
+  `run.packages`' reason and not `run.github`'s: **a toolchain is a capability of the flow**, and a
+  label/comment/PR trigger runs the same flows a cron trigger does. A value that is not a non-empty string
+  is **refused at load** in both services, as are a value with surrounding whitespace (the file is the
+  reviewed artifact and must not disagree with what runs) and one beginning with `-` (it is the final
+  positional in the docker argv, where a leading dash parses as a flag). The reference **grammar is
+  deliberately not validated** — that is docker's, and a regex over the OCI grammar would refuse the rarer
+  half of the problem (a malformed name) while missing the common half (a well-formed name for an image
+  nobody built), with an over-strict one refusing a legitimate
+  `registry.internal:5000/team/img:1.2@sha256:...` and taking the worker down at boot for a valid
+  deployment. A floating tag is accepted for the same reason `CONST-PI-VERSION-PINNED` tolerates it here:
+  with `--pull=never` a local tag can only move when a human runs `docker pull` or `docker build` on that
+  host, which is the explicit act that constraint asks for.
+  **The image decides what is in the box; it never decides what the box can do.** Whatever tag is named
+  runs under the whole of `INT-CONTAINER-RUNTIME-CONTRACT` unchanged — the same `ISOLATION_FLAGS`, the same
+  closed env allowlist, the same four mounts, all built by the worker's argv and none of them influenced by
+  anything an image contains. That contract, which previously never named an image at all, is now the
+  **conformance checklist** a nameable image must satisfy, and it says so.
+  **A named image must already be present on the host, and two mechanisms enforce that because they do
+  different jobs.** A pre-spend `docker image inspect` refuses the job **before `reserveBudget`**, as a
+  **policy** outcome and not an infra one (`CONST-RETRY-INFRA-ONLY`: retrying never makes a misspelled tag
+  appear; the precedent is `settings-overlay-invalid`) — that is what produces a readable refusal naming
+  the tag. `--pull=never` is what makes the registry unreachable from the run itself, so an unknown name
+  can never become a silent fetch-and-execute of a stranger's image under a name that looks like the
+  operator's. The check is readable but raceable; the flag is unraceable but silent. Neither is sufficient
+  alone. `pi-dispatch doctor` reports every distinct image the file names, which is the only warning that
+  arrives *before* a 03:00 trigger fires.
+  **There is deliberately no model-callable path to this field, and therefore no allowlist.**
+  `dispatch_trigger_add`/`_edit` carry **no `image` parameter**, exactly as they carry no `packages`
+  parameter; `dispatch_run` carries none; the panel displays it and has no key that sets it; it is **not**
+  a settings-overlay key, so `dispatch_set` cannot repoint the fleet. A `PI_JOB_IMAGE_ALLOWLIST` was
+  considered and rejected — see `DES-PER-TRIGGER-JOB-IMAGE`. Naming an image is an operator edit to the
+  reviewed file.
 - **Why**: The operator's trigger set is one host file — diffable, reviewable, git-trackable — rather than
   two files in two shapes across two services. The schema unifies the *view*; evaluation still splits by
   owner (a `label` is never scheduled; a `cron` never receives a webhook). `on.id` (cron only) must be
@@ -874,7 +966,9 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   `run.task` is operator-authored natural language and therefore **DATA** (`CONST-ISSUE-TEXT-IS-DATA`): it
   lands in `/job/prompt.md`, never in a system prompt. `provider`/`model`/`maxTurns` are **pure
   passthrough**: omitted → absent from the emitted job data, resolved at job start via the overlay then env
-  (`INT-CONFIG-OVERLAY-CONTRACT`). A `labeled` PR rule (like a `label` rule) requires a positive selector;
+  (`INT-CONFIG-OVERLAY-CONTRACT`). `image` is passthrough in the same sense with one deliberate difference:
+  it resolves against `PI_JOB_IMAGE` **only**, never the settings overlay, so no admin-editable runtime knob
+  can change which code every job executes (`DES-RUNTIME-SETTINGS-FILE-OVERLAY`). A `labeled` PR rule (like a `label` rule) requires a positive selector;
   at most one `comment` trigger may be configured.
 - **Traces to**: `DES-TRIGGERS-UNIFIED-FILE`, `DES-CRON-VIA-BULLMQ-SCHEDULER`, `REQ-TRIGGER-AUTHOR-GATE`,
   `CONST-ISSUE-TEXT-IS-DATA`, `INT-CONFIG-OVERLAY-CONTRACT`, `INT-PI-PACKAGES-FILE-CONTRACT`,
@@ -896,6 +990,19 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   byte-identical to the pre-issue one even for an unflagged trigger. That is a deliberate, stated exception in the same spirit as the cron
   `trigger: { id, pattern }` carve-out above, and for the same reason: it is a narrowing the whole fleet
   gets, not a per-trigger capability (`INT-CONTAINER-RUNTIME-CONTRACT`).
+  The byte-match admits `image` on the same terms as `github` and `packages`: it stays **absent** when the
+  trigger omits it (`undefined` drops out at JSON serialisation), so an unflagged trigger's `data` is
+  byte-identical to the pre-`image` shape and only a trigger that named one differs. Given a `run.image`
+  that is not a non-empty string, that carries surrounding whitespace, or that begins with `-`, on any of
+  the four kinds, when the config loads, then **both services throw**. Given a `run.image` naming an image
+  absent from the host, when the job is picked up, then it is refused **pre-spend** with reason
+  `job-image-missing`, reserving no budget slot and minting no credential — and `--pull=never` means that
+  tag could not have been fetched even had the check not run. **One scope correction to the env carve-out
+  above**: the env the **worker passes** is identical for every image, but the env **baked into** an image
+  is a fact about that image (*"facts about the image and not choices a job makes"*,
+  `INT-CONTAINER-RUNTIME-CONTRACT`), so two triggers naming two images do not have identical container
+  environments and never could. That is a property of the feature, not a defect, and it is stated here so
+  nobody reads the byte-match clause as covering it.
 
 ## INT-PI-PACKAGES-FILE-CONTRACT
 
@@ -1022,7 +1129,7 @@ worker reads.
     "flow":    "<flow name>" | null,
     "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
     "outcome":   "completed" | "policy" | "failed",
-    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|...>" | null,
+    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|job-image-missing|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
     "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number>,          // per-job usage totals; null when the container died before the exit line
@@ -1238,3 +1345,4 @@ worker reads.
 | 2026-07-16 | **Correction — "pi never throws" was FALSE**, and it was in this file for a day as the justification for forbidding `try`/`catch` outright. Adversarial re-verification refuted it: `agent-session.ts:1242-1244` is `catch (error) { preflightResult?.(false); throw error; }`, and pi's **own JSDoc** (`:1099-1100`) documents throws on no-model, no-API-key, and missing `streamingBehavior`; `agent.ts:470-471` throws `"Agent is already processing."` outside the lifecycle try entirely. The rule as written would have produced a runner that dies of an unhandled rejection on a missing API key, exiting Node's default `1` = *retryable*, so the queue pays to retry a job that can never succeed. **Both mechanisms are required and cover disjoint sets: preflight throws, the loop swallows.** Also corrected: `StopReason` has **five** values (`packages/ai/src/types.ts:380`) — the entry handled three, and a default branch silently maps `"length"` (truncated output) to success. `reload()` has **no early return** — a second call fully re-runs everything; the earlier "the `loaded` guard makes a double call safe" framing was wrong. The lesson is the file's own: this entry was written from source and still asserted an absolute from a partial read. `INT-CONTAINER-RUNTIME-CONTRACT` gained `--init`, `--shm-size` (explicitly **not** `--ipc=host`, which Playwright recommends but which would share the host IPC namespace with an adversarial container), fonts (absent ⇒ tofu-box screenshots that silently gut `REQ-FRONTEND-VISUAL-VERIFY`), and the fact that **`COPY --chown` does not fix the EACCES trap** because it skips auto-created parent dirs. |
 | 2026-07-15 | `INT-RUNNER-EXIT-CODE-PROTOCOL` gained its **mechanism**, which was the missing half. The codes were right; nothing said how to produce them, and **the obvious implementation produces them wrong**. ~~`pi never throws`~~ (**refuted the next day — see above**): `agent.ts:485-491` catches and `handleRunFailure` does not rethrow, so abort / 429 / 5xx / dead network all resolve `await session.prompt()` normally — and `prompt()` returns `Promise<void>`, so there is no return value either. A `try`/`catch` runner exits `0` on every infrastructure failure: queue records success, never retries, job did nothing — verbatim the worst failure class this project names. The exit code must be derived from `stopReason` on the terminal message, captured via `subscribe()`. Also recorded: the `subscribe()` listener is **sync and unawaited**, so a budget check that awaits will overshoot. `INT-CONTAINER-RUNTIME-CONTRACT` gained two runtime facts that fail *inside the container* where no Dockerfile hints at them: the agent dir must be **writable** by the non-root user (pi lazily writes `auth.json` on first credential touch), and Chromium needs **`--no-sandbox`** because `--cap-drop=ALL` denies it the seccomp/`SYS_ADMIN` its own sandbox requires — the container is the sandbox, and re-granting caps to Chromium would invert the security model. Two cited paths were **dead** (`packages/ai/src/api/env-api-keys.ts`, `packages/coding-agent/src/core/config.ts`); claims and line numbers were correct, only the addresses were wrong — the sneakiest defect class, since it reads as verified and cannot be followed. All cited paths now resolve. Good news recorded too: `before_agent_start` fires strictly before any provider HTTP call, so the assembled-prompt assertion costs **zero tokens**. |
 | 2026-07-15 | `INT-SDK-SESSION-OPTIONS` **materially corrected** before any code was written against it. The contract block was **not callable as published**: it passed `appendSystemPromptOverride` as a `createAgentSession` option (it is a `DefaultResourceLoader` option) and called `getModel` as a free function (it is a `ModelRuntime` method, and is not exported). Two further traps were found by reading source and are now recorded: `noContextFiles` is **off by default**, so `CONST-NO-CONTEXT-FILES-MANDATORY` fails **open by omission**; and `createAgentSession` **does not `reload()` a loader you pass it**, so the persona is silently empty — a second, previously-unrecorded path to this project's most-feared failure, created by the *interaction* of two constitutional constraints. The irony is the point: this block's own `Why` called it *"the only contract here that fails invisibly"*, and it was itself wrong in three ways for a month. This is the third time a doc-verified pi claim has been refuted by source — exactly what the evidence convention in `constitution.md` predicts. |
+| 2026-07-29 | Per-trigger job image (issue #41). **INT-TRIGGERS-FILE-CONTRACT**: an optional `run.image` on all four `run` shapes, with its own bullet mirroring `run.packages` — pure passthrough like `provider`/`model`/`maxTurns` (absent = `PI_JOB_IMAGE`, and resolved against **env only**, never the settings overlay), carried on all four kinds for `run.packages`' reason and not `run.github`'s (**a toolchain is a capability of the flow**, and a webhook trigger runs the same flows a cron trigger does), refused at load when not a non-empty string / when it carries whitespace / when it begins with `-`, its reference **grammar deliberately not validated** (docker's business; a regex would refuse malformed names while missing the far commoner well-formed-but-unbuilt one), and refused **pre-spend** when the tag is not on the host. The cron byte-match Acceptance admits `image` on the same terms as `github`/`packages` (absent stays absent, so an unflagged trigger's `data` is byte-identical), and the existing `PI_OFFLINE=1` env carve-out gains a **second dimension stated rather than discovered**: the env the worker *passes* is identical for every image, but the env *baked into* one is a fact about that image, so two triggers naming two images never had identical container environments. **INT-CONTAINER-RUNTIME-CONTRACT**: the real gap here — it **never named the image at all**, which was true-by-accident while there was one image this repo built. A new leading bullet makes it explicit that the contract is written against *an* image and is now the **conformance checklist** for any tag nameable in `run.image`, enumerating what the worker assumes and does not verify (non-root + writable `~/.pi/agent`, an entrypoint honouring `INT-RUNNER-EXIT-CODE-PROTOCOL`, the pinned pi version, the baked `PLAYWRIGHT_*` facts, root-owned agent-unwritable guardrails, fonts, and the **per-image** loader posture), with the note that **every one of them fails silently or late**. `--pull=never` added to the flag set with its own bullet: `docker run` defaults to `--pull=missing`, so an unknown name would be a **registry fetch** — the same make-it-unreachable move as `PI_OFFLINE=1`, one layer down. Acceptance extended to say the properties must hold for **every** nameable image, and that the assertions are ours for our tag and the operator's for theirs (`OQ-012`). **INT-SDK-SESSION-OPTIONS trap (g)** scoped: its `image/runner/package.json` claims describe an image built from **this repo's Dockerfile**; a foreign image's layout is simply not described — which costs nothing, because the trap's invariant is layout-independent by design (runtime mutation probe, `tryResolve` on both candidates). The *assertion* is what loses coverage, not the code. **INT-RUN-HISTORY-FILE-CONTRACT**: one enum token, `job-image-missing` — a policy outcome, not `container-never-started`, since the container was never attempted. |

@@ -375,31 +375,61 @@ test("readTriggers normalizes each on.type into its discriminated display record
     }),
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
+  // Every entry omits `run.packages`, and packages is an OPT-OUT -- so all four normalize to `true`.
   assert.deepEqual(res.triggers, [
-    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: false },
-    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: false },
-    { type: "comment", phrase: "@pi", flow: "fix", packages: false },
-    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: false },
+    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: true, image: null },
+    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: true, image: null },
+    { type: "comment", phrase: "@pi", flow: "fix", packages: true, image: null },
+    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: true, image: null },
   ]);
 });
 
-test("normalizeTriggerForDisplay carries the run.packages arming on all four kinds", () => {
+test("normalizeTriggerForDisplay carries run.packages on all four kinds, with the opt-out polarity", () => {
   const entries = [
-    { on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/p", flow: "tidy", packages: true } },
-    { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix", packages: true } },
-    { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: true } },
-    { on: { type: "pull_request", action: ["labeled"] }, run: { kind: "github", flow: "review", packages: true } },
+    { on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/p", flow: "tidy" } },
+    { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix" } },
+    { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } },
+    { on: { type: "pull_request", action: ["labeled"] }, run: { kind: "github", flow: "review" } },
   ];
   assert.deepEqual(
     entries.map((e) => normalizeTriggerForDisplay(e).packages),
     [true, true, true, true],
-    "every kind can arm the operator-staged packages, so every kind must display it",
+    "every kind loads the staged packages by default, so every kind must display it -- the OMITTED flag is the case the display used to miss",
+  );
+  assert.deepEqual(
+    entries.map((e) => normalizeTriggerForDisplay({ ...e, run: { ...e.run, packages: false } }).packages),
+    [false, false, false, false],
+    "and every kind can decline",
   );
 
-  // Unset, false, and a malformed value all read as unarmed -- the display fails closed like the validator.
-  for (const packages of [undefined, false, "true", 1, null]) {
+  // Only an explicit `false` withholds. A malformed value cannot reach the display at all -- parseTriggers
+  // refuses a non-boolean fail-loud at load -- so the display MIRRORS the worker rather than inventing a
+  // fails-closed state the running job would not agree with.
+  for (const packages of [undefined, true, "false", 0, null]) {
     const rec = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "fix", packages } });
-    assert.equal(rec.packages, false, `run.packages ${JSON.stringify(packages)} is not an arming`);
+    assert.equal(rec.packages, true, `run.packages ${JSON.stringify(packages)} is not a declination`);
+  }
+});
+
+test("normalizeTriggerForDisplay carries run.image on all four kinds, with null as the default-image sentinel", () => {
+  const entries = [
+    { on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/p", flow: "tidy" } },
+    { on: { type: "label", any: ["pi:frontend"] }, run: { kind: "github", flow: "frontend-fix" } },
+    { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } },
+    { on: { type: "pull_request", action: ["labeled"] }, run: { kind: "github", flow: "review" } },
+  ];
+  assert.deepEqual(
+    entries.map((e) => normalizeTriggerForDisplay({ ...e, run: { ...e.run, image: "my-python:1.2.0" } }).image),
+    ["my-python:1.2.0", "my-python:1.2.0", "my-python:1.2.0", "my-python:1.2.0"],
+    "every kind can name its own image, so every kind must display it",
+  );
+
+  // Fail-soft, mirroring the worker (`job.image ?? config.jobImage`) rather than re-validating: parseTriggers
+  // already refused anything that is not a non-empty string, so the display's job is to say "the deployment
+  // default", never to invent a third state.
+  for (const image of [undefined, "", "   ", 42, null, {}]) {
+    const rec = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "fix", image } });
+    assert.equal(rec.image, null, `run.image ${JSON.stringify(image)} reads as the deployment default`);
   }
 });
 
@@ -415,7 +445,7 @@ test("readTriggers skips an entry that is not a usable { on, run } object (viewe
     }),
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
-  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: false }]);
+  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true, image: null }]);
 });
 
 test("readTriggers returns { invalid } when there is no triggers array", () => {

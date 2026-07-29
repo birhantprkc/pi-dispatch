@@ -19,10 +19,13 @@ A job is a **trigger × target** (see `DES-CRON-VIA-BULLMQ-SCHEDULER`):
   the queue and triggers no jobs except the gated `dispatch_run` enqueue), a **webhook** (GitHub issue
   activity), or **cron** (a schedule).
 
-Everything below the trigger is identical: budget check → `/job:ro` inputs → one container → the runner
-→ an exit code. What differs is authz (a label/collaborator gate for webhooks vs CLI access for
-local), the credential (a short-lived scoped token for GitHub jobs vs none for local), and the completion signal
-(an issue comment vs the console, or the admin extension's runs view — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`).
+Everything below the trigger is identical **in shape**: budget check → `/job:ro` inputs → one container →
+the runner → an exit code — the same argv, the same isolation flags, the same env allowlist, the same
+mounts. What differs is authz (a label/collaborator gate for webhooks vs CLI access for
+local), the credential (a short-lived scoped token for GitHub jobs vs none for local), the completion signal
+(an issue comment vs the console, or the admin extension's runs view — see `REQ-JOB-STATUS-COMMENTS` and `REQ-LOCAL-JOB-VISIBILITY`),
+and — since `run.image` — **which image that one container is**, which changes the toolchain inside the box
+and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
 **Out of scope**: being a hosted service; multi-tenancy; merging anything.
 
@@ -83,7 +86,13 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 ## REQ-UPSTREAM-CONTRACT-TESTS
 
 - **Statement**: The image build shall assert every pinned assumption about pi, and fail the build when
-  one no longer holds. No image publishes on a failed assertion.
+  one no longer holds. No image publishes on a failed assertion. **"The image" here means the image this
+  repo builds and publishes.** A trigger's `run.image` (`INT-TRIGGERS-FILE-CONTRACT`) may name an image this
+  repo never built, whose build ran **no assertion at all** — so *"no image publishes on a failed
+  assertion"* is a statement about **our** publish step and is silent about an operator's. The gap is
+  deliberate, is registered as `OQ-012` rather than papered over here, and has a partial answer: the
+  assertions below are the checklist an operator-built image should be held to, and the `image` job is
+  written so it can be pointed at an arbitrary tag (`docs/job-image.md`).
 - **Why**: pi ships breaking changes between minors, and its HEAD moved within 24 hours of this
   project's design being written. `CONST-PI-VERSION-PINNED` makes an upgrade an explicit commit, so CI
   fires on it and these tests are the gate. A prose checklist depends on a maintainer reading it at 11pm
@@ -129,7 +138,9 @@ local), the credential (a short-lived scoped token for GitHub jobs vs none for l
 - **Traces to**: `CONST-PI-VERSION-PINNED`, `CONST-NO-CONTEXT-FILES-MANDATORY`, `INT-SDK-SESSION-OPTIONS`,
   `OQ-005`
 - **Acceptance**: Given a version bump where a pinned assumption breaks, the build fails and publishes
-  nothing.
+  nothing. Given an **operator-built** image named in `run.image`,
+  **nothing in this repo gates it**; the same suite is runnable against that tag by the operator
+  (`docs/job-image.md`), and the residual is `OQ-012`.
 
 ## REQ-DEDUP-BY-DELIVERY-GUID
 
@@ -694,3 +705,4 @@ wait-list working as designed, not a failure — see `README.md`.
 | 2026-07-22 | Coherence fix: reworded the two live "triggers no jobs" admin claims — REQ-ADMIN-VIA-PI-EXTENSION `Scope` and the `Triggers` overview bullet — to "triggers no jobs except the gated `dispatch_run` enqueue", resolving the self-contradiction with the same entry's `Statement`/`Why` `dispatch_run` clauses (still never materialised into a job's `/job` inputs). |
 | 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). REQ-TOKEN-ACCOUNTING-AND-CAPS: accounting is now **process-wide** — the runner meters at pi-ai's module-level api-provider registry, the choke point every in-process session shares, and the `subscribe()` per-turn sum is the documented **fallback**, attached only when the meter could not install. Records the negative fact that forces it (the event bus is per `AgentSession` instance, `CreateAgentSessionOptions` has no parent/bus option, no event carries a `sessionId`, so a 16-wide fanout registers as ~one turn), the honest note that a plain job's `total` now reads **>=** today's because compaction/summarisation calls were never root `turn_end`s, what a breach actually stops (`session.abort()` does not propagate to children; the forward brake is the synthetic aborted stream for every later call by any session; the backstop stays REQ-JOB-TIMEOUT-30M), and the residual subprocess gap (OQ-011). Acceptance gains the two-concurrent-sessions, breach-mid-fanout and meter-unavailable clauses. REQ-RUNNER-TURN-BUDGET gains a **Scope**: root-session turns only — the same per-instance bus bounds it, and it does not claim otherwise. REQ-GLOBAL-PI-OVERLAY: the overlay now also carries `packages/` — operator-staged third-party pi packages, gated four times over (exact pin in `pi-packages.json`, host-side `--ignore-scripts` staging with an admin-name block, a per-trigger `run.packages` opt-in, and runner-side path validation plus skill-precedence enforcement through the loader's `skillsOverride` seam, which re-imposes this REQ's own "repo wins on conflict" over pi's package-paths-first ordering), with `PI_OFFLINE=1` on every job so a package source can never become a job-time install. |
 | 2026-07-22 | Added REQ-TOKEN-ACCOUNTING-AND-CAPS (issue #25, unblocked by OQ-010): per-job token/cost accounting in the run record + admin views; an optional in-run per-job token budget (`maxTokens`/`PI_MAX_TOKENS`, exits policy `token_budget`); and an optional daily token cap (`dailyTokenCap`/`PI_DAILY_TOKEN_CAP`) enforced **check-AFTER** — the deliberate asymmetry with `CONST-BUDGET-BEFORE-TOKENS`, which is unchanged (still job-count, still check-before). Extended REQ-RUNTIME-SETTINGS-PICKUP's key list with `maxTokens`/`dailyTokenCap`; retargeted REQ-SPEND-CAPS-MULTI-WINDOW's OQ-010 forward-reference to the new REQ. |
+| 2026-07-29 | Issue #41. **REQ-UPSTREAM-CONTRACT-TESTS** gains a **scope boundary, not a new assertion**: "The image build shall assert every pinned assumption… No image publishes on a failed assertion" is a statement about **our** publish step, and after `run.image` a trigger may name an image this repo never built, whose build ran **no assertion at all**. Stated in the Statement and repeated in the Acceptance, with the residual registered as `OQ-012` rather than left as an implication of coverage; the bullet list is otherwise untouched and becomes the checklist an operator-built image should be held to (`docs/job-image.md`, and the `image` CI job made runnable against an arbitrary tag). **REQ-GLOBAL-PI-OVERLAY is UNCHANGED and was checked**: its "Works with the **pulled** prebuilt image — a runtime mount, not a rebuild" is still true and is now true of *any* conformant image, because the overlay is a mount; what it never covered, and still does not, is a **toolchain**, which is exactly the gap `run.image` fills. **Scope** amended: "Everything below the trigger is identical" was a live contradiction with a per-trigger image and now reads "identical **in shape** — the same argv, isolation flags, env allowlist and mounts", with **which image** added to the list of what differs. |

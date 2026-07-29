@@ -15,7 +15,7 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
                            [--from <agentDir>] [--to <overlayDir>]
 
   pi-dispatch run <folder> --task "<what to do>" [--flow <name>]
-                           [--provider <p>] [--model <m>] [--max-turns <n>] [--force]
+                           [--provider <p>] [--model <m>] [--max-turns <n>] [--image <ref>] [--force]
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
   pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
   pi-dispatch resume       resume taking jobs
@@ -57,6 +57,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 				provider: { type: "string" },
 				model: { type: "string" },
 				"max-turns": { type: "string" },
+				image: { type: "string" }, // the container image for this one job; blank/absent = PI_JOB_IMAGE
 				force: { type: "boolean", default: false },
 			},
 		});
@@ -88,6 +89,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 				provider: values.provider,
 				model: values.model,
 				maxTurns: values["max-turns"] ? Number(values["max-turns"]) : undefined,
+				// || not the raw value: `--image ""` must collapse to absent rather than becoming a falsy string that
+				// throws inside buildDockerRunArgs after a budget slot is reserved.
+				image: values.image || undefined,
 			});
 			process.stdout.write(`queued ${jobId} — folder ${folder}\nrun \`pi-dispatch worker\` to process it.\n`);
 		} catch (error) {

@@ -81,6 +81,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 	// what boot HANDS it (image, overlay, staged packages), never a docker launch. It records its args and
 	// returns an inert runContainer that is stored in deps and never invoked here.
 	const runContainerCalls = [];
+	const imagePreflightCalls = [];
 	const runContainerFactory =
 		makeRunContainer ??
 		((args) => {
@@ -104,6 +105,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 			makeRecordWriter: recordWriter,
 			makeLogReaper: logReaper,
 			makeRunContainer: runContainerFactory,
+			makeImagePreflight: (args) => (imagePreflightCalls.push(args), async () => ({ ok: true })),
 		});
 	} finally {
 		process.stdout.write = origWrite;
@@ -123,7 +125,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeReaper, makeLogSink,
 	});
 	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
 	// `registered` for the scheduler stall-guard test. Same object, one capture path.
-	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls, runContainerCalls };
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls, runContainerCalls, imagePreflightCalls };
 }
 
 // Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
@@ -403,6 +405,17 @@ test("staged packages: no overlay configured means no manifest read and no packa
 	const { logs, runContainerCalls } = await runStart({ makeAuth, makeHost: () => fakeHost() });
 	assert.deepEqual(runContainerCalls[0].packagePaths, [], "no overlay -> the empty staged set");
 	assert.ok(!logs.some((l) => l.event === "packages_manifest_absent"), "a deployment with no overlay at all has nothing to warn about");
+});
+
+test("the image preflight and the container factory are wired from the SAME config.jobImage", { skip }, async () => {
+	// If these two ever drifted, the worker would check one tag and run another -- the preflight would pass
+	// on an image the container never uses, and the guarantee it exists to provide would be a lie.
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { runContainerCalls, imagePreflightCalls } = await runStart({ env: { PI_JOB_IMAGE: "pi-job:0.1.0" }, makeAuth, makeHost: () => fakeHost() });
+
+	assert.equal(imagePreflightCalls.length, 1, "the preflight is constructed exactly once, at boot");
+	assert.equal(imagePreflightCalls[0].image, "pi-job:0.1.0", "PI_JOB_IMAGE reaches the preflight, not only the runner");
+	assert.equal(imagePreflightCalls[0].image, runContainerCalls[0].image, "one deployment default, two consumers");
 });
 
 test("run-history: worker_started announces logsDir, captureJobLogs and logRetentionDays (a path is not PII)", { skip }, async () => {

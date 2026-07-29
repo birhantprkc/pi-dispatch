@@ -133,15 +133,16 @@ function normalizeCron(on, run, index, path, state) {
 	}
 
 	const packages = validatePackagesFlag(run, `cron trigger "${id}"`, path);
+	const image = validateImageRef(run, `cron trigger "${id}"`, path);
 
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
-	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages stay
+	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages/image stay
 	// absent the same way -- and that matters more for `packages` now that absent means LOAD: writing a
 	// `true` in here would make the schedule payload claim an opt-in the operator never wrote, and would
 	// freeze today's default into every stored repeatable.
 	return {
 		on: { type: "cron", id, pattern },
-		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages },
+		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages, image },
 	};
 }
 
@@ -164,6 +165,52 @@ function validatePackagesFlag(run, at, path) {
 		throw configError(`${at}: run.packages must be true or false when present: ${path}`);
 	}
 	return run.packages;
+}
+
+/**
+ * Validate the per-trigger `run.image` reference, shared by all four normalizers. It selects the Docker image
+ * this trigger's job containers run in, overriding the deployment-wide `PI_JOB_IMAGE` for this trigger only;
+ * absent means the deployment default, resolved by the worker (image-preflight.mjs) and never frozen into the
+ * file here. Carried on all four kinds rather than cron only, for the same reason `run.packages` is: a
+ * toolchain is a capability of the FLOW, and a label/comment/PR trigger runs the flows a cron trigger runs.
+ *
+ * Deliberately NOT a shape check. `run.folder` -- also an operator-authored host reference -- is validated
+ * here as a non-empty string only, with existence deferred to the one place that can actually know; run.image
+ * gets exactly that split: type here, reality at job start via a pre-spend `docker image inspect`. A regex
+ * over the OCI reference grammar would refuse the rarer half of the problem (a malformed name) while missing
+ * the common half (a well-formed name for an image nobody built), and an over-strict one would refuse a
+ * legitimate `registry.internal:5000/team/img:1.2@sha256:...` and take the whole worker down at boot for a
+ * valid deployment. Docker validates its own grammar; we do not.
+ *
+ * A floating tag is likewise accepted, not warned. CONST-PI-VERSION-PINNED fears UNATTENDED drift, and that
+ * mechanism does not exist here: with `--pull=never` a local tag can only move when a human runs `docker
+ * pull` or `docker build` on this host, which is the explicit act the constraint asks for. Refusing `:latest`
+ * would also make `run.image: "pi-job:latest"` illegal while `PI_JOB_IMAGE=pi-job:latest` is the shipped
+ * default -- an incoherence an operator would rightly file as a bug.
+ *
+ * The three refusals below are not grammar. Each names a value that would corrupt something on OUR side: a
+ * non-string reaches `args.push(image)` and becomes a garbage argv token; an empty string is falsy and throws
+ * inside buildDockerRunArgs AFTER the budget slot is reserved; and a leading `-` lands in the image positional
+ * where docker's flag parser reads it as a flag, which is the one value that stops docker-run.mjs's
+ * explicit-array argv from being injection-free by inspection. Whitespace is refused rather than trimmed
+ * because the file is the reviewed artifact: it must not disagree with what runs.
+ *
+ * `at` is the caller's message prefix, exactly as validatePackagesFlag's is. Returns the reference, undefined
+ * when absent, so an unflagged trigger normalizes byte-identically to today's.
+ */
+function validateImageRef(run, at, path) {
+	const image = run.image;
+	if (image === undefined) return undefined;
+	if (typeof image !== "string" || image.trim() === "") {
+		throw configError(`${at}: run.image must be a non-empty string when present: ${path}`);
+	}
+	if (image !== image.trim()) {
+		throw configError(`${at}: run.image must not have leading or trailing whitespace (got ${JSON.stringify(image)}): ${path}`);
+	}
+	if (image.startsWith("-")) {
+		throw configError(`${at}: run.image must not start with "-" -- it is passed as the image positional in the docker argv, where a leading dash parses as a flag (got ${JSON.stringify(image)}): ${path}`);
+	}
+	return image;
 }
 
 /**
@@ -197,7 +244,8 @@ function normalizeLabel(on, run, index, path) {
 		throw configError(`${at}: label trigger run.flow must be a non-empty string: ${path}`);
 	}
 	const packages = validatePackagesFlag(run, at, path);
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow, packages } };
+	const image = validateImageRef(run, at, path);
+	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: "github", flow: run.flow, packages, image } };
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -213,7 +261,8 @@ function normalizeComment(on, run, index, path, state) {
 		throw configError(`${at}: at most one comment trigger is allowed: ${path}`);
 	}
 	const packages = validatePackagesFlag(run, at, path);
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow, packages } };
+	const image = validateImageRef(run, at, path);
+	return { on: { type: "comment", phrase: on.phrase }, run: { kind: "github", flow: run.flow, packages, image } };
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -239,8 +288,9 @@ function normalizePullRequest(on, run, index, path) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
 	}
 	const packages = validatePackagesFlag(run, at, path);
+	const image = validateImageRef(run, at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
-		run: { kind: "github", flow: run.flow, packages },
+		run: { kind: "github", flow: run.flow, packages, image },
 	};
 }

@@ -19,11 +19,14 @@ system. **pi-dispatch is exactly that missing operational layer, and nothing els
   mounted read-only — pi's missing permission system, enforced by Docker.
 - **Spend is bounded before a container starts** — a per-job turn budget and a daily cap, checked before
   a single token is spent.
-- **The image is yours to shape.** Bake a project's toolchain into [`image/Dockerfile`](image/Dockerfile);
-  it ships **Playwright + Chromium**, so a flow can build a frontend, screenshot it, and iterate on the
-  rendered result — the edge over a fixed hosted routine or `/loop`.
+- **The image is yours to shape — per deployment, or per trigger.** Bake a project's toolchain into
+  [`image/Dockerfile`](image/Dockerfile); it ships **Playwright + Chromium**, so a flow can build a frontend,
+  screenshot it, and iterate on the rendered result — the edge over a fixed hosted routine or `/loop`. A
+  trigger can name its own image with `run.image` when one flow needs Python and another needs Node
+  ([`docs/job-image.md`](docs/job-image.md)).
 - **Three triggers, one job.** A CLI command, a cron schedule, or a GitHub issue/PR — same job, same box,
-  same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control.
+  same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control —
+  one per deployment, or one per trigger.
 - **Your project steers it** — pi's native `.pi/skills` and persona, from your committed files, over a
   small immutable safety floor the agent can't remove.
 
@@ -34,7 +37,7 @@ You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthrop
 ```bash
 # 1. Get the job image — pull the prebuilt one (fast)...
 docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest
-#    ...or bake your own toolchain into it instead (slower, fully yours):
+#    ...or bake your own toolchain in (slower, fully yours) — same tag, or a new one you point triggers at:
 #    docker build -f image/Dockerfile -t pi-job:latest .
 
 # 2. Start Valkey (the durable job queue)
@@ -45,7 +48,7 @@ npm ci
 npx pi-dispatch init         # writes .env + triggers.json + pause-windows.json (never clobbers)
 #    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
 #    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
-npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the image, and your provider key
+npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the images your triggers name, and your provider key
 
 # 4. Run the worker in one terminal
 npx pi-dispatch worker       # (or: npm --workspace worker start)
@@ -56,6 +59,12 @@ npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 
 > **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
 > toolchain in (the edge cron/visual flows rely on), build `image/Dockerfile` yourself — step 1's second form.
+> And you can run **more than one**: `PI_JOB_IMAGE` is the deployment default, and any trigger may name its
+> own with `run.image`. See [`docs/job-image.md`](docs/job-image.md).
+>
+> Either way, **pull or build it before you run**: jobs launch with `--pull=never`, so the worker never
+> fetches an image at job time. A name it cannot find is refused *before* the job costs anything, rather than
+> becoming a silent pull of whatever answers to that name in a registry. `pi-dispatch doctor` checks presence.
 
 > **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
 > which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It
@@ -98,7 +107,9 @@ with the provider-side spend limit you should set anyway.
 
 Already run `pi`? Give every job your host setup — custom models, global skills, a global persona — **layered
 under each repo's own `.pi/`** (the repo still wins). Works with the pulled image; it's a read-only mount, not
-a rebuild.
+a rebuild — and it works the same in a per-trigger image, because a mount is a mount. What the overlay
+**cannot** deliver is a **toolchain** (apt packages, a language runtime, system libraries); that is what
+`run.image` and [`docs/job-image.md`](docs/job-image.md) are for.
 
 ```bash
 pi-dispatch import-pi          # stage a credential-free copy of ~/.pi/agent into ./pi-global
@@ -341,7 +352,8 @@ cron off), the receiver requires it.
 ```jsonc
 { "triggers": [
   { "on": { "type": "cron", "id": "nightly", "pattern": "0 3 * * *" },
-    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy" } },
+    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy",
+             "image": "pi-job:latest" } },
   { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
   { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
   { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } }
@@ -356,13 +368,25 @@ packages you staged into the global overlay. It is an **opt-out**: staged packag
 `"packages": false` is how one flow declines them. A non-boolean value is refused at load, and with nothing
 staged the flag loads nothing either way; `pi-dispatch doctor` reports both cases.
 
+`"image"` on any trigger's `run` (all four kinds) names the **container image** that trigger's jobs run in;
+absent means the deployment default `PI_JOB_IMAGE`. It is how one flow gets a Python toolchain and another
+gets Node + Playwright without one image carrying the union of both. **The image decides what is in the box,
+never what the box can do**: whichever tag runs, it runs under the same `--cap-drop=ALL`, the same non-root
+user, the same read-only `/job`, and the same closed env allowlist — all built by the worker, none of it
+influenced by the image. Jobs launch with `--pull=never`, so **build or pull every image you name**; a name
+this host does not have is refused before the job costs anything, and `pi-dispatch doctor` lists them all.
+Like `packages`, it is deliberately **not** settable from the panel or by an AI tool — naming an image is an
+edit to the reviewed `triggers.json`. See [`docs/job-image.md`](docs/job-image.md).
+
 ### Add a trigger from the panel
 
 You can edit `triggers.json` by hand, or add one from `/dispatch` without touching the file: press **`a`** and
 answer the **kind-first** prompts. The panel writes a validated entry and both services reload it live:
 
 - **cron** → `id` · `pattern` (5–6 field cron) · `folder` (absolute host path) · `flow` · `task`, then the
-  optional `model` / `provider` / `maxTurns` (blank = the deployment default).
+  optional `model` / `provider` / `maxTurns` (blank = the deployment default). Neither the panel nor
+  `dispatch_trigger_*` can set `image` or `packages` — both stay file edits; the panel shows them and edits
+  the flow only.
 - **label** → `labels` (space-separated, any-of) · `flow`. The issue text is the task.
 - **comment** → trigger `phrase` (e.g. `@pi`) · `flow`. The comment/issue text is the task.
 - **pull_request** → `action`s (`labeled opened synchronize reopened`) · `labels` (for `labeled`) · `flow`.
@@ -374,7 +398,7 @@ write waits on your confirmation.
 ### Scheduling recurring jobs
 
 A cron trigger runs a local folder through a flow on a cron pattern — `pattern` is a 5- or 6-field cron
-expression; `provider`, `model`, and `maxTurns` are optional on `run` and fall back to the worker's
+expression; `provider`, `model`, `maxTurns` and `image` are optional on `run` and fall back to the worker's
 defaults. `"github": true` on `run` is also optional — it mints the same per-job GitHub token the webhook
 path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off by default. A cron
 `folder` is a **host path** — the worker runs on the host
@@ -501,12 +525,13 @@ minutes.
 **vs Claude Code routines and `/loop`.** A routine runs a recurring agent task on a cron schedule (managed,
 in the cloud); `/loop` repeats a prompt on an interval inside your session. For generic recurring work
 they're simpler — nothing to host — and often the right call. pi-dispatch's cron trigger is the same idea
-with a different centre of gravity: the run happens in **a container image you build**, on **your**
+with a different centre of gravity: the run happens in **container images you build** — a different one per
+flow, if that is what the work needs — on **your**
 hardware, under **your** queue and spend caps. That is the edge when the task needs an environment a hosted
 routine cannot give it — a project's exact toolchain and system libraries, or the baked-in **Playwright +
 Chromium** that lets a scheduled flow build a frontend, screenshot it, and iterate until it renders right,
 then attach the before/after to a PR. Rule of thumb: if the recurring task is *"run a prompt,"* use a
-routine; if it is *"run this project's real build / test / visual loop on a schedule, in an image I
+routine; if it is *"run this project's real build / test / visual loop on a schedule, in images I
 control,"* that is this.
 
 ## Status

@@ -52,26 +52,50 @@ The confirm is the approval step. Treat a decline as a final, legitimate answer.
 
 ## Staged packages — `run.packages`, and why you cannot set it
 
-A trigger may carry `run.packages: true`. That arms it: when it fires, the job additionally loads the
-third-party **pi packages the operator staged** into their global overlay dir (`PI_GLOBAL_PI_DIR`, under
-`packages/`, pinned by version). An unarmed trigger loads none of them — this is opt-in per trigger, not a
-deployment-wide switch.
+When a trigger fires, the job loads the third-party **pi packages the operator staged** into their global
+overlay dir (`PI_GLOBAL_PI_DIR`, under `packages/`, pinned by version). `run.packages` is an **opt-out**:
+absent and `true` both load them, and only an explicit `run.packages: false` withholds them from that one
+trigger. So the question to answer for a user is never "is this trigger armed" — it is "did this trigger
+decline".
 
-It matters because an armed trigger runs pinned third-party code against adversarial input (issue/PR/comment
-text) with open network egress. So the panel makes it visible: an armed trigger is badged `[packages]` in
+It matters because a loading trigger runs pinned third-party code against adversarial input (issue/PR/comment
+text) with open network egress. So the panel makes it visible: a loading trigger is badged `[packages]` in
 the trigger list, and its trust-model drill-in names the staged `name@version` set.
 
-**Arming is an operator edit to the reviewed `triggers.json` file — never a panel action and never a tool
-call.** This is deliberate, not a gap:
+**Which packages are staged, and whether a trigger declines them, are both operator edits to reviewed files
+— never a panel action and never a tool call.** This is deliberate, not a gap:
 
-- `dispatch_triggers` shows you *whether* a trigger is armed. The `/dispatch` panel displays it too, and has
-  no key that sets it.
-- `dispatch_trigger_add` and `dispatch_trigger_edit` **have no `packages` parameter**. You cannot arm a
-  trigger, disarm one, or change which packages are staged — the same reason `dispatch_run` withholds the
-  provider and model from you.
+- `dispatch_triggers` shows you *whether* a trigger loads them. The `/dispatch` panel displays it too, and
+  has no key that sets it.
+- `dispatch_trigger_add` and `dispatch_trigger_edit` **have no `packages` parameter**. You can change it in
+  neither direction — you cannot make a trigger load packages and you cannot make one decline them — the
+  same reason `dispatch_run` withholds the provider and model from you.
 
-So if a user asks you to arm a trigger with packages, or to stage a package: **say plainly that you cannot,
-and that it is an edit they make to `triggers.json` (and to their overlay dir) themselves.** Do not attempt
-it through `dispatch_trigger_edit`, do not write the triggers file by another route, and do not treat the
-missing parameter as a bug to work around. Reporting the current armed state and explaining the change they
-would make is the whole of your part.
+So if a user asks you to change a trigger's packages flag, or to stage a package: **say plainly that you
+cannot, and that it is an edit they make to `triggers.json` (and to their overlay dir) themselves.** Do not
+attempt it through `dispatch_trigger_edit`, do not write the triggers file by another route, and do not treat
+the missing parameter as a bug to work around. Reporting which triggers load the staged set and explaining
+the change they would make is the whole of your part.
+
+## The job image — `run.image`, and why you cannot set it
+
+A trigger may carry `run.image`: the container image that trigger's jobs run in. Absent means the
+deployment default (`PI_JOB_IMAGE`). It exists so one flow can have a Python toolchain and another Node +
+Playwright, without one image carrying the union of both.
+
+Report it when asked, and be precise about what it does and does not decide. **Which image a job runs is
+which code it runs** — the pi version, the runner, the guardrail floor and the loader's discovery posture
+all come from the image. What it does *not* decide is what the container may do: `--cap-drop=ALL`, the
+non-root user, the read-only `/job` and the closed env allowlist are built by the worker for every image
+alike. The panel shows the tag in the trigger list and states it in the drill-in either way.
+
+**You cannot change it, in either direction.** `dispatch_trigger_add` and `dispatch_trigger_edit` have **no
+`image` parameter**, `dispatch_run` has none, and there is no allowlist for you to consult — because there
+is nothing model-callable to bound. Naming an image is an operator edit to the reviewed `triggers.json`,
+exactly like `run.packages`.
+
+So if a user asks you to point a trigger at a different image, or to build one: **say plainly that you
+cannot, and that it is an edit they make to `triggers.json` themselves.** Do not route around it via
+`dispatch_trigger_edit`, which changes the flow only. Two useful things you *can* say: the image must be
+built or pulled on the worker's own host, because jobs run with `--pull=never` and nothing is fetched at
+job time; and `pi-dispatch doctor` lists every image their triggers name and flags one that is missing.

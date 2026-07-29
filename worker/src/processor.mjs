@@ -8,6 +8,7 @@ import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
  *
  * The order is the contract, and every step before `runContainer` must be free of provider spend:
  *
+ *   0. refuse a job image this host does not have  -- INT-CONTAINER-RUNTIME-CONTRACT
  *   1. mint a scoped token (GitHub jobs, and local jobs opted in via `github: true`)
  *                                                 -- CONST-TOKEN-SCOPED-PER-JOB
  *   2. REFUSE an unprotected default branch (GitHub jobs only -- a local job has no repo)
@@ -32,6 +33,10 @@ export async function runJob(job, deps) {
 		softHoldPct, // int 1-99 or null; the soft-hold band applied to every active window
 		tokenCap = null, // int or null; the daily TOKEN cap (issue #25). Check-AFTER, so it gates the NEXT job on prior spend
 		recordSpend = recordTokenSpend, // injected so the post-container INCRBY is testable/stubbable
+		// (job) => { ok } | { missing: <ref> } | { unavailable: <ref> }. The pre-spend check that the image
+		// this job names is on this host (image-preflight.mjs). Default admits everything, so a wiring that
+		// omits it behaves exactly as before -- the container's own failure stays the backstop.
+		imagePreflight = async () => ({ ok: true }),
 		mintToken, // (repo) => scoped short-lived token. Called with the repo for github jobs, with undefined for local jobs opted in via `github: true`; unflagged local jobs never mint (token stays null)
 		isDefaultBranchProtected, // (repo, token) => boolean
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
@@ -59,6 +64,27 @@ export async function runJob(job, deps) {
 	let reserved = false;
 
 	try {
+		// The job image must exist on THIS host before anything else happens. Free, determinate and
+		// credential-less, so it precedes the mint, the clone and the reservation: a host that cannot run the
+		// image refuses without minting a credential it will not use, cloning a repo it will not read, or
+		// burning a cap slot. Jobs run with --pull=never (docker-run.mjs), so an absent image is never
+		// fetched -- this refusal IS the whole diagnosis, not a race with a background pull.
+		const img = await imagePreflight(job);
+		if (img.missing) {
+			await comment(job, `Refused: the job image "${img.missing}" is not present on the worker host. Not run.`);
+			log("refused_image_missing", { image: img.missing });
+			// The image ref is operator-authored config (PI_JOB_IMAGE), never payload, so naming it is PII-safe
+			// -- the same class as `repo` above.
+			// exitCode/turns/tokens null and budgetReserved false: refused pre-container AND pre-reserve.
+			return { outcome: "policy", reason: "job-image-missing", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+		}
+		if (img.unavailable) {
+			// docker itself did not answer -- transient infra, NOT a determinate refusal. THROWN so BullMQ
+			// retries (CONST-RETRY-INFRA-ONLY). `container-never-started` is literally true here, and it reuses
+			// the refund path below: a no-op pre-reserve, and still honest if this gate ever moves.
+			throw new InfraRetry("docker unavailable, image preflight could not run", { reason: "container-never-started" });
+		}
+
 		if (wantsGitHubToken) {
 			token = await mintToken(isGitHub ? job.repo : undefined);
 
@@ -98,7 +124,9 @@ export async function runJob(job, deps) {
 		// nothing, so it precedes reserveBudget's INCR and a refusal here burns no job-count slot. It can
 		// only stop the NEXT job once the day's accumulated spend has reached the cap; the actual INCRBY
 		// happens post-container via recordSpend. Reported before the job-count cap only because both are
-		// spend gates; the more-actionable branch-protection precondition is still reported first above.
+		// spend gates; the more-actionable branch-protection precondition is still reported first above --
+		// behind only the image check, which outranks it because a missing image blocks EVERY job of EVERY
+		// kind on this host, so it is the one the operator must fix first either way.
 		const tokenGate = await checkTokenCap(redis, { cap: tokenCap, now });
 		if (!tokenGate.allowed) {
 			await comment(job, `Over the daily token cap (${tokenGate.spent}/${tokenGate.cap} tokens). Not run.`);
@@ -162,6 +190,17 @@ export async function runJob(job, deps) {
 				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, budgetReserved: true };
 			case EXIT_INFRA:
 				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens });
+			case 125: // `docker run` itself failed (unusable image reference, bad flag)
+			case 126: // the entrypoint exists but is not executable
+			case 127: // the entrypoint was not found
+				// In all three docker never handed control to the runner, so NOTHING was spent -- which is
+				// exactly what `container-never-started` means, and it reuses the refund below rather than
+				// keeping a slot the agent never used. These used to fall to `default:`, which kept the slot
+				// AND retried, burning a second one. The preflight above converts the KNOWABLE case (an absent
+				// image) into a pre-spend policy refusal; a 125 that survives it is a race (the image was
+				// removed between the inspect and the run) or a docker-side fault we did not foresee --
+				// genuinely infra, and now with a retry that costs nothing.
+				throw new InfraRetry(`docker could not start the container, exit ${code}`, { reason: "container-never-started", exitCode: code, turns, tokens });
 			default:
 				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens });
 		}

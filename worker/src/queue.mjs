@@ -15,12 +15,14 @@ export function makeQueue(connection) {
  * removeOnComplete keeps the dedup window ~= the retention. Unlike webhooks, local jobs are not
  * redelivered, so a modest window is enough.
  */
-export async function enqueueLocalJob(queue, { folder, flow, task, provider, model, maxTurns, chainDepth, parentJobId, jobId, now = new Date() }) {
+export async function enqueueLocalJob(queue, { folder, flow, task, provider, model, maxTurns, image, chainDepth, parentJobId, jobId, now = new Date() }) {
 	const minute = now.toISOString().slice(0, 16); // YYYY-MM-DDTHH:MM -- the dedup window
 	// A caller-supplied jobId (the outbox collector's retry-idempotent chainedJobId) wins; otherwise the
 	// minute-windowed localJobId is the dedup key.
 	const id = jobId ?? localJobId({ folder, flow, task, minute });
-	// chainDepth/parentJobId land on `data` only when present, so a non-chained job's data is byte-identical.
+	// image/chainDepth/parentJobId land on `data` only when present, so a plain non-chained job's data is
+	// byte-identical. `image` is the container image this job runs in (INT-TRIGGERS-FILE-CONTRACT); absent
+	// resolves the deployment default at job start, never a value frozen here.
 	const data = {
 		kind: "local",
 		folder,
@@ -29,6 +31,7 @@ export async function enqueueLocalJob(queue, { folder, flow, task, provider, mod
 		provider,
 		model,
 		maxTurns,
+		...(image !== undefined && { image }),
 		...(chainDepth !== undefined && { chainDepth }),
 		...(parentJobId !== undefined && { parentJobId }),
 	};
@@ -63,12 +66,14 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  *     re-labels or repeated PR pushes coalesce to one active job. It coexists with jobId; it does not
  *     replace it.
  */
-export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages }) {
+export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages, image }) {
 	const jobId = deliveryJobId(trigger.deliveryId);
-	// `packages` (the matched trigger's opt-in to load the operator-staged pi packages,
-	// INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) lands on `data` only when the filter resolved
-	// one, exactly like chainDepth/parentJobId above, so an unflagged trigger's job data is byte-identical.
-	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }) };
+	// `packages` (whether to load the operator-staged pi packages) and `image` (which container image to run)
+	// come off the MATCHED trigger (INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) and land on `data`
+	// only when the filter resolved one, exactly like chainDepth/parentJobId above, so an unflagged trigger's
+	// job data is byte-identical. Both sit at JOB level, never inside `trigger` -- that object is descriptive
+	// and is copied verbatim into /job/event.json, where an execution knob has no business.
+	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }) };
 	await queue.add("github", data, {
 		jobId,
 		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
