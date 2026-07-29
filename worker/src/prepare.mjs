@@ -7,10 +7,14 @@ import { prepareLocalWorkspace } from "./prepare-local.mjs";
 /**
  * The `prepareWorkspace` dispatcher the processor injects. Creates a per-job dir under `jobsDir`
  * (holding the read-only /job inputs) and routes by job kind: local jobs go to `prepareLocalWorkspace`,
- * GitHub jobs to `prepareGithubWorkspace`.
+ * forge-backed jobs to the preparer registered for their kind.
  *
  * The `flow` becomes a prompt hint; the actual skill is provided by the project's materialised
  * .pi/skills.
+ *
+ * `forgeFor(job)` yields the `{ auth, host }` pair for that job's forge (start.mjs owns the map). The
+ * preparer is handed `host.resolveDefaultBranchSha` rather than the whole pair, so a preparer can only
+ * resolve a SHA -- it gets no minting capability and no comment surface it has no business holding.
  *
  * `findPreviousRun` (run-history's `makeFindPreviousRun`) feeds the cron event context below; the
  * default returns null so an unwired dispatcher (tests, a bare construction) still writes a complete
@@ -18,10 +22,12 @@ import { prepareLocalWorkspace } from "./prepare-local.mjs";
  */
 export function makePrepareWorkspace({
 	jobsDir,
-	resolveDefaultBranchSha,
+	forgeFor,
 	findPreviousRun = () => null,
 	prepareLocal = prepareLocalWorkspace,
-	prepareGithub = prepareGithubWorkspace,
+	// Keyed by `job.kind`, so a new forge is one entry rather than a new `if`. A kind with no entry falls
+	// through to the throw below, which is what makes an unrouted job loud instead of a silent no-op.
+	preparers = { github: prepareGithubWorkspace },
 }) {
 	mkdirSync(jobsDir, { recursive: true });
 	return async function prepareWorkspace(job, token, { queueJobId } = {}) {
@@ -38,8 +44,10 @@ export function makePrepareWorkspace({
 			const event = localEventContext(job, queueJobId, findPreviousRun);
 			return await prepareLocal({ folder: job.folder, task, jobDir, event });
 		}
-		if (job.kind === "github") {
-			return await prepareGithub(job, token, { jobDir, resolveDefaultBranchSha });
+		const prepare = preparers[job.kind];
+		if (prepare) {
+			const host = forgeFor?.(job)?.host;
+			return await prepare(job, token, { jobDir, resolveDefaultBranchSha: host?.resolveDefaultBranchSha });
 		}
 		throw new Error(`unknown job kind: ${job.kind}`);
 	};

@@ -114,10 +114,15 @@ export function makeReaper({ log }) {
  * needs, and starts draining the queue. `createWorker` already installs the timeout, the
  * abort->docker-stop, and the SIGTERM/SIGINT graceful shutdown.
  *
- * GitHub auth is initialised best-effort: a local-only deployment must still boot when no working
- * GITHUB_AUTH_SOURCE is present, so an auth failure is logged and the github deps fail closed per
- * job (mintToken throws configError) rather than blocking startup. Collaborators are injectable
- * (defaulting to the real ones) so the wiring is testable offline with no Redis and no GitHub.
+ * This is where a job's KIND becomes a pair of collaborators. Each forge is one `forges` entry of
+ * `{ auth, host }`, and the four deps that used to be bound to one forge -- `mintToken`, `comment`,
+ * `isDefaultBranchProtected`, `prepareWorkspace` -- now look their forge up from the job. The processor
+ * therefore never branches on which forge a job belongs to; the only place that knows is here.
+ *
+ * Forge auth is initialised best-effort, per forge: a local-only deployment must still boot when no
+ * working GITHUB_AUTH_SOURCE is present, so an auth failure is logged and that forge's deps fail closed
+ * per job (mintToken throws configError) rather than blocking startup. Collaborators are injectable
+ * (defaulting to the real ones) so the wiring is testable offline with no Redis and no forge.
  */
 export async function startWorker(
 	env = process.env,
@@ -146,14 +151,25 @@ export async function startWorker(
 	// pauses. Held in a mutable ref so the live-reload watcher can hot-swap it. [] means no scoped pauses.
 	const pauseWindows = { current: loadPauseWindows(config) };
 
-	let gh = null;
+	// The forge a job belongs to is resolved PER JOB from `job.kind`, not bound once for the process.
+	// Each entry is `{ auth, host }`: `auth` is get-token's `{ mintToken, selfId, source }` (null when that
+	// forge is unconfigured or unreachable), `host` is the three methods github-host.mjs returns. The map
+	// is the seam -- `forgeFor` below is the only place a kind becomes a pair of collaborators, so the
+	// processor never learns which forge it is talking to.
+	//
+	// Auth stays BEST-EFFORT per forge, exactly as it was: a local-only deployment has no GitHub
+	// credentials and must still boot and drain cron jobs. The refusal is deferred to the job that needs
+	// the missing credential (the mintToken fallback below), not raised at startup.
+	const forges = { github: { auth: null, host: makeHost() } };
 	try {
-		gh = await makeAuth(config.github);
-		log("self_identity", { id: gh.selfId, source: gh.source });
+		forges.github.auth = await makeAuth(config.github);
+		log("self_identity", { kind: "github", id: forges.github.auth.selfId, source: forges.github.auth.source });
 	} catch (err) {
-		log("github_auth_unavailable", { reason: err?.message });
+		log("github_auth_unavailable", { kind: "github", reason: err?.message });
 	}
-	const host = makeHost();
+
+	/** The `{ auth, host }` pair a job's kind names, or `undefined` for a local job (which has no forge). */
+	const forgeFor = (job) => forges[job?.kind];
 
 	// Clear strays left by a previous crash before the worker starts draining. Best-effort: the reaper
 	// swallows its own docker errors; this guard keeps any reaper failure from blocking boot.
@@ -259,7 +275,7 @@ export async function startWorker(
 			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
-				resolveDefaultBranchSha: host.resolveDefaultBranchSha,
+				forgeFor,
 				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
 				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
 				findPreviousRun: makeFindPreviousRun({ logsDir: config.logsDir }),
@@ -269,24 +285,43 @@ export async function startWorker(
 				// Best-effort: the processor awaits comment() inside its try, so a rejection here would
 				// corrupt the job outcome and could drive a wrong retry / second PR (CONST-RETRY-INFRA-ONLY).
 				// This adapter NEVER throws.
-				if (job?.kind === "github" && gh) {
+				const forge = forgeFor(job);
+				if (forge?.auth) {
 					try {
-						const token = await gh.mintToken(job.repo);
-						await host.postStatusComment(job.repo, job.target.number, text, token);
+						const token = await forge.auth.mintToken(job);
+						await forge.host.postStatusComment(job.repo, job.target, text, token);
 					} catch (err) {
 						log("comment_failed", { jobId: job?.id, reason: err?.message });
 					}
 					return;
 				}
+				// A local job, or a forge-backed one whose auth never came up. Either way there is nowhere to
+				// post, so the line on stdout IS the completion signal (REQ-LOCAL-JOB-VISIBILITY).
 				log("comment", { jobId: job?.id, text });
 			},
 			log,
-			mintToken:
-				gh?.mintToken ??
-				(async () => {
+			// Resolved per job so the credential always comes from the job's OWN forge. A job whose forge has
+			// no working auth refuses here, at mint time, rather than running anonymously -- and the refusal
+			// names the kind, because with more than one forge configured "auth is broken" is not diagnostic.
+			//
+			// A LOCAL job reaches this only via the `run.github: true` cron opt-in
+			// (INT-TRIGGERS-FILE-CONTRACT), and that flag names github explicitly -- so it mints from the
+			// github forge and not from a "default" one. There is deliberately no default: which forge a
+			// token comes from must always be something the trigger said.
+			mintToken: async (job) => {
+				const kind = job?.kind === "local" ? "github" : job?.kind;
+				const auth = forges[kind]?.auth;
+				if (auth) return await auth.mintToken(job);
+				if (kind === "github") {
 					throw configError("github jobs and cron triggers with run.github require a working GITHUB_AUTH_SOURCE (gh/pat/app)");
-				}),
-			isDefaultBranchProtected: host.isDefaultBranchProtected,
+				}
+				throw configError(`no forge credentials are configured for job kind ${JSON.stringify(job?.kind)} -- see .env.example`);
+			},
+			isDefaultBranchProtected: async (job, token) => {
+				const host = forgeFor(job)?.host;
+				if (!host) throw configError(`no forge host is configured for job kind ${JSON.stringify(job?.kind)}`);
+				return await host.isDefaultBranchProtected(job.repo, token);
+			},
 		},
 	});
 

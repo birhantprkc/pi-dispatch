@@ -86,17 +86,23 @@ export function makeGitHubHost({ octokitFor = (token) => new Octokit({ auth: tok
 	}
 
 	/**
-	 * Post `text` as an issue comment. `number` is an issue OR a pull request number -- a PR shares the
-	 * `/issues/{n}/comments` endpoint, so posting to a PR number comments on the PR conversation.
+	 * Post `text` as a comment on `target` -- the job's discriminated `{ type, number }`.
 	 * Content-agnostic: `text` is passed through as `body` verbatim, never inspected, filtered, or logged.
+	 *
+	 * `target.type` is deliberately UNREAD here: on GitHub an issue and a pull request share one number
+	 * sequence and one `/issues/{n}/comments` endpoint, so posting to a PR number comments on the PR
+	 * conversation. The parameter is the whole target rather than a bare number because that is what a
+	 * forge whose issue and merge-request comments are DIFFERENT endpoints needs, and a host method that
+	 * cannot be called uniformly is not a seam. Passing the number alone would push that discrimination
+	 * into the caller, where it would have to know which forge it was talking to.
 	 */
-	async function postStatusComment(repo, number, text, token) {
+	async function postStatusComment(repo, target, text, token) {
 		const [owner, name] = splitRepo(repo);
 		const octokit = octokitFor(token);
 		await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
 			owner,
 			repo: name,
-			issue_number: number,
+			issue_number: target?.number,
 			body: text,
 		});
 	}

@@ -155,8 +155,15 @@ test("github configured: real mintToken and the host's isDefaultBranchProtected 
 	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 123, source: "gh" });
 	const { deps, logs } = await runStart({ makeAuth, makeHost: () => host });
 
-	assert.equal(await deps.mintToken("o/r"), "tok", "mintToken must be the real one (not the throwing fallback)");
-	assert.equal(deps.isDefaultBranchProtected, host.isDefaultBranchProtected, "isDefaultBranchProtected must be the host's");
+	const ghJob = { kind: "github", repo: "o/r" };
+	assert.equal(await deps.mintToken(ghJob), "tok", "mintToken must be the real one (not the throwing fallback)");
+	// Both deps now resolve the forge from the JOB rather than being bound to one host at wiring time, so
+	// the assertion is that they ROUTE to this host -- identity-equality would only prove the old binding.
+	let asked = null;
+	const routing = fakeHost({ isDefaultBranchProtected: async (repo) => ((asked = repo), true) });
+	const { deps: d2 } = await runStart({ makeAuth, makeHost: () => routing });
+	assert.equal(await d2.isDefaultBranchProtected(ghJob, "tok"), true);
+	assert.equal(asked, "o/r", "the github host must be asked about the job's own repo");
 	assert.equal(typeof deps.prepareWorkspace, "function");
 	assert.ok(
 		logs.some((l) => l.event === "self_identity" && l.id === 123 && l.source === "gh"),
@@ -189,7 +196,7 @@ test("auth unavailable: the worker still boots; mintToken fails github jobs clos
 	assert.ok(captured, "startWorker must still construct the worker (a local-only deployment boots)");
 	assert.ok(logs.some((l) => l.event === "github_auth_unavailable"), "a github_auth_unavailable log must be emitted");
 	await assert.rejects(
-		() => deps.mintToken("o/r"),
+		() => deps.mintToken({ kind: "github", repo: "o/r" }),
 		(err) => err?.piDispatchConfig === true,
 		"mintToken must reject with a .piDispatchConfig-tagged configError when auth is unavailable",
 	);

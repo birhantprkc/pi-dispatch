@@ -27,8 +27,8 @@ test("dispatches a github job to prepareGithub with (job, token, { jobDir, resol
 
 		const prepareWorkspace = makePrepareWorkspace({
 			jobsDir,
-			resolveDefaultBranchSha: fakeResolve,
-			prepareGithub: fakeGithub,
+			forgeFor: () => ({ host: { resolveDefaultBranchSha: fakeResolve } }),
+			preparers: { github: fakeGithub },
 			prepareLocal: fakeLocal,
 		});
 
@@ -65,8 +65,8 @@ test("dispatches a local job to prepareLocal with { folder, task, jobDir, event 
 
 		const prepareWorkspace = makePrepareWorkspace({
 			jobsDir,
-			resolveDefaultBranchSha: async () => ({ sha: "x" }),
-			prepareGithub: fakeGithub,
+			forgeFor: () => ({ host: { resolveDefaultBranchSha: async () => ({ sha: "x" }) } }),
+			preparers: { github: fakeGithub },
 			prepareLocal: fakeLocal,
 		});
 
@@ -96,8 +96,8 @@ async function dispatchLocal(jobsDir, job, { queueJobId, findPreviousRun } = {})
 	const calls = [];
 	const prepareWorkspace = makePrepareWorkspace({
 		jobsDir,
-		resolveDefaultBranchSha: async () => ({ sha: "x" }),
-		prepareGithub: async () => {},
+		forgeFor: () => ({ host: { resolveDefaultBranchSha: async () => ({ sha: "x" }) } }),
+		preparers: { github: async () => {} },
 		prepareLocal: async (arg) => {
 			calls.push(arg);
 			return { outcome: "ok" };
@@ -182,8 +182,8 @@ test("throws on an unknown job kind", async () => {
 	try {
 		const prepareWorkspace = makePrepareWorkspace({
 			jobsDir,
-			resolveDefaultBranchSha: async () => ({ sha: "x" }),
-			prepareGithub: async () => {},
+			forgeFor: () => ({ host: { resolveDefaultBranchSha: async () => ({ sha: "x" }) } }),
+			preparers: { github: async () => {} },
 			prepareLocal: async () => {},
 		});
 

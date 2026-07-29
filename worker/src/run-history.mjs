@@ -140,9 +140,13 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 }
 
 /**
- * A stable, non-PII target label. GitHub jobs read `repo#number` (issue or PR number); local jobs read
- * `local:<basename>` -- basename only, so the full folder path (which on Windows carries the OS account
- * name) never lands in the record.
+ * A stable, non-PII target label. GitHub jobs read `repo#number`; local jobs read `local:<basename>` --
+ * basename only, so the full folder path (which on Windows carries the OS account name) never lands in
+ * the record.
+ *
+ * `#` serves an issue AND a pull request on GitHub because they share one per-repo number sequence, so
+ * `repo#7` names exactly one thing. That is a fact about GitHub, not about forges -- a forge with
+ * separate sequences needs the target type in the label or `repo#7` is ambiguous.
  */
 function targetFor(kind, data) {
 	if (kind === "github") return `${data.repo}#${data.target?.number}`;

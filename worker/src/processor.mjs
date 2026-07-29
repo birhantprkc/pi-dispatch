@@ -37,8 +37,12 @@ export async function runJob(job, deps) {
 		// this job names is on this host (image-preflight.mjs). Default admits everything, so a wiring that
 		// omits it behaves exactly as before -- the container's own failure stays the backstop.
 		imagePreflight = async () => ({ ok: true }),
-		mintToken, // (repo) => scoped short-lived token. Called with the repo for github jobs, with undefined for local jobs opted in via `github: true`; unflagged local jobs never mint (token stays null)
-		isDefaultBranchProtected, // (repo, token) => boolean
+		// (job) => scoped short-lived token. Takes the JOB, not the repo: which forge mints -- and therefore
+		// which credential the container gets -- is a property of `job.kind`, and only the wiring knows the
+		// map. Called for forge-backed jobs and for local jobs opted in via `github: true`; unflagged local
+		// jobs never mint (token stays null).
+		mintToken,
+		isDefaultBranchProtected, // (job, token) => boolean; same reason -- the forge is the job's, not the process's
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
 		// runContainer({ job, token, prepared, name, signal }) => { code, aborted, turns }. It MUST honour
 		// `signal`: stop the container on abort, and reject/exit promptly if `signal.aborted` is already
@@ -54,11 +58,15 @@ export async function runJob(job, deps) {
 		now = new Date(),
 	} = deps;
 
-	const isGitHub = job.kind === "github";
+	// "Forge-backed" is the negation of local, not an enumeration of forges: a job that is not editing a
+	// folder on this host is working against a remote, and every gate below applies for the same reason
+	// regardless of WHICH remote. Written this way so a new forge inherits the gates rather than having to
+	// be added to them -- the failure mode of an enumeration is a forge that silently skips a money gate.
+	const isForgeBacked = job.kind !== "local";
 	// A local job opted in via `github: true` (cron trigger opt-in, INT-TRIGGERS-FILE-CONTRACT) mints the
-	// same scoped per-job token the github path mints (CONST-TOKEN-SCOPED-PER-JOB) -- repo arg undefined,
-	// since a local job has none. Unflagged local jobs stay tokenless, exactly as before.
-	const wantsGitHubToken = isGitHub || job.github === true;
+	// same scoped per-job token the github path mints (CONST-TOKEN-SCOPED-PER-JOB). Unflagged local jobs
+	// stay tokenless, exactly as before.
+	const wantsForgeToken = isForgeBacked || job.github === true;
 	let token = null;
 	let prepared = null;
 	let reserved = false;
@@ -85,8 +93,8 @@ export async function runJob(job, deps) {
 			throw new InfraRetry("docker unavailable, image preflight could not run", { reason: "container-never-started" });
 		}
 
-		if (wantsGitHubToken) {
-			token = await mintToken(isGitHub ? job.repo : undefined);
+		if (wantsForgeToken) {
+			token = await mintToken(job);
 
 			// Defense-in-depth at the DI seam: mintToken is injected, so we cannot assume it routed
 			// through get-token's own empty-token guard. An empty credential here would reach
@@ -97,11 +105,11 @@ export async function runJob(job, deps) {
 			}
 		}
 
-		if (isGitHub) {
-			// REQ-BRANCH-PROTECTION-PRECONDITION. The agent's token can merge (contents:write covers
-			// push AND merge), so branch protection is the only technical barrier to a self-merge.
-			// Refuse before spending anything. GitHub jobs only: a local job has no job.repo to check.
-			if (!(await isDefaultBranchProtected(job.repo, token))) {
+		if (isForgeBacked) {
+			// REQ-BRANCH-PROTECTION-PRECONDITION. The agent's token can merge, so branch protection is the
+			// only technical barrier to a self-merge. Refuse before spending anything. Forge-backed jobs
+			// only: a local job has no remote branch to protect.
+			if (!(await isDefaultBranchProtected(job, token))) {
 				await comment(job, "Refused: the default branch is not protected. See SECURITY.md.");
 				log("refused_unprotected", { repo: job.repo });
 				// exitCode/turns/tokens null: refused pre-container, so no container exit, turn, or token count exists.

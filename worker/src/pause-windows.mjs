@@ -190,9 +190,13 @@ export function windowEndAt(w, nowMs) {
 	return null;
 }
 
-/** The scope key a window matches against: the repo for a github job, the folder for a local job. */
+/**
+ * The scope key a window matches against: the folder for a local job, the repo for any forge-backed one.
+ * Keyed on local rather than on a list of forges, so a new forge is scoped by its `repo` automatically --
+ * an enumeration that forgot one would make that forge's jobs unpausable, which is a silent failure.
+ */
 export function scopeOf(job) {
-	return job?.kind === "github" ? job?.repo : job?.folder;
+	return job?.kind === "local" ? job?.folder : job?.repo;
 }
 
 /**
