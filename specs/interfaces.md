@@ -680,10 +680,14 @@ Evidence convention as in `constitution.md`.
     reaps nothing. Chromium spawns many processes; zombies accumulate against `--pids-limit` until the
     job dies of something unrelated to its actual work.
   - Env **passed by the worker**: the configured provider's key variable(s), derived — not hardcoded
-    (see below); `GITHUB_TOKEN` and `GH_TOKEN`, both set to the same minted per-job token (short-lived; gh
-    prefers `GH_TOKEN`, and mirroring the two names forecloses precedence surprises) — present for
-    GitHub-backed jobs and for local cron jobs that opt in via `run.github: true`
-    (`INT-TRIGGERS-FILE-CONTRACT`), absent otherwise; `PI_JOB_ID`; `PI_PROVIDER`;
+    (see below); the minted per-job token under **its own forge's variable
+    names, and only those**: `GITHUB_TOKEN` + `GH_TOKEN` for a github job (and for a local cron job that
+    opts in via `run.github: true`, `INT-TRIGGERS-FILE-CONTRACT`); `GITLAB_TOKEN` + `GL_TOKEN`, plus
+    `GITLAB_HOST`, for a gitlab job. Each forge's pair is mirrored because its CLI has its own preference
+    (gh prefers `GH_TOKEN`, glab prefers `GITLAB_TOKEN`), which forecloses precedence surprises.
+    **Cross-forge export is refused by construction**: a GitLab credential exported as `GITHUB_TOKEN`
+    would be sent by `gh` to github.com on the agent's first invocation — a working credential handed to
+    the wrong host, which is precisely how a scoped token stops being scoped. Absent otherwise; `PI_JOB_ID`; `PI_PROVIDER`;
     `PI_MODEL`; `PI_MAX_TURNS`; `PI_MAX_TOKENS` (the per-job token budget — forwarded ONLY when set, omitted
     otherwise so the runner meters usage without a cap; `REQ-TOKEN-ACCOUNTING-AND-CAPS`); `PI_CODING_AGENT_DIR`
     (if not `$HOME/.pi/agent`); `PI_GLOBAL_ALLOW_EXTENSIONS=0` (forwarded ONLY to carry the operator's explicit
@@ -694,9 +698,10 @@ Evidence convention as in `constitution.md`.
     when empty, never an empty string. The delimiter is `":"` because these are CONTAINER paths; the host's
     `path.delimiter` is `";"` on Windows and would be wrong); and each name in `PI_FORWARD_ENV` (an explicit operator
     allowlist of extra host vars — e.g. a custom provider's key — forwarded by exact `-e NAME=VALUE`, never a
-    pass-through, so it satisfies `no-broad-env-into-container`; `GITHUB_TOKEN` and `GH_TOKEN` are refused in
-    the allowlist at config load — a forwarded operator token would silently override the minted per-job
-    value). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
+    pass-through, so it satisfies `no-broad-env-into-container`; **every** minted-token name — `GITHUB_TOKEN`,
+    `GH_TOKEN`, `GITLAB_TOKEN`, `GL_TOKEN` — is refused in the allowlist at config load, because a
+    forwarded operator token would silently override the minted per-job value. The list grows with each
+    forge, which is why it is a set rather than a pair). Note `PI_DAILY_TOKEN_CAP` is **worker-only and is
     NOT forwarded** — the daily token counter is enforced host-side, and the container stays queue/budget-blind.
   - **`PI_OFFLINE=1` is set UNCONDITIONALLY, on every job — the one env addition here that is not opt-in.**
     Every other variable above is forwarded only when something armed it; this one is not, and the reason is
@@ -833,7 +838,9 @@ Evidence convention as in `constitution.md`.
 
 ## INT-WEBHOOK-PAYLOAD-SUBSET
 
-**GitHub → receiver.**
+**GitHub → receiver.** *(GitLab's is a separate contract — `INT-GITLAB-PAYLOAD-SUBSET`. This ID keeps
+its name and its GitHub-only body: IDs are permanent addresses, and a second forge's payload is a
+different shape rather than an extension of this one.)*
 
 - **Contract**:
   - Events consumed: `issues`, `issue_comment`, `pull_request`. Everything else drops as `unhandled-event`.
@@ -869,6 +876,56 @@ Evidence convention as in `constitution.md`.
   `pull_request` payload, no `head.sha`/`head.ref` value is ever passed to a clone or fetch — the fetch
   pins the base default-branch SHA.
 
+## INT-GITLAB-PAYLOAD-SUBSET
+
+**GitLab → receiver.** The sibling of `INT-WEBHOOK-PAYLOAD-SUBSET`, kept separate because a GitLab
+payload is a different shape rather than an extension of GitHub's.
+
+- **Contract**:
+  - Events consumed: `Issue Hook`, `Note Hook`, `Merge Request Hook` (`object_kind`: `issue`, `note`,
+    `merge_request`). Everything else drops as `unhandled-event`.
+  - Headers consumed: `X-Gitlab-Event`; `webhook-id` **or** `Idempotency-Key` (the delivery id); and, per
+    the endpoint's declared mode, either `webhook-signature` + `webhook-timestamp` or `X-Gitlab-Token`.
+  - Body fields consumed: `object_kind`, `user.id`, `user.username`, `project.id`,
+    `project.path_with_namespace`, `project.default_branch`, `object_attributes.{iid, title, description,
+    action, note, noteable_type, labels[].title, oldrev}`, `changes.labels.{previous, current}[].title`,
+    and for a note event the noteable's `{iid, title, description, labels[].title}` under `issue` or
+    `merge_request`.
+  - **Everything else is ignored.**
+- **Three fields have no GitHub counterpart**, and they are why this is a separate projection:
+  - **`changes.labels` — the DIFF is the trigger.** GitLab has no `labeled` action; adding a label arrives
+    as `action: "update"` with a before/after pair. The label set a rule is tested against is
+    `current \ previous`, and an `update` carrying no `changes.labels` matches nothing. Testing the
+    *current* set instead — the shape the GitHub path uses, because there a `labeled` action already means
+    "a label just moved" — would re-fire on every later edit of an already-labelled issue: retitle it,
+    reassign it, re-milestone it, and each one starts another paid run. `open` is the single case with no
+    previous set, and there the whole set is the addition.
+  - **`noteable_type`** states whether a comment is on an issue or a merge request, where GitHub infers it
+    from the presence of `issue.pull_request`. Routing it wrong mints a `pi/issue-<n>` branch for
+    something that is already a merge request: wrong work, no error, and it reads as a successful run.
+  - **`user.username`** is carried, where GitHub's `sender.login` is deliberately dropped, because GitLab
+    puts no access level in the payload and the member lookup needs an identity. It is **personal data**
+    with exactly one consumer: it reaches the resolver and goes no further — never a log line, never the
+    job, never the run record (`no-pii-in-logs`).
+- **`iid`, never `id`.** `iid` is the per-project number a human sees and an API path takes; `id` is a
+  global database key that would address a valid-looking object belonging to somebody else.
+- **The project is carried as its numeric `id`**, with `path_with_namespace` kept only as a human-readable
+  label for logs, run history and pause-window scopes. A GitLab project path is `group/subgroup/project`
+  with no fixed segment count, so the `owner/name` split the GitHub path uses does not merely fail on one
+  — it **succeeds wrongly**, both halves non-empty, and the project silently becomes its own parent group.
+- **Why**: Naming the subset **is** the contract, for the reason its sibling states: because everything
+  unlisted is ignored by construction, an upstream schema addition cannot change our behaviour, and a
+  reviewer sees the entire attack surface as one list. Every field here is attacker-controlled except the
+  headers, and the headers are only trustworthy after `CONST-HMAC-OVER-RAW-BODY` has run. Unlike GitHub's
+  `author_association`, **nothing in this list establishes authority** — GitLab computes no such field, so
+  the approval gate is an API lookup performed outside the filter (`REQ-TRIGGER-AUTHOR-GATE`).
+- **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `REQ-TRIGGER-AUTHOR-GATE`, `REQ-DEDUP-BY-DELIVERY-GUID`,
+  `INT-CONTAINER-JOB-INPUTS`, `INT-WEBHOOK-PAYLOAD-SUBSET`
+- **Acceptance**: Given a payload with unknown extra fields, behaviour is unchanged. Given an `update`
+  whose `changes` carries no `labels`, no job is enqueued. Given a note whose `noteable_type` is
+  `MergeRequest`, the job's target type is `pull_request`. No enqueued job, log line or run record
+  contains `user.username`.
+
 ## INT-TRIGGERS-FILE-CONTRACT
 
 **operator → worker + receiver.** One unified file, read by both services; each validates the WHOLE file
@@ -897,10 +954,31 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
       "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean>,
                "image": "<optional>" } } ] }
   ```
-- **The on × run diagonal is the trust boundary, enforced fail-loud at load**: `cron ⟹ run.kind:"local"`;
-  every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind:"github"`. Off-diagonal throws a
-  `piDispatchConfig` error — a `cron` trigger has no webhook delivery, issue/PR number, title, or body to
-  supply a github run, and a webhook trigger is adversarial input that always produces a github job.
+- **The on × run MATRIX is the trust boundary, enforced fail-loud at load**: `cron ⟹ run.kind:"local"`;
+  every webhook type (`label`, `comment`, `pull_request`) `⟹ run.kind ∈ {"github", "gitlab"}` — a forge
+  job, never a local one. Off-matrix throws a `piDispatchConfig` error — a `cron` trigger has no webhook
+  delivery, issue/PR number, title, or body to supply a forge run, and a webhook trigger is adversarial
+  input that always produces a forge job.
+- **`run.kind` selects the forge; `on.type` is shared.** A label is a label and a comment is a comment on
+  any forge, so the trigger types and their `{any, all, none}` predicates are identical. The **action**
+  vocabulary is not, and is validated against the vocabulary of whichever forge the entry names:
+  `github` takes `labeled|opened|synchronize|reopened`, `gitlab` takes `open|update|reopen|approved` — each
+  in that forge's own words, so an operator can grep their own documentation for them. GitLab has no
+  `labeled` (a label added to a merge request arrives as `update` with a `changes.labels` diff), no
+  `synchronize` (an `update` carrying `oldrev` is the analogue), and `approved` has no GitHub counterpart
+  at all; `merge` and `close` are omitted because a job started by either has nothing left to act on.
+  **The refusal matters more than it looks**: an action word from the wrong forge is not malformed and
+  breaks nothing downstream — it simply never matches an event, so the trigger loads clean and is
+  silently dead. Refusing at load is what turns that into a message.
+- **A `labeled` github `pull_request` rule must carry a positive selector; a gitlab one need not.** Not an
+  inconsistency: on GitHub the predicate IS the approval gate for that action, so a rule without one is
+  ungated. Every gitlab trigger is additionally gated on the actor's resolved access level
+  (`CONST-TRIGGER-AUTHOR-GATE`), so there is no ungated case for a predicate to have to close. A **label**
+  trigger still requires a positive selector on both forges, because a `none`-only rule fires on any
+  labelling event at all.
+- **At most one `comment` trigger PER FORGE.** The receiver holds one comment rule per forge and a second
+  would be silently unreachable, so the cap is on ambiguity rather than on count — and a deployment
+  serving both forges is entitled to answer `@pi` on each.
 - **`run.github` (cron only, optional boolean)**: absent or `false` = no token — the zero-GitHub default;
   `true` = the worker mints the same per-job token the GitHub path mints and injects it as
   `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
@@ -1123,9 +1201,9 @@ worker reads.
   <logsDir>/<sanitizedJobId>.log      append-only container stdout+stderr; untrusted, PII-bearing; written ONLY when PI_CAPTURE_JOB_LOGS=1
   <logsDir>/<sanitizedJobId>.json     one JSON object, PII-free, overwritten on each terminal state (last-write-wins across retries)
   (logsDir via PI_LOGS_DIR; empty/unset = <OS temp>/pi-dispatch/logs)
-  { "jobId":   "<raw job id: delivery GUID | local-<hex> | repeat:<sched>:<millis>>",
-    "kind":    "github" | "local" | null,
-    "target":  "<repo>#<issue>"  |  "local:<basename>" | null,
+  { "jobId":   "<raw job id: delivery id | local-<hex> | repeat:<sched>:<millis>>",
+    "kind":    "github" | "gitlab" | "local" | null,
+    "target":  "<repo>#<issue>"  |  "<project>!<iid>"  |  "local:<basename>" | null,
     "flow":    "<flow name>" | null,
     "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
     "outcome":   "completed" | "policy" | "failed",
@@ -1346,3 +1424,4 @@ worker reads.
 | 2026-07-15 | `INT-RUNNER-EXIT-CODE-PROTOCOL` gained its **mechanism**, which was the missing half. The codes were right; nothing said how to produce them, and **the obvious implementation produces them wrong**. ~~`pi never throws`~~ (**refuted the next day — see above**): `agent.ts:485-491` catches and `handleRunFailure` does not rethrow, so abort / 429 / 5xx / dead network all resolve `await session.prompt()` normally — and `prompt()` returns `Promise<void>`, so there is no return value either. A `try`/`catch` runner exits `0` on every infrastructure failure: queue records success, never retries, job did nothing — verbatim the worst failure class this project names. The exit code must be derived from `stopReason` on the terminal message, captured via `subscribe()`. Also recorded: the `subscribe()` listener is **sync and unawaited**, so a budget check that awaits will overshoot. `INT-CONTAINER-RUNTIME-CONTRACT` gained two runtime facts that fail *inside the container* where no Dockerfile hints at them: the agent dir must be **writable** by the non-root user (pi lazily writes `auth.json` on first credential touch), and Chromium needs **`--no-sandbox`** because `--cap-drop=ALL` denies it the seccomp/`SYS_ADMIN` its own sandbox requires — the container is the sandbox, and re-granting caps to Chromium would invert the security model. Two cited paths were **dead** (`packages/ai/src/api/env-api-keys.ts`, `packages/coding-agent/src/core/config.ts`); claims and line numbers were correct, only the addresses were wrong — the sneakiest defect class, since it reads as verified and cannot be followed. All cited paths now resolve. Good news recorded too: `before_agent_start` fires strictly before any provider HTTP call, so the assembled-prompt assertion costs **zero tokens**. |
 | 2026-07-15 | `INT-SDK-SESSION-OPTIONS` **materially corrected** before any code was written against it. The contract block was **not callable as published**: it passed `appendSystemPromptOverride` as a `createAgentSession` option (it is a `DefaultResourceLoader` option) and called `getModel` as a free function (it is a `ModelRuntime` method, and is not exported). Two further traps were found by reading source and are now recorded: `noContextFiles` is **off by default**, so `CONST-NO-CONTEXT-FILES-MANDATORY` fails **open by omission**; and `createAgentSession` **does not `reload()` a loader you pass it**, so the persona is silently empty — a second, previously-unrecorded path to this project's most-feared failure, created by the *interaction* of two constitutional constraints. The irony is the point: this block's own `Why` called it *"the only contract here that fails invisibly"*, and it was itself wrong in three ways for a month. This is the third time a doc-verified pi claim has been refuted by source — exactly what the evidence convention in `constitution.md` predicts. |
 | 2026-07-29 | Per-trigger job image (issue #41). **INT-TRIGGERS-FILE-CONTRACT**: an optional `run.image` on all four `run` shapes, with its own bullet mirroring `run.packages` — pure passthrough like `provider`/`model`/`maxTurns` (absent = `PI_JOB_IMAGE`, and resolved against **env only**, never the settings overlay), carried on all four kinds for `run.packages`' reason and not `run.github`'s (**a toolchain is a capability of the flow**, and a webhook trigger runs the same flows a cron trigger does), refused at load when not a non-empty string / when it carries whitespace / when it begins with `-`, its reference **grammar deliberately not validated** (docker's business; a regex would refuse malformed names while missing the far commoner well-formed-but-unbuilt one), and refused **pre-spend** when the tag is not on the host. The cron byte-match Acceptance admits `image` on the same terms as `github`/`packages` (absent stays absent, so an unflagged trigger's `data` is byte-identical), and the existing `PI_OFFLINE=1` env carve-out gains a **second dimension stated rather than discovered**: the env the worker *passes* is identical for every image, but the env *baked into* one is a fact about that image, so two triggers naming two images never had identical container environments. **INT-CONTAINER-RUNTIME-CONTRACT**: the real gap here — it **never named the image at all**, which was true-by-accident while there was one image this repo built. A new leading bullet makes it explicit that the contract is written against *an* image and is now the **conformance checklist** for any tag nameable in `run.image`, enumerating what the worker assumes and does not verify (non-root + writable `~/.pi/agent`, an entrypoint honouring `INT-RUNNER-EXIT-CODE-PROTOCOL`, the pinned pi version, the baked `PLAYWRIGHT_*` facts, root-owned agent-unwritable guardrails, fonts, and the **per-image** loader posture), with the note that **every one of them fails silently or late**. `--pull=never` added to the flag set with its own bullet: `docker run` defaults to `--pull=missing`, so an unknown name would be a **registry fetch** — the same make-it-unreachable move as `PI_OFFLINE=1`, one layer down. Acceptance extended to say the properties must hold for **every** nameable image, and that the assertions are ours for our tag and the operator's for theirs (`OQ-012`). **INT-SDK-SESSION-OPTIONS trap (g)** scoped: its `image/runner/package.json` claims describe an image built from **this repo's Dockerfile**; a foreign image's layout is simply not described — which costs nothing, because the trap's invariant is layout-independent by design (runtime mutation probe, `tryResolve` on both candidates). The *assertion* is what loses coverage, not the code. **INT-RUN-HISTORY-FILE-CONTRACT**: one enum token, `job-image-missing` — a policy outcome, not `container-never-started`, since the container was never attempted. |
+| 2026-07-29 | Issue #42 (GitLab triggers). Added **INT-GITLAB-PAYLOAD-SUBSET**, a SIBLING of `INT-WEBHOOK-PAYLOAD-SUBSET` rather than an extension of it — IDs are permanent addresses, and a GitLab payload is a different shape, not more of GitHub's. It names three fields with no GitHub counterpart and says why each exists: **`changes.labels`, where the DIFF is the trigger** (GitLab has no `labeled` action, so a label add arrives as `update` with a before/after pair — matching the CURRENT set, which is what the GitHub path does because there a `labeled` action already means "a label just moved", would re-fire on every later retitle, reassign or milestone change of an already-labelled issue, each one a paid run); **`noteable_type`**, which states issue-vs-merge-request where GitHub infers it from `issue.pull_request`, and getting it wrong mints a `pi/issue-<n>` branch for something that is already an MR — wrong work, no error, reads as success; and **`user.username`**, carried where GitHub's `sender.login` is deliberately dropped, because GitLab puts no access level in the payload and the member lookup needs an identity — personal data with exactly one consumer, which never reaches a log line, the job, or the run record. Also records `iid`-never-`id` and that the project rides as its numeric id, because a `group/subgroup/project` path does not merely break the `owner/name` split — it **passes** it, both halves non-empty, and the project silently becomes its own parent group. **INT-TRIGGERS-FILE-CONTRACT**: the diagonal becomes a **matrix** — the sentence "every webhook type ⟹ `run.kind:"github"`" was flatly false and is replaced — plus three new bullets: `run.kind` selects the forge while `on.type` stays shared (a label is a label anywhere); the **action vocabulary is per forge**, validated against the one the entry names, because a word from the wrong forge is not malformed and breaks nothing — it never matches an event, so the trigger loads clean and is silently dead, and refusing at load is what turns that into a message; and the positive-selector rule differs for a reason rather than by accident (a `labeled` github rule has only its predicate as the approval gate, while every gitlab trigger is additionally access-gated). The one-comment-trigger cap becomes **per forge**: it exists because the receiver holds one comment rule per forge and a second would be unreachable, so it caps ambiguity, not count. **INT-CONTAINER-RUNTIME-CONTRACT**: the minted token now goes under **its own forge's variable names and only those** (`GITHUB_TOKEN`/`GH_TOKEN`, or `GITLAB_TOKEN`/`GL_TOKEN`/`GITLAB_HOST`) — cross-forge export is refused by construction, because a GitLab credential exported as `GITHUB_TOKEN` is sent by `gh` to github.com on the agent's first invocation, which is exactly how a scoped token stops being scoped — and the `PI_FORWARD_ENV` refusal grows from a pair to a set of every minted name. **INT-RUN-HISTORY-FILE-CONTRACT**: `kind` gains `gitlab`, and the `target` grammar gains `<project>!<iid>`, GitLab's own notation, because issues and merge requests are separate per-project sequences and `repo#5` would name two different objects. **INT-CONTAINER-JOB-INPUTS** and **INT-OUTBOX-CONTRACT** are UNCHANGED and were checked: `/outbox` stays local-only, a gitlab job is driven by adversarial issue text exactly as a github one is, and it inherits `OQ-009` verbatim rather than opening a new question. |

@@ -254,7 +254,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   - **Deterministic `jobId`** — `repeat:<schedulerId>:<nextMillis>` — so scheduler jobs get
     `REQ-DEDUP-BY-DELIVERY-GUID`-equivalent dedup for free, with no GUID to supply.
   - **Local-only this slice.** The on × run diagonal rejects a `cron → github` trigger at load
-    (`INT-TRIGGERS-FILE-CONTRACT`, `DES-TRIGGERS-UNIFIED-FILE`). A scheduled GitHub job has no webhook
+    (`INT-TRIGGERS-FILE-CONTRACT`, `DES-TRIGGERS-UNIFIED-FILE`). A scheduled job on any forge has no webhook
     delivery, issue/PR number, title, or body to supply, and post-integration the github path would perform
     a real host clone and per-job token mint before failing every tick — spend and side effects for a
     trigger that cannot complete. GitHub scheduling is deferred to a later slice.
@@ -285,19 +285,65 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `CONST-RETRY-INFRA-ONLY`, `CONST-BUDGET-BEFORE-TOKENS`, `REQ-RUNNER-TURN-BUDGET`,
   `REQ-QUEUE-BURST-NO-DROP`
 
+## DES-FORGE-IS-A-PER-JOB-DEPENDENCY
+
+- **Decision**: A job's forge is resolved **per job**, from `job.kind`, at exactly one place: the worker's
+  composition root holds a `forges` map of `{ auth, host }`, and the four dependencies that used to be
+  bound to one forge — `mintToken`, `comment`, `isDefaultBranchProtected`, `prepareWorkspace` — look their
+  forge up from the job they were handed. The interface is the one that already existed: `get-token`'s
+  `{ mintToken, selfId, source }` and `github-host`'s three methods. The receiver routes **by path**
+  (`/gitlab`, with `/` remaining GitHub), so each source has its own secret and its own trust regime,
+  chosen before a byte of the body is read.
+- **Why**: `processor.mjs` already consumed those four as independently injected functions rather than as
+  one `github` object, so it was written against a de-facto interface and merely called it behind
+  `job.kind === "github"` guards. Making the lookup per job removed the guards without inventing anything:
+  no abstraction was designed ahead of its second user, because the shapes were already there and the
+  second user only revealed which *parameters* were wrong — a repo string where a job belonged. What the
+  processor gained is that "forge-backed" is now the negation of local rather than a list of forges; an
+  enumeration that forgot a forge would let it silently skip a money gate.
+- **Rejected**:
+  - *A generic "any forge" plugin framework.* Three named forges are wanted (#42, #43, #61), and one seam
+    discovered from a real second one beats a shape guessed from none.
+  - *Routing by header rather than by path.* Forgejo emits `X-GitHub-*` on every delivery (#61), so
+    headers cannot reliably tell forges apart — and worse, a request able to select which gate it faced
+    would select the weakest available. A path is chosen by the operator when they configure the webhook,
+    not by the sender at delivery time.
+  - *Negotiating the verification mechanism from what the request carries.* The same reason one layer
+    down: `CONST-HMAC-OVER-RAW-BODY`'s mode is config-declared, and a delivery presenting the other mode's
+    header is refused even when that header is correct.
+  - *A filter that performs its own membership lookup.* `filter.mjs` and `filter-gitlab.mjs` import
+    nothing side-effecting, do no I/O and never throw, and that purity is exactly what makes the
+    security-critical decision testable offline. The lookup runs in the receiver, between verification and
+    the gate, and arrives as a plain number.
+  - *Adapting GitHub's "404 means unprotected" to GitLab.* It has no such 404, and #61 records what
+    carrying that assumption across a forge boundary costs: every branch reports unprotected and the
+    never-merge backstop is silently disarmed. GitLab reads the protected-branches **list** instead.
+  - *Inferring approval from label-application on GitLab.* The premise that makes it work on GitHub is
+    false there (`CONST-TRIGGER-AUTHOR-GATE`), so the actor's access level is resolved for every trigger
+    type rather than only for comments.
+  - *Forking the clone path per forge.* The askpass helper, the hardening flags, the gone-SHA markers and
+    the pinned detached checkout are facts about git and this project, not about GitHub; only the remote
+    URL and the agent's envelope differ, and both are injected. A second copy would be a second place to
+    fix a clone bug, and the copy that did not get fixed would be the one nobody was looking at.
+  - *One shared `postStatusComment(repo, number, …)`.* GitLab's issues and merge requests are separate
+    endpoints AND separate number sequences, so the method takes the discriminated target. GitHub reads
+    `target.type` not at all — but a host method that cannot be called uniformly is not a seam.
+- **Traces to**: `CONST-TRIGGER-AUTHOR-GATE`, `CONST-HMAC-OVER-RAW-BODY`, `CONST-TOKEN-SCOPED-PER-JOB`,
+  `INT-GITLAB-PAYLOAD-SUBSET`, `INT-TRIGGERS-FILE-CONTRACT`, `OQ-013`
+
 ## DES-TRIGGERS-UNIFIED-FILE
 
 - **Decision**: One `triggers.json` of `{ on, run }` entries is the single source of standing triggers for
   **both** services. A shared validator (`worker/src/triggers.mjs`, exported as
   `@pi-dispatch/worker/triggers`) parses and validates the whole file; the worker selects `on.type:"cron"`
-  and the receiver selects `on.type ∈ {label, comment, pull_request}`. Both validate everything; each
+  and the receiver selects `on.type ∈ {label, comment, pull_request}` for whichever forge each entry's `run.kind` names. Both validate everything; each
   evaluates only its own subset. This replaces the two prior files (`PI_SCHEDULES_FILE` and
   `receiver.flows.json`) with **no compatibility shim** — a clean cutover.
 - **Why**: The schema unifies the operator's *view* of triggers; it does **not** merge the engines. The
   `receiver`/`worker`, adversarial/trusted boundary is untouched: a `label` `on` is never scheduled (no
   delivery GUID to dedup on, no fresh collaborator approval), and a `cron` `on` never receives a webhook.
-  The `on × run` matrix is near-diagonal (`cron ↔ local`, webhook ↔ `github`) and that diagonal **is** the
-  trust boundary, encoded as a fail-loud validation rule (`INT-TRIGGERS-FILE-CONTRACT`). One validator, run
+  The `on × run` matrix pairs `cron ↔ local` and webhook ↔ a **forge** (`github`|`gitlab`), and that
+  pairing **is** the trust boundary, encoded as a fail-loud validation rule (`INT-TRIGGERS-FILE-CONTRACT`). One validator, run
   by both, means a malformed file fails both services identically — the two cannot drift. The shared module
   lives in the worker package because `receiver` and `admin` already depend on `@pi-dispatch/worker`; the
   dependency is one-way, so no cycle.
@@ -754,8 +800,9 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     everything else there. Making a flow AI-triggerable is a reviewed commit, not a runtime toggle — the
     same reviewability that keeps flows as reviewed repo markdown (`DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`).
   - **Relationship to `CONST-TRIGGER-AUTHOR-GATE`, stated carefully.** That constraint is
-    **webhook/comment-scoped** and governs **WHO** may start a job (only a collaborator can apply the
-    allowlisted label). It is **unaffected** here. The frontmatter opt-in governs **WHICH** flows a
+    **webhook/comment-scoped** and governs **WHO** may start a job (on GitHub, only a collaborator can
+    apply the allowlisted label; on GitLab that premise is false and the actor's resolved access level is
+    the gate instead — `CONST-TRIGGER-AUTHOR-GATE`). It is **unaffected** here. The frontmatter opt-in governs **WHICH** flows a
     model-callable tool may fire — a **different axis, WHAT not WHO**. It is an **additional** local defense,
     justified because the `dispatch_run` tool and the outbox collector are **prompt-injection-reachable**
     where the operator-typed CLI is not. It does **not** "satisfy" or "extend" the author-gate — treating a
@@ -802,8 +849,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
     slice is **same-folder-only**, with no arbitrary host-path mount. The freeform **task text is DATA**: it
     lands in the child's `prompt.md`, never as instructions to the harness (`CONST-ISSUE-TEXT-IS-DATA`, one
     layer down — the same payload-subset discipline the receiver applies to issue text).
-  - **GitHub-parent outboxes are dropped.** A GitHub job is driven by adversarial issue text, so **no
-    `/outbox` mount is created for `kind:github`** — an untrusted issue author cannot chain. This is a
+  - **Forge-parent outboxes are dropped.** A forge job is driven by adversarial issue text, so **no
+    `/outbox` mount is created for any forge kind** (`github`, `gitlab`) — an untrusted issue author cannot chain. This is a
     deliberate **deferral**, recorded inline here; the open-questions register row is a sibling task's job.
   - **Budget is unchanged.** Chained jobs are ordinary local jobs; they pass `reserveBudget` consumer-side
     in the processor before `runContainer` (`CONST-BUDGET-BEFORE-TOKENS`). The depth/count caps
@@ -1188,3 +1235,4 @@ a tunnel.
 | 2026-07-28 | Issue #58. Added **`DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY`**: token usage is metered at pi-ai's module-level api-provider registry — the one choke point every in-process session shares — instead of on a per-instance `AgentSession` bus that cannot see a subagent fanout, with the `subscribe()` accumulator kept as the fallback. Records the rejected alternatives (the subscribe-only meter, `getSessionStats`, undici/SSE parsing, an `after_provider_response` extension hook, patching pi) and the four things any implementation must handle, all found by runtime probe rather than by reading source: the dual pi-ai module instance, `resetApiProviders()` wiping raw registrations, wrapper displacement in both directions (identity tracking + a `WeakSet` of observed streams), and builtin-auth fidelity through the sibling-loaded fallback catalog. `DES-OPERATOR-GLOBAL-OVERLAY` amended: the overlay gains a **packages tier** (host-staged, exact-pinned, per-trigger armed, appended last to `additionalExtensionPaths`) and records the skill-ordering finding — pi puts package skill paths FIRST and `loadSkills` is first-path-wins, so on the raw load a staged skill beats the repo's, which would invert this entry's own "repo wins on conflict". Path order cannot fix it, but `DefaultResourceLoaderOptions.skillsOverride` (a declared option on the pinned loader, plus the public `loadSkillsFromDir`) can and does: precedence is re-imposed on the loaded result, repo before overlay before package, so the requirement holds by enforcement. **Correction on the way in**: an earlier draft of this row and entry said there was "no reordering lever" and resolved the finding by refusing the job — the premise was false and the refusal is gone; what remains is the collision *report* (visibility, and the tripwire that goes quiet if a future pi reorders `skillPaths`). Four new Rejected entries: a separate `/opt/pi-packages:ro` mount (would amend `CONST-ISOLATION-CONTAINER-PER-JOB`'s enumerated acceptance for no capability the overlay lacks), a third env arming flag (redundant, and coarser than the per-trigger gate), routing packages through pi's `settings.packages` (would re-open the `SettingsManager.inMemory` protection), and `npm:` sources resolved in-container (a live network install of third-party code in an adversarial-input container, every run). |
 | 2026-07-23 | `DES-ADMIN-VIA-PI-EXTENSION` amended for **AI-operable, confirm-gated writes**: the model-callable surface gains `dispatch_triggers` (read) and the write tools `dispatch_set` + `dispatch_trigger_add`/`_edit`/`_delete`, each routed through `confirmedWrite` — applied only after an operator approves a `ctx.ui.confirm` showing the concrete before/after, refused (writing nothing) when `ctx.hasUI` is false. Adds a **third named injection residual** bounded by that human confirm rather than by structure; supersedes the "every settings write is operator-typed, never a model tool" clause. Both `CONST-BUDGET-BEFORE-TOKENS` (check-before-tokens ordering) and `CONST-TRIGGER-AUTHOR-GATE` (webhook author-gating) are unchanged — the confirm is the human approval, and both write paths reach the same validated/atomic `writeTriggers`/`writeSettings`. Extension also ships an `operate-pi-dispatch` skill (advertised via `resources_discover`) recommending how to use the gates. `USED_API` gains `on`. Companion `requirements.md`/`constitution.md` amendments land with it. |
 | 2026-07-29 | Issue #41. Added **`DES-PER-TRIGGER-JOB-IMAGE`**: the job image resolves per job (`job.image ?? PI_JOB_IMAGE`) from an optional operator-authored `run.image`, present on no model-callable tool, no panel key and not the settings overlay; a missing tag is refused pre-spend by `docker image inspect` and `--pull=never` joins `ISOLATION_FLAGS`. Rejected, with reasons on the record: **`PI_JOB_IMAGE_ALLOWLIST`** (the issue floats it — rejected because there is **nothing model-callable to bound**; `PI_DISPATCH_RUN_ROOTS` exists to bound a **model-supplied** folder, and an allowlist over a field only an operator can write can only refuse the operator's own edit while advertising a threat model this design forecloses — it arrives **with** the first tool that ever takes an image parameter, and that row is why it must); `image` in the runtime settings overlay; an `image` parameter on `dispatch_trigger_add`/`_edit`; **a flow-declared image read from the serviced repo** (the issue's second option — rejected hardest: that file is merge-gated, not operator-authored, and `DES-AI-TRIGGER-FLOW-GATE` takes only a **boolean** from it precisely because an image ref would hand that population the loader flags, the guardrail floor, the pinned pi version and the non-root user); a second mount or a job-time pull; and keeping every toolchain baked into one image. **`DES-RUNTIME-SETTINGS-FILE-OVERLAY` is amended, not reversed**: its *Per-message env mutation* rejection stands verbatim and `image` is **not** an exception to it — the overlay key list is unchanged and `dispatch_set` cannot set an image. The distinction is stated where it was previously only implied: that overlay is the **admin-editable runtime** channel (which is why its "never persona or hard rules" bar is scoped to it), while `triggers.json` is reviewed deploy-time operator config in the trust class `REQ-GLOBAL-PI-OVERLAY` calls *"the same trust class as baking the image"*. **`DES-OPERATOR-GLOBAL-OVERLAY`'s "Bake the overlay into the image" rejection is UNCHANGED and was checked**: nothing that was a mount becomes a bake, the overlay still rides `:ro` into whichever image runs, and the boundary is now written down — overlay = pi *configuration*, mounted, one per deployment; image = the *operating system* a flow needs, built, per flow. |
+| 2026-07-29 | Issue #42. Added **`DES-FORGE-IS-A-PER-JOB-DEPENDENCY`**: a job's forge is resolved per job from `job.kind` at exactly one place — a `forges` map of `{ auth, host }` in the worker's composition root — and the four deps that were bound to one forge (`mintToken`, `comment`, `isDefaultBranchProtected`, `prepareWorkspace`) look theirs up from the job. **No abstraction was invented ahead of its second user**: `processor.mjs` already consumed those four as independently injected functions rather than as one `github` object, so it was written against a de-facto interface and merely called it behind `job.kind === "github"` guards; the second forge revealed which *parameters* were wrong — a repo string where a job belonged — not that a new interface was needed. Rejected, with reasons on the record: a generic any-forge plugin framework; **routing by header** (Forgejo emits `X-GitHub-*` on every delivery per #61, so headers cannot tell forges apart — and a request able to select which gate it faced would select the weakest, where a path is chosen by the operator at configuration time and not by the sender at delivery time); negotiating the verification mechanism from the request, for the same reason one layer down; **a filter that does its own membership lookup** (both filters are pure, total and I/O-free, and that is exactly what makes the security-critical decision testable offline — so the lookup runs in the receiver and arrives as a plain number); **adapting GitHub's 404-means-unprotected** (#61 records the cost: every branch reports unprotected and the never-merge backstop is silently disarmed); inferring approval from label-application on GitLab; **forking the clone path** (the askpass helper, hardening flags, gone-SHA markers and pinned detached checkout are git and this project, not GitHub — only the remote URL and the envelope differ, and a second copy is a second place to fix a clone bug); and one shared `postStatusComment(repo, number, …)`, since GitLab's issues and merge requests are separate endpoints AND separate sequences, and a host method that cannot be called uniformly is not a seam. `DES-TRIGGERS-UNIFIED-FILE` amended: the near-diagonal becomes `cron ↔ local`, webhook ↔ a forge. `DES-PR-TRIGGER-ROUTES-TO-FLOW` amended to say its `target` union is the **shared** vocabulary and not GitHub's — a GitLab merge request is a `pull_request` target carrying its `iid`, so the job shape does not fork per forge even though the two forges' nouns differ. `DES-AI-TRIGGER-FLOW-GATE` amended in one parenthetical that carried the broken premise into a WHO/WHAT passage. `DES-JOB-OUTBOX-CHAINING` generalised from `kind:github` to any forge kind — the adversarial-text reasoning was never GitHub-specific. `DES-CRON-VIA-BULLMQ-SCHEDULER` amended in one sentence for the same reason. `DES-OPERATOR-GLOBAL-OVERLAY` and `DES-PER-TRIGGER-JOB-IMAGE` are **UNCHANGED and were checked**: the overlay is a mount and the image is a tag, and neither is a property of which forge triggered the job — a gitlab trigger carries `run.packages` and `run.image` on exactly the same terms as a github one. |

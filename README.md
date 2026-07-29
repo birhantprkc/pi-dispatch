@@ -5,7 +5,7 @@
 # pi-dispatch
 
 **Run the [pi](https://github.com/earendil-works/pi) coding agent as a service — triggered on demand, on a
-cron schedule, or by a GitHub issue or pull request — in a container you control, with a durable queue, a
+cron schedule, or by a GitHub or GitLab issue, comment or pull/merge request — in a container you control, with a durable queue, a
 spend cap, and a live admin panel.**
 
 ![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg)
@@ -24,8 +24,8 @@ system. **pi-dispatch is exactly that missing operational layer, and nothing els
   screenshot it, and iterate on the rendered result — the edge over a fixed hosted routine or `/loop`. A
   trigger can name its own image with `run.image` when one flow needs Python and another needs Node
   ([`docs/job-image.md`](docs/job-image.md)).
-- **Three triggers, one job.** A CLI command, a cron schedule, or a GitHub issue/PR — same job, same box,
-  same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control —
+- **Three triggers, one job.** A CLI command, a cron schedule, or a GitHub/GitLab issue, comment or
+  PR/MR — same job, same box, same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control —
   one per deployment, or one per trigger.
 - **Your project steers it** — pi's native `.pi/skills` and persona, from your committed files, over a
   small immutable safety floor the agent can't remove.
@@ -344,9 +344,9 @@ an AI tool — run that flow at all (default **deny**).
 
 ## Triggers: cron, labels, comments, pull requests
 
-Every standing trigger — cron schedules and GitHub triggers alike — lives in one unified
+Every standing trigger — cron schedules and webhook triggers alike — lives in one unified
 **`triggers.json`**, a list of `{ on, run }` pairs read by both the worker (cron) and the receiver
-(GitHub). Point both services at it with `PI_TRIGGERS_FILE`; the worker treats it as optional (unset =
+(GitHub, GitLab). Point both services at it with `PI_TRIGGERS_FILE`; the worker treats it as optional (unset =
 cron off), the receiver requires it.
 
 ```jsonc
@@ -356,12 +356,19 @@ cron off), the receiver requires it.
              "image": "pi-job:latest" } },
   { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
   { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
-  { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } }
+  { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } },
+
+  { "on": { "type": "label", "any": ["pi:fix"] },                   "run": { "kind": "gitlab", "flow": "fix" } },
+  { "on": { "type": "pull_request", "action": ["open", "update"] }, "run": { "kind": "gitlab", "flow": "review" } }
 ] }
 ```
 
 The `on × run` matrix is the trust boundary, enforced fail-loud at load: a `cron` trigger must run
-`local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs `github`.
+`local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs on a forge
+— `github` or `gitlab`. `run.kind` picks the forge; the trigger types and label predicates are shared, but
+the `pull_request` **actions** are each forge's own words (`labeled|opened|synchronize|reopened` vs
+`open|update|reopen|approved`), and a word from the wrong forge is refused at load rather than left to
+silently never match. See [`docs/gitlab.md`](docs/gitlab.md).
 
 `"packages"` on any trigger's `run` (all four kinds) decides whether that trigger loads the third-party pi
 packages you staged into the global overlay. It is an **opt-out**: staged packages load for every job, and
@@ -400,7 +407,8 @@ write waits on your confirmation.
 A cron trigger runs a local folder through a flow on a cron pattern — `pattern` is a 5- or 6-field cron
 expression; `provider`, `model`, `maxTurns` and `image` are optional on `run` and fall back to the worker's
 defaults. `"github": true` on `run` is also optional — it mints the same per-job GitHub token the webhook
-path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off by default. A cron
+path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off by default. It names
+GitHub explicitly — there is no cron opt-in for a GitLab token. A cron
 `folder` is a **host path** — the worker runs on the host
 ([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must be
 readable by the worker's user.
@@ -440,7 +448,7 @@ it at boot and live-reloads edits:
 ] }
 ```
 
-`scope` is a repo `"owner/name"`, a local folder path, or `"*"` for all; `from > to` is an overnight window;
+`scope` is a repo path (`"owner/name"`, or a nested GitLab `"group/sub/project"`), a local folder path, or `"*"` for all; `from > to` is an overnight window;
 `days`/`dateFrom`/`dateTo` gate the day the window starts.
 
 **Manage windows from the panel:** in `/dispatch`, press **`w`** and choose *Add*, *Edit*, or *Delete* —
@@ -513,6 +521,30 @@ flowchart TD
   EN -->|"Valkey down"| E503["503 — GitHub redelivers,<br/>deduped by GUID"]
 ```
 
+## GitLab automation
+
+Same machinery, one new field. Point a GitLab webhook at **`/gitlab`** (`/` is the GitHub endpoint), set
+`GITLAB_TOKEN` plus a verification mode, and write `"kind": "gitlab"` on your triggers.
+
+```bash
+GITLAB_TOKEN=glpat-xxxxxxxxxxxx        # a PROJECT access token, `api` scope, Developer or above
+GITLAB_URL=https://gitlab.com          # your instance, if self-hosted
+GITLAB_WEBHOOK_MODE=signature          # or `token` below GitLab 19.0
+GITLAB_WEBHOOK_SECRET=whsec_...
+```
+
+Three things differ from the GitHub arm, and each is a correctness matter rather than a rename:
+
+- **A GitLab label is not an approval.** A Guest can label an issue they are creating, and the minimum
+  role for labelling varies by version and edition — so every GitLab trigger is gated on the actor's
+  API-resolved project `access_level >= 30` (Developer), labels included.
+- **Labels fire on the diff.** GitLab has no `labeled` event; a label add arrives as `update` with a
+  before/after pair. Adding your label fires once; editing the issue afterwards fires nothing.
+- **GitLab 17.4 or later.** Dedup uses GitLab's own retry-stable delivery id. An older instance is refused
+  with a clear 400 rather than run on a key that would only half-dedup.
+
+Full setup, the `api`-scope trade-off, and what is not supported: [`docs/gitlab.md`](docs/gitlab.md).
+
 ## How it compares
 
 **vs the Claude Code GitHub Action.** For GitHub automation, often reach for the action —
@@ -536,7 +568,8 @@ control,"* that is this.
 
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitHub path (receiver → queue →
+The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitLab path (the same, for
+issues, notes and merge requests), the GitHub path (receiver → queue →
 clone → PR for both issues and pull requests), and scheduled (cron) triggers for local folders are built
 and work; the worker runs in a terminal or as an OS service on Linux, macOS or Windows (see **Run as a
 service**). The admin surface ships as a pi extension (see **Admin (pi extension)**). The design is

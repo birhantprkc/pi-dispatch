@@ -266,6 +266,50 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   acceptable, given that the unmetered path requires an operator to have staged and armed a package that
   spawns `pi`.
 
+
+## OQ-013 — GitLab's approval gate is weaker in kind than GitHub's, and depends on a lookup that can fail
+
+- **Status**: **ACCEPTED RISK** — *wants explicit ratification*
+- **Position**: GitLab triggers ship gated on an API-resolved project `access_level >= 30` (Developer),
+  applied to every trigger type. That is the strongest gate GitLab makes available, and it is weaker than
+  GitHub's in three ways that are worth naming rather than averaging away.
+  **(a) It is a network call, not a payload field.** GitHub computes `author_association` and hands it
+  over inside the signed body, so its gate is decidable from the delivery alone. GitLab computes nothing
+  equivalent, so authority is established by asking — and asking can fail. It fails *closed* for a
+  determinate answer (a 404 is level 0, refused) and *loudly* for an indeterminate one (503, redelivered),
+  but a gate with a moving part is not the same object as a gate without one.
+  **(b) The role table is not fixed.** The minimum role for label management has differed across GitLab
+  versions, and Ultimate's **custom roles** let an operator grant individual permissions at any level. So
+  `>= 30` is a claim about a number, and what that number *permits* is the operator's to know. This is
+  precisely why the gate does not read the label as an approval the way the GitHub path does.
+  **(c) A Guest can label an issue at creation.** That single fact is what forced (b)'s conclusion: a
+  stranger can open an issue already carrying the trigger label, so on GitLab a label proves nothing at
+  all about who approved anything.
+- **Why it is a risk row and not a constraint**: `CONST-TRIGGER-AUTHOR-GATE` already states what the gate
+  IS, per forge, and the code enforces it. What this row records is the residual after that enforcement —
+  the shape of what is left, not an unimplemented intention. A constraint that promised parity between the
+  two forges would be a constraint that shipped unenforced, which this project holds to be worse than an
+  honest open risk (`OQ-004`, `OQ-012`).
+- **What bounds it meanwhile**: The gate is `>= 30`, not `> 0` — Guest (10), Reporter (20) and GitLab's
+  intermediate roles are all refused, so the population that can start a paid run is the population that
+  could push a branch itself. The lookup uses `members/all`, so group-inherited access counts and a real
+  maintainer is not refused for holding their role one level up. The bot-loop guard runs BEFORE the access
+  gate, so the harness's own note cannot recurse even though its token IS a project member. Verification
+  runs before the lookup, so an unauthenticated flood cannot make this project call GitLab at all. And
+  every gate downstream is unchanged: budget, pause windows, branch protection, never-merge.
+- **What detection ships today**: An indeterminate lookup logs `gitlab_access_lookup_failed` and answers
+  503, so a broken or revoked token is loud rather than silent — the failure mode is "nothing runs and
+  GitLab keeps retrying", never "everything runs". `doctor` reports whether `GITLAB_TOKEN` is set when the
+  triggers file names gitlab, and names the `api`-scope trade-off.
+- **What would close it**: A GitLab-side equivalent of `author_association` — a payload field stating the
+  actor's relationship to the project, inside the signed body. None exists, and none is announced. Short
+  of that, the honest improvement is narrower: cache nothing, and keep the refusal loud.
+- **Related risks**: `OQ-004` (egress) is unchanged and now applies per forge. `CONST-TOKEN-SCOPED-PER-JOB`
+  carries the *credential* half of GitLab's weakness — `api` scope, hand-minted expiry — which is a
+  separate axis from this row's *authorisation* half.
+- **Needs**: A maintainer's explicit ratification that a resolved Developer-or-above access level is an
+  acceptable substitute for GitHub's collaborator gate, given (a), (b) and (c) above.
+
 ---
 
 ## Retired from the source design document
@@ -361,3 +405,4 @@ adversarial passes did.
 | 2026-07-28 | Issue #58. **OQ-010 scope-corrected in place** (kept, not rewritten): its CLOSED answer was **root-session-scoped** and never said so — `subscribe()` delivers one instance's events, `CreateAgentSessionOptions` has no parent/shared-bus option, and no event carries a `sessionId`, so a subagent fanout emits nothing on the parent's bus and registers as ~one turn. The answer to the question asked is unchanged; the gap was the question's reach. Accounting moved to pi-ai's module-level api-provider registry with the bus sum kept as the fallback, and `REQ-RUNNER-TURN-BUDGET` is now explicitly bounded to root-session turns by the same fact. Added **OQ-011** (`ACCEPTED RISK — wants explicit ratification`): a staged package that spawns a **`pi` subprocess** is invisible to any in-process hook — pi's own SDK example does exactly that — so its tokens miss the exit line and the daily counter. Records what detection ships today (Linux `/proc` child sampling, diagnostic only, logged at teardown), what bounds it meanwhile, and that it closes **with** `OQ-004`, because reading usage off a subprocess needs TLS termination and therefore the same container-level proxy. |
 | 2026-07-22 | OQ-010 **Unblocks** retargeted: the #25 follow-up landed as `REQ-TOKEN-ACCOUNTING-AND-CAPS` (per-job token/cost accounting + optional in-run per-job token budget + optional check-after daily token cap). The recorded lagging-control constraint is what shapes that REQ's asymmetry with `CONST-BUDGET-BEFORE-TOKENS`. |
 | 2026-07-29 | Issue #41. Added **OQ-012** (`ACCEPTED RISK — wants explicit ratification`): an operator-built job image named by a trigger's `run.image` is outside `REQ-UPSTREAM-CONTRACT-TESTS` — its own pi version, its own runner and exit codes, its own guardrails floor, its own **per-image** loader posture — and nothing in this repo can gate it. Records what bounds it (the isolation surface is the worker's argv, not the image's, so a non-conformant image is a **worse agent**, not a wider blast radius; an operator-only edit path; preflight + `--pull=never` mean only locally-present images run), what detection ships (presence of every named image in the preflight and `doctor`, plus an entrypoint **warning** — **not** conformance), and why the cheap close does not work: an OCI label proves intent, not conformance, and only running the assertions is non-lying. `OQ-004` and `OQ-011` unchanged, and noted as now additionally per-image. |
+| 2026-07-29 | Issue #42. Added **OQ-013** (`ACCEPTED RISK — wants explicit ratification`): GitLab's approval gate is weaker in kind than GitHub's, three ways. It is a **network call rather than a signed payload field**, so authority is established by asking and asking can fail — closed for a determinate 404, loudly (503, redelivered) for an indeterminate answer, but a gate with a moving part is not the same object as one without. The **role table is not fixed** across versions or editions, and Ultimate custom roles can grant label management at any level, so `>= 30` is a claim about a number whose permissions are the operator's to know. And a **Guest can label an issue at creation**, which is the fact that forced the whole design: a stranger can open an issue already carrying the trigger label, so on GitLab a label proves nothing about who approved anything, and the access gate covers label triggers where on GitHub the label carries that weight itself. Records what bounds it (`>= 30` not `> 0`, so the population that can start a paid run is the population that could push the branch itself; `members/all` so group-inherited access is not mistaken for absence; the bot-loop guard ordered BEFORE the access gate, since the harness's own token IS a project member; verification before the lookup, so an unauthenticated flood cannot make this project call GitLab), what detection ships (`gitlab_access_lookup_failed` + 503, so a revoked token fails as "nothing runs" and never as "everything runs"; `doctor` naming the `api`-scope trade), and what would close it — a GitLab-side `author_association` equivalent inside the signed body, which does not exist and is not announced. `OQ-004` unchanged and now per-forge; `OQ-009` (chaining from a forge parent) inherited verbatim, since a gitlab job gets no `/outbox` for the same adversarial-text reason a github one does not. |

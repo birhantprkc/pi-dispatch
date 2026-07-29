@@ -37,7 +37,8 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 
 | Trigger | Who can start a job | Undo |
 |---|---|---|
-| **Webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
+| **GitHub webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
+| **GitLab webhook** — label, `@pi` comment, or MR activity | A project member with **Developer access or above**, resolved from the API on every delivery. The label is **not** the approval step — see below. | Decline the MR |
 | **CLI** — manual run (`pi-dispatch run`) | Whoever has shell on the host / can run the CLI | Decline the PR, or **nothing** for a folder |
 | **Cron** — a schedule | **Nobody, at the time it runs.** It fires unattended. | As above |
 | **AI tool** — `dispatch_run` (operator session) | Whoever can prompt-inject the operator's model | **Nothing** — it enqueues a paid run that edits a folder in place |
@@ -58,23 +59,41 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 
 ## What is defended
 
-- **Who can trigger.** Comment triggers require `author_association ∈ {OWNER, MEMBER, COLLABORATOR}`.
-  Label triggers require an allowlisted label — and since only collaborators can apply labels, **the
-  label is the human approval step**, not a routing hint. A stranger's issue sits until a maintainer
-  labels it.
-- **Webhook authenticity.** `X-Hub-Signature-256` is verified with a timing-safe comparison over the
-  **raw** body, before parsing. Without this every other gate collapses, because the label and author
-  checks would be reading fields from a body nobody authenticated.
+- **Who can trigger.** On GitHub, comment triggers require `author_association ∈ {OWNER, MEMBER,
+  COLLABORATOR}`, and label triggers require an allowlisted label — since only collaborators can apply
+  labels, **the label is the human approval step**, not a routing hint. A stranger's issue sits until a
+  maintainer labels it.
+- **Who can trigger, on GitLab — and why the rule is different there.** That reasoning does not hold on
+  GitLab: the minimum role for managing labels has differed across versions, Ultimate's **custom roles**
+  can grant it at any level, and **a Guest can set labels on an issue they are creating**, so a stranger
+  can open an issue already carrying your trigger label. A GitLab label is therefore a routing hint and
+  nothing more, and **every** GitLab trigger — labels included — is gated on the actor's API-resolved
+  project `access_level >= 30` (Developer). Group-inherited membership counts; a lookup that cannot
+  complete answers 503 and is redelivered rather than silently dropped. `OQ-013` records the residual:
+  this gate depends on a network call, and on a role table that varies by version and edition.
+- **Webhook authenticity.** Every source is verified over the **raw** body, timing-safe, before parsing.
+  Without this every other gate collapses, because the label and author checks would be reading fields
+  from a body nobody authenticated. GitHub: the `X-Hub-Signature-256` HMAC. GitLab: either the
+  `webhook-signature` HMAC (19.0+) or an `X-Gitlab-Token` compare — you declare which, and only that one
+  is accepted, so a sender cannot choose the weaker gate. **Token mode is genuinely weaker**: it proves
+  the sender knew a secret, and nothing at all about whether the body arrived as it was sent. Prefer
+  `signature` where your instance supports it.
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.
 - **Credential scope.** A repo-scoped, short-lived token minted per job — a GitHub App installation
   token, or a single-owner fine-grained PAT. Its narrow scope and short expiry bound **where** and for
   **how long** an injected agent can act within that repo. See *What is NOT defended*.
-- **CI integrity.** The token is minimally-permissioned — `contents` and `pull-requests`, **not**
-  `workflows`, which is a separate scope. For a fine-grained PAT this is an operator-set property. An
-  injected agent therefore cannot rewrite `.github/workflows/` even though it can write code. This one
+- **CI integrity — on GitHub.** The token is minimally-permissioned — `contents` and `pull-requests`,
+  **not** `workflows`, which is a separate scope. For a fine-grained PAT this is an operator-set property.
+  An injected agent therefore cannot rewrite `.github/workflows/` even though it can write code. This one
   holds.
+  **It does NOT hold on GitLab.** A project access token needs `api` to post a note, and `api` grants full
+  project API read/write; `write_repository` alone already permits pushing `.gitlab-ci.yml`. GitLab offers
+  no contents-vs-CI split, so an injected agent on a GitLab job **can** rewrite your pipeline definition,
+  bounded only by branch protection and by the human who reviews the merge request. If that matters to
+  you, protect `.gitlab-ci.yml` with a CODEOWNERS-equivalent approval rule and keep the default branch
+  protected.
 - **Branch protection is required.** The worker refuses to run against a repository whose default branch
   is unprotected, checked before any money is spent. This is the control that makes human review real
   rather than customary — without it, nothing technical stops a merge.
@@ -215,13 +234,21 @@ Stated openly rather than discovered later:
 - Do not blanket-forward host environment into job containers. Pass only the variables the configured
   provider needs. In particular `ANTHROPIC_OAUTH_TOKEN` silently takes precedence over
   `ANTHROPIC_API_KEY`, so a stray variable in the host environment can quietly redirect which credential
-  a job spends. `GITHUB_TOKEN` and `GH_TOKEN` are refused in `PI_FORWARD_ENV` at config load — the worker
-  sets both to the minted per-job value, and a forwarded operator token would silently override it.
+  a job spends. Every minted-token name — `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GL_TOKEN` — is
+  refused in `PI_FORWARD_ENV` at config load: the worker sets them from the per-job mint, and a forwarded
+  operator token would silently override it.
 - **With `GITHUB_AUTH_SOURCE=gh` (the default), your entire gh login reaches every token-carrying job.**
   The minted value is your own full-scope `gh auth token`, and `pi-dispatch doctor` warns and names the
   scopes it carries (calling out broad ones like `admin:org`, `delete_repo`, `workflow`). Prefer a
   fine-grained PAT — or an App — for real per-job scoping. Your `~/.config/gh` is never mounted into a
   container; the credential reaches jobs only as env values.
+- **On GitLab there is no stronger option to prefer.** GitLab has no App equivalent and no short-expiry
+  per-job token, so your project access token is what every GitLab job gets, for as long as you leave it
+  valid. Use a **project** token rather than a group token (a group token reaches every project in the
+  group), give it the shortest expiry you will tolerate re-minting, and rotate it — the expiry bound is
+  yours to enforce, because nothing on GitLab's side enforces it for you. `pi-dispatch doctor` says so
+  when your triggers name GitLab. A GitLab token is exported to containers only as `GITLAB_TOKEN` /
+  `GL_TOKEN`, never under the GitHub names, and your `~/.config/glab` is never mounted.
 - **By default the worker sources the provider key from pi's `~/.pi/agent/auth.json` when the env has none.**
   It is a host-side read env-injected into the container — never a credential file mounted in — and accepts
   **API-key** logins only; an OAuth/subscription login is refused. The env always wins when set; set

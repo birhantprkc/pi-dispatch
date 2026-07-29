@@ -99,3 +99,29 @@ cannot, and that it is an edit they make to `triggers.json` themselves.** Do not
 `dispatch_trigger_edit`, which changes the flow only. Two useful things you *can* say: the image must be
 built or pulled on the worker's own host, because jobs run with `--pull=never` and nothing is fetched at
 job time; and `pi-dispatch doctor` lists every image their triggers name and flags one that is missing.
+
+## The forge a trigger listens to — `run.kind`
+
+A webhook trigger names its forge: `"kind": "github"` or `"kind": "gitlab"`. Everything else about the
+trigger is the same — the `on.type`, the `{any, all, none}` label predicate, `flow`, `packages`, `image`.
+
+Two things are NOT the same, and both refuse at load rather than misbehaving quietly:
+
+- **`pull_request` actions are the forge's own words.** GitHub takes
+  `labeled | opened | synchronize | reopened`; GitLab takes `open | update | reopen | approved`. A word
+  from the wrong forge is refused when the file is written. It would not break anything otherwise — it
+  would simply never match an event, and the trigger would look configured while doing nothing.
+- **One `comment` trigger per forge.** Two GitHub comment triggers are refused; one GitHub and one GitLab
+  are fine.
+
+`dispatch_trigger_add` takes an optional `forge` parameter, defaulting to `github`. Unlike `image`, this
+one IS offered to the model — a model that can already add a GitHub trigger can already arm a paid run,
+and naming GitLab instead does not widen that. Both paths stay behind the same operator confirm.
+
+If you are asked why a GitLab trigger did not fire, the usual answers in order:
+
+1. **The actor was not a Developer.** Every GitLab trigger is gated on the actor's project access level,
+   including label triggers — a GitLab label is not an approval the way a GitHub one is.
+2. **No label was added by that event.** GitLab has no `labeled` action; the trigger fires on the labels
+   an event *added*, so editing an already-labelled issue does nothing. This is deliberate.
+3. **The action word belongs to the other forge.** See above.
