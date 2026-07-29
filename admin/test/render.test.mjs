@@ -148,17 +148,18 @@ test("renderTriggers renders each of the four on.types", () => {
   assert.match(out, /pull_request {2}action\[labeled\] any\[pi:review\] → review/);
 });
 
-test("renderTriggers marks an armed trigger with [packages] and leaves an unarmed one unchanged", () => {
+test("renderTriggers marks a packages-loading trigger and leaves a declining one unchanged", () => {
   const cron = (packages) => ({ type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", packages });
-  const armed = renderTriggers({ schedulers: [], triggers: { triggers: [cron(true)] } });
-  assert.match(armed, /cron {2}nightly {2}0 3 \* \* \* → \/srv\/p\/tidy {2}\[packages\]/, "an armed cron line carries the marker");
+  // `true` is what normalizeTriggerForDisplay yields for a trigger that OMITS run.packages -- the common
+  // case under the opt-out polarity, and the one that used to render bare.
+  const loading = renderTriggers({ schedulers: [], triggers: { triggers: [cron(true)] } });
+  assert.match(loading, /cron {2}nightly {2}0 3 \* \* \* → \/srv\/p\/tidy {2}\[packages\]/, "a loading cron line carries the marker");
 
-  // A trigger that loads no third-party code must read exactly as it did before the marker existed.
-  const unarmed = renderTriggers({ schedulers: [], triggers: { triggers: [cron(false)] } });
-  assert.doesNotMatch(unarmed, /\[packages\]/);
-  assert.equal(unarmed, renderTriggers({ schedulers: [], triggers: { triggers: [cron(undefined)] } }), "unset reads as unarmed");
+  // A trigger that declined must read exactly as it did before the marker existed.
+  const declined = renderTriggers({ schedulers: [], triggers: { triggers: [cron(false)] } });
+  assert.doesNotMatch(declined, /\[packages\]/);
 
-  // All four kinds carry it -- every kind can arm the operator-staged packages.
+  // All four kinds carry it -- every kind loads the operator-staged packages unless it declined.
   const all = renderTriggers({
     schedulers: [],
     triggers: {

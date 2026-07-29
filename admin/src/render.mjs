@@ -144,9 +144,11 @@ export function renderTriggers({ schedulers, triggers } = {}) {
 /**
  * One trigger's display line, discriminated on `type`. A null field reads as "-".
  *
- * An ARMED trigger (`run.packages: true`) carries a trailing `[packages]` marker: it loads the
- * operator-staged third-party pi packages, so it must never read the same as one that does not. Unarmed
- * lines are byte-identical to before -- the marker is purely additive.
+ * A trigger that loads the operator-staged third-party pi packages carries a trailing `[packages]` marker:
+ * it must never read the same as one that does not. Loading is the DEFAULT (`run.packages` is an opt-out),
+ * so the marker is the common case once the operator has staged anything, and its absence means the trigger
+ * carries an explicit `run.packages: false`. Lines without it are byte-identical to before -- the marker is
+ * purely additive.
  */
 function triggerLine(t) {
   const flow = t?.flow ?? "-";

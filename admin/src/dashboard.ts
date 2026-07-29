@@ -595,9 +595,10 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   const cursor = sel ? styler.fg("accent", "›") : " ";
   const kind = t?.type ?? "?";
   const badge = styler.cell(kind, KIND_WIDTH, { color: KIND_COLOR[kind] ?? "muted" });
-  // An armed trigger (`run.packages: true`) loads the operator-staged third-party pi packages, so the row
-  // says so: without this, a trigger running third-party code with open network egress renders identically
-  // to one that does not. Amber, and appended AFTER the layout parts, so color stays post-layout.
+  // A trigger that loads the operator-staged third-party pi packages says so: without this, a trigger
+  // running third-party code with open network egress renders identically to one that does not. Loading is
+  // the default (`run.packages` is an opt-out), so the badge is present unless the trigger declined.
+  // Amber, and appended AFTER the layout parts, so color stays post-layout.
   const pkgs = t?.packages === true ? " " + styler.fg("warning", "[packages]") : "";
   return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}`, inner, styler);
 }
@@ -766,13 +767,14 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
   blank();
   section("trust model");
   for (const line of trustModel(t)) out.push(fitLine(styler.fg("border", "· ") + styler.fg("text", line), inner, styler));
-  // An ARMED trigger (`run.packages: true`) additionally loads the operator-staged third-party pi packages
-  // into the job — name+version, so the operator sees exactly which pinned code this trigger runs, plus the
-  // one-line consequence. Display only: arming is an edit to the reviewed triggers file, never a panel key.
+  // A trigger that did not decline (`run.packages: false`) additionally loads the operator-staged
+  // third-party pi packages into the job — name+version, so the operator sees exactly which pinned code this
+  // trigger runs, plus the one-line consequence. Display only: declining is an edit to the reviewed triggers
+  // file, never a panel key.
   if (t.packages === true) {
-    const armed = (text: string) => out.push(fitLine(styler.fg("border", "· ") + styler.fg("warning", text), inner, styler));
-    armed(`packages armed · ${stagedNames(staged)}`);
-    armed("third-party code on adversarial input, open network egress");
+    const loads = (text: string) => out.push(fitLine(styler.fg("border", "· ") + styler.fg("warning", text), inner, styler));
+    loads(`packages loaded · ${stagedNames(staged)}`);
+    loads("third-party code on adversarial input, open network egress");
   }
   return out;
 }

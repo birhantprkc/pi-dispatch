@@ -548,11 +548,17 @@ export function readTriggers({ triggersPath, fs = nodeFs }) {
  * Normalize one `{ on, run }` entry into its display record, or `null` when it is not usable. Exported for
  * the display tests; `readTriggers` is the only production caller.
  *
- * `packages` -- the trigger's `run.packages: true` opt-in to load the operator-staged third-party pi
- * packages (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -- is carried on ALL FOUR kinds: a trigger
- * that runs third-party code with open network egress must not render identically to one that does not.
- * Anything other than a literal `true` reads as unarmed, so a malformed value fails closed in the display
- * exactly as it does in the worker's validator.
+ * `packages` -- whether the trigger loads the operator-staged third-party pi packages
+ * (INT-TRIGGERS-FILE-CONTRACT, REQ-GLOBAL-PI-OVERLAY) -- is carried on ALL FOUR kinds: a trigger that runs
+ * third-party code with open network egress must not render identically to one that does not. It is an
+ * opt-OUT, so `!== false`: absent and `true` both load, and only an explicit `false` withholds. The
+ * `=== true` this replaced was the display half of a polarity that flipped in the worker and did not flip
+ * here, and it was silent in exactly the wrong direction -- the commonest loading trigger is one that omits
+ * the flag entirely, and it rendered with no marker at all.
+ *
+ * The display MIRRORS the worker rather than re-validating. `parseTriggers` refuses a non-boolean fail-loud
+ * at load, so a string "false" never reaches this function; a display that "failed closed" on it would be
+ * inventing a state the system cannot be in, and would disagree with the job that actually runs.
  */
 export function normalizeTriggerForDisplay(entry) {
   if (entry === null || typeof entry !== "object") return null;
@@ -560,7 +566,7 @@ export function normalizeTriggerForDisplay(entry) {
   if (on === null || typeof on !== "object") return null;
   const run = entry.run !== null && typeof entry.run === "object" ? entry.run : {};
   const flow = typeof run.flow === "string" ? run.flow : null;
-  const packages = run.packages === true;
+  const packages = run.packages !== false;
   switch (on.type) {
     case "cron":
       return {
