@@ -56,11 +56,26 @@ what is *inside* the box, not what the box can do.
 
 ## Verify it
 
-The `image` job in `.github/workflows/pi-upgrade-check.yml` is this checklist in executable form. Its
-**CORE** steps are the ones any conformant image must pass; its **RUNNER** steps assert things specific to
-the runner this repo ships. Run it against your own tag from the Actions tab — *Upstream contract checks →
-Run workflow* — and set the `image` input to your tag. With the input set, the build step is skipped and
-every assertion runs against what you supply.
+```bash
+./image/verify-image.sh my-python:1.2.0
+```
+
+That script is this checklist in executable form, and it is the **same** definition CI runs against the
+image this repo builds — so the list above, the script, and the gate cannot drift apart.
+
+**Run it on the machine that holds the image.** That is not a limitation to work around, it is the only
+place the check means anything: jobs launch with `--pull=never`, so the images pi-dispatch can actually run
+are exactly the ones on the worker's own host. A CI runner somewhere else has no access to them, which is
+why this is a script rather than a button in the Actions tab.
+
+It checks the **CORE** half — what any image must satisfy to be nameable in `run.image`. CI adds **RUNNER**
+assertions on top, and those are deliberately *not* in the script: they pin properties of the runner this
+repo ships (its exact refusal strings, a path under `/app`) and a conformant image built another way has no
+reason to satisfy them.
+
+Three rows of the table above it deliberately **cannot** check, and it says so when it finishes: that the pi
+version inside matches the pin, that the entrypoint honours the exit-code protocol on every path, and that
+the loader flags carry the posture you expect. Running a container can observe behaviour, not intent.
 
 ## Wire it up
 

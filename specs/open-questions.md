@@ -317,8 +317,11 @@ build does not.
   refuse/report by name; doctor additionally **warns** when a named image's entrypoint does not look like
   the runner. Neither inspects the image's contents. Naming a conformance verdict that had not been computed
   would be worse than reporting none — the same honesty as `OQ-011`'s child-process sampler.
-- **What would close it**: the conformance suite made runnable against an arbitrary tag (the parameterised
-  `image` CI job, documented in `docs/job-image.md`) **plus** a worker-side gate at job start. The honest
+- **What would close it**: a worker-side gate at job start. Half the ingredients exist — `image/verify-image.sh`
+  is the CORE checklist as one runnable definition, shared by CI and by the operator, and it runs **on the
+  host that holds the image**, which is the only place it can (`--pull=never` means the runnable images are
+  exactly the local ones, so a CI runner elsewhere could never verify them). What is missing is the harness
+  running it. The honest
   difficulty is that the cheap version of the gate does not work: a required OCI label proves **intent**, not
   conformance, because an image can assert any label it likes. The only non-lying check is *running* the
   assertions, which costs a container start per distinct image — cacheable per image ID, but a real cost and

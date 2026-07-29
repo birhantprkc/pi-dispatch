@@ -40,11 +40,6 @@ on:
     # project's design being written. A pin that is never exercised rots silently.
     - cron: "0 6 * * 1"
   workflow_dispatch:
-    inputs:
-      image:
-        description: "Run the image job's assertions against an EXISTING tag instead of building one (docs/job-image.md). Leave blank to build from image/Dockerfile."
-        required: false
-        default: ""
 
 jobs:
   version-pin:
@@ -166,22 +161,22 @@ jobs:
   image:
     name: the job image holds its contract
     runs-on: ubuntu-latest
-    # The tag every assertion below runs against. Default: the one this job builds. A workflow_dispatch
-    # `image` input replaces it and skips the build, which is what makes this job the executable form of
-    # docs/job-image.md's conformance checklist -- an operator can point it at an image they built for
-    # run.image (INT-TRIGGERS-FILE-CONTRACT) instead of taking the list on faith.
-    #
-    # Steps are labelled CORE or RUNNER, and the line matters. CORE is what ANY conformant image must pass.
-    # RUNNER asserts properties of the runner THIS repo ships -- our exact refusal strings, our loader, a
-    # path under /app that a foreign image need not have. That distinction is exactly the difference between
+    # CORE vs RUNNER, and the line matters. CORE is what ANY image must satisfy to be nameable in a
+    # trigger's `run.image` -- it lives in image/verify-image.sh, which this job calls, so the portable
+    # checklist has ONE definition rather than a copy here and a copy in the docs. RUNNER asserts properties
+    # of the runner THIS repo ships (its exact refusal strings, a path under /app a foreign image need not
+    # have) and stays here, because it is not portable. That distinction is the difference between
     # "conformant" and "built from this repo", which docs/job-image.md and OQ-012 both have to draw.
+    #
+    # An operator verifying THEIR image runs the script directly, on the host that holds it. It cannot be a
+    # workflow input: jobs launch with --pull=never, so the images pi-dispatch can run are exactly the ones
+    # on the worker's own machine, and a GitHub runner has no access to those.
     env:
-      IMAGE_REF: ${{ github.event.inputs.image || 'pi-job:ci' }}
+      IMAGE_REF: pi-job:ci
     steps:
       - uses: actions/checkout@v4
 
       - name: Build
-        if: ${{ !github.event.inputs.image }}
         run: docker build -f image/Dockerfile -t pi-job:ci .
 
       # --- CORE: nothing may make docker fetch an image (INT-CONTAINER-RUNTIME-CONTRACT) ---
@@ -203,49 +198,12 @@ jobs:
       # contract test that costs money is a contract test that gets disabled.
       # --entrypoint is required: ENTRYPOINT is the runner and ignores CMD, so `docker run img pi ...`
       # would silently run the runner instead of pi and the assertion would test nothing.
-      - name: "CORE: pi -p is still a flag"
-        run: docker run --rm --entrypoint pi "$IMAGE_REF" -p --help >/dev/null
-
-      # --- CONST-ISOLATION-CONTAINER-PER-JOB ---
-      # --cap-drop=ALL is the enforcement surface. Read the effective capability set directly rather
-      # than install libcap just to ask.
-      - name: "CORE: no capabilities under --cap-drop=ALL"
-        run: |
-          caps=$(docker run --rm --cap-drop=ALL --security-opt no-new-privileges \
-                   --entrypoint sh "$IMAGE_REF" -c 'grep ^CapEff /proc/self/status' | awk '{print $2}')
-          [ "$caps" = "0000000000000000" ] || { echo "::error::Container retains capabilities: $caps"; exit 1; }
-          echo "OK: CapEff=$caps"
-
-      - name: "CORE: runs as a non-root user"
-        run: |
-          uid=$(docker run --rm --entrypoint id "$IMAGE_REF" -u)
-          [ "$uid" != "0" ] || { echo "::error::Job container runs as root."; exit 1; }
-
-      # --- INT-CONTAINER-JOB-INPUTS ---
-      # /job:ro is what makes CONST-ISSUE-TEXT-IS-DATA enforceable by filesystem permission rather
-      # than by asking nicely. It is a security boundary, so assert the kernel enforces it.
-      - name: "CORE: /job is genuinely read-only from inside"
-        run: |
-          mkdir -p fixture/pi
-          echo "x" > fixture/pi/APPEND_SYSTEM.md
-          if docker run --rm --cap-drop=ALL -v "$PWD/fixture:/job:ro" --entrypoint sh "$IMAGE_REF" \
-               -c 'echo pwned > /job/pi/APPEND_SYSTEM.md' 2>/dev/null; then
-            echo "::error::/job is writable. The agent can rewrite its own instructions."
-            exit 1
-          fi
-          echo "OK: /job:ro enforced"
-
-      # --- INT-CONTAINER-RUNTIME-CONTRACT ---
-      # pi lazily creates ~/.pi/agent and writes auth.json on the FIRST credential operation. If the
-      # dir is root-owned the job dies EACCES at runtime, on a path nothing in the Dockerfile hints
-      # at. COPY --chown does not fix it (it skips auto-created parents), so assert the real thing.
-      - name: "CORE: the agent dir is writable by the runtime user"
-        run: docker run --rm --entrypoint sh "$IMAGE_REF" -c 'touch "$HOME/.pi/agent/auth.json" && rm "$HOME/.pi/agent/auth.json"'
-
-      - name: "CORE: the guardrails are baked where the runner reads them"
-        run: |
-          docker run --rm --entrypoint grep "$IMAGE_REF" -q "pi-dispatch-guardrails-v1" /opt/pi-dispatch/HARD_RULES.md \
-            || { echo "::error::Guardrails sentinel missing from /opt/pi-dispatch/HARD_RULES.md"; exit 1; }
+      # The CORE checklist, from the single definition an operator also runs against their own image
+      # (docs/job-image.md). Kept as a script rather than inlined steps so the portable half cannot drift
+      # from what the docs promise: pi present, CapEff=0, non-root, /job:ro enforced by the kernel, a
+      # writable agent dir, guardrails present AND unwritable, Chromium rendering a real page, fonts.
+      - name: "CORE: the conformance checklist any nameable image must pass"
+        run: ./image/verify-image.sh "$IMAGE_REF"
 
       # --- INT-CONTAINER-JOB-INPUTS / REQ-GLOBAL-PI-OVERLAY ---
       # A staged package that did not mount must be refused BEFORE any spend. This is the one failure
@@ -367,47 +325,3 @@ jobs:
           docker run --rm --network none -e PROBE="$PROBE" \
             --entrypoint sh "$IMAGE_REF" -c 'node --input-type=module -e "$PROBE"' \
             || { echo "::error::The usage meter no longer offers pi-coding-agent's NESTED pi-ai first in this image. That copy owns the module-level api-provider registry every session dispatches through, so it is the only one worth metering; installProcessUsageMeter still DECIDES by runtime mutation probe and would fall back, so this step is about the ORDER and the surface, not the decision. If the layout moved, re-verify in this order: resolvePiAiCompat's nested-path derivation in image/runner/src/usage-meter.mjs, the compat exports the probe and the wrapper call (getApiProvider/getApiProviders/registerApiProvider/resetApiProviders, createAssistantMessageEventStream), trap (g) in specs/interfaces.md, and image/runner/test/pinned-api.test.mjs -- which pins the dual-copy layout in contract-tests, where the worker's hoisted pi-ai is installed too."; exit 1; }
-
-      # --- DES-PLAYWRIGHT-CLI-NOT-CHROME-DEVTOOLS / REQ-FRONTEND-VISUAL-VERIFY ---
-      # Root-installed Chromium lands in /root/.cache/ms-playwright, invisible to the non-root user
-      # CONST-ISOLATION-CONTAINER-PER-JOB requires. --shm-size, NOT --ipc=host: Playwright recommends
-      # the latter, but it shares the HOST IPC namespace with a container running adversarial-input
-      # agent code. The crash it prevents is caused by a 64MB /dev/shm, so fix that instead.
-      #
-      # This asserts REAL rendering, not merely "a PNG exists". An earlier version opened a file://
-      # URL -- which playwright-cli BLOCKS by default -- so it screenshotted about:blank and passed
-      # on a blank page: green and vacuous. Two corrections: (1) navigate over http, which is what a
-      # frontend job actually does (a dev server), and which is not blocked; (2) diff the screenshot
-      # against a blank baseline, so a blank or all-tofu page FAILS. A non-empty PNG proves nothing;
-      # a PNG that differs from about:blank proves the browser painted the page.
-      # Two assertions that a NON-VACUOUS test needs, both learned the hard way:
-      #  - The page is served over HTTP (a dev server, what a frontend job hits), not file:// --
-      #    playwright-cli BLOCKS file:// by default, so the old test screenshotted about:blank and
-      #    passed green on a blank page.
-      #  - Correctness is proven by finding a MARKER in the page snapshot, not by diffing the
-      #    screenshot against blank. When the server is down, `open` renders Chrome's own
-      #    connection-refused error page, which ALSO differs from blank -- so a pixel diff passes on
-      #    an error page. The DOM snapshot containing our marker proves the real page loaded.
-      #  - The page is passed via env, not a bind mount: mounts are the one thing that behaves
-      #    differently across host OSes, and this must not depend on that.
-      # Both directions verified locally: a dead server makes the marker absent and the step fails.
-      - name: "CORE: Chromium renders a real page as non-root"
-        run: |
-          docker run --rm --init --cap-drop=ALL --security-opt no-new-privileges --shm-size=1g \
-            -e PAGE='<html><body style="background:#f00"><h1 style="color:#fff">RENDER-CHECK-MARKER</h1></body></html>' \
-            --entrypoint sh "$IMAGE_REF" -c \
-            'node -e "require(\"http\").createServer((_,r)=>{r.writeHead(200,{\"content-type\":\"text/html\"});r.end(process.env.PAGE)}).listen(8099)" & sleep 1;
-             playwright-cli open http://localhost:8099 >/dev/null 2>&1;
-             playwright-cli snapshot 2>&1 | grep -q RENDER-CHECK-MARKER || { echo "page did not load — chromium could not navigate/render"; exit 1; };
-             playwright-cli screenshot --filename /tmp/s.png >/dev/null 2>&1;
-             test -s /tmp/s.png || { echo "no screenshot produced"; exit 1; }' \
-            || { echo "::error::Chromium did not render a real page. Check PLAYWRIGHT_BROWSERS_PATH (build+run), PLAYWRIGHT_MCP_BROWSER, PLAYWRIGHT_MCP_SANDBOX, fonts."; exit 1; }
-
-      # Fonts: a weaker, independent check. The render diff above already catches a totally blank
-      # page; this catches "fonts package silently dropped" specifically. Neither proves LEGIBILITY
-      # (that needs OCR, which is not worth it here) -- honest about what it does and does not show.
-      - name: "CORE: fonts are installed"
-        run: |
-          n=$(docker run --rm --entrypoint sh "$IMAGE_REF" -c 'fc-list | wc -l')
-          [ "$n" -gt 0 ] || { echo "::error::No fonts. Chromium renders tofu; REQ-FRONTEND-VISUAL-VERIFY degraded."; exit 1; }
-          echo "OK: $n fonts"
