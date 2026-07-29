@@ -56,6 +56,10 @@ npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 
 > **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
 > toolchain in (the edge cron/visual flows rely on), build `image/Dockerfile` yourself — step 1's second form.
+>
+> Either way, **pull or build it before you run**: jobs launch with `--pull=never`, so the worker never
+> fetches an image at job time. A name it cannot find is refused *before* the job costs anything, rather than
+> becoming a silent pull of whatever answers to that name in a registry. `pi-dispatch doctor` checks presence.
 
 > **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
 > which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It

@@ -149,7 +149,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		maxTurns: positiveInt(env, "PI_MAX_TURNS", 30), // pi has no turn limit; we impose one
 		maxTokens: optionalBoundedInt(env, "PI_MAX_TOKENS", 1), // issue #25; null = per-job token budget disabled (lagging in-run backstop)
 		dailyTokenCap: optionalBoundedInt(env, "PI_DAILY_TOKEN_CAP", 1), // issue #25; null = daily token counter disabled (check-AFTER, host-side)
-		jobImage: env.PI_JOB_IMAGE ?? "pi-job:latest",
+		jobImage: env.PI_JOB_IMAGE || "pi-job:latest", // || (not ??) so an empty string falls back; "" is falsy and would throw inside buildDockerRunArgs AFTER a budget slot was reserved
 		globalPiDir: resolveGlobalPiDir(env, fileExists), // REQ-GLOBAL-PI-OVERLAY: operator's ~/.pi/agent subset, :ro-mounted; null = off
 		allowGlobalExtensions: globalExtensionsEnabled(env), // REQ-GLOBAL-PI-OVERLAY: ON unless PI_GLOBAL_ALLOW_EXTENSIONS=0
 		forwardEnv: forwardEnvList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist, GitHub token names refused

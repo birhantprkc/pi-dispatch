@@ -617,9 +617,25 @@ Evidence convention as in `constitution.md`.
 **worker → docker daemon.**
 
 - **Contract**:
-  - Flags: `--rm --init --cap-drop=ALL --security-opt no-new-privileges --memory=4g --cpus=2
+  - Flags: `--pull=never --rm --init --cap-drop=ALL --security-opt no-new-privileges --memory=4g --cpus=2
     --pids-limit=512 --shm-size=1g`
   - User: non-root
+  - **`--pull=never`.** `docker run` defaults to `--pull=missing`, which makes an unrecognised image name a
+    **registry fetch**: a typo in the operator's image config would pull and execute a stranger's image under
+    a name that looks like theirs. `never` makes that branch **unreachable rather than merely unlikely** --
+    the same move `PI_OFFLINE=1` makes one layer up (pi's job-time `npm install`), for the same reason and
+    with the same shape: a narrowing the whole fleet gets, not a per-job capability. Every other flag in this
+    list bounds what a chosen image may **do**; this one bounds **which image is chosen at all**, which is
+    why it leads. It costs nothing the documented flow was using: the install step in `README.md` is an
+    explicit `docker pull && docker tag`, `pi-job:latest` is a local-only tag with no registry behind it, and
+    `pi-dispatch doctor` already checks presence. The affected case is an operator who set `PI_JOB_IMAGE` to
+    a registry ref and relied on the first job pulling it; they now get a **pre-spend refusal naming the
+    image** instead of a multi-minute pull inside a container whose 30-minute kill timer is already running,
+    charged to a budget slot. That readable refusal is the **preflight's** job -- a `docker image inspect`
+    before `reserveBudget` (`worker/src/image-preflight.mjs`), returning `policy` with reason
+    `job-image-missing` rather than throwing, because retrying never makes a misspelled tag appear
+    (`CONST-RETRY-INFRA-ONLY`). The two are not redundant: the check is readable but raceable, the flag is
+    unraceable but silent.
   - **`--shm-size=1g`, and explicitly NOT `--ipc=host`.** Playwright's docs say verbatim: *"Using
     `--ipc=host` is recommended when using Chromium. Without it, Chromium can run out of memory and
     crash."* **We deliberately diverge.** `--ipc=host` shares the **host's IPC namespace** with a
@@ -1022,7 +1038,7 @@ worker reads.
     "flow":    "<flow name>" | null,
     "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
     "outcome":   "completed" | "policy" | "failed",
-    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|...>" | null,
+    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|job-image-missing|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
     "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number>,          // per-job usage totals; null when the container died before the exit line

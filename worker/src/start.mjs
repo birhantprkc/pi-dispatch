@@ -7,6 +7,7 @@ import { makeRedisClient, parseConnection } from "./connection.mjs";
 import { reconcile, reloadSchedules } from "./cron.mjs";
 import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
+import { makeImagePreflight } from "./image-preflight.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
 import { containerPackagePaths, readStageManifest } from "./packages.mjs";
@@ -129,6 +130,7 @@ export async function startWorker(
 		makeRecordWriter: makeRecordWriterFn = makeRecordWriter,
 		makeLogReaper: makeLogReaperFn = makeLogReaper,
 		makeRunContainer: makeRunContainerFn = makeRunContainer,
+		makeImagePreflight: makeImagePreflightFn = makeImagePreflight,
 	} = {},
 ) {
 	const config = loadConfig(env);
@@ -237,6 +239,14 @@ export async function startWorker(
 		pauseUntil: (job, now) => pauseUntilMs(pauseWindows.current, job, now),
 		deps: {
 			collectChain,
+			// One deployment default, two consumers, adjacent by construction: the preflight that refuses a missing
+			// image BEFORE the budget slot, and the factory that puts it in the argv. Both resolve a trigger's own
+			// `run.image` through the same resolveJobImage, so the image that was checked is the image that runs.
+			// Nothing is memoised: `docker image inspect` costs ~tens of ms against a container run of minutes, and a
+			// cache would be wrong in both directions -- an operator who builds the image mid-day would stay refused,
+			// one who removes it would stay admitted. Contrast the staged-package manifest, correctly read once at
+			// boot because it is deploy-time state under a :ro mount; the host's image set is not.
+			imagePreflight: makeImagePreflightFn({ image: config.jobImage }),
 			runContainer: makeRunContainerFn({
 				image: config.jobImage,
 				hostEnv: env,
@@ -285,7 +295,8 @@ export async function startWorker(
 	// comment and the signal for CONST-PI-VERSION-PINNED's silent-no-op mode -- a missing line is
 	// what tells a human a run did nothing. The container's own output already streams via
 	// runContainer's onOutput during the run.
-	// `reason` is a fixed enum (worker-abort | over-budget | unprotected-branch | runner-policy), never
+	// `reason` is a fixed enum (worker-abort | over-budget | unprotected-branch | runner-policy |
+	// job-image-missing), never
 	// user content. Included only when present so success lines stay clean; a shutdown-aborted job logs
 	// { outcome: "policy", reason: "worker-abort" }, making a restart-dropped job visible.
 	worker.on("completed", (job, result) =>

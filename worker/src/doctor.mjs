@@ -140,7 +140,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 				const probe = await runCmdCapture(
 					spawn,
 					"docker",
-					["run", "--rm", "-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "--entrypoint", "gh", jobImage, "auth", "status"],
+					["run", "--rm", "--pull=never", "-e", "GH_TOKEN", "-e", "GITHUB_TOKEN", "--entrypoint", "gh", jobImage, "auth", "status"],
 					{ env: { ...env, GH_TOKEN: token, GITHUB_TOKEN: token } },
 				);
 				checks.push({

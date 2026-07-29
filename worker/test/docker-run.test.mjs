@@ -14,12 +14,16 @@ const base = {
 test("carries every isolation flag -- these ARE the boundary", () => {
 	const args = buildDockerRunArgs(base);
 	const s = args.join(" ");
-	for (const flag of ["--rm", "--init", "--cap-drop=ALL", "no-new-privileges", "--pids-limit=512", "--shm-size=1g"]) {
+	for (const flag of ["--pull=never", "--rm", "--init", "--cap-drop=ALL", "no-new-privileges", "--pids-limit=512", "--shm-size=1g"]) {
 		assert.ok(args.includes(flag) || s.includes(flag), `missing isolation flag: ${flag}`);
 	}
 	// The dangerous one we must NEVER add.
 	assert.ok(!s.includes("--ipc=host"), "--ipc=host shares the host IPC namespace with adversarial code");
 	assert.ok(!s.includes("--privileged"), "--privileged");
+	// The image is the last positional, and nothing may make docker fetch it: --pull=never is what stops a
+	// per-trigger image name from becoming a registry pull of a stranger's image (INT-TRIGGERS-FILE-CONTRACT).
+	assert.equal(args.at(-1), base.image, "the image is the final argv element");
+	assert.ok(!s.includes("--pull=missing") && !s.includes("--pull=always"), "no argv may re-enable the fetch");
 });
 
 test("/job is read-only, /workspace is writable", () => {
@@ -98,6 +102,7 @@ test("refuses to build without image / name / workspace", () => {
 test("ISOLATION_FLAGS is frozen intent -- the exact set the spec pins", () => {
 	// A change here is a change to the security boundary and must be deliberate.
 	assert.deepEqual(ISOLATION_FLAGS, [
+		"--pull=never",
 		"--rm",
 		"--init",
 		"--cap-drop=ALL",
