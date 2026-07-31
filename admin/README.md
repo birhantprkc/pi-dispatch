@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png?v=0.3.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+  <img src="https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/banner.png?v=0.4.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
 </p>
 
 # pi-dispatch — run the pi coding agent as a self-hosted service
@@ -40,7 +40,7 @@ Every trigger produces the same job, through the same path — one queue, one co
 This extension puts a live TUI over the whole deployment in one command:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/dispatch-dashboard.png?v=0.3.0" alt="The /dispatch panel: status, spend meters, triggers, runs, and settings" width="820">
+  <img src="https://raw.githubusercontent.com/edgehero/pi-dispatch/main/docs/images/dispatch-dashboard.png?v=0.4.0" alt="The /dispatch panel: status, spend meters, triggers, runs, and settings" width="820">
 </p>
 
 - **Status & spend.** Queue and worker state, day/week/month **spend meters** + a daily token counter, and a run-history table with per-job token & cost.

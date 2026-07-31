@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { issueBranch } from "./branch.mjs";
+import { isForgeKind } from "./forges.mjs";
 
 /**
  * session-key.mjs -- which persisted transcript, if any, a job runs on.
@@ -57,7 +58,10 @@ export function sessionKeyFor(job, resolved = {}) {
 export function keyParts(job, resolved = {}) {
 	const kind = job?.kind;
 
-	if (kind === "github" || kind === "gitlab") {
+	// Keyed on "is this a forge job", never on a list of forge names. An enumeration that forgot one would
+	// not throw: every job on that forge would resolve no key and cold-start forever, which looks exactly
+	// like a deployment that never armed run.resume. `local` is handled below, on its own terms.
+	if (isForgeKind(kind)) {
 		const repo = job?.repo;
 		if (typeof repo !== "string" || repo === "") return null;
 
@@ -90,6 +94,7 @@ export function keyParts(job, resolved = {}) {
 	}
 
 	// Everything else -- a CLI `pi-dispatch run`, a chained /outbox child -- has no trigger entry that
-	// could have armed run.resume, so there is nothing to honour and no stable identity to key on.
+	// could have armed run.resume, so there is nothing to honour and no stable identity to key on. A job
+	// kind that is neither a forge nor local lands here too, which is the safe direction: no session.
 	return null;
 }

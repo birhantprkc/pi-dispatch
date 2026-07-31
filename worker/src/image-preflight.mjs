@@ -31,6 +31,7 @@ export function resolveJobImage(job, defaultImage) {
  *   { ok: true, image }   -- present on this host
  *   { missing: image }    -- the daemon answered and does not have it  => POLICY, refuse, do not retry
  *   { unavailable: image} -- docker itself did not answer              => INFRA, retry
+ *   { forgeUnsupported }  -- present, but declares it cannot serve this job's forge => POLICY, refuse
  *
  * A non-zero `docker image inspect` is AMBIGUOUS -- an absent image and an unreachable daemon both exit 1 --
  * so the failure path disambiguates POSITIVELY with `docker info` rather than by matching docker's stderr.
@@ -54,9 +55,23 @@ export function makeImagePreflight({ image, spawnFn = spawn }) {
 		// the current schema (docs/extensions.md, on prepareArguments). We cannot fix that mid-run -- the
 		// repair hook is an extension-author API and we do not own pi's built-in tool schemas -- so the
 		// answer is to refuse the resume, which needs the version before the container starts.
-		const probe = await runDocker(spawnFn, ["image", "inspect", `--format={{.Id}}${FIELD_SEP}${PI_VERSION_TEMPLATE}`, wanted], true);
+		//
+		// The FORGES label rides the same inspect, for a different failure. `run.image` is optional, so an
+		// azure trigger that forgets it runs on the default image, finds no `az`, and fails INSIDE a paid
+		// container -- on every single delivery. The image declares which forges it can serve and this
+		// refuses before the budget slot is taken.
+		const probe = await runDocker(spawnFn, ["image", "inspect", `--format={{.Id}}${FIELD_SEP}${PI_VERSION_TEMPLATE}${FIELD_SEP}${FORGES_TEMPLATE}`, wanted], true);
 		if (probe.code === 0) {
-			return { ok: true, image: wanted, piVersion: parsePiVersion(probe.stdout) };
+			const [piVersion, forges] = parseLabels(probe.stdout);
+			const kind = job?.kind;
+			// Absent label => ALLOW. The polarity matters and is the opposite of what "declare your
+			// capabilities" suggests: every operator-built image predating this label (OQ-012) declares
+			// nothing, and refusing those would break working deployments with no warning first. Only a label
+			// that is PRESENT and excludes this job's forge refuses.
+			if (forges !== null && kind !== undefined && kind !== "local" && !forges.includes(kind)) {
+				return { forgeUnsupported: wanted, kind, declared: forges };
+			}
+			return { ok: true, image: wanted, piVersion };
 		}
 		if ((await runDocker(spawnFn, ["info"])).code === 0) return { missing: wanted };
 		return { unavailable: wanted };
@@ -71,9 +86,11 @@ export function makeImagePreflight({ image, spawnFn = spawn }) {
 export const FIELD_SEP = "|";
 const PI_VERSION_LABEL = "dev.pi-dispatch.pi-version";
 const PI_VERSION_TEMPLATE = `{{index .Config.Labels "${PI_VERSION_LABEL}"}}`;
+export const FORGES_LABEL = "dev.pi-dispatch.forges";
+const FORGES_TEMPLATE = `{{index .Config.Labels "${FORGES_LABEL}"}}`;
 
 /**
- * The image's declared pi version, or `null` when it declares none.
+ * The image's declared pi version and forge list, each `null` when it declares none.
  *
  * `null` is the SAFE answer and is treated as "never resume" downstream, not as "assume it matches". An
  * operator-built image (OQ-012) that omits the label therefore runs every job cold rather than resuming
@@ -84,13 +101,24 @@ const PI_VERSION_TEMPLATE = `{{index .Config.Labels "${PI_VERSION_LABEL}"}}`;
  * Go's text/template renders a missing map key as the literal "<no value>", which is why that string is
  * not a version rather than being compared as one.
  */
-function parsePiVersion(stdout) {
-	const raw = String(stdout ?? "").trim();
-	const at = raw.indexOf(FIELD_SEP);
-	if (at === -1) return null;
-	const value = raw.slice(at + FIELD_SEP.length).trim();
-	if (value === "" || value === "<no value>") return null;
-	return value;
+function parseLabels(stdout) {
+	// A SPLIT, not two indexOf calls: the format string now has three fields, and the image id (which is
+	// `sha256:<hex>`) is the first. Neither a version nor a comma-separated forge list can contain `|`, so
+	// the split is unambiguous. A short line -- an older docker, a truncated pipe -- yields nulls, which is
+	// the safe answer on both fields.
+	const parts = String(stdout ?? "").trim().split(FIELD_SEP);
+	const piVersion = label(parts[1]);
+	const forgesRaw = label(parts[2]);
+	const forges = forgesRaw === null ? null : forgesRaw.split(",").map((s) => s.trim()).filter((s) => s !== "");
+	// A label that is present but parses to nothing usable is treated as ABSENT rather than as "serves no
+	// forge" -- the latter would refuse every job on an image whose label was merely malformed.
+	return [piVersion, forges !== null && forges.length > 0 ? forges : null];
+}
+
+/** One label value, or `null`. Go's text/template renders a missing map key as the literal "<no value>". */
+function label(raw) {
+	const value = String(raw ?? "").trim();
+	return value === "" || value === "<no value>" ? null : value;
 }
 
 /**

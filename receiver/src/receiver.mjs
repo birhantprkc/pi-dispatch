@@ -19,10 +19,15 @@
 
 import { makeVerifiedHandler } from "./verify.mjs";
 import { filter } from "./filter.mjs";
-import { enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
+import { enqueueForgeJob, enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
 import { filterGitLab } from "./filter-gitlab.mjs";
 import { parseGitLabSubset } from "./gitlab-subset.mjs";
 import { makeGitLabVerifiedHandler } from "./verify-gitlab.mjs";
+import { filterForgejo } from "./filter-forgejo.mjs";
+import { parseForgejoSubset } from "./forgejo-subset.mjs";
+import { filterAzure } from "./filter-azure.mjs";
+import { parseAzureSubset } from "./azure-subset.mjs";
+import { makeAzureVerifiedHandler } from "./verify-azure.mjs";
 
 /** Write a small JSON body with an explicit status; a 204 carries no body. verify's `respond` is private. */
 function respond(res, status, obj) {
@@ -88,15 +93,27 @@ export function parseSubset(payload) {
  * A forge with no configuration gets no route at all -- not a route that answers 401. An endpoint that
  * responds to an unconfigured forge is an endpoint an operator can believe is armed.
  */
-export function makeReceiver({ queue, selfId, cfg, log, gitlab = null }) {
+export function makeReceiver({ queue, selfId, cfg, log, gitlab = null, forgejo = null, azure = null }) {
 	const github = makeGitHubHandler({ queue, selfId, cfg, log });
-	const gitlabHandler = gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null;
+
+	// A TABLE, built once, rather than one `if` per forge. Two forges made that a single branch; four make
+	// it a chain, and a chain is where one arm quietly ends up checked after the fallthrough. A path present
+	// with a null handler is a CONFIGURED-OFF forge and answers 404; a path absent from the table entirely
+	// falls through to GitHub, which is what keeps `/` working.
+	const routes = {
+		"/gitlab": gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null,
+		"/forgejo": forgejo ? makeForgejoHandler({ queue, cfg, log, ...forgejo }) : null,
+		"/azure": azure ? makeAzureHandler({ queue, cfg, log, ...azure }) : null,
+	};
 
 	return async function receiverHandler(req, res) {
 		const path = pathOf(req.url);
-		if (path === "/gitlab") {
-			if (!gitlabHandler) return respond(res, 404, { error: "gitlab webhooks are not configured" });
-			return await gitlabHandler(req, res);
+		if (Object.hasOwn(routes, path)) {
+			const handler = routes[path];
+			// Not a 401. An endpoint that answers "unauthorized" for a forge nobody configured is an endpoint
+			// an operator can believe is armed and merely mis-keyed.
+			if (!handler) return respond(res, 404, { error: `${path.slice(1)} webhooks are not configured` });
+			return await handler(req, res);
 		}
 		return await github(req, res);
 	};
@@ -147,14 +164,14 @@ function makeGitHubHandler({ queue, selfId, cfg, log }) {
  * and the gate, because GitLab puts no `author_association` in the payload (gitlab-members.mjs).
  *
  * That resolution is a network call, and its three outcomes are deliberately not two:
- *   - a level (including 0 for a determinate non-member) is handed to the gate, which decides;
+ *   - a determinate verdict (authorized or not) is handed to the gate, which decides;
  *   - an INDETERMINATE lookup is a 503, so GitLab redelivers and the stable `webhook-id` dedups the
  *     retry. Answering 204 would drop real work during an outage, and it would look on the wire exactly
  *     like a stranger being correctly refused.
  * The lookup runs only for events that could still fire -- after verification, and after the payload has
  * been projected -- so an unauthenticated flood cannot make this project call GitLab at all.
  */
-function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAccessLevel, now }) {
+function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAuthority, now }) {
 	return makeGitLabVerifiedHandler({ mode, secret, ...(now ? { now } : {}) }, async ({ rawBody, delivery }, res) => {
 		let subset;
 		try {
@@ -163,7 +180,7 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAcces
 			return respond(res, 400, { error: "invalid-json" });
 		}
 
-		const resolved = await resolveAccessLevel(subset.project?.id, subset.user?.id);
+		const resolved = await resolveAuthority(subset.project?.id, subset.user?.id);
 		if (resolved.indeterminate) {
 			// The reason names the lookup, never the actor -- `user.username` is personal data and exists
 			// only to have been asked about (no-pii-in-logs).
@@ -171,7 +188,7 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAcces
 			return respond(res, 503, { error: "access-lookup-failed" });
 		}
 
-		const result = filterGitLab(subset, cfg.triggers?.gitlab, cfg.triggers?.knownFlows, selfId, resolved.level, delivery);
+		const result = filterGitLab(subset, cfg.triggers?.gitlab, cfg.triggers?.knownFlows, selfId, resolved.authorized, delivery);
 		if (!result.enqueue) {
 			log?.({ event: "dropped", delivery, reason: result.reason });
 			return respond(res, 204);
@@ -186,6 +203,114 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAcces
 
 		// `!` for a merge request, `#` for an issue -- GitLab's own notation, and the same discrimination
 		// the semantic dedup key makes, because the two are separate number sequences.
+		const sep = result.job.target.type === "pull_request" ? "!" : "#";
+		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.repo}${sep}${result.job.target.number}`, flow: result.job.flow });
+		return respond(res, 202, { status: "queued" });
+	});
+}
+
+/**
+ * The Forgejo arm. Structurally the GitLab one -- verify, project, RESOLVE, gate, enqueue, respond -- with
+ * one difference that is worth stating because it is invisible in the code: the verification step is
+ * GITHUB'S, unmodified.
+ *
+ * Forgejo signs the raw body with HMAC-SHA256 and sends `X-Hub-Signature-256`, `X-GitHub-Delivery` and
+ * `X-GitHub-Event`, which is byte-for-byte what `makeVerifiedHandler` already reads. So
+ * CONST-HMAC-OVER-RAW-BODY is satisfied here by EXISTING code rather than new code, and
+ * REQ-DEDUP-BY-DELIVERY-GUID transfers with no adaptation at all. What Forgejo needs is its own SECRET,
+ * which is why it is a separate handler and a separate path: `makeVerifiedHandler` closes over one secret
+ * per construction, and serving two sources from one would mean either sharing a secret between forges or
+ * letting the request choose which one it was checked against.
+ */
+function makeForgejoHandler({ queue, cfg, log, secret, selfId, resolveAuthority }) {
+	return makeVerifiedHandler({ secret }, async ({ rawBody, event, delivery }, res) => {
+		let subset;
+		try {
+			subset = parseForgejoSubset(JSON.parse(rawBody));
+		} catch {
+			return respond(res, 400, { error: "invalid-json" });
+		}
+
+		const resolved = await resolveAuthority(subset.repository?.full_name, subset.sender?.login);
+		if (resolved.indeterminate) {
+			// The reason names the lookup, never the actor -- `sender.login` is personal data and exists here
+			// only to have been asked about (no-pii-in-logs).
+			log?.({ event: "forgejo_permission_lookup_failed", delivery, reason: resolved.indeterminate });
+			return respond(res, 503, { error: "permission-lookup-failed" });
+		}
+
+		const result = filterForgejo(event, subset, cfg.triggers?.forgejo, cfg.triggers?.knownFlows, selfId, resolved.authorized, delivery);
+		if (!result.enqueue) {
+			log?.({ event: "dropped", delivery, reason: result.reason });
+			return respond(res, 204);
+		}
+
+		try {
+			await enqueueForgeJob(queue, "forgejo", result.job);
+		} catch (err) {
+			log?.({ event: "enqueue_failed", delivery, reason: err?.message });
+			return respond(res, 503, { error: "enqueue-failed" }); // Forgejo redelivers; dedup by GUID coalesces
+		}
+
+		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.target.type}#${result.job.target.number}`, flow: result.job.flow });
+		return respond(res, 202, { status: "queued" });
+	});
+}
+
+/**
+ * The Azure DevOps arm. The same five steps, with two things no other arm has.
+ *
+ * THE DELIVERY ID COMES OUT OF THE BODY. Azure sends no delivery-id header, so the dedup key
+ * (REQ-DEDUP-BY-DELIVERY-GUID) is the payload's own top-level `id` GUID. `verify-gitlab.mjs` refuses to do
+ * this and 400s instead -- correctly, for a forge that HAS a header. Azure has none, so the choice is a
+ * body-derived key or no dedup at all, and the ordering is unaffected: the body is parsed here, inside
+ * `onVerified`, after the credential check. A delivery with no `id` is refused rather than run
+ * undeduplicated.
+ *
+ * THE ACTOR MAY BE AN EMAIL. A pull-request delivery names a GUID; a work item names only
+ * `"Display Name <email>"`. Both the resolver and the bot-loop guard handle both forms -- see
+ * filter-azure.mjs, where the ordering constraint is stated in full.
+ */
+function makeAzureHandler({ queue, cfg, log, mode, secret, headerName, selfId, resolveAuthority }) {
+	return makeAzureVerifiedHandler({ mode, secret, headerName }, async ({ rawBody }, res) => {
+		let subset;
+		try {
+			subset = parseAzureSubset(JSON.parse(rawBody));
+		} catch {
+			return respond(res, 400, { error: "invalid-json" });
+		}
+
+		const delivery = subset.id;
+		if (typeof delivery !== "string" || delivery === "") {
+			// Without it there is no dedup key, and a redelivery would be billed as new work. A synthesised
+			// key would dedup some redeliveries and bill for the rest -- a weaker guarantee wearing
+			// REQ-DEDUP-BY-DELIVERY-GUID's name, which is worse than a clear refusal.
+			return respond(res, 400, { error: "missing-delivery-id" });
+		}
+
+		const resolved = await resolveAuthority(subset.project?.id, subset.actor);
+		if (resolved.indeterminate) {
+			// The reason names the lookup, never the actor -- an email address is personal data and exists
+			// here only to have been asked about (no-pii-in-logs).
+			log?.({ event: "azure_membership_lookup_failed", delivery, reason: resolved.indeterminate });
+			return respond(res, 503, { error: "membership-lookup-failed" });
+		}
+
+		const result = filterAzure(subset, cfg.triggers?.azure, cfg.triggers?.knownFlows, selfId, resolved.authorized, delivery);
+		if (!result.enqueue) {
+			log?.({ event: "dropped", delivery, reason: result.reason });
+			return respond(res, 204);
+		}
+
+		try {
+			await enqueueForgeJob(queue, "azure", result.job);
+		} catch (err) {
+			log?.({ event: "enqueue_failed", delivery, reason: err?.message });
+			return respond(res, 503, { error: "enqueue-failed" });
+		}
+
+		// `!` for a pull request, `#` for a work item -- Azure numbers them separately, and this is the same
+		// discrimination the semantic dedup key makes.
 		const sep = result.job.target.type === "pull_request" ? "!" : "#";
 		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.repo}${sep}${result.job.target.number}`, flow: result.job.flow });
 		return respond(res, 202, { status: "queued" });

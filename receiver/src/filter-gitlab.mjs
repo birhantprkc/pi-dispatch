@@ -19,10 +19,16 @@
  * for label management has differed across versions, Ultimate's custom roles let an operator grant it at
  * any level, and a Guest can set labels on an issue AT CREATION -- so a stranger can open an issue already
  * carrying the trigger label. A label therefore proves nothing here on its own, and every gitlab trigger
- * is gated on `accessLevel >= DEVELOPER` regardless of type. `accessLevel` is resolved by the receiver
+ * is gated on the actor's resolved authority regardless of type. That verdict is produced by the receiver
  * BEFORE this function (gitlab-members.mjs) and passed in, occupying the slot `author_association` holds
  * on the GitHub side: the lookup is a network call, and putting a fetch inside the gate would destroy the
  * purity that makes the gate testable.
+ *
+ * What crosses that boundary is a BOOLEAN, not GitLab's role integer. Every forge answers "may this actor
+ * start a job" in its own vocabulary -- an integer role here, a string enum on Forgejo, a payload field on
+ * GitHub, a group membership on Azure DevOps -- and only the answer is common. The `>= 30` threshold lives
+ * with the lookup that produces the number; this file owns what to DO about the verdict, which is the part
+ * that has to be the same everywhere.
  *
  * WHY A LABEL RULE MATCHES THE DIFF AND NOT THE LABEL SET.
  *
@@ -37,23 +43,17 @@
 import { firstMatchingRule, labelSet, matchedLabel } from "./predicate.mjs";
 
 /**
- * GitLab's Developer role. Below this an actor cannot push a branch or open a merge request, so a job
- * started on their say-so would be doing work they could not do themselves -- which is the line
- * `CONST-TRIGGER-AUTHOR-GATE` draws. Maintainer (40) and Owner (50) are above it and pass.
- */
-export const DEVELOPER = 30;
-
 /** The merge-request actions a trigger may name, mirrored from the loader's gitlab vocabulary. */
 const MR_ACTIONS = new Set(["open", "update", "reopen", "approved"]);
 
 /**
  * Decide. Returns `{ enqueue: false, reason }` or `{ enqueue: true, job }`.
  *
- * `subset` is a `parseGitLabSubset` projection; `triggers` is the gitlab rule group; `accessLevel` is the
- * actor's resolved project access level (0 for a determinate non-member); `deliveryId` is the stable
- * `webhook-id`, carried into the job for dedup.
+ * `subset` is a `parseGitLabSubset` projection; `triggers` is the gitlab rule group; `authorized` is the
+ * receiver's resolved verdict for this actor; `deliveryId` is the stable `webhook-id`, carried into the job
+ * for dedup.
  */
-export function filterGitLab(subset, triggers, knownFlows, selfId, accessLevel, deliveryId) {
+export function filterGitLab(subset, triggers, knownFlows, selfId, authorized, deliveryId) {
 	// (0) Fail-closed on identity. MUST precede the self compare -- see header.
 	if (typeof subset?.user?.id !== "number") {
 		return { enqueue: false, reason: "missing-sender-id" };
@@ -65,7 +65,9 @@ export function filterGitLab(subset, triggers, knownFlows, selfId, accessLevel, 
 	}
 
 	// (2) The access gate, for EVERY trigger type. See the header for why a label does not substitute.
-	if (!(typeof accessLevel === "number" && accessLevel >= DEVELOPER)) {
+	// Strict `!== true`, so anything that is not an explicit yes -- undefined, a stray truthy value, a
+	// resolver that returned the wrong shape -- refuses rather than passes.
+	if (authorized !== true) {
 		return { enqueue: false, reason: "author-not-allowed" };
 	}
 

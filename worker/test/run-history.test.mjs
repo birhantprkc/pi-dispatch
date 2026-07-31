@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import { test } from "node:test";
 import { buildRecord, makeFindPreviousRun, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
+import { FORGE_KINDS } from "../src/forges.mjs";
 
 /**
  * A fake writable that records chunks and lets a test drive `finish`/`error` timing.
@@ -212,6 +213,51 @@ test("buildRecord stores a completed run's tokens object as an explicit field", 
 	});
 	assert.deepEqual(record.tokens, tokens);
 	assert.equal(record.turns, 4);
+});
+
+test("a gitlab run records project!iid for an MR and project#iid for an issue, never null", () => {
+	// INT-RUN-HISTORY-FILE-CONTRACT documented `<project>!<iid>` from the day the GitLab arm landed, and
+	// `targetFor` enumerated github only -- so every GitLab run since #42 wrote `target: null`, silently,
+	// with no test in this file mentioning gitlab at all. The notation is the forge's own, and the two
+	// target types must not collapse onto one label: GitLab numbers issues and MRs separately, so
+	// `project#5` and `project!5` name different objects.
+	const record = (target) =>
+		buildRecord({
+			job: { id: "gl-x", attemptsMade: 0, name: "gitlab", data: { kind: "gitlab", repo: "grp/sub/proj", projectId: 42, flow: "fix", target } },
+			result: { outcome: "completed" },
+			startedAt: "2026-07-18T00:00:00.000Z",
+			endedAt: "2026-07-18T00:01:00.000Z",
+		}).target;
+
+	assert.equal(record({ type: "pull_request", number: 5 }), "grp/sub/proj!5", "a merge request is ! on GitLab");
+	assert.equal(record({ type: "issue", number: 5 }), "grp/sub/proj#5", "an issue is # on every forge");
+});
+
+test("every forge the table knows records a target label -- none of them inherits null", () => {
+	// Written as a loop so a forge added to FORGES and missed by targetFor fails HERE. The old shape
+	// returned null for anything it did not enumerate, which is invisible: the record is still written,
+	// still valid against the contract's `| null`, and simply never says what the job was about.
+	for (const kind of FORGE_KINDS) {
+		const record = buildRecord({
+			job: { id: `${kind}-1`, attemptsMade: 0, name: kind, data: { kind, repo: "o/r", flow: "fix", target: { type: "issue", number: 7 } } },
+			result: { outcome: "completed" },
+			startedAt: "2026-07-18T00:00:00.000Z",
+			endedAt: "2026-07-18T00:01:00.000Z",
+		});
+		assert.equal(record.target, "o/r#7", `${kind}: a forge job's durable record must name its target`);
+	}
+});
+
+test("a job kind that is neither a forge nor local still records target null rather than throwing", () => {
+	// The contract admits null, and a chained/CLI job genuinely has no forge target. What must not happen
+	// is a throw on the record path -- writing history is not allowed to fail a run.
+	const record = buildRecord({
+		job: { id: "chain-1", attemptsMade: 0, name: "chained", data: { kind: "chained", flow: "fix" } },
+		result: { outcome: "completed" },
+		startedAt: "2026-07-18T00:00:00.000Z",
+		endedAt: "2026-07-18T00:01:00.000Z",
+	});
+	assert.equal(record.target, null);
 });
 
 test("buildRecord for a github job keeps id-only fields and admits no PII", () => {

@@ -107,13 +107,17 @@ jobs:
           # here to grep, and the REAL enforcement is parseTriggers' load-time refusal plus the worker's
           # pre-spend `docker image inspect`. This step only keeps the EXAMPLE we ship honest -- an example
           # naming "my-python:latest" would teach a tag nobody has, and turn a first run into a refusal.
+          # The list grew when this repo started producing a second image: Azure DevOps' only CLI is the
+          # Azure CLI plus its devops extension (~1 GB of Python), which does not belong in the image every
+          # job runs, so it ships as image/Dockerfile.azure and an azure trigger names it via run.image
+          # (DES-IMAGE-DECLARES-ITS-FORGES). Any OTHER tag here is still refused.
           bad=$(grep -oE '"image"[[:space:]]*:[[:space:]]*"[^"]*"' triggers.example.json \
-                | grep -vE '"image"[[:space:]]*:[[:space:]]*"pi-job:latest"' || true)
+                | grep -vE '"image"[[:space:]]*:[[:space:]]*"pi-job:(latest|azure)"' || true)
           if [ -n "$bad" ]; then
             echo "::error::triggers.example.json names an image this repo does not produce: $bad"
             exit 1
           fi
-          echo "OK: the example names only pi-job:latest"
+          echo "OK: the example names only images this repo produces"
 
       - name: glab is pinned by version AND checksum
         run: |
@@ -132,6 +136,40 @@ jobs:
             exit 1
           fi
           echo "OK: glab pinned by version and verified by checksum"
+
+      - name: tea is pinned by version AND checksum
+        run: |
+          # Identical reasoning to glab's, and issue #61 asks for it by name -- "a second CLI should not
+          # repeat that". `gh` remains this image's one unpinned dependency; every CLI added since is
+          # pinned to an exact version and verified against a per-architecture digest.
+          for name in TEA_VERSION TEA_SHA256_AMD64 TEA_SHA256_ARM64; do
+            if ! grep -qE "^ARG ${name}=[0-9a-f.]+$" image/Dockerfile; then
+              echo "::error::${name} is missing or not a literal pin in image/Dockerfile."
+              exit 1
+            fi
+          done
+          echo "OK: tea pinned by version and verified by checksum"
+
+      - name: The azure image variant pins the Azure CLI and declares its forges
+        run: |
+          # The variant is built from the default image, so it inherits the base digest, the pi pin and the
+          # pi-version label rather than re-declaring them -- a second copy of those is a second thing to
+          # forget to bump. What it MUST declare itself is the Azure CLI version and the forge list the
+          # worker's pre-spend preflight reads: a label naming a forge whose CLI is absent would turn a
+          # loud refusal into a paid container that fails at step 3 (DES-IMAGE-DECLARES-ITS-FORGES).
+          if ! grep -qE '^ARG AZURE_CLI_VERSION=[0-9]' image/Dockerfile.azure; then
+            echo "::error::AZURE_CLI_VERSION is missing or not a literal pin in image/Dockerfile.azure."
+            exit 1
+          fi
+          if ! grep -q 'dev.pi-dispatch.forges=.*azure' image/Dockerfile.azure; then
+            echo "::error::image/Dockerfile.azure does not declare azure in dev.pi-dispatch.forges."
+            exit 1
+          fi
+          if ! grep -q 'dev.pi-dispatch.forges=' image/Dockerfile; then
+            echo "::error::image/Dockerfile does not declare dev.pi-dispatch.forges."
+            exit 1
+          fi
+          echo "OK: the azure variant pins its CLI and declares its forges"
 
   no-automatic-merge:
     name: no automatic merge (CONST-MERGE-NEVER-AUTOMATIC)

@@ -36,7 +36,7 @@ export function makeRunContainer({
 	packagePaths = [], // REQ-GLOBAL-PI-OVERLAY: container paths of the operator-staged packages, resolved once at boot
 	forwardEnv = [],
 	authFromPi = false, // fall back to ~/.pi/agent/auth.json for the provider key when the env has none
-	gitlabHost = null, // the GitLab instance a gitlab job targets, so `glab` in the container talks to it
+	forgeHosts = {}, // per-forge self-hosted instance URLs, so a forge CLI in the container talks to the right one
 }) {
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
@@ -54,7 +54,7 @@ export function makeRunContainer({
 			githubToken: token ?? undefined,
 			// Which forge minted it, so the token lands in that forge's own variable names and no other.
 			forgeKind: job?.kind,
-			gitlabHost,
+			forgeHosts,
 			hostEnv,
 			allowGlobalExtensions, // REQ-GLOBAL-PI-OVERLAY: false emits the explicit PI_GLOBAL_ALLOW_EXTENSIONS=0 opt-out
 			// REQ-GLOBAL-PI-OVERLAY: the per-job value comes off `job` (like maxTurns), the staged set off

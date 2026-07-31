@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.png?v=0.3.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+  <img src="docs/images/banner.png?v=0.4.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
 </p>
 
 # pi-dispatch
@@ -8,9 +8,9 @@
 cron schedule, or by a GitHub or GitLab issue, comment or pull/merge request — in a container you control, with a durable queue, a
 spend cap, and a live admin panel.**
 
-![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.3.0)
+![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.4.0)
 
-![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg?v=0.3.0)
+![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg?v=0.4.0)
 
 pi has no job queue, no concurrency control, no spend limit, and — by its own README — no permission
 system. **pi-dispatch is exactly that missing operational layer, and nothing else.**
@@ -577,6 +577,49 @@ Chromium** that lets a scheduled flow build a frontend, screenshot it, and itera
 then attach the before/after to a PR. Rule of thumb: if the recurring task is *"run a prompt,"* use a
 routine; if it is *"run this project's real build / test / visual loop on a schedule, in images I
 control,"* that is this.
+
+## Forgejo / Gitea automation
+
+```bash
+FORGEJO_URL=https://forgejo.example.com
+FORGEJO_TOKEN=...            # repo-scoped: write:repository + write:issue
+FORGEJO_BOT_ID=42            # required when the token is repo-scoped -- it cannot call GET /user
+FORGEJO_WEBHOOK_SECRET=...
+```
+
+Point the webhook at **`/forgejo`**. Three things differ from the GitHub arm, and each is a correctness
+matter rather than a rename:
+
+- **Forgejo's transport is byte-compatible with GitHub's**, so `verify.mjs` is unmodified and delivery
+  dedup transfers unchanged. This is the only forge of which that is true.
+- **Actions are Forgejo's own words** — `label_updated`, `synchronized`. Against GitHub's vocabulary they
+  fall out silently as an unhandled event, so the loader refuses the wrong forge's words at load.
+  `label_cleared` fires nothing, ever.
+- **Every trigger is gated on the actor's resolved repository permission** (`admin`/`write`), labels
+  included — not because a Forgejo label is untrustworthy, but because we have not verified that it is.
+
+Full setup, including the token scope trade-off: [`docs/forgejo.md`](docs/forgejo.md).
+
+## Azure DevOps automation
+
+```bash
+AZURE_ORG_URL=https://dev.azure.com/your-org
+AZURE_TOKEN=...              # a dedicated identity; needs vso.graph as well as code/work scopes
+AZURE_WEBHOOK_MODE=basic     # required, deliberately not defaulted
+AZURE_WEBHOOK_SECRET=...
+```
+
+Point the Service Hook at **`/azure`**, and read [`docs/azure-devops.md`](docs/azure-devops.md) before you
+enable it — this is the weakest transport of the four, and the doc says exactly how:
+
+- **No HMAC exists.** The credential proves the sender knew a secret and covers no bytes; there is no
+  delivery-id header (the dedup key comes from the body) and no signed timestamp (so no replay window).
+  `OQ-015` records the residual.
+- **Tags are the label analogue, and the DIFF is the trigger.** Matching the current tag set would start a
+  paid run on every later edit of a tagged work item.
+- **A work item names no repository**, so an azure label/comment trigger must set `run.repository`.
+- **Azure's CLI needs its own image.** Build `image/Dockerfile.azure` and name it with `run.image`; a
+  trigger that forgets is refused *before* it costs anything.
 
 ## Status
 

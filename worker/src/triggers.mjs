@@ -24,11 +24,16 @@
  */
 
 import { configError } from "./config.mjs";
+import { FORGE_KINDS, RUN_KINDS, forgeSpec, isForgeKind } from "./forges.mjs";
 
 const ON_TYPES = new Set(["cron", "label", "comment", "pull_request"]);
-const RUN_KINDS = new Set(["local", "github", "gitlab"]);
-// The kinds a webhook trigger may produce. `local` is deliberately absent -- that is the matrix.
-const FORGE_KINDS = new Set(["github", "gitlab"]);
+
+// `RUN_KINDS` and `FORGE_KINDS` come from the forge table (forges.mjs) rather than being written out
+// here. They differ by exactly `local`, and that difference IS the on x run matrix below: a webhook
+// trigger produces a forge job, a cron trigger produces a local one. Re-exported because the receiver's
+// config builds one trigger group per forge and a group it forgot would throw inside a reload that keeps
+// the previous rules -- so the two have to be derived from one list, and a test asserts they are.
+export { FORGE_KINDS };
 
 /**
  * The `pull_request` action vocabulary, per forge, in each forge's OWN words -- so an operator writes
@@ -42,6 +47,16 @@ const FORGE_KINDS = new Set(["github", "gitlab"]);
 const PR_ACTIONS = {
 	github: new Set(["labeled", "opened", "synchronize", "reopened"]),
 	gitlab: new Set(["open", "update", "reopen", "approved"]),
+	// Forgejo's own spellings. `label_updated` is its `labeled` and `synchronized` its `synchronize` -- a
+	// one-letter difference that an operator would otherwise discover as a trigger that loads clean and
+	// never fires. `label_cleared` is deliberately ABSENT and always will be: REMOVING a label must never
+	// start a paid run, and it has no GitHub counterpart to inherit that rule from.
+	forgejo: new Set(["label_updated", "opened", "synchronized", "reopened"]),
+	// Azure's Service Hook events reduced to the two that leave something to act on. `git.pullrequest.merged`
+	// is omitted for the same reason GitLab's `merge` and `close` are: a job started by a merge has nothing
+	// left to do. There is no label action at all -- Azure attaches tags to WORK ITEMS, never to pull
+	// requests -- which is why azure's `prLabelAction` is null and a predicated PR rule is refused below.
+	azure: new Set(["created", "updated"]),
 };
 
 // A cron id flows into BullMQ's deterministic `repeat:<id>:<nextMillis>` jobId, so a `:` corrupts that
@@ -90,8 +105,11 @@ function normalizeTrigger(entry, index, path, state) {
 	if (!ON_TYPES.has(on.type)) {
 		throw configError(`${at}: on.type must be one of cron|label|comment|pull_request (got ${JSON.stringify(on.type)}): ${path}`);
 	}
-	if (!RUN_KINDS.has(run.kind)) {
-		throw configError(`${at}: run.kind must be one of local|github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
+	// The legal-values half of every message below is JOINED from the table rather than typed out, so a
+	// forge added to the table can never be refused by a message that does not mention it -- which reads
+	// to an operator as a bug in their file rather than in ours.
+	if (!RUN_KINDS.includes(run.kind)) {
+		throw configError(`${at}: run.kind must be one of ${RUN_KINDS.join("|")} (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 
 	// The on x run matrix -- the trust boundary, fail-loud (mirrors the old schedules kind:github refusal).
@@ -101,8 +119,8 @@ function normalizeTrigger(entry, index, path, state) {
 		}
 		return normalizeCron(on, run, index, path, state);
 	}
-	if (!FORGE_KINDS.has(run.kind)) {
-		throw configError(`${at}: a ${on.type} trigger is webhook-driven and produces a forge job; run.kind must be one of github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
+	if (!isForgeKind(run.kind)) {
+		throw configError(`${at}: a ${on.type} trigger is webhook-driven and produces a forge job; run.kind must be one of ${FORGE_KINDS.join("|")} (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 	if (on.type === "label") return normalizeLabel(on, run, index, path);
 	if (on.type === "comment") return normalizeComment(on, run, index, path, state);
@@ -292,6 +310,34 @@ function validatePredicate(on, index, path, requirePositive) {
 	return { any: on.any, all: on.all, none: on.none };
 }
 
+
+/**
+ * `run.repository` -- WHICH repository a job clones, for a forge whose trigger subject does not name one.
+ *
+ * Azure DevOps is the only such forge so far, and the gap is real rather than cosmetic: a work item belongs
+ * to a PROJECT, and a project may hold many repositories, so `workitem.updated` says nothing about where
+ * the agent should work. A pull request names its own repository and needs none.
+ *
+ * REQUIRED on exactly the azure trigger types a work item can fire (`label`, `comment`) and REFUSED on the
+ * others, rather than accepted-and-ignored. A field that is silently unused is a field an operator will set
+ * and then trust; refusing it is how they find out it does nothing here.
+ */
+function validateRepository(run, onType, at, path) {
+	const needed = run.kind === "azure" && (onType === "label" || onType === "comment");
+	const raw = run.repository;
+	if (raw === undefined) {
+		if (!needed) return undefined;
+		throw configError(`${at}: an azure ${onType} trigger must set run.repository -- a work item belongs to a project, not a repository, so nothing in the delivery says where to clone: ${path}`);
+	}
+	if (!needed) {
+		throw configError(`${at}: run.repository is only meaningful on an azure label or comment trigger (a pull request names its own repository): ${path}`);
+	}
+	if (!isNonEmptyString(raw) || raw !== raw.trim() || raw.includes("/")) {
+		throw configError(`${at}: run.repository must be a non-empty repository NAME within the project, with no slashes and no surrounding whitespace (got ${JSON.stringify(raw)}): ${path}`);
+	}
+	return raw;
+}
+
 function normalizeLabel(on, run, index, path) {
 	const at = `trigger at index ${index}`;
 	const predicate = validatePredicate(on, index, path, true);
@@ -301,7 +347,11 @@ function normalizeLabel(on, run, index, path) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
+	const repository = validateRepository(run, "label", at, path);
+	return {
+		on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none },
+		run: { kind: run.kind, flow: run.flow, packages, image, resume, ...(repository !== undefined && { repository }) },
+	};
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -322,7 +372,11 @@ function normalizeComment(on, run, index, path, state) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
+	const repository = validateRepository(run, "comment", at, path);
+	return {
+		on: { type: "comment", phrase: on.phrase },
+		run: { kind: run.kind, flow: run.flow, packages, image, resume, ...(repository !== undefined && { repository }) },
+	};
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -347,11 +401,18 @@ function normalizePullRequest(on, run, index, path) {
 	// (opened/synchronize/reopened) are gated by author_association in the filter, so a predicate is
 	// optional there and only narrows scope when present.
 	//
-	// GitLab has no `labeled` action and therefore no rule to attach this to: a label added to a merge
-	// request arrives as `update`. It needs none, because EVERY gitlab trigger is gated on the actor's
-	// resolved access level (CONST-TRIGGER-AUTHOR-GATE) rather than on the label alone -- so an
-	// unpredicated gitlab MR rule is gated, where an unpredicated `labeled` github rule would not be.
-	const requirePositive = run.kind === "github" && actions.includes("labeled");
+	// WHICH word that is, and whether the forge has one at all, lives in the forge table rather than being
+	// tested by name here. GitLab's is null: a label added to a merge request arrives as a plain `update`,
+	// so there is no action for the rule to attach to. Forgejo's is `label_updated`.
+	const labelAction = forgeSpec(run.kind)?.prLabelAction;
+	const requirePositive = typeof labelAction === "string" && actions.includes(labelAction);
+
+	// Azure attaches tags to WORK ITEMS and never to pull requests, so a predicate on an azure pull_request
+	// rule cannot match anything. Refusing it is the same fail-loud call the action vocabulary gets: a rule
+	// that loads clean and can never fire reads to an operator as a harness that is broken.
+	if (run.kind === "azure" && (on.any !== undefined || on.all !== undefined || on.none !== undefined)) {
+		throw configError(`${at}: an azure pull_request trigger cannot carry a label predicate -- Azure DevOps attaches tags to work items, never to pull requests, so any/all/none could never match: ${path}`);
+	}
 	const predicate = validatePredicate(on, index, path, requirePositive);
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
@@ -359,6 +420,7 @@ function normalizePullRequest(on, run, index, path) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
+	validateRepository(run, "pull_request", at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
 		run: { kind: run.kind, flow: run.flow, packages, image, resume },

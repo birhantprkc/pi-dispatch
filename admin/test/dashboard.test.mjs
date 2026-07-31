@@ -654,3 +654,52 @@ test("x in TRIGGER_DETAIL signals deleteTrigger; Esc backs out without signaling
   assert.deepEqual(escActions, [], "Esc from the trigger detail signals no CRUD action");
   await c2.dispose();
 });
+
+/** The rendered LIST and TRIGGER_DETAIL for one trigger, stripped of colour. */
+async function renderTrigger(trigger) {
+  const comp = makeDashboard({ paths: {}, done: () => {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => triggerSnap([trigger]) }) });
+  await flush();
+  const list = stripAnsi(comp.render(100).join("\n"));
+  comp.handleInput("\r");
+  await flush();
+  return { list, detail: stripAnsi(comp.render(100).join("\n")) };
+}
+
+test("a trigger's row names its forge ONCE -- the target says it, so no badge repeats it", async () => {
+  // The badge existed because the target read `-> github` for every forge, so a gitlab row contradicted its
+  // own badge. Fixing the target removed the badge's REASON to exist, not merely its wrongness. render.mjs
+  // keeps its badge, and its own suite still pins it, because that line never names the forge at all.
+  const { list } = await renderTrigger({ type: "label", forge: "gitlab", any: ["pi:go"], all: [], none: [], flow: "fix" });
+  assert.ok(list.includes("gitlab"), "the forge is named");
+  assert.equal(list.includes("[gitlab]"), false, "and not named a second time as a badge");
+});
+
+test("a trigger's row names ITS forge, never github by default", async () => {
+  // The row read `-> github <flow>  [gitlab]` before this: the line contradicting its own badge. The forge
+  // is carried verbatim by read-model.mjs, so an unrecognised one shows as itself rather than as a
+  // plausible default the operator would then trust.
+  for (const forge of ["gitlab", "forgejo", "azure"]) {
+    const { list } = await renderTrigger({ type: "label", forge, any: ["pi:go"], all: [], none: [], flow: "fix" });
+    assert.ok(list.includes(forge), `${forge}: the row must name the forge it listens to`);
+    assert.equal(list.includes("github"), false, `${forge}: and must not also claim github`);
+  }
+});
+
+test("the trust model is per forge -- an azure trigger must not claim HMAC or a delivery GUID", async () => {
+  // Both are FALSE on Azure: Service Hooks offer no HMAC at all and send no delivery-id header. A trust
+  // model that is wrong is worse than one that is absent, because an operator reads it to decide whether
+  // they are comfortable running the thing.
+  const azure = (await renderTrigger({ type: "label", forge: "azure", any: ["pi:go"], all: [], none: [], flow: "fix" })).detail;
+  assert.match(azure, /NO HMAC/);
+  assert.equal(/X-GitHub-Delivery/.test(azure), false, "Azure sends no such header");
+  assert.match(azure, /project membership/);
+
+  const gitlab = (await renderTrigger({ type: "label", forge: "gitlab", any: ["pi:go"], all: [], none: [], flow: "fix" })).detail;
+  assert.match(gitlab, /access level/, "a GitLab label is not an approval -- the resolved level is the gate");
+
+  const forgejo = (await renderTrigger({ type: "label", forge: "forgejo", any: ["pi:go"], all: [], none: [], flow: "fix" })).detail;
+  assert.match(forgejo, /repository permission/);
+
+  const github = (await renderTrigger({ type: "label", forge: "github", any: ["pi:go"], all: [], none: [], flow: "fix" })).detail;
+  assert.match(github, /X-GitHub-Delivery/);
+});

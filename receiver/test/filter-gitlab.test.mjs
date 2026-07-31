@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { filterGitLab, DEVELOPER } from "../src/filter-gitlab.mjs";
+import { filterGitLab } from "../src/filter-gitlab.mjs";
 import { parseGitLabSubset } from "../src/gitlab-subset.mjs";
 
 const SELF_ID = 999;
@@ -52,8 +52,8 @@ function notePayload(over = {}) {
 	};
 }
 
-const run = (payload, { level = DEVELOPER, selfId = SELF_ID, delivery = "wh-1" } = {}) =>
-	filterGitLab(parseGitLabSubset(payload), triggers, knownFlows, selfId, level, delivery);
+const run = (payload, { authorized = true, selfId = SELF_ID, delivery = "wh-1" } = {}) =>
+	filterGitLab(parseGitLabSubset(payload), triggers, knownFlows, selfId, authorized, delivery);
 
 // --- the label diff (the repeat-paid-run bug this design exists to prevent) ---
 
@@ -103,25 +103,26 @@ test("an issue OPENED already carrying the label fires -- there is no previous s
 
 // --- the access gate ---
 
-test("a below-Developer actor is refused on EVERY trigger type, label included", () => {
+test("an unauthorized actor is refused on EVERY trigger type, label included", () => {
 	// GitHub can treat a label as the approval because only collaborators can apply one. On GitLab a Guest
-	// can set labels on an issue they are creating, so the label proves nothing and the level is the gate.
+	// can set labels on an issue they are creating, so the label proves nothing and the verdict is the gate.
+	// Which ROLE clears it is the resolver's business now (gitlab-members.mjs, and its own tests); what this
+	// file owns is that a `false` verdict stops every trigger type, not only the ones without a label.
 	for (const [name, payload] of [["issue", issuePayload()], ["merge_request", mrPayload()], ["note", notePayload()]]) {
-		for (const level of [0, 10, 20, 29]) {
-			const r = run(payload, { level });
-			assert.equal(r.enqueue, false, `${name} at access_level ${level} must not enqueue`);
-			assert.equal(r.reason, "author-not-allowed");
-		}
+		const r = run(payload, { authorized: false });
+		assert.equal(r.enqueue, false, `${name} must not enqueue for an unauthorized actor`);
+		assert.equal(r.reason, "author-not-allowed");
 	}
 });
 
-test("Developer, Maintainer and Owner all pass; a non-numeric level does not", () => {
-	for (const level of [30, 40, 50]) assert.equal(run(issuePayload(), { level }).enqueue, true, `access_level ${level} is at or above Developer`);
-	// Called directly, not through `run`, whose default would substitute a passing level for `undefined`
-	// and quietly turn this into an assertion about the helper.
-	for (const level of [undefined, null, "30", NaN]) {
-		const r = filterGitLab(parseGitLabSubset(issuePayload()), triggers, knownFlows, SELF_ID, level, "wh-x");
-		assert.equal(r.enqueue, false, `a ${JSON.stringify(level)} level must fail closed, never coerce`);
+test("only an explicit `true` clears the gate -- nothing truthy, nothing coerced", () => {
+	assert.equal(run(issuePayload(), { authorized: true }).enqueue, true);
+	// Called directly, not through `run`, whose default would substitute a passing verdict for `undefined`
+	// and quietly turn this into an assertion about the helper. A resolver that returned the wrong shape,
+	// or a caller that read the wrong field, lands here -- and must refuse rather than pass.
+	for (const authorized of [undefined, null, "true", 1, 30, {}]) {
+		const r = filterGitLab(parseGitLabSubset(issuePayload()), triggers, knownFlows, SELF_ID, authorized, "wh-x");
+		assert.equal(r.enqueue, false, `a ${JSON.stringify(authorized)} verdict must fail closed, never coerce`);
 		assert.equal(r.reason, "author-not-allowed");
 	}
 });
@@ -129,13 +130,13 @@ test("Developer, Maintainer and Owner all pass; a non-numeric level does not", (
 test("the bot-loop guard runs BEFORE the access gate, so our own comment cannot recurse", () => {
 	// Under a project access token the harness IS a member and would clear the access gate -- so ordering
 	// is what stops the harness's own status comment from starting another job.
-	const r = run(notePayload({ user: { id: SELF_ID, username: "pi-bot" } }), { level: 50 });
+	const r = run(notePayload({ user: { id: SELF_ID, username: "pi-bot" } }), { authorized: true });
 	assert.equal(r.enqueue, false);
 	assert.equal(r.reason, "self");
 });
 
 test("a missing user.id is refused before the self compare -- undefined must not fall through", () => {
-	const r = run(issuePayload({ user: {} }), { level: 50 });
+	const r = run(issuePayload({ user: {} }), { authorized: true });
 	assert.equal(r.reason, "missing-sender-id");
 });
 
@@ -194,7 +195,7 @@ test("packages and image ride the JOB from the matched rule, never inside trigge
 		...triggers,
 		label: [{ index: 2, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", packages: false, image: "my-python:1.2.0" }],
 	};
-	const r = filterGitLab(parseGitLabSubset(issuePayload()), t, knownFlows, SELF_ID, DEVELOPER, "wh-9");
+	const r = filterGitLab(parseGitLabSubset(issuePayload()), t, knownFlows, SELF_ID, true, "wh-9");
 	assert.equal(r.job.packages, false);
 	assert.equal(r.job.image, "my-python:1.2.0");
 	// `trigger` is copied verbatim into /job/event.json; an execution knob has no business describing the

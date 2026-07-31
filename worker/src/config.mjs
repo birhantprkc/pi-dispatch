@@ -7,6 +7,7 @@
 
 import { existsSync } from "node:fs";
 import { delimiter } from "node:path";
+import { MINTED_TOKEN_VARS } from "./forges.mjs";
 
 export function configError(message) {
 	const error = new Error(message);
@@ -71,13 +72,15 @@ function commaList(raw) {
 		.filter((s) => s.length > 0);
 }
 
-// PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs
-// sets GITHUB_TOKEN and GH_TOKEN from the per-job mint; forwarding either from the host would
-// silently swap which credential every job spends, so this fails loud here rather than per-job.
-// Every variable name env-allowlist.mjs assigns from a per-job mint. Forwarding one from the host would
-// override that mint with a broader, longer-lived operator credential -- silently, and in the direction
-// that matters. The list grows with each forge; it is the reason it is a set rather than two names.
-const MINTED_TOKEN_VARS = new Set(["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"]);
+// PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs sets
+// them from the per-job mint; forwarding one from the host would silently swap which credential every job
+// spends, so this fails loud here rather than per-job.
+//
+// Derived from the forge table rather than written out, because this list and the mint that writes those
+// names have to agree and used to be two hand-maintained lists twenty lines apart in different files. A
+// forge added to the mint but missed here is not refused -- so an operator could forward a long-lived host
+// token under that name into every container of every forge, with nothing failing and nothing logged.
+// `forges.mjs` derives both from one row, and `env-allowlist.test.mjs` binds them.
 
 function forwardEnvList(raw) {
 	const names = commaList(raw);
@@ -184,6 +187,8 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		dispatchRunRoots: delimitedList(env.PI_DISPATCH_RUN_ROOTS), // DES-AI-TRIGGER-FLOW-GATE: default [] fails closed — no folder passes, dispatch_run refuses everything
 		github: { ...loadGitHubAuth(env, fileExists), allowGhResume: env.PI_SESSIONS_ALLOW_GH_SOURCE === "1" },
 		gitlab: loadGitLabAuth(env),
+		forgejo: loadForgejoAuth(env),
+		azure: loadAzureAuth(env),
 	};
 }
 
@@ -244,6 +249,46 @@ export function defaultSettingsFile() {
 	// allowlist (no-broad-env-into-container). Exported so the admin extension resolves the same default
 	// without calling loadConfig, which throws on unrelated env problems.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/settings.json`.replace(/\\/g, "/");
+}
+
+/**
+ * The worker's Azure DevOps auth config, or `null` when none is configured -- same presence rule as the
+ * other two optional forges.
+ */
+export function loadAzureAuth(env) {
+	const token = env.AZURE_TOKEN;
+	if (typeof token !== "string" || token.trim() === "") return null;
+	const source = env.AZURE_AUTH_SOURCE ?? "pat";
+	if (source !== "pat") {
+		throw configError(`AZURE_AUTH_SOURCE must be "pat" (got ${JSON.stringify(source)}) -- Azure DevOps has no App or installation-token equivalent, so there is no other source`);
+	}
+	const orgUrl = env.AZURE_ORG_URL;
+	if (typeof orgUrl !== "string" || orgUrl.trim() === "") {
+		throw configError("AZURE_ORG_URL is required when AZURE_TOKEN is set (e.g. https://dev.azure.com/your-org)");
+	}
+	return { source, orgUrl: orgUrl.trim().replace(/\/+$/, ""), tokenVar: "AZURE_TOKEN" };
+}
+
+/**
+ * The worker's Forgejo auth config, or `null` when none is configured -- same presence rule as GitLab's.
+ *
+ * `FORGEJO_BOT_ID` rides here because a repository-scoped Forgejo token cannot call `GET /user`, so the
+ * identity the bot-loop guard needs may have to be supplied rather than asked for (forgejo-identity.mjs).
+ */
+export function loadForgejoAuth(env) {
+	const token = env.FORGEJO_TOKEN;
+	if (typeof token !== "string" || token.trim() === "") return null;
+	const source = env.FORGEJO_AUTH_SOURCE ?? "pat";
+	if (source !== "pat") {
+		throw configError(`FORGEJO_AUTH_SOURCE must be "pat" (got ${JSON.stringify(source)}) -- Forgejo has no App or installation-token equivalent, so there is no other source`);
+	}
+	const apiUrl = env.FORGEJO_URL;
+	// No default instance, deliberately: Forgejo is self-hosted by nature and there is no forgejo.com to
+	// fall back to. Guessing one would send an operator's token to a host they never named.
+	if (typeof apiUrl !== "string" || apiUrl.trim() === "") {
+		throw configError("FORGEJO_URL is required when FORGEJO_TOKEN is set -- there is no default Forgejo instance to fall back to");
+	}
+	return { source, apiUrl: apiUrl.trim(), tokenVar: "FORGEJO_TOKEN", botId: env.FORGEJO_BOT_ID ?? null };
 }
 
 /**

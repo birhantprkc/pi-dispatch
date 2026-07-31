@@ -455,6 +455,30 @@ test("a missing job image refuses BEFORE mint, prepare and reserveBudget -- noth
 	);
 });
 
+test("an image that cannot serve this job's forge refuses pre-spend, and names run.image as the fix", async () => {
+	// Same money gate, a different cause: the image is PRESENT and says it ships no CLI for this forge.
+	// Without this the job runs, finds no such command, and fails at step 3 inside a paid container -- on
+	// every delivery, looking exactly like a bad agent run rather than a missing tool.
+	const redis = fakeRedis();
+	// The shared fake truncates comment text, so this test captures it whole -- the WORDING is the point
+	// here, not merely that something was posted.
+	const posted = [];
+	const { deps: d, calls } = deps({
+		redis,
+		comment: async (_j, t) => posted.push(t),
+		imagePreflight: async () => ({ forgeUnsupported: "pi-job:latest", kind: "azure", declared: ["github", "gitlab", "forgejo"] }),
+	});
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "job-image-forge-unsupported");
+	assert.equal(r.budgetReserved, false);
+	assert.equal(redis.incrCalls, 0, "a trigger that forgot run.image must not burn a cap slot to find out");
+	assert.ok(!calls.some((c) => c.startsWith("mint:")), "no credential is minted for a job that cannot run");
+	assert.ok(!calls.includes("run-container"), "no container");
+	assert.ok(posted[0]?.includes("run.image"), "the message names the likely cause, not the label that detected it");
+	assert.ok(posted[0]?.includes("azure"), "and which forge it could not serve");
+});
+
 test("a missing job image is RETURNED, never thrown -- retrying cannot make a misspelled tag appear", async () => {
 	// Throwing would make BullMQ retry and burn a SECOND slot on a determinate config fault. This is the
 	// same policy-not-infra call CONST-RETRY-INFRA-ONLY makes for settings-overlay-invalid.

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { makeForgePreparers, makePrepareWorkspace } from "../src/prepare.mjs";
+import { FORGE_KINDS } from "../src/forges.mjs";
 
 /** A fresh real jobsDir under os.tmpdir, plus a cleanup fn — mkdtempSync(join(jobsDir,"job-")) needs it real. */
 function withJobsDir() {
@@ -211,4 +212,30 @@ test("makeForgePreparers hands the gitlab arm a GitLab clone URL and the glab en
 	await preparers.github({ kind: "github", repo: "o/r" }, "tok", { jobDir: "/j" });
 	assert.equal(seen[1].url, undefined);
 	assert.equal(seen[1].prompt, undefined);
+});
+
+test("makeForgePreparers hands the forgejo arm a Forgejo clone URL and the tea envelope", async () => {
+	// Same silent failure as the gitlab arm: a job cloning from the wrong instance either finds nothing or
+	// -- worse -- finds a stranger's repository and reports success against it.
+	const seen = [];
+	const preparers = makeForgePreparers({
+		forgejoApiUrl: "https://fj.internal",
+		prepareForge: async (job, _token, opts) => (seen.push({ kind: job.kind, url: opts.remoteUrlFor?.(job), prompt: opts.buildPrompt }), { ok: true }),
+	});
+
+	await preparers.forgejo({ kind: "forgejo", repo: "acme/widgets", flow: "fix", target: { type: "issue", number: 3 } }, "tok", { jobDir: "/j" });
+	assert.equal(seen[0].url, "https://fj.internal/acme/widgets.git");
+	const envelope = seen[0].prompt({ flow: "fix", target: { type: "issue", number: 3 } });
+	assert.ok(envelope.includes("tea"), "the envelope must speak tea");
+	assert.equal(/\bgh (pr|issue) /.test(envelope), false, "and never gh -- gh implements the GitHub API");
+});
+
+test("every forge the table knows has a preparer -- a kind with none throws 'unknown job kind' at run time", async () => {
+	// `prepare.mjs` dispatches on `preparers[job.kind]` and throws when there is none. That throw is loud,
+	// but it happens INSIDE a job, after the budget slot is taken. Asserting the map covers the table moves
+	// the discovery to here.
+	const preparers = makeForgePreparers({ prepareForge: async () => ({ ok: true }) });
+	for (const kind of FORGE_KINDS) {
+		assert.equal(typeof preparers[kind], "function", `${kind}: a forge with no preparer burns a budget slot before it fails`);
+	}
 });

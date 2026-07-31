@@ -1,16 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="pi-dispatch — run the pi coding agent as a self-hosted service, triggered by cron, GitHub or GitLab">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="pi-dispatch — run the pi coding agent as a self-hosted service, triggered by cron, GitHub, GitLab, Forgejo or Azure DevOps">
   <rect x="1" y="1" width="1198" height="358" rx="18" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
 
   <!-- wordmark + tagline -->
   <text x="72" y="132" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="66" font-weight="700" fill="#58a6ff">pi-dispatch</text>
   <text x="75" y="182" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">Run the pi coding agent as a self-hosted service —</text>
-  <text x="75" y="214" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">on demand, on a cron, or on a GitHub or GitLab issue.</text>
+  <text x="75" y="214" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#c9d1d9">on demand, on a cron, or on an issue on any of four forges.</text>
 
   <!-- differentiator chips -->
   <g font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="17">
     <text x="75" y="278" fill="#3fb950">●</text><text x="95" y="278" fill="#8b949e">container-isolated</text>
     <text x="256" y="278" fill="#d6a531">●</text><text x="276" y="278" fill="#8b949e">spend-capped before tokens</text>
-    <text x="520" y="278" fill="#58a6ff">●</text><text x="540" y="278" fill="#8b949e">cron · GitHub · GitLab · CLI</text>
+    <text x="520" y="278" fill="#58a6ff">●</text><text x="540" y="278" fill="#8b949e">cron · CLI · webhook</text>
+    <text x="75" y="312" fill="#a371f7">●</text><text x="95" y="312" fill="#8b949e">GitHub · GitLab · Forgejo · Azure DevOps</text>
   </g>
 
   <!-- mini /dispatch panel -->

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findEnvKeys } from "@earendil-works/pi-ai/compat";
+import { forgeSpec } from "./forges.mjs";
 
 function configError(message) {
 	const error = new Error(message);
@@ -109,7 +110,7 @@ function resolveEnvName(provider, cred) {
  * `allowGlobalExtensions` defaults to TRUE here, matching loadConfig's default (REQ-GLOBAL-PI-OVERLAY): a
  * caller that says nothing gets the operator's staged setup, and only an explicit `false` withholds it.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, forgeKind, gitlabHost, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], sessionFile = null, authFromPi = false, agentDir, readFile = readFileSync }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, forgeKind, forgeHosts = {}, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], sessionFile = null, authFromPi = false, agentDir, readFile = readFileSync }) {
 	// The provider credential(s), by pi's expected variable name(s) -- from the worker env, or (when
 	// PI_AUTH_FROM_PI is set and the env has none) host-side from pi's auth.json. Throws (config) if
 	// neither source yields one, which the processor turns into a pre-spend refusal.
@@ -176,15 +177,21 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 	// This assignment deliberately sits AFTER the PI_FORWARD_ENV loop so a forwarded name can never
 	// override the mint (and loadConfig refuses those names at load anyway).
 	// Absent token => absent variable, never an empty one.
+	//
+	// The forge is looked UP, never fallen back to. This was an `if gitlab / else github`, and the `else`
+	// was the whole hazard: a job of any kind the table did not name -- a new forge wired up everywhere but
+	// here, a typo that survived validation -- got its credential exported as GITHUB_TOKEN and GH_TOKEN,
+	// which is precisely the "working credential handed to the wrong host" the paragraph above describes.
+	// A local cron job that opted in via run.github has kind "local" and genuinely wants GitHub's names, so
+	// it is mapped explicitly rather than inheriting them from a default.
 	if (githubToken) {
-		if (forgeKind === "gitlab") {
-			env.GITLAB_TOKEN = githubToken;
-			env.GL_TOKEN = githubToken;
-			if (gitlabHost) env.GITLAB_HOST = gitlabHost;
-		} else {
-			env.GITHUB_TOKEN = githubToken;
-			env.GH_TOKEN = githubToken;
+		const spec = forgeSpec(forgeKind === "local" ? "github" : forgeKind);
+		if (!spec) {
+			throw configError(`buildContainerEnv: no token variable names for job kind ${JSON.stringify(forgeKind)} -- add it to FORGES in worker/src/forges.mjs rather than letting it inherit another forge's`);
 		}
+		for (const name of spec.tokenVars) env[name] = githubToken;
+		const host = forgeHosts?.[forgeKind];
+		if (spec.hostVar && host) env[spec.hostVar] = host;
 	}
 
 	return env;

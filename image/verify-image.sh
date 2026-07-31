@@ -49,14 +49,45 @@ docker run --rm --entrypoint pi "$IMAGE_REF" -p --help >/dev/null 2>&1 \
 	|| fail "pi is not on PATH, or -p is no longer a flag. The image must carry the pinned pi (CONST-PI-VERSION-PINNED); a stale or absent pi makes jobs no-ops that still report success."
 ok "pi is present and -p is still a flag"
 
-# The two forge CLIs the job envelopes instruct the agent to use. Each is only meaningful for jobs on its
-# own forge, but a MISSING one fails the same silent way: the agent follows an envelope naming a command
-# that is not there, reports what went wrong in prose, and exits 0.
-for cli in gh glab; do
+# The forge CLIs the job envelopes instruct the agent to use. Each is only meaningful for jobs on its own
+# forge, but a MISSING one fails the same silent way: the agent follows an envelope naming a command that
+# is not there, reports what went wrong in prose, and exits 0.
+#
+# The forge => CLI mapping is spelled out here because the next block checks the image's own
+# `dev.pi-dispatch.forges` label against it. That label is what the worker's pre-spend preflight trusts to
+# refuse a job this image cannot serve, so it has to be checked against reality rather than believed.
+forge_cli() {
+	case "$1" in
+		github) echo gh ;;
+		gitlab) echo glab ;;
+		forgejo) echo tea ;;
+		azure) echo az ;;
+		*) echo "" ;;
+	esac
+}
+
+for cli in gh glab tea; do
 	docker run --rm --entrypoint "$cli" "$IMAGE_REF" --version >/dev/null 2>&1 \
 		|| fail "$cli is not on PATH. A ${cli}-driven job envelope cannot publish its work, and the failure looks like a completed run."
 	ok "$cli is present"
 done
+
+# THE LABEL MUST NOT LIE. The worker refuses a job pre-spend when this list excludes its forge, and admits
+# it when the list includes it -- so a label naming a forge whose CLI is absent converts a loud pre-spend
+# refusal into a paid container that fails at step 3. Declaring nothing is allowed (it means "no claim",
+# and the preflight then admits everything); declaring something false is not.
+declared=$(docker image inspect --format '{{index .Config.Labels "dev.pi-dispatch.forges"}}' "$IMAGE_REF" 2>/dev/null)
+if [ -z "$declared" ] || [ "$declared" = "<no value>" ]; then
+	ok "no dev.pi-dispatch.forges label -- the image makes no claim, and the preflight admits every forge"
+else
+	for forge in $(echo "$declared" | tr ',' ' '); do
+		cli=$(forge_cli "$forge")
+		[ -n "$cli" ] || fail "dev.pi-dispatch.forges names an unknown forge '$forge'"
+		docker run --rm --entrypoint "$cli" "$IMAGE_REF" --version >/dev/null 2>&1 \
+			|| fail "the image declares it serves '$forge' but $cli is not on PATH -- the label would turn a pre-spend refusal into a paid container that fails at step 3"
+	done
+	ok "dev.pi-dispatch.forges ($declared) matches the CLIs actually installed"
+fi
 
 # --cap-drop=ALL is CONST-ISOLATION-CONTAINER-PER-JOB's enforcement surface. Read the effective capability
 # set directly rather than install libcap just to ask.

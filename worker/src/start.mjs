@@ -9,6 +9,10 @@ import { makeGitHubAuth } from "./get-token.mjs";
 import { makeGitHubHost } from "./github-host.mjs";
 import { makeGitLabAuth } from "./gitlab-auth.mjs";
 import { makeGitLabHost } from "./gitlab-host.mjs";
+import { makeForgejoAuth } from "./forgejo-auth.mjs";
+import { makeForgejoHost } from "./forgejo-host.mjs";
+import { makeAzureAuth } from "./azure-auth.mjs";
+import { makeAzureHost } from "./azure-host.mjs";
 import { makeImagePreflight } from "./image-preflight.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
@@ -141,6 +145,10 @@ export async function startWorker(
 		makeImagePreflight: makeImagePreflightFn = makeImagePreflight,
 		makeGitLabAuth: makeGitLabAuthFn = makeGitLabAuth,
 		makeGitLabHost: makeGitLabHostFn = makeGitLabHost,
+		makeForgejoAuth: makeForgejoAuthFn = makeForgejoAuth,
+		makeForgejoHost: makeForgejoHostFn = makeForgejoHost,
+		makeAzureAuth: makeAzureAuthFn = makeAzureAuth,
+		makeAzureHost: makeAzureHostFn = makeAzureHost,
 	} = {},
 ) {
 	const config = loadConfig(env);
@@ -182,6 +190,31 @@ export async function startWorker(
 			log("self_identity", { kind: "gitlab", id: forges.gitlab.auth.selfId, source: forges.gitlab.auth.source });
 		} catch (err) {
 			log("gitlab_auth_unavailable", { kind: "gitlab", reason: err?.message });
+		}
+	}
+	// Forgejo joins on the same best-effort terms. Its auth can fail for one reason the others cannot: a
+	// repository-scoped token cannot call GET /user, so an operator who scoped their token without setting
+	// FORGEJO_BOT_ID lands here. The message names the fix (forgejo-identity.mjs) and the forge stays
+	// credential-less, which refuses its jobs at mint time rather than running them unattributed.
+	if (config.forgejo) {
+		forges.forgejo = { auth: null, host: makeForgejoHostFn({ apiUrl: config.forgejo.apiUrl }) };
+		try {
+			forges.forgejo.auth = await makeForgejoAuthFn(config.forgejo);
+			log("self_identity", { kind: "forgejo", id: forges.forgejo.auth.selfId, source: forges.forgejo.auth.source });
+		} catch (err) {
+			log("forgejo_auth_unavailable", { kind: "forgejo", reason: err?.message });
+		}
+	}
+	// Azure joins on the same terms. Its selfId is an OBJECT (`{ id, email }`) rather than a scalar, because
+	// a pull-request delivery names an actor by GUID and a work item names them only by address -- the one
+	// place a forge's identity does not reduce to a single value.
+	if (config.azure) {
+		forges.azure = { auth: null, host: makeAzureHostFn({ orgUrl: config.azure.orgUrl }) };
+		try {
+			forges.azure.auth = await makeAzureAuthFn(config.azure);
+			log("self_identity", { kind: "azure", id: forges.azure.auth.selfId?.id ?? null, source: forges.azure.auth.source });
+		} catch (err) {
+			log("azure_auth_unavailable", { kind: "azure", reason: err?.message });
 		}
 	}
 
@@ -309,12 +342,15 @@ export async function startWorker(
 				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; every job receives them unless its trigger set packages:false
 				forwardEnv: config.forwardEnv,
 				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
-				gitlabHost: config.gitlab?.apiUrl ?? null, // so `glab` in a gitlab job's container talks to the right instance
+				// Self-hosted instance URLs, keyed by forge. A MAP rather than one scalar per forge: the table says
+				// which variable each lands in, so a forge with no self-hosted concept simply has no entry, and
+				// adding one does not widen this signature again.
+				forgeHosts: { gitlab: config.gitlab?.apiUrl ?? null, forgejo: config.forgejo?.apiUrl ?? null, azure: config.azure?.orgUrl ?? null },
 			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				forgeFor,
-				preparers: makeForgePreparers({ gitlabApiUrl: config.gitlab?.apiUrl ?? null }),
+				preparers: makeForgePreparers({ gitlabApiUrl: config.gitlab?.apiUrl ?? null, forgejoApiUrl: config.forgejo?.apiUrl ?? null, azureOrgUrl: config.azure?.orgUrl ?? null }),
 				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
 				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
 				findPreviousRun: makeFindPreviousRun({ logsDir: config.logsDir }),

@@ -1,0 +1,245 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { filterAzure } from "../src/filter-azure.mjs";
+import { actorOf, extractEmail, parseAzureSubset, parseTags, tagChange } from "../src/azure-subset.mjs";
+
+const SELF = { id: "self-guid", email: "pi-bot@example.com" };
+const MEMBER = "member-guid";
+const PROJECT = { id: "proj-guid", baseUrl: "https://dev.azure.com/contoso/" };
+
+const triggers = {
+	label: [{ index: 0, predicate: { any: ["pi:go"] }, flow: "fix", repository: "widgets" }],
+	comment: { index: 1, phrase: "@pi", defaultFlow: "triage", repository: "widgets" },
+	pullRequest: [{ index: 2, actions: new Set(["created", "updated"]), predicate: null, flow: "review" }],
+};
+const knownFlows = new Set(["fix", "triage", "review"]);
+
+const workItem = (over = {}) => ({
+	id: "delivery-guid",
+	eventType: "workitem.updated",
+	resourceContainers: { project: PROJECT },
+	resource: {
+		id: 7,
+		fields: {
+			"System.ChangedBy": { oldValue: "A <a@example.com>", newValue: "Dev Person <dev@example.com>" },
+			"System.Tags": { oldValue: "", newValue: "pi:go" },
+		},
+		revision: { fields: { "System.Title": "T", "System.Description": "B", "System.Tags": "pi:go", "System.TeamProject": "Fabrikam" } },
+	},
+	...over,
+});
+
+const pullRequest = (over = {}) => ({
+	id: "delivery-guid",
+	eventType: "git.pullrequest.created",
+	resourceContainers: { project: PROJECT },
+	resource: {
+		pullRequestId: 12,
+		title: "PT",
+		description: "PB",
+		sourceRefName: "refs/heads/feature",
+		targetRefName: "refs/heads/main",
+		createdBy: { id: MEMBER },
+		repository: { id: "repo-guid", name: "widgets", project: { id: "proj-guid", name: "Fabrikam" } },
+	},
+	...over,
+});
+
+const run = (payload, { authorized = true, selfId = SELF } = {}) =>
+	filterAzure(parseAzureSubset(payload), triggers, knownFlows, selfId, authorized, "delivery-guid");
+
+// --- the tag DIFF, which is the expensive thing to get wrong ---
+
+test("a work-item update that ADDS an allowlisted tag enqueues", () => {
+	const r = run(workItem());
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.flow, "fix");
+	assert.equal(r.job.repo, "Fabrikam/widgets", "the project comes from the payload; the repository from run.repository");
+	assert.deepEqual(r.job.azure, { project: "Fabrikam", projectId: "proj-guid", repository: "widgets" });
+});
+
+test("an update that changed NO tags never enqueues -- the trap that would bill a run per typo fix", () => {
+	// Azure has no `labeled` event. Matching the current tag SET instead of the change would fire this
+	// trigger again on every later edit of any field on a tagged work item, forever.
+	const noTagChange = workItem({
+		resource: {
+			id: 7,
+			fields: { "System.ChangedBy": { oldValue: "A <a@example.com>", newValue: "Dev Person <dev@example.com>" }, "System.Title": { oldValue: "T", newValue: "T2" } },
+			revision: { fields: { "System.Title": "T2", "System.Tags": "pi:go", "System.TeamProject": "Fabrikam" } },
+		},
+	});
+	const r = run(noTagChange);
+	assert.equal(r.enqueue, false, "the work item still CARRIES pi:go -- matching the set would fire here");
+	assert.equal(r.reason, "no-label-change");
+});
+
+test("a tag REMOVAL never enqueues -- the same rule Forgejo's label_cleared gets", () => {
+	const removed = workItem({
+		resource: {
+			id: 7,
+			fields: { "System.ChangedBy": { newValue: "Dev <dev@example.com>" }, "System.Tags": { oldValue: "pi:go;other", newValue: "other" } },
+			revision: { fields: { "System.Tags": "other", "System.TeamProject": "Fabrikam" } },
+		},
+	});
+	assert.equal(run(removed).reason, "no-label-change");
+});
+
+test("a work item CREATED already carrying the tag enqueues -- it changed from having none", () => {
+	const created = {
+		id: "d",
+		eventType: "workitem.created",
+		resourceContainers: { project: PROJECT },
+		resource: { id: 7, fields: { "System.CreatedBy": "Dev <dev@example.com>", "System.Tags": "pi:go", "System.Title": "T", "System.TeamProject": "Fabrikam" } },
+	};
+	assert.equal(run(created).enqueue, true);
+});
+
+test("tagChange and parseTags handle both spacings and an absent previous value", () => {
+	// Which separator spacing Azure uses has varied across versions; a tag list that silently matched
+	// nothing because of a space would look exactly like a trigger nobody armed.
+	assert.deepEqual(parseTags("a;b"), [{ name: "a" }, { name: "b" }]);
+	assert.deepEqual(parseTags("a; b ; "), [{ name: "a" }, { name: "b" }]);
+	assert.deepEqual(parseTags(undefined), []);
+	assert.deepEqual(tagChange({ "System.Tags": { newValue: "a" } }), { previous: [], current: [{ name: "a" }] }, "a first tag on an untagged item is a real change");
+	assert.equal(tagChange({}), undefined, "no tag field at all is not a change");
+});
+
+// --- the dual-identity bot-loop guard ---
+
+test("the harness's own work-item comment drops as self, matched on the ADDRESS", () => {
+	// A work-item payload names the actor only as "Display Name <email>". If the guard compared only GUIDs
+	// it would never match here, and the harness's own status comments would re-trigger jobs whose comments
+	// re-trigger jobs.
+	const own = workItem({
+		eventType: "workitem.commented",
+		resource: {
+			id: 7,
+			fields: { "System.ChangedBy": "pi-dispatch <PI-BOT@Example.com>", "System.History": "@pi done" },
+			revision: { fields: { "System.TeamProject": "Fabrikam" } },
+		},
+	});
+	assert.equal(run(own).reason, "self", "compared case-insensitively -- Azure does not normalise case");
+});
+
+test("a display name CONTAINING the bot address is not the bot -- the spoofable-substring case", () => {
+	// The display half is attacker-settable. A substring test would let this read as the harness (silencing
+	// a real trigger) or, on the authority side, as somebody else entirely.
+	const impostor = workItem({
+		eventType: "workitem.commented",
+		resource: {
+			id: 7,
+			fields: { "System.ChangedBy": "pi-bot@example.com is not me <mallory@evil.test>", "System.History": "@pi run" },
+			revision: { fields: { "System.TeamProject": "Fabrikam" } },
+		},
+	});
+	const r = run(impostor);
+	assert.notEqual(r.reason, "self", "the anchored match must read the address, not the display name");
+	assert.equal(r.enqueue, true);
+});
+
+test("the harness's own pull-request activity drops as self, matched on the GUID", () => {
+	assert.equal(run(pullRequest({ resource: { ...pullRequest().resource, createdBy: { id: SELF.id } } })).reason, "self");
+});
+
+test("an EMPTY side of selfId never matches -- a half-resolved identity must not match every actor", () => {
+	// resolveAzureSelfId tolerates one of the two forms being absent. That must degrade to "cannot
+	// recognise myself on those events", never to "everybody is me".
+	const halfGuid = run(workItem(), { selfId: { id: "self-guid", email: null } });
+	assert.equal(halfGuid.enqueue, true, "an email-only actor must not match a null self email");
+	const halfEmail = run(pullRequest(), { selfId: { id: null, email: "pi-bot@example.com" } });
+	assert.equal(halfEmail.enqueue, true, "a guid-only actor must not match a null self guid");
+});
+
+test("an actor that resolves to NEITHER form is refused before the self compare", () => {
+	const anonymous = workItem({ resource: { id: 7, fields: { "System.Tags": { newValue: "pi:go" } }, revision: { fields: { "System.TeamProject": "Fabrikam" } } } });
+	assert.equal(run(anonymous).reason, "missing-sender-id");
+});
+
+test("extractEmail is anchored, lowercases, and refuses a bare display name", () => {
+	assert.equal(extractEmail("Dev Person <Dev@Example.com>"), "dev@example.com");
+	assert.equal(extractEmail("dev@example.com"), "dev@example.com");
+	assert.equal(extractEmail("a@b.test <c@d.test>"), "c@d.test", "the TRAILING angle-bracketed address wins");
+	assert.equal(extractEmail("Dev Person"), null);
+	assert.equal(extractEmail(undefined), null);
+});
+
+test("actorOf prefers a GUID and falls back to the address", () => {
+	assert.deepEqual(actorOf({ resource: { createdBy: { id: "g" } } }), { id: "g" });
+	assert.deepEqual(actorOf({ resource: { fields: { "System.ChangedBy": "D <e@f.test>" } } }), { email: "e@f.test" });
+	assert.deepEqual(actorOf({ resource: {} }), {});
+});
+
+// --- the gate and routing ---
+
+test("an unauthorized actor is refused on EVERY trigger type", () => {
+	for (const [name, payload] of [["work item", workItem()], ["pull request", pullRequest()]]) {
+		const r = run(payload, { authorized: false });
+		assert.equal(r.reason, "author-not-allowed", name);
+	}
+});
+
+test("only an explicit `true` clears the gate", () => {
+	for (const authorized of [undefined, null, "true", 1, {}]) {
+		const r = filterAzure(parseAzureSubset(workItem()), triggers, knownFlows, SELF, authorized, "d");
+		assert.equal(r.enqueue, false, `a ${JSON.stringify(authorized)} verdict must fail closed`);
+	}
+});
+
+test("a pull request event uses the payload's own repository, never run.repository", () => {
+	const r = run(pullRequest());
+	assert.equal(r.job.repo, "Fabrikam/widgets");
+	assert.equal(r.job.azure.repositoryId, "repo-guid", "the id the git APIs actually take");
+	assert.equal(r.job.target.head.ref, "feature", "refs/heads/ is stripped -- the rest of this codebase does not qualify refs");
+});
+
+test("a pull-request comment routes a pull_request target and carries the comment text", () => {
+	const commented = {
+		id: "d",
+		eventType: "ms.vss-code.git-pullrequest-comment-event",
+		resourceContainers: { project: PROJECT },
+		resource: {
+			comment: { content: "@pi please look", author: { id: MEMBER } },
+			pullRequest: { pullRequestId: 12, title: "PT", description: "PB", repository: { id: "repo-guid", name: "widgets", project: { name: "Fabrikam" } } },
+		},
+	};
+	const r = run(commented);
+	assert.equal(r.enqueue, true);
+	assert.equal(r.job.target.type, "pull_request");
+	assert.equal(r.job.flow, "triage");
+});
+
+test("an unhandled event id drops rather than routing somewhere plausible", () => {
+	assert.equal(run(workItem({ eventType: "git.push" })).reason, "unhandled-event");
+	assert.equal(run(workItem({ eventType: "workitem.deleted" })).reason, "unhandled-event");
+});
+
+test("the job carries no email address -- an opaque stable id stands in for it", () => {
+	// The job is copied verbatim into /job/event.json and summarised into the durable run record, both of
+	// which are PII-free BY CONSTRUCTION. A work-item payload offers nothing but "Display Name <email>",
+	// so the address is hashed rather than carried.
+	const r = run(workItem());
+	const serialized = JSON.stringify(r.job);
+	assert.equal(serialized.includes("dev@example.com"), false, "no address may reach event.json or the run record");
+	assert.equal(serialized.includes("Dev Person"), false, "nor a display name");
+	assert.match(r.job.trigger.sender.id, /^azid-[0-9a-f]{16}$/);
+});
+
+test("the same actor hashes to the same id, and a different one does not", () => {
+	// The id has one job: letting two records be compared for "same person". A per-delivery value would
+	// look identical in a single record and be useless across two.
+	const a = run(workItem()).job.trigger.sender.id;
+	const b = run(workItem()).job.trigger.sender.id;
+	assert.equal(a, b);
+	const other = workItem({
+		resource: {
+			id: 7,
+			fields: { "System.ChangedBy": { newValue: "Other <other@example.com>" }, "System.Tags": { oldValue: "", newValue: "pi:go" } },
+			revision: { fields: { "System.Tags": "pi:go", "System.TeamProject": "Fabrikam" } },
+		},
+	});
+	assert.notEqual(run(other).job.trigger.sender.id, a);
+});
+
+test("a pull-request job still carries the GUID verbatim -- it is already opaque", () => {
+	assert.equal(run(pullRequest()).job.trigger.sender.id, MEMBER);
+});
