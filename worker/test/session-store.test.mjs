@@ -1,0 +1,188 @@
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { makeSessionStore, SESSION_FILE_NAME } from "../src/session-store.mjs";
+import { sessionKeyFor } from "../src/session-key.mjs";
+
+const HEADER = `${JSON.stringify({ type: "session", version: 3, id: "s1", cwd: "/workspace" })}\n`;
+const PI = "0.80.7";
+const ghIssue = { kind: "github", repo: "o/r", target: { type: "issue", number: 7 } };
+
+function fixture({ ttlDays = 14, maxBytes = 1_000_000, now = () => 1_000_000_000 } = {}) {
+	const root = mkdtempSync(join(tmpdir(), "pi-store-"));
+	const sessionsDir = join(root, "sessions");
+	mkdirSync(sessionsDir, { recursive: true });
+	const logs = [];
+	const store = makeSessionStore({ sessionsDir, ttlDays, maxBytes, now, log: (e, f) => logs.push([e, f]) });
+	const jobDir = mkdtempSync(join(root, "job-"));
+	return { root, sessionsDir, store, jobDir, logs };
+}
+
+/** Seed the canonical store for a key, the way a promotion would have. */
+function seed(sessionsDir, key, { body = HEADER, piVersion = PI } = {}) {
+	const dir = join(sessionsDir, key);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, SESSION_FILE_NAME), body);
+	writeFileSync(join(dir, "pi-version"), piVersion);
+	return join(dir, SESSION_FILE_NAME);
+}
+
+test("a cold start stages a 0-BYTE file, never an absent one", () => {
+	const { store, jobDir } = fixture();
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	assert.equal(s.resume, false);
+	assert.equal(s.reason, "absent");
+	// 0 bytes is what makes pi write its own header at open and mark the manager flushed, so _persist
+	// never reaches openSync(path, "wx") -- the EEXIST race becomes unreachable rather than unlikely.
+	assert.equal(statSync(join(s.hostDir, SESSION_FILE_NAME)).size, 0);
+});
+
+test("a seeded transcript resumes, and the canonical store is NOT what gets mounted", () => {
+	const { store, jobDir, sessionsDir } = fixture();
+	const key = sessionKeyFor(ghIssue);
+	seed(sessionsDir, key);
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	assert.equal(s.resume, true);
+	assert.equal(s.reason, "resumed");
+	// The mount is a per-job COPY under jobDir. The container can name its own transcript and nothing
+	// else, so a compromised agent that computes another repo's key still cannot reach it -- the mount is
+	// the capability, and the hash is not one.
+	assert.equal(s.hostDir, join(jobDir, "session"));
+	assert.equal(s.hostDir.startsWith(sessionsDir), false, "mounting the store itself would expose every key to one job");
+	assert.equal(readFileSync(join(s.hostDir, SESSION_FILE_NAME), "utf8"), HEADER);
+});
+
+test("a SYMLINK in the store is refused and its target is never read", () => {
+	const { store, jobDir, sessionsDir, root } = fixture();
+	const key = sessionKeyFor(ghIssue);
+	const dir = join(sessionsDir, key);
+	mkdirSync(dir, { recursive: true });
+	const secret = join(root, "worker-secret");
+	writeFileSync(secret, "AWS_SECRET=hunter2\n");
+	symlinkSync(secret, join(dir, SESSION_FILE_NAME));
+	writeFileSync(join(dir, "pi-version"), PI);
+
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	assert.equal(s.resume, false, "the agent owns /session; a symlink it plants resolves on the HOST, so following one would replay any worker-readable file into the next job");
+	assert.equal(s.reason, "not-a-regular-file");
+	assert.equal(readFileSync(join(s.hostDir, SESSION_FILE_NAME), "utf8"), "", "and nothing of the target reaches the staged copy");
+});
+
+test("a symlink written BY THE CONTAINER is refused at promotion too -- both edges, not just one", () => {
+	const { store, jobDir, sessionsDir, root } = fixture();
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	const secret = join(root, "host-secret");
+	writeFileSync(secret, "sensitive\n");
+	const staged = join(s.hostDir, SESSION_FILE_NAME);
+	writeFileSync(staged, "");
+	symlinkSync(secret, `${staged}.link`);
+	// Simulate the agent replacing its transcript with a symlink.
+	renameSync(`${staged}.link`, staged);
+
+	const p = store.promoteSession(s, { piVersion: PI });
+	assert.equal(p.promoted, false);
+	assert.equal(p.reason, "not-a-regular-file");
+	assert.equal(sessionKeyFor(ghIssue) && statSync(join(sessionsDir, sessionKeyFor(ghIssue)), { throwIfNoEntry: false }), undefined, "nothing was promoted at all");
+});
+
+test("an expired transcript cold-starts, and mtime is the authority", () => {
+	const { store, jobDir, sessionsDir } = fixture({ ttlDays: 1, now: () => Date.now() });
+	const key = sessionKeyFor(ghIssue);
+	const file = seed(sessionsDir, key);
+	const old = (Date.now() - 3 * 86400000) / 1000;
+	utimesSync(file, old, old);
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	assert.equal(s.resume, false);
+	assert.equal(s.reason, "expired", "a stale transcript is a live input to a future job, not debris -- so the gate runs at OPEN, not only at boot");
+});
+
+test("a transcript written by a different pi version cold-starts rather than resuming into a moved schema", () => {
+	const { store, jobDir, sessionsDir } = fixture();
+	seed(sessionsDir, sessionKeyFor(ghIssue), { piVersion: "0.79.0" });
+	assert.equal(store.resolveSession(ghIssue, { jobDir, piVersion: PI }).reason, "pi-version-changed");
+	// An image that declares no version never resumes: null is the SAFE answer, never "assume it matches".
+	assert.equal(store.resolveSession(ghIssue, { jobDir, piVersion: null }).reason, "pi-version-changed");
+});
+
+test("an oversized or unparseable transcript cold-starts instead of reaching the container", () => {
+	const big = fixture({ maxBytes: 10 });
+	seed(big.sessionsDir, sessionKeyFor(ghIssue), { body: HEADER });
+	assert.equal(big.store.resolveSession(ghIssue, { jobDir: big.jobDir, piVersion: PI }).reason, "too-large");
+
+	const bad = fixture();
+	seed(bad.sessionsDir, sessionKeyFor(ghIssue), { body: "not a session\n" });
+	assert.equal(bad.store.resolveSession(ghIssue, { jobDir: bad.jobDir, piVersion: PI }).reason, "unparseable");
+});
+
+test("promotion writes the transcript and stamps the pi version that produced it", () => {
+	const { store, jobDir, sessionsDir } = fixture();
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	writeFileSync(join(s.hostDir, SESSION_FILE_NAME), HEADER);
+	const p = store.promoteSession(s, { piVersion: PI });
+	assert.equal(p.promoted, true);
+	const key = sessionKeyFor(ghIssue);
+	assert.equal(readFileSync(join(sessionsDir, key, SESSION_FILE_NAME), "utf8"), HEADER);
+	assert.equal(readFileSync(join(sessionsDir, key, "pi-version"), "utf8"), PI);
+});
+
+test("a job with no key gets no mount at all -- byte-identical to a pre-feature job", () => {
+	const { store, jobDir } = fixture();
+	// A fork PR, and a CLI local run: both resolve no key, so there is no /session and nothing on disk.
+	const fork = { kind: "github", repo: "o/r", target: { type: "pull_request", number: 8 } };
+	assert.equal(store.resolveSession(fork, { jobDir, resolved: { headRef: "pi/issue-7", headRepo: "stranger/r" }, piVersion: PI }), null);
+	assert.equal(store.resolveSession({ kind: "local", folder: "/srv", flow: "f" }, { jobDir, piVersion: PI }), null);
+});
+
+test("an unset PI_SESSIONS_DIR yields no session rather than a temp-dir default", () => {
+	const store = makeSessionStore({ sessionsDir: null, ttlDays: 14, maxBytes: 1000 });
+	assert.equal(store.resolveSession(ghIssue, { jobDir: "/tmp", piVersion: PI }), null);
+});
+
+test("the store never throws -- a disk fault must not fail the prepare that only asked", () => {
+	const store = makeSessionStore({
+		sessionsDir: "/nonexistent-root/sessions",
+		ttlDays: 14,
+		maxBytes: 1000,
+		fs: {
+			mkdirSync: () => {
+				throw new Error("EACCES");
+			},
+		},
+	});
+	assert.doesNotThrow(() => store.resolveSession(ghIssue, { jobDir: "/tmp", piVersion: PI }));
+	assert.equal(store.resolveSession(ghIssue, { jobDir: "/tmp", piVersion: PI }), null);
+	assert.doesNotThrow(() => store.reapSessions());
+});
+
+test("a second writer on one key discards rather than clobbers", () => {
+	// Two jobs on one PR inside one runtime is a real shape (REQ-QUEUE-BURST-NO-DROP), and last-write-wins
+	// there would interleave two agents' turns into one transcript, then resume whichever wrote last.
+	const { store, jobDir, sessionsDir } = fixture();
+	const key = sessionKeyFor(ghIssue);
+	const first = seed(sessionsDir, key);
+	writeFileSync(first, HEADER);
+
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	writeFileSync(join(s.hostDir, SESSION_FILE_NAME), `${HEADER}{"type":"message"}\n`);
+
+	// Another worker holds the key: the lock is an exclusive create, so this one must stand down.
+	writeFileSync(join(sessionsDir, key, "lock"), "");
+	const p = store.promoteSession(s, { piVersion: PI });
+	assert.equal(p.promoted, false);
+	assert.equal(p.reason, "locked");
+	assert.equal(readFileSync(first, "utf8"), HEADER, "the loser must leave the canonical transcript untouched");
+});
+
+test("the lock is released, so the next job on the key is not wedged forever", () => {
+	const { store, jobDir, sessionsDir } = fixture();
+	const s = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	writeFileSync(join(s.hostDir, SESSION_FILE_NAME), HEADER);
+	assert.equal(store.promoteSession(s, { piVersion: PI }).promoted, true);
+
+	const s2 = store.resolveSession(ghIssue, { jobDir, piVersion: PI });
+	writeFileSync(join(s2.hostDir, SESSION_FILE_NAME), `${HEADER}{"type":"message"}\n`);
+	assert.equal(store.promoteSession(s2, { piVersion: PI }).promoted, true, "a held-and-released lock must not outlive the run that took it");
+	assert.match(readFileSync(join(sessionsDir, sessionKeyFor(ghIssue), SESSION_FILE_NAME), "utf8"), /"type":"message"/);
+});
