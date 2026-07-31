@@ -237,6 +237,11 @@ Stated openly rather than discovered later:
   accumulated history in one request, where before it could only exfiltrate its own view. And a review
   comment now arrives into a conversation that already contains the previous author's text in the
   assistant's own voice — an injection that failed the first time gets a second, better-placed attempt.
+  **Do not arm `run.resume` on a multi-tenant deployment** — one servicing repositories whose push access
+  you do not control. That is the same carve-out context discovery carries, for the same reason, and it is
+  doctrine rather than a mechanism: nothing in the harness can tell a multi-tenant deployment from a
+  single-tenant one. `OQ-014` ratifies the risk **only** for the case where you control, or trust, who can
+  push to the repositories you service.
   Store transcripts on a disk you would put issue text on, mode `0700`, with the shortest
   `PI_SESSIONS_TTL_DAYS` you can work with, and **check that `PI_SESSIONS_DIR` is outside any repository
   you commit** — the shipped `.gitignore` covers the conventional layout and cannot cover a path it has

@@ -51,7 +51,17 @@ that can receive a transcript is your repository's **push-access** population.
 
 That is one step wider than the population pi-dispatch already trusts to put code in a job container, and
 what they gain is short: the model's own reasoning, and anything a credential-bearing command echoed.
-`specs/open-questions.md` records this as `OQ-014` rather than glossing it.
+It is worth being concrete about how small that step is: pi-dispatch already lets anyone who can land a
+commit on your default branch **run code inside a job container**, with the job token and open network
+egress. This lets a slightly wider group **read a transcript**. Wider population, much narrower capability.
+
+**So: do not enable this if you service repositories whose push access you do not control.** If your
+deployment is your own repos, or your team's, the people who could be handed a transcript are people who
+can already push code the agent will run — and refusing them a transcript would be a lock on the wrong
+door. If you run pi-dispatch for repositories belonging to others, `run.resume` is not for you, in the
+same way context discovery is not (`SECURITY.md`). Nothing enforces this: no code here can tell the two
+situations apart, which is exactly why it is written down in three places. `specs/open-questions.md`
+records the full reasoning as `OQ-014`.
 
 **A fork pull request never resumes.** No key is resolved, no mount is created, and the job is identical
 to one run before this feature. That is what stops a stranger forking your repo, naming a branch
