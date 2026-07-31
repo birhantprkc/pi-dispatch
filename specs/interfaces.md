@@ -968,6 +968,106 @@ payload is a different shape rather than an extension of GitHub's.
   `MergeRequest`, the job's target type is `pull_request`. No enqueued job, log line or run record
   contains `user.username`.
 
+## INT-FORGEJO-PAYLOAD-SUBSET
+
+**Forgejo/Gitea → receiver.** A sibling of `INT-WEBHOOK-PAYLOAD-SUBSET`, and the closest of the three to
+it — which is precisely why it is separate. "Almost the same" is the shape that breaks quietly.
+
+- **Contract**:
+  - Events consumed: `issues`, `issue_comment`, `pull_request` — the `X-GitHub-Event` values Forgejo
+    emits verbatim. Everything else drops as `unhandled-event`.
+  - Headers consumed: `X-GitHub-Event`, `X-GitHub-Delivery` (the delivery id), `X-Hub-Signature-256`.
+    These are GitHub's names, sent by Forgejo unchanged, and read by **unmodified** `verify.mjs`.
+  - Body fields consumed: `action`, `sender.{id, login}`, `is_pull`, `issue.{number, title, body,
+    labels[].name}`, `comment.body`, `pull_request.{number, title, body, labels[].name, head.{ref, sha,
+    repo.full_name}, base.ref}`, `repository.full_name`.
+  - **Everything else is ignored.**
+- **The action vocabulary is Forgejo's, and the mismatch is SILENT.** `HookEventType.Event()` reports an
+  `issue_label` event as `X-GitHub-Event: issues` carrying `"action": "label_updated"`. Read against
+  GitHub's vocabulary that passes the event check, fails the action check, and falls out as
+  `unhandled-event`: HTTP 200, no job, no error, and nothing that says why. So the map is explicit —
+  `label_updated` → `labeled`, `synchronized` → `synchronize` — and an action that is RECOGNISED but not
+  actionable drops under its own reason (`action-not-actionable`), so "Forgejo said something we
+  deliberately ignore" is distinguishable from "we did not recognise this".
+- **`label_cleared` maps to nothing, permanently.** It has no GitHub counterpart, so there is no rule for
+  it to inherit: removing a label must never start a paid run, and it has to be stated rather than assumed.
+- **`is_pull` is TOP-LEVEL**, where GitHub carries `issue.pull_request`. Reading the wrong one routes every
+  pull-request comment as an issue, and the envelope then tells the agent to open `pi/issue-<n>` for
+  something that is already a pull request: wrong work, no error, and it reads as a successful run.
+- **`sender.login` is carried**, where GitHub's is deliberately dropped, because Forgejo computes no
+  `author_association` and the collaborator-permission lookup takes a username — Forgejo's endpoint offers
+  no numeric-id form. It is **personal data** with exactly one consumer: it reaches the resolver and goes
+  no further — never a log line, never the job, never the run record (`no-pii-in-logs`).
+- **Why**: Naming the subset **is** the contract, for the reason its siblings state. What is specific here
+  is that Forgejo's transport is byte-compatible with GitHub's, so `CONST-HMAC-OVER-RAW-BODY` and
+  `REQ-DEDUP-BY-DELIVERY-GUID` are satisfied by EXISTING code rather than new code — and that is exactly
+  the condition under which a shared projection would have looked correct and been wrong in three places.
+- **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `CONST-TRIGGER-AUTHOR-GATE`, `REQ-TRIGGER-AUTHOR-GATE`,
+  `REQ-DEDUP-BY-DELIVERY-GUID`, `INT-WEBHOOK-PAYLOAD-SUBSET`
+- **Acceptance**: Given `action: "label_updated"` on an allowlisted label, a job is enqueued. Given
+  `label_cleared`, none is, and the drop reason is not `unhandled-event`. Given a comment whose `is_pull`
+  is true, the job's target type is `pull_request`. A delivery signed with any other endpoint's secret
+  returns 401 through unmodified `verify.mjs`. No enqueued job, log line or run record contains
+  `sender.login`.
+
+---
+
+## INT-AZURE-PAYLOAD-SUBSET
+
+**Azure DevOps → receiver.** A sibling of `INT-WEBHOOK-PAYLOAD-SUBSET`, and the one that shares least
+with it: no delivery-id header, two actor representations, tags as a string, and a scope triple.
+
+- **Contract**:
+  - Events consumed: `workitem.created`, `workitem.updated`, `workitem.commented`,
+    `git.pullrequest.created`, `git.pullrequest.updated`, `ms.vss-code.git-pullrequest-comment-event`.
+    Everything else drops as `unhandled-event`.
+  - Headers consumed: `Authorization` (Basic) **or** one operator-named custom header, per the endpoint's
+    declared mode. There is no signature header and no delivery-id header.
+  - Body fields consumed: `id`, `eventType`, `resourceContainers.project.id`, and per event class:
+    `resource.{id, workItemId, fields, revision.fields}` for a work item;
+    `resource.{pullRequestId, title, description, sourceRefName, targetRefName, createdBy.id,
+    repository.{id, name, project.{id, name}}}` for a pull request; `resource.comment.{content, author.id}`
+    and `resource.pullRequest.*` for a pull-request comment.
+  - **Everything else is ignored** — including `message` and `detailedMessage`, which are pre-rendered
+    prose containing the work item's title and are exactly the kind of field that looks convenient and
+    drags untrusted text into a place it was never classified for.
+- **The delivery id is in the BODY.** Azure sends no delivery-id header at all, so
+  `REQ-DEDUP-BY-DELIVERY-GUID`'s key is the payload's top-level `id` GUID, read after the credential check.
+  `notificationId` is **not** it: that is a per-subscription integer sequence, so two subscriptions collide
+  on delivery 1. A delivery carrying no `id` is refused with 400 rather than run undeduplicated.
+- **Two actor representations, inside one forge.** A pull-request event carries `resource.createdBy.id`, a
+  GUID. A work-item event carries the actor ONLY as the string `"Display Name <email>"` in
+  `System.CreatedBy` / `System.ChangedBy`, with no id anywhere. Both the author gate and the bot-loop guard
+  therefore handle two forms, and the address is extracted with an **anchored** trailing `<...>` match: the
+  display half is attacker-settable, so a substring test would let
+  `"pi-bot@example.com is not me <mallory@evil.test>"` read as the harness.
+- **Tags are a semicolon STRING, and on an update they arrive as a DIFF.** `System.Tags` is
+  `"performance;urgent"`, normalised to the `[{name}]` shape `predicate.mjs` reads (trimmed, because the
+  spacing has varied across resource versions). Azure has no `labeled` event: a tag change arrives as
+  `workitem.updated` with a `{oldValue, newValue}` pair, and the set a rule is tested against is
+  `newValue \ oldValue`. Testing the CURRENT set would re-fire on every later edit of any field on a tagged
+  work item — a paid run per typo fix, forever. This is `INT-GITLAB-PAYLOAD-SUBSET`'s `changes.labels` trap,
+  arrived at from a different direction.
+- **The scope is a triple, and a work item names only two of it.** `resourceContainers.project` plus the
+  work item's `System.TeamProject` give the project; a work item belongs to a PROJECT and a project may
+  hold many repositories, so the REPOSITORY comes from the matched rule's `run.repository`. A pull-request
+  event names its own and that is authoritative.
+- **`System.Description` is rich text (HTML)** on most work item types. It stays DATA either way — fenced
+  below the delimiter like every other payload string (`CONST-ISSUE-TEXT-IS-DATA`) — but the envelope says
+  so, because an agent handed markup where it expected Markdown will otherwise guess.
+- **Why**: Naming the subset **is** the contract. What is specific here is that the headers are NOT
+  trustworthy in the sense the other three enjoy: the credential proves the sender knew a secret and covers
+  no bytes (`CONST-HMAC-OVER-RAW-BODY`), so every field in this list is attacker-controlled to anyone who
+  holds it. That is why the list is short and why `message`/`detailedMessage` are excluded.
+- **Traces to**: `CONST-HMAC-OVER-RAW-BODY`, `CONST-TRIGGER-AUTHOR-GATE`, `REQ-TRIGGER-AUTHOR-GATE`,
+  `REQ-DEDUP-BY-DELIVERY-GUID`, `INT-WEBHOOK-PAYLOAD-SUBSET`, `OQ-015`
+- **Acceptance**: Given a `workitem.updated` whose `fields` carries no `System.Tags` pair, no job is
+  enqueued. Given one whose tag change is a removal only, none is. Given a delivery with no top-level `id`,
+  the receiver returns 400. No enqueued job, log line or run record contains an email address — a
+  work-item actor reaches the run record as a SHA-256 prefix, never as the address itself.
+
+---
+
 ## INT-TRIGGERS-FILE-CONTRACT
 
 **operator → worker + receiver.** One unified file, read by both services; each validates the WHOLE file
@@ -1553,3 +1653,4 @@ worker reads.
 | 2026-07-29 | Per-trigger job image (issue #41). **INT-TRIGGERS-FILE-CONTRACT**: an optional `run.image` on all four `run` shapes, with its own bullet mirroring `run.packages` — pure passthrough like `provider`/`model`/`maxTurns` (absent = `PI_JOB_IMAGE`, and resolved against **env only**, never the settings overlay), carried on all four kinds for `run.packages`' reason and not `run.github`'s (**a toolchain is a capability of the flow**, and a webhook trigger runs the same flows a cron trigger does), refused at load when not a non-empty string / when it carries whitespace / when it begins with `-`, its reference **grammar deliberately not validated** (docker's business; a regex would refuse malformed names while missing the far commoner well-formed-but-unbuilt one), and refused **pre-spend** when the tag is not on the host. The cron byte-match Acceptance admits `image` on the same terms as `github`/`packages` (absent stays absent, so an unflagged trigger's `data` is byte-identical), and the existing `PI_OFFLINE=1` env carve-out gains a **second dimension stated rather than discovered**: the env the worker *passes* is identical for every image, but the env *baked into* one is a fact about that image, so two triggers naming two images never had identical container environments. **INT-CONTAINER-RUNTIME-CONTRACT**: the real gap here — it **never named the image at all**, which was true-by-accident while there was one image this repo built. A new leading bullet makes it explicit that the contract is written against *an* image and is now the **conformance checklist** for any tag nameable in `run.image`, enumerating what the worker assumes and does not verify (non-root + writable `~/.pi/agent`, an entrypoint honouring `INT-RUNNER-EXIT-CODE-PROTOCOL`, the pinned pi version, the baked `PLAYWRIGHT_*` facts, root-owned agent-unwritable guardrails, fonts, and the **per-image** loader posture), with the note that **every one of them fails silently or late**. `--pull=never` added to the flag set with its own bullet: `docker run` defaults to `--pull=missing`, so an unknown name would be a **registry fetch** — the same make-it-unreachable move as `PI_OFFLINE=1`, one layer down. Acceptance extended to say the properties must hold for **every** nameable image, and that the assertions are ours for our tag and the operator's for theirs (`OQ-012`). **INT-SDK-SESSION-OPTIONS trap (g)** scoped: its `image/runner/package.json` claims describe an image built from **this repo's Dockerfile**; a foreign image's layout is simply not described — which costs nothing, because the trap's invariant is layout-independent by design (runtime mutation probe, `tryResolve` on both candidates). The *assertion* is what loses coverage, not the code. **INT-RUN-HISTORY-FILE-CONTRACT**: one enum token, `job-image-missing` — a policy outcome, not `container-never-started`, since the container was never attempted. |
 | 2026-07-29 | Issue #42 (GitLab triggers). Added **INT-GITLAB-PAYLOAD-SUBSET**, a SIBLING of `INT-WEBHOOK-PAYLOAD-SUBSET` rather than an extension of it — IDs are permanent addresses, and a GitLab payload is a different shape, not more of GitHub's. It names three fields with no GitHub counterpart and says why each exists: **`changes.labels`, where the DIFF is the trigger** (GitLab has no `labeled` action, so a label add arrives as `update` with a before/after pair — matching the CURRENT set, which is what the GitHub path does because there a `labeled` action already means "a label just moved", would re-fire on every later retitle, reassign or milestone change of an already-labelled issue, each one a paid run); **`noteable_type`**, which states issue-vs-merge-request where GitHub infers it from `issue.pull_request`, and getting it wrong mints a `pi/issue-<n>` branch for something that is already an MR — wrong work, no error, reads as success; and **`user.username`**, carried where GitHub's `sender.login` is deliberately dropped, because GitLab puts no access level in the payload and the member lookup needs an identity — personal data with exactly one consumer, which never reaches a log line, the job, or the run record. Also records `iid`-never-`id` and that the project rides as its numeric id, because a `group/subgroup/project` path does not merely break the `owner/name` split — it **passes** it, both halves non-empty, and the project silently becomes its own parent group. **INT-TRIGGERS-FILE-CONTRACT**: the diagonal becomes a **matrix** — the sentence "every webhook type ⟹ `run.kind:"github"`" was flatly false and is replaced — plus three new bullets: `run.kind` selects the forge while `on.type` stays shared (a label is a label anywhere); the **action vocabulary is per forge**, validated against the one the entry names, because a word from the wrong forge is not malformed and breaks nothing — it never matches an event, so the trigger loads clean and is silently dead, and refusing at load is what turns that into a message; and the positive-selector rule differs for a reason rather than by accident (a `labeled` github rule has only its predicate as the approval gate, while every gitlab trigger is additionally access-gated). The one-comment-trigger cap becomes **per forge**: it exists because the receiver holds one comment rule per forge and a second would be unreachable, so it caps ambiguity, not count. **INT-CONTAINER-RUNTIME-CONTRACT**: the minted token now goes under **its own forge's variable names and only those** (`GITHUB_TOKEN`/`GH_TOKEN`, or `GITLAB_TOKEN`/`GL_TOKEN`/`GITLAB_HOST`) — cross-forge export is refused by construction, because a GitLab credential exported as `GITHUB_TOKEN` is sent by `gh` to github.com on the agent's first invocation, which is exactly how a scoped token stops being scoped — and the `PI_FORWARD_ENV` refusal grows from a pair to a set of every minted name. **INT-RUN-HISTORY-FILE-CONTRACT**: `kind` gains `gitlab`, and the `target` grammar gains `<project>!<iid>`, GitLab's own notation, because issues and merge requests are separate per-project sequences and `repo#5` would name two different objects. **INT-CONTAINER-JOB-INPUTS** and **INT-OUTBOX-CONTRACT** are UNCHANGED and were checked: `/outbox` stays local-only, a gitlab job is driven by adversarial issue text exactly as a github one is, and it inherits `OQ-009` verbatim rather than opening a new question. |
 | 2026-07-31 | Issue #48. **NEW `INT-SESSION-STORE-CONTRACT`**: the second agent-authored channel the host reads back, described in `INT-OUTBOX-CONTRACT`'s shape. Canonical store never mounted, per-job copy, completed-only promotion, and both validation orders in full. Three clauses carry their own reasoning rather than a rule: **`lstat`, regular files only** is security not hygiene — the agent owns `/session`, so a symlink it plants resolves on the HOST, and the repo's own habit is wrong here since `makeLogReaper` uses `statSync`; the **0-byte staging** is what makes pi's `openSync(path,"wx")` EEXIST race unreachable rather than merely unlikely; and the **pi-version gate** exists because a transcript outlives the pi that wrote it and the repair hook is an extension-author API this project cannot reach. `INT-CONTAINER-RUNTIME-CONTRACT` **AMENDED ×3**: `/session:rw` joins the mount list (per-job, conditional), `PI_SESSION_FILE` joins the env list under the `PI_PACKAGES` omitted-when-absent rule, and the conformance checklist gains the pi-version LABEL — which belongs on that list precisely because both its failure modes are quiet. `INT-CONTAINER-JOB-INPUTS` **AMENDED**: says why `/session` is deliberately NOT a `/job` input — `/job` is the read-only agent-untamperable channel and `/session` is agent-written by design, so putting it there would have required making part of `/job` writable, which is the property `/job` exists to have. `INT-TRIGGERS-FILE-CONTRACT` **AMENDED ×2**: `run.resume` in the grammar and its own bullet, including why its polarity is the OPPOSITE of `run.packages` (staging is an act already performed; persisting is a disclosure) and why the damaging misreading runs the other way — a truthy `"false"` string reads as an opt-out and would arm it. `INT-RUN-HISTORY-FILE-CONTRACT` **AMENDED**: the additive nullable `session` object, and the explicit statement that the key and branch name are ABSENT BY DESIGN, since this record's PII-free-by-construction property rests on holding no attacker-chosen string. `INT-SDK-SESSION-OPTIONS` **AMENDED**: its *"`SessionManager.inMemory()` because the container is ephemeral"* sentence becomes conditional, and it gains the traps found by reading pi's own docs — `open` throws on a non-empty unparseable file, `model` must stay explicit or a transcript picks it, `thinkingLevel` is NOT passed and therefore IS restored from the transcript, and `PI_CODING_AGENT_SESSION_DIR` is documented by pi and read by nothing in `dist/`. `INT-WEBHOOK-PAYLOAD-SUBSET` **UNCHANGED, and the check matters**: the head ref is resolved from the forge API, never the payload, so its *"no `head.sha`/`head.ref` value is ever passed to a clone or fetch"* clause extends to session keys with nothing to weaken. `INT-OUTBOX-CONTRACT` **UNCHANGED, checked**: `/outbox` stays local-only; `/session` is a different channel with a different contract. |
+| 2026-07-31 | Issues #43 + #61. Added **INT-FORGEJO-PAYLOAD-SUBSET** and **INT-AZURE-PAYLOAD-SUBSET**, both SIBLINGS of `INT-WEBHOOK-PAYLOAD-SUBSET` rather than extensions of it -- IDs are permanent addresses, and a forge's payload is a different shape rather than more of GitHub's. Forgejo's is the closest of the four to GitHub's, which is exactly why it is separate: "almost the same" is the shape that breaks quietly, and it breaks in three places -- `label_updated`/`synchronized` are Forgejo's own action words (read against GitHub's vocabulary they fall out as `unhandled-event`: HTTP 200, no job, no error, nothing that says why), `is_pull` is TOP-LEVEL where GitHub carries `issue.pull_request` (reading the wrong one mints `pi/issue-<n>` for something already a pull request), and `sender.login` must be carried because the permission lookup takes a username. `label_cleared` maps to **nothing, permanently**. Azure's shares least: no delivery-id header (the key is the body's `id`; `notificationId` is a per-subscription integer sequence and would collide on delivery 1), **two actor representations inside one forge** (GUID on a pull request, a `Display Name <email>` string on a work item), tags as a semicolon STRING arriving as a DIFF on update -- `INT-GITLAB-PAYLOAD-SUBSET`'s `changes.labels` trap reached from a different direction, and matching the current SET would bill a run per typo fix forever -- and a scope TRIPLE of which a work item names only two, since a work item belongs to a project and a project may hold many repositories. `message`/`detailedMessage` are excluded deliberately: pre-rendered prose carrying the title, the kind of field that looks convenient and drags untrusted text somewhere it was never classified for. `INT-WEBHOOK-PAYLOAD-SUBSET` **amended in its sub-title only** and stays GitHub-only, exactly as it did for GitLab. `INT-TRIGGERS-FILE-CONTRACT` **amended**: `run.kind` gains `forgejo` and `azure`, two more per-forge action vocabularies, and a genuinely new field -- **`run.repository`**, required on an azure `label`/`comment` trigger and REFUSED on every other forge's, because an Azure work item names no repository and accepted-and-ignored is how an operator comes to trust a field that does nothing. An azure `pull_request` rule may not carry a label predicate at all: Azure attaches tags to work items and never to pull requests, so `any`/`all`/`none` could never match and a rule that loads clean and can never fire reads as a broken harness. `INT-CONTAINER-RUNTIME-CONTRACT` **amended**: per-forge token variable names for two more forges, and the new **`dev.pi-dispatch.forges`** image label joins the conformance checklist -- it belongs in the "fails silently or late" list the entry already keeps, and `verify-image.sh` checks the declared list against the CLIs actually installed so the label cannot lie. `INT-RUN-HISTORY-FILE-CONTRACT` **amended**: `kind` gains `forgejo` and `azure`, the `target` grammar gains their notations -- **and the documented-but-unimplemented `gitlab` case is finally implemented**, closing a gap open since #42. `INT-CONTAINER-JOB-INPUTS`, `INT-OUTBOX-CONTRACT`, `INT-SDK-SESSION-OPTIONS`, `INT-SESSION-STORE-CONTRACT` **UNCHANGED, checked**: the container contract is forge-blind, and a fourth forge changes no byte of what a job container is handed. |
