@@ -313,7 +313,9 @@ test("a job kind with no table entry refuses, rather than inheriting the github 
 	// exported as GITHUB_TOKEN and GH_TOKEN. That is a working credential handed to the wrong host, which
 	// is how a scoped token stops being scoped. Refusing costs a pre-spend config error; the alternative
 	// costs the token.
-	for (const forgeKind of ["azure", "forgejo", "", undefined, null]) {
+	// Deliberately NOT the name of a forge that might later be added -- these are the kinds that genuinely
+	// never carry a forge credential (a chained /outbox child, a CLI run) plus outright junk.
+	for (const forgeKind of ["chained", "", undefined, null, 42]) {
 		assert.throws(
 			() =>
 				buildContainerEnv({

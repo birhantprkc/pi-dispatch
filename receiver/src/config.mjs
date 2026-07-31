@@ -46,6 +46,7 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
 		triggers: loadTriggers(env, readFile, fileExists),
 		github: loadGitHubAuth(env, fileExists),
 		gitlab: loadGitLabConfig(env),
+		forgejo: loadForgejoConfig(env),
 	};
 }
 
@@ -81,6 +82,42 @@ function loadGitLabConfig(env) {
 		throw configError("GITLAB_TOKEN is required for gitlab triggers -- the receiver resolves the actor's project access level before it may enqueue");
 	}
 	return { mode, secret, token, apiUrl };
+}
+
+/**
+ * The Forgejo/Gitea block, or `null` when nothing names it -- same presence rule as GitLab's: an endpoint
+ * that answers for a forge nobody configured is an endpoint an operator can believe is armed.
+ *
+ * There is no MODE here, and that absence is the good news. Forgejo signs the raw body with HMAC-SHA256
+ * and sends GitHub's three headers verbatim, so there is exactly one verification mechanism and it is the
+ * strong one -- no choice to make, and none to get wrong.
+ *
+ * `FORGEJO_BOT_ID` is optional and exists for one reason: a repository-scoped token cannot call
+ * `GET /user` (see worker/src/forgejo-identity.mjs). Without it, following the token-scoping advice would
+ * make the receiver unable to identify itself, and identity is not optional here.
+ */
+function loadForgejoConfig(env) {
+	const secret = env.FORGEJO_WEBHOOK_SECRET;
+	const token = env.FORGEJO_TOKEN;
+	const apiUrl = env.FORGEJO_URL;
+	const botId = env.FORGEJO_BOT_ID ?? null;
+	if (!secret && !token && !apiUrl) return null;
+
+	// No default instance URL, deliberately: Forgejo is self-hosted by nature and there is no forgejo.com to
+	// fall back to. Guessing one would send a token to a host the operator never named.
+	if (typeof apiUrl !== "string" || apiUrl.trim() === "") {
+		throw configError("FORGEJO_URL is required for forgejo triggers -- there is no default instance to fall back to");
+	}
+	if (typeof secret !== "string" || secret.trim() === "") {
+		throw configError("FORGEJO_WEBHOOK_SECRET is required; refusing to start a forgejo endpoint that cannot verify deliveries");
+	}
+	// Needed BEFORE any job runs: the actor's repository permission is what authorises a forgejo trigger at
+	// all (CONST-TRIGGER-AUTHOR-GATE), and without a token every lookup is indeterminate and every delivery
+	// 503s. Refusing at boot is the difference between one clear message and a redelivery loop.
+	if (typeof token !== "string" || token.trim() === "") {
+		throw configError("FORGEJO_TOKEN is required for forgejo triggers -- the receiver resolves the actor's repository permission before it may enqueue");
+	}
+	return { secret, token, apiUrl: apiUrl.trim(), botId };
 }
 
 /**

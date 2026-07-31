@@ -27,7 +27,9 @@ import { loadReceiverConfig, triggersFilePath, reloadTriggers } from "./config.m
 import { makeReceiver } from "./receiver.mjs";
 import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
 import { resolveGitLabSelfId } from "@pi-dispatch/worker/gitlab-identity";
+import { resolveForgejoSelfId } from "@pi-dispatch/worker/forgejo-identity";
 import { makeResolveAuthority } from "./gitlab-members.mjs";
+import { makeResolveForgejoAuthority } from "./forgejo-members.mjs";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { parseConnection } from "@pi-dispatch/worker/connection";
 
@@ -43,6 +45,8 @@ export async function startReceiver(
 		createServer = http.createServer,
 		resolveGitLabSelfId: resolveSelfIdFn = resolveGitLabSelfId,
 		makeResolveAuthority: makeResolveAuthorityFn = makeResolveAuthority,
+		resolveForgejoSelfId: resolveForgejoSelfIdFn = resolveForgejoSelfId,
+		makeResolveForgejoAuthority: makeResolveForgejoAuthorityFn = makeResolveForgejoAuthority,
 	} = {},
 ) {
 	// Single-object log line: `makeReceiver` calls `log?.({ event, ... })`, so the sink takes ONE object.
@@ -75,7 +79,23 @@ export async function startReceiver(
 		};
 	}
 
-	const handler = makeReceiver({ queue, selfId, cfg, log, gitlab });
+	// The Forgejo arm, when configured. Identity resolution is HARD-FAIL here too, and it is the arm where
+	// that matters most: a repo-scoped Forgejo token cannot call GET /user, so an operator who follows the
+	// scoping advice without setting FORGEJO_BOT_ID lands exactly here -- and a receiver that shrugged and
+	// continued would run with selfId undefined, which never equals a sender id and silently turns the
+	// harness's own comments into more paid jobs.
+	let forgejo = null;
+	if (cfg.forgejo) {
+		const forgejoSelfId = await resolveForgejoSelfIdFn({ apiUrl: cfg.forgejo.apiUrl, token: cfg.forgejo.token, botId: cfg.forgejo.botId });
+		log({ event: "self_identity", forge: "forgejo", id: forgejoSelfId, source: cfg.forgejo.botId ? "FORGEJO_BOT_ID" : "api" });
+		forgejo = {
+			secret: cfg.forgejo.secret,
+			selfId: forgejoSelfId,
+			resolveAuthority: makeResolveForgejoAuthorityFn({ apiUrl: cfg.forgejo.apiUrl, token: cfg.forgejo.token }),
+		};
+	}
+
+	const handler = makeReceiver({ queue, selfId, cfg, log, gitlab, forgejo });
 	const server = createServer(handler);
 	server.listen(cfg.port, cfg.bind, () =>
 		log({ event: "receiver_started", port: cfg.port, bind: cfg.bind, valkey: cfg.valkeyUrl }),

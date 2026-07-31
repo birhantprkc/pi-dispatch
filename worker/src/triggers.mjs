@@ -24,7 +24,7 @@
  */
 
 import { configError } from "./config.mjs";
-import { FORGE_KINDS, RUN_KINDS, isForgeKind } from "./forges.mjs";
+import { FORGE_KINDS, RUN_KINDS, forgeSpec, isForgeKind } from "./forges.mjs";
 
 const ON_TYPES = new Set(["cron", "label", "comment", "pull_request"]);
 
@@ -47,6 +47,11 @@ export { FORGE_KINDS };
 const PR_ACTIONS = {
 	github: new Set(["labeled", "opened", "synchronize", "reopened"]),
 	gitlab: new Set(["open", "update", "reopen", "approved"]),
+	// Forgejo's own spellings. `label_updated` is its `labeled` and `synchronized` its `synchronize` -- a
+	// one-letter difference that an operator would otherwise discover as a trigger that loads clean and
+	// never fires. `label_cleared` is deliberately ABSENT and always will be: REMOVING a label must never
+	// start a paid run, and it has no GitHub counterpart to inherit that rule from.
+	forgejo: new Set(["label_updated", "opened", "synchronized", "reopened"]),
 };
 
 // A cron id flows into BullMQ's deterministic `repeat:<id>:<nextMillis>` jobId, so a `:` corrupts that
@@ -355,11 +360,11 @@ function normalizePullRequest(on, run, index, path) {
 	// (opened/synchronize/reopened) are gated by author_association in the filter, so a predicate is
 	// optional there and only narrows scope when present.
 	//
-	// GitLab has no `labeled` action and therefore no rule to attach this to: a label added to a merge
-	// request arrives as `update`. It needs none, because EVERY gitlab trigger is gated on the actor's
-	// resolved access level (CONST-TRIGGER-AUTHOR-GATE) rather than on the label alone -- so an
-	// unpredicated gitlab MR rule is gated, where an unpredicated `labeled` github rule would not be.
-	const requirePositive = run.kind === "github" && actions.includes("labeled");
+	// WHICH word that is, and whether the forge has one at all, lives in the forge table rather than being
+	// tested by name here. GitLab's is null: a label added to a merge request arrives as a plain `update`,
+	// so there is no action for the rule to attach to. Forgejo's is `label_updated`.
+	const labelAction = forgeSpec(run.kind)?.prLabelAction;
+	const requirePositive = typeof labelAction === "string" && actions.includes(labelAction);
 	const predicate = validatePredicate(on, index, path, requirePositive);
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);

@@ -19,10 +19,12 @@
 
 import { makeVerifiedHandler } from "./verify.mjs";
 import { filter } from "./filter.mjs";
-import { enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
+import { enqueueForgeJob, enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
 import { filterGitLab } from "./filter-gitlab.mjs";
 import { parseGitLabSubset } from "./gitlab-subset.mjs";
 import { makeGitLabVerifiedHandler } from "./verify-gitlab.mjs";
+import { filterForgejo } from "./filter-forgejo.mjs";
+import { parseForgejoSubset } from "./forgejo-subset.mjs";
 
 /** Write a small JSON body with an explicit status; a 204 carries no body. verify's `respond` is private. */
 function respond(res, status, obj) {
@@ -88,7 +90,7 @@ export function parseSubset(payload) {
  * A forge with no configuration gets no route at all -- not a route that answers 401. An endpoint that
  * responds to an unconfigured forge is an endpoint an operator can believe is armed.
  */
-export function makeReceiver({ queue, selfId, cfg, log, gitlab = null }) {
+export function makeReceiver({ queue, selfId, cfg, log, gitlab = null, forgejo = null }) {
 	const github = makeGitHubHandler({ queue, selfId, cfg, log });
 
 	// A TABLE, built once, rather than one `if` per forge. Two forges made that a single branch; four make
@@ -97,6 +99,7 @@ export function makeReceiver({ queue, selfId, cfg, log, gitlab = null }) {
 	// falls through to GitHub, which is what keeps `/` working.
 	const routes = {
 		"/gitlab": gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null,
+		"/forgejo": forgejo ? makeForgejoHandler({ queue, cfg, log, ...forgejo }) : null,
 	};
 
 	return async function receiverHandler(req, res) {
@@ -198,6 +201,54 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAutho
 		// the semantic dedup key makes, because the two are separate number sequences.
 		const sep = result.job.target.type === "pull_request" ? "!" : "#";
 		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.repo}${sep}${result.job.target.number}`, flow: result.job.flow });
+		return respond(res, 202, { status: "queued" });
+	});
+}
+
+/**
+ * The Forgejo arm. Structurally the GitLab one -- verify, project, RESOLVE, gate, enqueue, respond -- with
+ * one difference that is worth stating because it is invisible in the code: the verification step is
+ * GITHUB'S, unmodified.
+ *
+ * Forgejo signs the raw body with HMAC-SHA256 and sends `X-Hub-Signature-256`, `X-GitHub-Delivery` and
+ * `X-GitHub-Event`, which is byte-for-byte what `makeVerifiedHandler` already reads. So
+ * CONST-HMAC-OVER-RAW-BODY is satisfied here by EXISTING code rather than new code, and
+ * REQ-DEDUP-BY-DELIVERY-GUID transfers with no adaptation at all. What Forgejo needs is its own SECRET,
+ * which is why it is a separate handler and a separate path: `makeVerifiedHandler` closes over one secret
+ * per construction, and serving two sources from one would mean either sharing a secret between forges or
+ * letting the request choose which one it was checked against.
+ */
+function makeForgejoHandler({ queue, cfg, log, secret, selfId, resolveAuthority }) {
+	return makeVerifiedHandler({ secret }, async ({ rawBody, event, delivery }, res) => {
+		let subset;
+		try {
+			subset = parseForgejoSubset(JSON.parse(rawBody));
+		} catch {
+			return respond(res, 400, { error: "invalid-json" });
+		}
+
+		const resolved = await resolveAuthority(subset.repository?.full_name, subset.sender?.login);
+		if (resolved.indeterminate) {
+			// The reason names the lookup, never the actor -- `sender.login` is personal data and exists here
+			// only to have been asked about (no-pii-in-logs).
+			log?.({ event: "forgejo_permission_lookup_failed", delivery, reason: resolved.indeterminate });
+			return respond(res, 503, { error: "permission-lookup-failed" });
+		}
+
+		const result = filterForgejo(event, subset, cfg.triggers?.forgejo, cfg.triggers?.knownFlows, selfId, resolved.authorized, delivery);
+		if (!result.enqueue) {
+			log?.({ event: "dropped", delivery, reason: result.reason });
+			return respond(res, 204);
+		}
+
+		try {
+			await enqueueForgeJob(queue, "forgejo", result.job);
+		} catch (err) {
+			log?.({ event: "enqueue_failed", delivery, reason: err?.message });
+			return respond(res, 503, { error: "enqueue-failed" }); // Forgejo redelivers; dedup by GUID coalesces
+		}
+
+		log?.({ event: "enqueued", delivery, repo: result.job.repo, target: `${result.job.target.type}#${result.job.target.number}`, flow: result.job.flow });
 		return respond(res, 202, { status: "queued" });
 	});
 }

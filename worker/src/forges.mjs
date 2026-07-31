@@ -39,6 +39,11 @@
  *   into every container, and nothing would have said so.
  * - `hostVar` is where a self-hosted instance URL lands in the container, or `null` for a forge that has
  *   no instance concept in this codebase yet.
+ * - `prLabelAction` is this forge's `pull_request` action meaning "a label changed", or `null` where the
+ *   forge has no distinguishable one. It decides whether a rule naming that action must carry a positive
+ *   selector, and the reason is independent of who is gating: a rule keyed on labels that names no labels
+ *   is a rule that fires on ALL of them. GitLab's is null because a label added to a merge request arrives
+ *   as a plain `update`, indistinguishable from any other edit -- there is no action to attach the rule to.
  */
 export const FORGES = {
 	github: {
@@ -47,6 +52,7 @@ export const FORGES = {
 		pullRequestSep: "#",
 		tokenVars: ["GITHUB_TOKEN", "GH_TOKEN"],
 		hostVar: null,
+		prLabelAction: "labeled",
 	},
 	gitlab: {
 		jobIdPrefix: "gl-",
@@ -54,6 +60,30 @@ export const FORGES = {
 		pullRequestSep: "!",
 		tokenVars: ["GITLAB_TOKEN", "GL_TOKEN"],
 		hostVar: "GITLAB_HOST",
+		// A label added to a merge request arrives as a plain `update`, indistinguishable from any other
+		// edit, so there is no action for a positive-selector rule to attach to. (Separately, a GitLab label
+		// is not an approval at all -- a Guest can set one at issue creation -- which is why every gitlab
+		// trigger is gated on the actor's resolved access level.)
+		prLabelAction: null,
+	},
+	forgejo: {
+		// Forgejo's webhook transport is byte-compatible with GitHub's -- it signs the raw body HMAC-SHA256
+		// and sends X-Hub-Signature-256, X-GitHub-Delivery and X-GitHub-Event. So the delivery id is a GUID
+		// with the same across-retry stability GitHub's has, and REQ-DEDUP-BY-DELIVERY-GUID transfers
+		// unchanged. Only the PREFIX differs, and only so the id spaces stay disjoint.
+		jobIdPrefix: "fj-",
+		deliveryIdName: "X-GitHub-Delivery GUID",
+		// Forgejo numbers issues and pull requests from ONE per-repository sequence, exactly as GitHub does
+		// -- an issue and a PR cannot share an index. So `#` names one thing and no discriminator is needed.
+		pullRequestSep: "#",
+		// `tea` reads GITEA_SERVER_TOKEN; the unprefixed name is what the API examples and most scripts use.
+		tokenVars: ["FORGEJO_TOKEN", "GITEA_SERVER_TOKEN"],
+		hostVar: "FORGEJO_HOST",
+		// Forgejo names the action, so the positive-selector rule applies exactly as it does on GitHub.
+		// Note this is HYGIENE, not the gate: unlike GitHub, every forgejo trigger is additionally gated on
+		// the actor's resolved repository permission -- see filter-forgejo.mjs for why that is not
+		// redundant belt-and-braces but the only claim about Forgejo this project is willing to make.
+		prLabelAction: "label_updated",
 	},
 };
 
