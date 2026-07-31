@@ -46,8 +46,16 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
   nothing would alert us; it would just cost more than the design says.
 - **Honest note**: no verification pass has tested this. It is listed as unknown rather than assumed
   safe.
-- **Mitigating factor**: jobs are short-lived and single-purpose, so compaction may never trigger in
-  practice. That is a hypothesis, not an answer.
+- **Mitigating factor**: ~~jobs are short-lived and single-purpose, so compaction may never trigger in
+  practice~~ — **STRUCK 2026-07-31 by `run.resume` (issue #48)**. A resumed session is by construction
+  long-lived and multi-purpose, so the one thing that made this question theoretical is gone. `pi`'s own
+  docs give the threshold: auto-compaction fires at `contextTokens > contextWindow - reserveTokens`
+  (default reserve 16384) and keeps `keepRecentTokens` (default 20k), appending a `CompactionEntry`. Both
+  are settable in `<project-dir>/.pi/settings.json`, which is **discovered** since
+  `CONST-NO-CONTEXT-FILES-MANDATORY` was reversed, so a serviced repo can move them.
+- **The question this row was never asked, and now must be**: past that threshold what a resumed job
+  replays is not the transcript but a **model-generated summary of it**, written while that model was
+  reading attacker-authored text. That makes this a safety row as well as an economics one (`OQ-014` (d)).
 
 ## OQ-004 — Egress from the job container is unrestricted in v1
 
@@ -312,6 +320,76 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
 
 ---
 
+## OQ-014 — A resumed session is state crossing jobs, and its key is a name the base repo's push population can choose
+
+- **Status**: **ACCEPTED RISK** — *wants explicit ratification*
+- **Position**: `run.resume` ships persisting the agent's session transcript per key and replaying it into
+  the next job on that key. `CONST-ISOLATION-CONTAINER-PER-JOB` is **amended rather than reinterpreted**,
+  and its Acceptance now enumerates a fifth mount. What remains after that enforcement is four things,
+  worth naming rather than averaging away.
+  **(a) The key is a name, not an identity.** `pi/issue-<n>` is asked for by a prompt and a hard rule and
+  verified by nothing. Anyone who can push to the base repository can create a branch of any name, open a
+  pull request from it, and — if they are in `AUTHOR_ALLOWLIST`, or a collaborator acts on it — receive the
+  transcript keyed to that name. Issue numbers do not recycle; **branch names do**.
+  **(b) The population is one step wider than the one already trusted.**
+  `CONST-NO-CONTEXT-FILES-MANDATORY` trusts *"anyone who can land a commit on the default branch"*, which
+  branch protection narrows. Push access to a side branch passes no gate. The delta is small and
+  enumerable — the model's own reasoning, and whatever a credential-bearing command echoed — but "small"
+  is a judgement someone has to make on the record.
+  **(c) The transcript is a durable capture of everything the agent saw.** It is strictly more PII-bearing
+  than `logs/<jobId>.log`, which `REQ-DURABLE-RUN-HISTORY` made opt-in and gitignored precisely because it
+  *"may echo issue text"* — and unlike that log it **must exist for the feature to work at all**.
+  **(d) Replay is a placement class this project has never had.** `CONST-ISSUE-TEXT-IS-DATA` is enforced
+  by placement: rules above, payload below. A replayed transcript is neither — it is prior turns, some in
+  the assistant's own voice, from a previous job's adversarial input. An injection that failed once
+  because the guardrail floor held returns as *"the assistant previously did X."* And if pi compacted,
+  what returns is not the transcript but a **model-generated summary of it**, written while that model was
+  reading attacker text.
+- **Why it is a risk row and not a constraint**: `CONST-ISOLATION-CONTAINER-PER-JOB` already states what
+  the boundary is, now including its one exception, and the code enforces it. This row records the
+  residual **after** that enforcement. A constraint promising a resumed transcript reaches only its own
+  author would be a constraint shipped unenforced, which this project holds to be worse than an honest
+  open risk (`OQ-004`, `OQ-011`, `OQ-012`, `OQ-013`).
+- **What bounds it meanwhile**: The feature is **off by default and per trigger** — absent `run.resume`,
+  not one byte is written and the docker argv is unchanged. A **fork is refused**, expressed as a missing
+  key rather than a checked boolean, and the head repository is read from the forge API rather than from
+  attacker-supplied payload fields. The **canonical store is never mounted**, so a compromised agent that
+  computes another key cannot reach it — the mount is the capability and the hash is not one.
+  **Completed-only promotion** means a failed or refused run leaves the canonical file byte-identical
+  (`CONST-RETRY-INFRA-ONLY`). An **exclusive per-key lock** means one writer. The **directory name is a
+  hash**, so a branch name never becomes a host path segment. **Age, size, shape and pi version are gated
+  host-side at open**, with `lstat` and regular-files-only, so an agent cannot turn the store into a
+  host-file-read or disk-exhaustion primitive. And every gate downstream is unchanged: budget, pause
+  windows, branch protection, never-merge, the bot-loop guard.
+  **One thing it deliberately does not bound**: the key does not include the flow. Two flows armed on one
+  pull request share one transcript, because cross-flow continuity IS the feature — the issue flow opens
+  the PR and the review flow continues it. `run.resume` being per trigger is how an operator decides which
+  flows join that lineage.
+- **What detection ships**: the run record carries `session.{resumed, reason, bytes}` — a boolean, a fixed
+  enum and an integer, deliberately **not** the key or the branch name. Every non-resume is a named reason
+  rather than a silent cold start. `pi-dispatch doctor` reports the store's presence and warns about its
+  contents whenever a trigger arms the flag. What ships **undetected** is the CONTENT of a transcript:
+  nothing scans it, and nothing will — see below.
+- **What would close it**: a key the push population cannot choose — a forge-assigned identifier joining an
+  issue to the pull request its job opened. `pull_request.number` is exactly that and is useless here,
+  because nothing host-side knows which PR an issue's job created without **recording** it, and recording
+  it is the index `DES-SESSION-KEY-IS-DERIVED-NOT-INDEXED` refuses. Closing this row therefore means
+  either accepting an index or GitHub surfacing the issue-to-PR link in a payload. Short of that the
+  honest improvements are narrower: shorten `PI_SESSIONS_TTL_DAYS`, and keep the refusals loud.
+  **A transcript redactor is explicitly NOT the answer** and should not be proposed as one: this project's
+  own position is that content-filtering natural language is not a boundary (`CONST-ISSUE-TEXT-IS-DATA`),
+  and a scrubber that rewrote a session file would corrupt the artifact it was protecting.
+- **Related**: `OQ-003` is **amended by this change** rather than merely cited — its mitigating factor
+  (short-lived, single-purpose jobs) is exactly what resume removes. `OQ-004` is unchanged in kind and
+  **wider in reach**: exfiltration was bounded to one job's own view and is now bounded to the key's
+  accumulated history, retrievable in one request. `OQ-007` stops being disk hygiene for this store and
+  becomes a resume-window question, which is why the age gate runs at open as well as at boot. `OQ-009` is
+  **not** resolved by the new mount — `/outbox` nominates host folders and enqueues paid jobs; `/session`
+  returns bytes to one key, creates no job and names no host path.
+- **Needs**: a maintainer's explicit ratification that a branch-name-derived key, refused across forks and
+  bounded to the base repository's push population, is an acceptable authority for handing one job's
+  transcript to another — given (a), (b), (c) and (d).
+
 ## Retired from the source design document
 
 `DESIGN.md` v0.1 §10 carried a ten-item "verify-on-implementation checklist". It is not reproduced here,
@@ -406,3 +484,4 @@ adversarial passes did.
 | 2026-07-22 | OQ-010 **Unblocks** retargeted: the #25 follow-up landed as `REQ-TOKEN-ACCOUNTING-AND-CAPS` (per-job token/cost accounting + optional in-run per-job token budget + optional check-after daily token cap). The recorded lagging-control constraint is what shapes that REQ's asymmetry with `CONST-BUDGET-BEFORE-TOKENS`. |
 | 2026-07-29 | Issue #41. Added **OQ-012** (`ACCEPTED RISK — wants explicit ratification`): an operator-built job image named by a trigger's `run.image` is outside `REQ-UPSTREAM-CONTRACT-TESTS` — its own pi version, its own runner and exit codes, its own guardrails floor, its own **per-image** loader posture — and nothing in this repo can gate it. Records what bounds it (the isolation surface is the worker's argv, not the image's, so a non-conformant image is a **worse agent**, not a wider blast radius; an operator-only edit path; preflight + `--pull=never` mean only locally-present images run), what detection ships (presence of every named image in the preflight and `doctor`, plus an entrypoint **warning** — **not** conformance), and why the cheap close does not work: an OCI label proves intent, not conformance, and only running the assertions is non-lying. `OQ-004` and `OQ-011` unchanged, and noted as now additionally per-image. |
 | 2026-07-29 | Issue #42. Added **OQ-013** (`ACCEPTED RISK — wants explicit ratification`): GitLab's approval gate is weaker in kind than GitHub's, three ways. It is a **network call rather than a signed payload field**, so authority is established by asking and asking can fail — closed for a determinate 404, loudly (503, redelivered) for an indeterminate answer, but a gate with a moving part is not the same object as one without. The **role table is not fixed** across versions or editions, and Ultimate custom roles can grant label management at any level, so `>= 30` is a claim about a number whose permissions are the operator's to know. And a **Guest can label an issue at creation**, which is the fact that forced the whole design: a stranger can open an issue already carrying the trigger label, so on GitLab a label proves nothing about who approved anything, and the access gate covers label triggers where on GitHub the label carries that weight itself. Records what bounds it (`>= 30` not `> 0`, so the population that can start a paid run is the population that could push the branch itself; `members/all` so group-inherited access is not mistaken for absence; the bot-loop guard ordered BEFORE the access gate, since the harness's own token IS a project member; verification before the lookup, so an unauthenticated flood cannot make this project call GitLab), what detection ships (`gitlab_access_lookup_failed` + 503, so a revoked token fails as "nothing runs" and never as "everything runs"; `doctor` naming the `api`-scope trade), and what would close it — a GitLab-side `author_association` equivalent inside the signed body, which does not exist and is not announced. `OQ-004` unchanged and now per-forge; `OQ-009` (chaining from a forge parent) inherited verbatim, since a gitlab job gets no `/outbox` for the same adversarial-text reason a github one does not. |
+| 2026-07-31 | Issue #48. **NEW `OQ-014`** (`ACCEPTED RISK — wants ratification`): a resumed session is state crossing jobs, and its key is a name the base repo's push population can choose. Four parts stated rather than averaged: the key is a name and not an identity; the population is one step wider than the one already trusted; the transcript is a durable capture of everything the agent saw and is strictly more PII-bearing than the raw job log that `REQ-DURABLE-RUN-HISTORY` made opt-in for that reason; and replay is a placement class `CONST-ISSUE-TEXT-IS-DATA` has never described. Records what bounds it, what detection ships, what ships UNDETECTED (the content of a transcript — nothing scans it and nothing will), and that a **transcript redactor is explicitly not the answer**, since content-filtering is not a boundary by this project's own doctrine and a scrubber would corrupt the artifact. `OQ-003` **AMENDED — its mitigating factor is STRUCK, not rewritten** (the `OQ-010` precedent): *"jobs are short-lived and single-purpose, so compaction may never trigger in practice"* is exactly what resume deletes, and pi's own docs supply the threshold it now triggers at. It also gains the question it was never asked — past that threshold a resumed job replays a **model-generated summary** written while that model was reading attacker text — which makes it a safety row and not only an economics one. `OQ-007` **UNCHANGED, and answered for this store rather than deferred**: the age gate runs at OPEN as well as at boot, because a stale transcript is a live input to a future job rather than debris; its own question (a periodic sweep for the logs) stays open. `OQ-004` **UNCHANGED in kind and WIDER in reach**, said here rather than left implied: exfiltration was bounded to one job's own view and is now bounded to a key's accumulated history, retrievable in one request. `OQ-001` **UNCHANGED, checked**: its reopener is *"abandoning container-per-job. Nothing else"* — still true, and its concern was two sessions in one process, where this is two jobs on one file, answered by the lock. `OQ-009` **UNCHANGED, checked** — see `DES-JOB-OUTBOX-CHAINING`. `OQ-012` **UNCHANGED, checked**: an operator image that ignores `PI_SESSION_FILE` or omits the pi-version LABEL produces jobs that never resume; the LABEL case is the safe direction, the runner case is not, and both are named in the conformance checklist. |
