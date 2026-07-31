@@ -322,6 +322,9 @@ test("source=app with all vars present and key file present parses the exact blo
 		appId: "1",
 		installationId: "2",
 		privateKeyPath: "/k.pem",
+		// The gh-source resume escape hatch (PI_SESSIONS_ALLOW_GH_SOURCE), carried on the block so
+		// makeGitHubAuth reads it without a second env lookup. False here: unset means the refusal is armed.
+		allowGhResume: false,
 	});
 });
 

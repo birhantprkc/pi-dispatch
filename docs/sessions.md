@@ -57,9 +57,20 @@ what they gain is short: the model's own reasoning, and anything a credential-be
 to one run before this feature. That is what stops a stranger forking your repo, naming a branch
 `pi/issue-7`, and being handed issue 7's history.
 
-**Do not arm this on `GITHUB_AUTH_SOURCE=gh`** without reading `SECURITY.md` first. That source is your
-whole `gh` login: full-scope and non-expiring. An env var dies with the container; a transcript is a file,
-and any command that echoed an auth header put your token in it.
+**A `run.resume` job refuses to start under `GITHUB_AUTH_SOURCE=gh`.** That source is your whole `gh`
+login: full-scope and non-expiring. An env var dies with the container; a transcript is a **file**, and any
+command that echoed an auth header put your token in it, permanently. The refusal happens at mint time, so
+it costs no budget slot.
+
+Use `GITHUB_AUTH_SOURCE=app` or a short-expiry fine-grained PAT, so the exposure is bounded by an expiry
+rather than by whether an agent ever ran a verbose curl. If you want the trade anyway, take it explicitly:
+
+```bash
+PI_SESSIONS_ALLOW_GH_SOURCE=1
+```
+
+It is a refusal rather than a warning because the asymmetry decides it: a warning is read once at setup,
+and the disclosure is permanent and silent.
 
 ## What actually gets resumed
 

@@ -163,17 +163,21 @@ function triggerLine(t) {
   const forge = t?.forge && t.forge !== "github" ? `  [${t.forge}]` : "";
   const pkgs = t?.packages === true ? "  [packages]" : "";
   const img = t?.image ? `  [image ${t.image}]` : "";
+  // A trigger that PERSISTS the agent's working history to disk says so. Without this badge it renders
+  // identically to one that does not, which is the defect 0.1.4 fixed for [packages] arriving in a new
+  // field -- and a transcript is a bigger disclosure than staged packages are.
+  const res = t?.resume === true ? "  [resume]" : "";
   switch (t?.type) {
     case "cron":
-      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}${forge}${pkgs}${img}`;
+      return `cron  ${t.id ?? "-"}  ${t.pattern ?? "-"} → ${t.folder ?? "-"}/${flow}${forge}${pkgs}${img}${res}`;
     case "label":
-      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}${forge}${pkgs}${img}`;
+      return `label  ${ruleClauses(t) || "(no selector)"} → ${flow}${forge}${pkgs}${img}${res}`;
     case "comment":
-      return `comment  "${t.phrase ?? "-"}" → ${flow}${forge}${pkgs}${img}`;
+      return `comment  "${t.phrase ?? "-"}" → ${flow}${forge}${pkgs}${img}${res}`;
     case "pull_request": {
       const clauses = ruleClauses(t);
       const action = `action[${(t.action ?? []).join(",")}]`;
-      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}${forge}${pkgs}${img}`;
+      return `pull_request  ${action}${clauses ? ` ${clauses}` : ""} → ${flow}${forge}${pkgs}${img}${res}`;
     }
     default:
       return "(unknown trigger)";

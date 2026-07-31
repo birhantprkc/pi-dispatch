@@ -243,3 +243,30 @@ test("a non-github forge is badged in the LIST line, and a github one renders by
   assert.ok(show(gl).includes("[gitlab]"), "a gitlab trigger must say so -- two forges can select the same label");
   assert.ok(!show(gh).includes("[github]"), "github is the unmarked default");
 });
+
+test("a resume-armed trigger is BADGED, and an unarmed one renders byte-identically to before", () => {
+  // The failure this guards is the one 0.1.4 shipped a fix for, arriving in a new field: a trigger whose
+  // jobs persist the agent's working history to disk rendering identically to one whose jobs do not --
+  // no badge and no warning, quiet exactly where the risk is.
+  const base = { type: "comment", phrase: "@pi", flow: "fix", packages: false, image: null, forge: "github" };
+  const armed = renderTriggers({ schedulers: [], triggers: { triggers: [{ ...base, resume: true }] } });
+  assert.match(armed, /\[resume\]/);
+
+  for (const cold of [false, undefined]) {
+    const out = renderTriggers({ schedulers: [], triggers: { triggers: [{ ...base, resume: cold }] } });
+    assert.equal(out.includes("[resume]"), false, `resume ${JSON.stringify(cold)} must not badge`);
+    assert.equal(out, renderTriggers({ schedulers: [], triggers: { triggers: [base] } }), "an unarmed trigger must render byte-identically to a deployment that never heard of this feature");
+  }
+});
+
+test("the badge is opt-IN -- the opposite polarity to [packages], which is the bug that shipped once", () => {
+  // [packages] is `=== true` on an opt-OUT field, so absent means LOADING and the badge is present.
+  // [resume] is `=== true` on an opt-IN field, so absent means COLD and the badge is absent. Testing both
+  // in one place is what stops the next person from "harmonising" them.
+  const t = { type: "label", any: ["x"], all: [], none: [], flow: "f", forge: "github" };
+  const neither = renderTriggers({ schedulers: [], triggers: { triggers: [{ ...t, packages: undefined, resume: undefined }] } });
+  assert.equal(neither.includes("[resume]"), false, "absent resume is a cold start");
+  const both = renderTriggers({ schedulers: [], triggers: { triggers: [{ ...t, packages: true, resume: true }] } });
+  assert.match(both, /\[packages\]/);
+  assert.match(both, /\[resume\]/);
+});

@@ -573,6 +573,17 @@ function triggerList(paths: any): any[] {
  *
  * An unrecognised forge is passed through rather than corrected, so `parseTriggers` refuses it fail-loud at
  * the write. Silently rewriting a typo to github would arm a trigger on a forge the operator did not name.
+ *
+ * `run.resume` is deliberately on NEITHER path, following `run.image` rather than `f.forge`, and the test
+ * is the one that separates those two: is it a capability the model would GAIN? A forge is not — a model
+ * that can add a github trigger can already arm a paid run, and naming gitlab does not widen that. Resume
+ * is. Arming it creates a channel in which the agent's own output persists to host disk and is replayed
+ * into a later job on the same branch, so a model able to set it could arrange for its own reasoning to
+ * reach a future run. That is a self-influence channel, and it is not one an operator confirm on a single
+ * dialog meaningfully bounds — the confirm approves one entry, the channel outlives it.
+ * Enabling it stays an edit to the reviewed `triggers.json` (`docs/sessions.md`), which is the same answer
+ * `run.image` gets and for a stricter version of the same reason. The panel still DISPLAYS it, because
+ * reading a disclosure and being able to arm one are different things.
  */
 function buildTriggerEntry(kind: string, f: any): any {
   if (kind === "cron") {

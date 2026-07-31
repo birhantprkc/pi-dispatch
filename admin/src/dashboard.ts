@@ -608,7 +608,12 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // code), and an operator-built image is not third-party. `accent` is already this file's colour for "this
   // trigger overrides a deployment default" -- the same choice the pinned-model row makes below.
   const img = t?.image ? " " + styler.fg("accent", `[${t.image}]`) : "";
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${forge}${pkgs}${img}`, inner, styler);
+  // `warning`, not `accent`: amber is this file's colour for a risk badge rather than for "overrides a
+  // deployment default", and persisting the agent's full working history to host disk -- issue text, file
+  // contents, tool output, its own reasoning -- is a disclosure, not a preference. Same class as
+  // [packages], which is the badge whose inverted polarity 0.1.4 had to fix.
+  const res = t?.resume === true ? " " + styler.fg("warning", "[resume]") : "";
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${forge}${pkgs}${img}${res}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
@@ -778,6 +783,10 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
   // deliberate rather than an omitted row: a missing row would read as "I don't know", this reads as
   // "I checked". Which image runs is which code runs, so it is not a fact to leave implicit.
   out.push(kv("image", t.image ?? "deployment default", t.image ? "accent" : "dim"));
+  // Rendered on BOTH branches and on every kind, with the same "I checked" dim default the image row uses.
+  // `warning` when armed, because this is the one row on this pane that describes something LEAVING the
+  // job: everything above says what the job runs, this says what it writes down and hands to the next one.
+  out.push(kv("resume", t.resume === true ? "continues the previous session" : "cold start", t.resume === true ? "warning" : "dim"));
 
   // TRUST MODEL — who authorizes it, how it dedups, which service owns it.
   blank();
@@ -791,6 +800,15 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
     const loads = (text: string) => out.push(fitLine(styler.fg("border", "· ") + styler.fg("warning", text), inner, styler));
     loads(`packages loaded · ${stagedNames(staged)}`);
     loads("third-party code on adversarial input, open network egress");
+  }
+  // The disclosure, stated where an operator is already reading the trust model rather than only in
+  // SECURITY.md. A transcript is strictly MORE PII-bearing than the raw job log, which is opt-in and off
+  // by default for exactly this reason -- and unlike that log it must exist for the feature to work.
+  if (t.resume === true) {
+    const keeps = (text: string) => out.push(fitLine(styler.fg("border", "· ") + styler.fg("warning", text), inner, styler));
+    keeps("persists the agent transcript to PI_SESSIONS_DIR");
+    keeps("issue text, file contents, tool output, the agent's own reasoning");
+    keeps("replayed into the next job on the same branch; forks never resume");
   }
   return out;
 }
