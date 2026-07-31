@@ -27,7 +27,7 @@ import { loadReceiverConfig, triggersFilePath, reloadTriggers } from "./config.m
 import { makeReceiver } from "./receiver.mjs";
 import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
 import { resolveGitLabSelfId } from "@pi-dispatch/worker/gitlab-identity";
-import { makeResolveAccessLevel } from "./gitlab-members.mjs";
+import { makeResolveAuthority } from "./gitlab-members.mjs";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { parseConnection } from "@pi-dispatch/worker/connection";
 
@@ -42,7 +42,7 @@ export async function startReceiver(
 		makeQueueFn = makeQueue,
 		createServer = http.createServer,
 		resolveGitLabSelfId: resolveSelfIdFn = resolveGitLabSelfId,
-		makeResolveAccessLevel: makeResolveAccessLevelFn = makeResolveAccessLevel,
+		makeResolveAuthority: makeResolveAuthorityFn = makeResolveAuthority,
 	} = {},
 ) {
 	// Single-object log line: `makeReceiver` calls `log?.({ event, ... })`, so the sink takes ONE object.
@@ -71,7 +71,7 @@ export async function startReceiver(
 			mode: cfg.gitlab.mode,
 			secret: cfg.gitlab.secret,
 			selfId: gitlabSelfId,
-			resolveAccessLevel: makeResolveAccessLevelFn({ apiUrl: cfg.gitlab.apiUrl, token: cfg.gitlab.token }),
+			resolveAuthority: makeResolveAuthorityFn({ apiUrl: cfg.gitlab.apiUrl, token: cfg.gitlab.token }),
 		};
 	}
 

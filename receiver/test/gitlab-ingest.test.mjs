@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
 import { makeReceiver } from "../src/receiver.mjs";
-import { makeResolveAccessLevel } from "../src/gitlab-members.mjs";
+import { makeResolveAuthority } from "../src/gitlab-members.mjs";
 
 const SELF_ID = 999;
 const SHARED_TOKEN = "a-shared-secret";
@@ -65,8 +65,8 @@ const LABELLED = JSON.stringify({
 	changes: { labels: { previous: [], current: [{ title: "pi:frontend" }] } },
 });
 
-/** A receiver whose gitlab arm resolves every actor to `level`, in token mode. */
-function build({ level = 30, resolve, logs = [] } = {}) {
+/** A receiver whose gitlab arm resolves every actor to `authorized`, in token mode. */
+function build({ authorized = true, resolve, logs = [] } = {}) {
 	const { calls, queue } = recordingQueue();
 	const handler = makeReceiver({
 		queue,
@@ -77,7 +77,7 @@ function build({ level = 30, resolve, logs = [] } = {}) {
 			mode: "token",
 			secret: SHARED_TOKEN,
 			selfId: SELF_ID,
-			resolveAccessLevel: resolve ?? (async () => ({ level })),
+			resolveAuthority: resolve ?? (async () => ({ authorized })),
 		},
 	});
 	return { handler, calls, logs };
@@ -123,7 +123,7 @@ test("an issue and a merge request numbered alike do NOT share a semantic dedup 
 		selfId: 1,
 		cfg: mrCfg,
 		log: () => {},
-		gitlab: { mode: "token", secret: SHARED_TOKEN, selfId: SELF_ID, resolveAccessLevel: async () => ({ level: 30 }) },
+		gitlab: { mode: "token", secret: SHARED_TOKEN, selfId: SELF_ID, resolveAuthority: async () => ({ authorized: true }) },
 	});
 	await drive(
 		mrHandler,
@@ -143,7 +143,7 @@ test("an issue and a merge request numbered alike do NOT share a semantic dedup 
 });
 
 test("a non-member is dropped 204 and never reaches the queue", async () => {
-	const { handler, calls, logs } = build({ level: 0 });
+	const { handler, calls, logs } = build({ authorized: false });
 	const res = mockRes();
 	await drive(handler, mockReq(), res, LABELLED);
 	assert.equal(res.statusCode, 204);
@@ -195,43 +195,59 @@ test("a query string and a trailing slash still route to /gitlab", async () => {
 	assert.equal(calls.length, 2);
 });
 
-// --- the access-level resolver ---
+// --- the authority resolver ---
 
 const okResponse = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 
-test("resolveAccessLevel asks the inherited-membership endpoint by numeric id", async () => {
+test("resolveAuthority asks the inherited-membership endpoint by numeric id", async () => {
 	let seen = null;
-	const resolve = makeResolveAccessLevel({
+	const resolve = makeResolveAuthority({
 		apiUrl: "https://gitlab.example.com/",
 		token: "tok",
 		fetchFn: async (url, init) => ((seen = { url, init }), okResponse({ access_level: 40 })),
 	});
-	assert.deepEqual(await resolve(42, 7), { level: 40 });
+	assert.deepEqual(await resolve(42, 7), { authorized: true }, "Maintainer (40) is above Developer");
 	assert.equal(seen.url, "https://gitlab.example.com/api/v4/projects/42/members/all/7", "members/all -- the plain endpoint misses group-inherited access and would refuse a real maintainer");
 	assert.equal(seen.init.headers["PRIVATE-TOKEN"], "tok");
 });
 
-test("404 is a determinate non-member (level 0); every other failure is indeterminate", async () => {
-	const at = (status) => makeResolveAccessLevel({ apiUrl: "https://gl", token: "t", fetchFn: async () => okResponse({}, status) });
-	assert.deepEqual(await at(404)(42, 7), { level: 0 });
+test("404 is a determinate non-member; every other failure is indeterminate", async () => {
+	const at = (status) => makeResolveAuthority({ apiUrl: "https://gl", token: "t", fetchFn: async () => okResponse({}, status) });
+	assert.deepEqual(await at(404)(42, 7), { authorized: false });
 	for (const status of [401, 403, 429, 500, 502]) {
 		const r = await at(status)(42, 7);
 		assert.ok(r.indeterminate, `${status} must not read as "not a member"`);
 	}
-	const network = makeResolveAccessLevel({ apiUrl: "https://gl", token: "t", fetchFn: async () => { throw new Error("ECONNREFUSED"); } });
+	const network = makeResolveAuthority({ apiUrl: "https://gl", token: "t", fetchFn: async () => { throw new Error("ECONNREFUSED"); } });
 	assert.ok((await network(42, 7)).indeterminate);
 });
 
-test("a 200 with no integer access_level is indeterminate, never zero", async () => {
-	// Reporting 0 would turn an upstream schema change into a silent, permanent refusal of every trigger.
-	const resolve = makeResolveAccessLevel({ apiUrl: "https://gl", token: "t", fetchFn: async () => okResponse({ access_level: "40" }) });
+test("a 200 with no integer access_level is indeterminate, never a refusal", async () => {
+	// Reporting `authorized: false` would turn an upstream schema change into a silent, permanent refusal
+	// of every trigger.
+	const resolve = makeResolveAuthority({ apiUrl: "https://gl", token: "t", fetchFn: async () => okResponse({ access_level: "40" }) });
 	assert.ok((await resolve(42, 7)).indeterminate);
 });
 
-test("a payload that named no project or actor is level 0 without a lookup", async () => {
+test("a payload that named no project or actor refuses without a lookup", async () => {
 	let called = false;
-	const resolve = makeResolveAccessLevel({ apiUrl: "https://gl", token: "t", fetchFn: async () => ((called = true), okResponse({})) });
-	assert.deepEqual(await resolve(undefined, 7), { level: 0 });
-	assert.deepEqual(await resolve(42, undefined), { level: 0 });
+	const resolve = makeResolveAuthority({ apiUrl: "https://gl", token: "t", fetchFn: async () => ((called = true), okResponse({})) });
+	assert.deepEqual(await resolve(undefined, 7), { authorized: false });
+	assert.deepEqual(await resolve(42, undefined), { authorized: false });
 	assert.equal(called, false, "there is nothing to ask about -- determinate, not a failure");
+});
+
+test("the Developer threshold is the resolver's, and every role at or above it authorizes", async () => {
+	// These assertions used to live in filter-gitlab's suite, where they described the gate. They belong
+	// here: the gate now asks "is this actor authorized", and WHICH GitLab role answers yes is a fact about
+	// GitLab, resolved alongside the lookup that produces the number. Guest (10) and Reporter (20) cannot
+	// push a branch, so a job started on their say-so would be doing work they could not do themselves --
+	// which is the line CONST-TRIGGER-AUTHOR-GATE draws.
+	const at = (access_level) => makeResolveAuthority({ apiUrl: "https://gl", token: "t", fetchFn: async () => okResponse({ access_level }) });
+	for (const level of [30, 40, 50]) {
+		assert.deepEqual(await at(level)(42, 7), { authorized: true }, `access_level ${level} is at or above Developer`);
+	}
+	for (const level of [0, 5, 10, 20, 29]) {
+		assert.deepEqual(await at(level)(42, 7), { authorized: false }, `access_level ${level} is below Developer and cannot push`);
+	}
 });

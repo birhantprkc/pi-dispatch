@@ -90,13 +90,23 @@ export function parseSubset(payload) {
  */
 export function makeReceiver({ queue, selfId, cfg, log, gitlab = null }) {
 	const github = makeGitHubHandler({ queue, selfId, cfg, log });
-	const gitlabHandler = gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null;
+
+	// A TABLE, built once, rather than one `if` per forge. Two forges made that a single branch; four make
+	// it a chain, and a chain is where one arm quietly ends up checked after the fallthrough. A path present
+	// with a null handler is a CONFIGURED-OFF forge and answers 404; a path absent from the table entirely
+	// falls through to GitHub, which is what keeps `/` working.
+	const routes = {
+		"/gitlab": gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null,
+	};
 
 	return async function receiverHandler(req, res) {
 		const path = pathOf(req.url);
-		if (path === "/gitlab") {
-			if (!gitlabHandler) return respond(res, 404, { error: "gitlab webhooks are not configured" });
-			return await gitlabHandler(req, res);
+		if (Object.hasOwn(routes, path)) {
+			const handler = routes[path];
+			// Not a 401. An endpoint that answers "unauthorized" for a forge nobody configured is an endpoint
+			// an operator can believe is armed and merely mis-keyed.
+			if (!handler) return respond(res, 404, { error: `${path.slice(1)} webhooks are not configured` });
+			return await handler(req, res);
 		}
 		return await github(req, res);
 	};
@@ -147,14 +157,14 @@ function makeGitHubHandler({ queue, selfId, cfg, log }) {
  * and the gate, because GitLab puts no `author_association` in the payload (gitlab-members.mjs).
  *
  * That resolution is a network call, and its three outcomes are deliberately not two:
- *   - a level (including 0 for a determinate non-member) is handed to the gate, which decides;
+ *   - a determinate verdict (authorized or not) is handed to the gate, which decides;
  *   - an INDETERMINATE lookup is a 503, so GitLab redelivers and the stable `webhook-id` dedups the
  *     retry. Answering 204 would drop real work during an outage, and it would look on the wire exactly
  *     like a stranger being correctly refused.
  * The lookup runs only for events that could still fire -- after verification, and after the payload has
  * been projected -- so an unauthenticated flood cannot make this project call GitLab at all.
  */
-function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAccessLevel, now }) {
+function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAuthority, now }) {
 	return makeGitLabVerifiedHandler({ mode, secret, ...(now ? { now } : {}) }, async ({ rawBody, delivery }, res) => {
 		let subset;
 		try {
@@ -163,7 +173,7 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAcces
 			return respond(res, 400, { error: "invalid-json" });
 		}
 
-		const resolved = await resolveAccessLevel(subset.project?.id, subset.user?.id);
+		const resolved = await resolveAuthority(subset.project?.id, subset.user?.id);
 		if (resolved.indeterminate) {
 			// The reason names the lookup, never the actor -- `user.username` is personal data and exists
 			// only to have been asked about (no-pii-in-logs).
@@ -171,7 +181,7 @@ function makeGitLabHandler({ queue, cfg, log, mode, secret, selfId, resolveAcces
 			return respond(res, 503, { error: "access-lookup-failed" });
 		}
 
-		const result = filterGitLab(subset, cfg.triggers?.gitlab, cfg.triggers?.knownFlows, selfId, resolved.level, delivery);
+		const result = filterGitLab(subset, cfg.triggers?.gitlab, cfg.triggers?.knownFlows, selfId, resolved.authorized, delivery);
 		if (!result.enqueue) {
 			log?.({ event: "dropped", delivery, reason: result.reason });
 			return respond(res, 204);
