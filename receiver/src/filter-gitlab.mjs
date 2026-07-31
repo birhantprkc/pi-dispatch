@@ -96,6 +96,9 @@ export function filterGitLab(subset, triggers, knownFlows, selfId, accessLevel, 
 		flow: resolved.flow,
 		...(resolved.packages !== undefined ? { packages: resolved.packages } : {}),
 		...(resolved.image !== undefined ? { image: resolved.image } : {}),
+		// Conditional like packages/image, and for the same reason: an unflagged job's data must stay
+		// byte-identical to today's, so the key is absent rather than present-and-undefined.
+		...(resolved.resume !== undefined ? { resume: resolved.resume } : {}),
 		trigger: {
 			event: kind,
 			action: subset.action,
@@ -126,6 +129,7 @@ function routeLabel(subset, triggers, targetType) {
 		flow: rule.flow,
 		packages: rule.packages,
 		image: rule.image,
+		resume: rule.resume,
 		matched: { index: rule.index, type: "label", label: matchedLabel(added, rule.predicate) },
 		target: buildTarget(subset, targetType),
 	};
@@ -182,6 +186,7 @@ function mrResult(subset, rule, matched) {
 		flow: rule.flow,
 		packages: rule.packages,
 		image: rule.image,
+		resume: rule.resume,
 		matched,
 		target: buildTarget(subset, "pull_request"),
 	};
@@ -215,6 +220,7 @@ function routeNote(subset, triggers, knownFlows) {
 		flow,
 		packages: triggers.comment.packages,
 		image: triggers.comment.image,
+		resume: triggers.comment.resume,
 		matched: { index: triggers.comment.index, type: "comment", phrase },
 		target: buildTarget(subset, targetType),
 		// The invoking comment rides the job as DATA (CONST-ISSUE-TEXT-IS-DATA). No author_association

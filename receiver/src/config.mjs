@@ -132,11 +132,11 @@ function loadTriggers(env, readFile, fileExists) {
 		knownFlows.add(run.flow);
 		const group = groups[run.kind];
 		if (on.type === "label") {
-			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image, resume: run.resume });
 		} else if (on.type === "comment") {
-			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image }; // parseTriggers guarantees at most one per forge
+			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image, resume: run.resume }; // parseTriggers guarantees at most one per forge
 		} else if (on.type === "pull_request") {
-			group.pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image });
+			group.pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image, resume: run.resume });
 		}
 	}
 

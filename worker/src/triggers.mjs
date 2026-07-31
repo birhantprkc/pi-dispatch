@@ -156,6 +156,7 @@ function normalizeCron(on, run, index, path, state) {
 
 	const packages = validatePackagesFlag(run, `cron trigger "${id}"`, path);
 	const image = validateImageRef(run, `cron trigger "${id}"`, path);
+	const resume = validateResumeFlag(run, `cron trigger "${id}"`, path);
 
 	// provider/model/maxTurns stay absent when omitted so the value resolves at job start against the
 	// settings overlay/env, not a default frozen here (INT-CONFIG-OVERLAY-CONTRACT). github/packages/image stay
@@ -164,7 +165,7 @@ function normalizeCron(on, run, index, path, state) {
 	// freeze today's default into every stored repeatable.
 	return {
 		on: { type: "cron", id, pattern },
-		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages, image },
+		run: { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages, image, resume },
 	};
 }
 
@@ -187,6 +188,38 @@ function validatePackagesFlag(run, at, path) {
 		throw configError(`${at}: run.packages must be true or false when present: ${path}`);
 	}
 	return run.packages;
+}
+
+/**
+ * Validate the per-trigger `run.resume` flag, shared by all four normalizers (REQ-RESUMABLE-SESSION).
+ *
+ * An opt-IN, and the POLARITY IS THE OPPOSITE of `run.packages` above -- deliberately, because the two
+ * flags gate different kinds of thing. Staging a pi package is an operator act already performed, so the
+ * set they staged is the set their jobs get and a trigger opts out. Persisting a session transcript is a
+ * DISCLOSURE: the agent's full working history -- tool output, file contents, its own reasoning -- written
+ * to host disk and replayed into a later job on the same key. Disclosures default off. Absent and `false`
+ * both mean today's behaviour, with not one byte written to disk and no /session mount in the argv.
+ *
+ * Carried on all four kinds for `run.image`'s reason rather than cron-only like `run.github`: continuing a
+ * conversation is a property of the FLOW, and a cron trigger's flow is a flow. A cron job keys on its own
+ * scheduler id (session-key.mjs), which is the one key in this feature chosen by nobody untrusted.
+ *
+ * Strictly boolean and fail-loud, the house rule -- and here the damaging misreading is a truthy `"false"`
+ * string, which reads to an operator as an opt-out and would arm the disclosure instead. That is the exact
+ * inversion validatePackagesFlag's own comment describes, arriving from the other direction.
+ *
+ * Type here, reality at job start, exactly as `run.image` splits it: this cannot know whether
+ * PI_SESSIONS_DIR is set, whether a key resolves, or whether a transcript exists. Those are the worker's
+ * to answer, and all but the first degrade to a cold start rather than refusing.
+ *
+ * `at` is the caller's message prefix. Returns the flag, undefined when absent, so an unflagged trigger
+ * normalizes byte-identically to today's.
+ */
+function validateResumeFlag(run, at, path) {
+	if (run.resume !== undefined && typeof run.resume !== "boolean") {
+		throw configError(`${at}: run.resume must be true or false when present: ${path}`);
+	}
+	return run.resume;
 }
 
 /**
@@ -267,7 +300,8 @@ function normalizeLabel(on, run, index, path) {
 	}
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: run.kind, flow: run.flow, packages, image } };
+	const resume = validateResumeFlag(run, at, path);
+	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -287,7 +321,8 @@ function normalizeComment(on, run, index, path, state) {
 	}
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: run.kind, flow: run.flow, packages, image } };
+	const resume = validateResumeFlag(run, at, path);
+	return { on: { type: "comment", phrase: on.phrase }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -323,8 +358,9 @@ function normalizePullRequest(on, run, index, path) {
 	}
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
+	const resume = validateResumeFlag(run, at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
-		run: { kind: run.kind, flow: run.flow, packages, image },
+		run: { kind: run.kind, flow: run.flow, packages, image, resume },
 	};
 }

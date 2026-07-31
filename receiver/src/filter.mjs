@@ -87,6 +87,9 @@ export function filter(eventName, subset, cfg, selfId, deliveryId) {
 		flow: resolved.flow,
 		...(resolved.packages !== undefined ? { packages: resolved.packages } : {}),
 		...(resolved.image !== undefined ? { image: resolved.image } : {}),
+		// Conditional like packages/image, and for the same reason: an unflagged job's data must stay
+		// byte-identical to today's, so the key is absent rather than present-and-undefined.
+		...(resolved.resume !== undefined ? { resume: resolved.resume } : {}),
 		trigger: {
 			event: eventName,
 			action,
@@ -111,6 +114,7 @@ function routeIssueLabel(subset, triggers) {
 		flow: rule.flow,
 		packages: rule.packages, // the MATCHED rule's fields -- rules in one file may differ on them
 		image: rule.image,
+		resume: rule.resume,
 		matched: { index: rule.index, type: "label", label: matchedLabel(L, rule.predicate) },
 		target: { type: "issue", number: subset.issue?.number, title: subset.issue?.title, body: subset.issue?.body },
 	};
@@ -153,6 +157,7 @@ function routeComment(subset, triggers, knownFlows) {
 		// <flow>` override changes WHICH flow runs, never which triggers.json entry authorized it.
 		packages: triggers.comment.packages,
 		image: triggers.comment.image,
+		resume: triggers.comment.resume,
 		matched: { index: triggers.comment.index, type: "comment", phrase },
 		// The invoking comment rides on the trigger: body and author_association are both named by
 		// INT-WEBHOOK-PAYLOAD-SUBSET, and the body stays DATA all the way down (CONST-ISSUE-TEXT-IS-DATA).
@@ -189,6 +194,8 @@ function routePullRequest(subset, triggers, action) {
 			flow: rule.flow,
 			packages: rule.packages, // the MATCHED rule's fields -- rules in one file may differ on them
 			image: rule.image,
+			resume: rule.resume,
+		resume: rule.resume,
 			matched: { index: rule.index, type: "pull_request", action },
 			target: buildPrTarget(pr),
 		};

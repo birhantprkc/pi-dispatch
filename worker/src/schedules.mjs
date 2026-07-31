@@ -53,7 +53,7 @@ function normalizeCronSchedule({ on, run }, path, existsSync) {
 	// cron-only field: it is carried into the local `/job/event.json` (INT-CONTAINER-JOB-INPUTS) so a
 	// scheduled job can name its own trigger; the INT-TRIGGERS-FILE-CONTRACT byte-match acceptance is
 	// amended for exactly this field.
-	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages: run.packages, image: run.image, trigger: { id: on.id, pattern: on.pattern } };
+	const data = { kind: "local", folder: run.folder, flow: run.flow, task: run.task, provider: run.provider, model: run.model, maxTurns: run.maxTurns, github: run.github, packages: run.packages, image: run.image, resume: run.resume, trigger: { id: on.id, pattern: on.pattern } };
 	// Retention only; the deterministic repeat:<id>:<millis> jobId supplies dedup, so no jobId here, and
 	// scheduler jobs are not retried (DES-CRON-VIA-BULLMQ-SCHEDULER) so no attempts/backoff.
 	const opts = { removeOnComplete: { age: 24 * 3600 }, removeOnFail: { age: 7 * 24 * 3600 } };

@@ -67,14 +67,14 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  *     re-labels or repeated PR pushes coalesce to one active job. It coexists with jobId; it does not
  *     replace it.
  */
-export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages, image }) {
+export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
 	const jobId = deliveryJobId(trigger.deliveryId);
 	// `packages` (whether to load the operator-staged pi packages) and `image` (which container image to run)
 	// come off the MATCHED trigger (INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) and land on `data`
 	// only when the filter resolved one, exactly like chainDepth/parentJobId above, so an unflagged trigger's
 	// job data is byte-identical. Both sit at JOB level, never inside `trigger` -- that object is descriptive
 	// and is copied verbatim into /job/event.json, where an execution knob has no business.
-	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }) };
+	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }), ...(resume !== undefined && { resume }) };
 	await queue.add("github", data, {
 		jobId,
 		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
@@ -102,9 +102,9 @@ export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, pro
  * other's 10-minute window and never running. The separator is GitLab's own notation: `#` for an issue,
  * `!` for a merge request.
  */
-export async function enqueueGitLabJob(queue, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image }) {
+export async function enqueueGitLabJob(queue, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
 	const jobId = gitlabDeliveryJobId(trigger.deliveryId);
-	const data = { kind: "gitlab", repo, projectId, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }) };
+	const data = { kind: "gitlab", repo, projectId, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }), ...(resume !== undefined && { resume }) };
 	const sep = target.type === "pull_request" ? "!" : "#";
 	await queue.add("gitlab", data, {
 		jobId,

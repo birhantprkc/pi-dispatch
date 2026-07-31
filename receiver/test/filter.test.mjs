@@ -551,3 +551,30 @@ test("an unhandled action on a handled event is dropped as unhandled-event", () 
 	assert.equal(r.enqueue, false);
 	assert.equal(r.reason, "unhandled-event");
 });
+
+// run.resume rides the MATCHED rule, exactly as packages/image do -- rules in one file may differ on it,
+// so a job's transcript is decided by the entry that authorized it and not by the file as a whole.
+const resumeCfg = forgeCfg({
+	triggers: {
+		label: [
+			{ index: 0, predicate: { any: ["pi:fix"] }, flow: "fix", resume: true },
+			{ index: 1, predicate: { any: ["pi:docs"] }, flow: "docs" },
+		],
+		comment: { index: 2, phrase: "@pi", defaultFlow: "triage", resume: true },
+		pullRequest: [{ index: 3, actions: new Set(["synchronize"]), predicate: {}, flow: "review", resume: true }],
+		knownFlows: new Set(["fix", "docs", "triage", "review"]),
+	},
+});
+
+test("a matched rule's run.resume reaches the JOB, and an unflagged rule omits the key entirely", () => {
+	const labelled = filter("issues", { sender: { id: 1 }, action: "labeled", issue: { number: 7, title: "T", body: "B", labels: [{ name: "pi:fix" }] } }, resumeCfg, 99, "d1");
+	assert.equal(labelled.job.resume, true, "an armed trigger must carry the flag to the worker, or the store never sees it");
+
+	// Absent rather than present-and-undefined: an unflagged job's data must stay byte-identical to what
+	// it was before this feature, so the key is conditionally spread exactly as packages/image are.
+	const docs = filter("issues", { sender: { id: 1 }, action: "labeled", issue: { number: 8, title: "T", body: "B", labels: [{ name: "pi:docs" }] } }, resumeCfg, 99, "d2");
+	assert.equal("resume" in docs.job, false);
+
+	const commented = filter("issue_comment", { sender: { id: 1 }, action: "created", comment: { body: "@pi", author_association: "OWNER" }, issue: { number: 9, title: "T", body: "B", labels: [] } }, resumeCfg, 99, "d3");
+	assert.equal(commented.job.resume, true);
+});

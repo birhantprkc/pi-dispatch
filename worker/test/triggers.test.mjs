@@ -57,7 +57,7 @@ test("a non-object entry / on / run is a config error", () => {
 test("a valid cron trigger normalizes; omitted provider/model/maxTurns/github/packages/image pass through absent", () => {
 	const [t] = parse([CRON]);
 	assert.deepEqual(t.on, { type: "cron", id: "nightly-tidy", pattern: "0 3 * * *" });
-	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined, packages: undefined, image: undefined });
+	assert.deepEqual(t.run, { kind: "local", folder: "/proj", flow: "tidy", task: "run the tidy pass", provider: undefined, model: undefined, maxTurns: undefined, github: undefined, packages: undefined, image: undefined, resume: undefined });
 });
 
 test("cron entry-level provider/model/maxTurns pass through verbatim", () => {
@@ -124,7 +124,7 @@ test("cron missing folder / flow / task is a config error", () => {
 
 test("a valid label trigger normalizes", () => {
 	const [t] = parse([LABEL]);
-	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix", packages: undefined, image: undefined } });
+	assert.deepEqual(t, { on: { type: "label", any: ["pi:frontend"], all: undefined, none: undefined }, run: { kind: "github", flow: "frontend-fix", packages: undefined, image: undefined, resume: undefined } });
 });
 
 test("label trigger with no positive selector (none-only) is a config error", () => {
@@ -144,7 +144,7 @@ test("label trigger missing run.flow is a config error", () => {
 
 test("a valid comment trigger normalizes", () => {
 	const [t] = parse([COMMENT]);
-	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: undefined, image: undefined } });
+	assert.deepEqual(t, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", packages: undefined, image: undefined, resume: undefined } });
 });
 
 test("comment trigger missing phrase or flow is a config error", () => {
@@ -160,7 +160,7 @@ test("a second comment trigger is a config error (at most one)", () => {
 
 test("a valid labeled PR trigger normalizes with its predicate", () => {
 	const [t] = parse([PR_LABELED]);
-	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review", packages: undefined, image: undefined } });
+	assert.deepEqual(t, { on: { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: undefined, none: undefined }, run: { kind: "github", flow: "review", packages: undefined, image: undefined, resume: undefined } });
 });
 
 test("a labeled PR trigger with no positive selector is a config error", () => {
@@ -412,4 +412,39 @@ test("the one-comment-trigger cap is PER FORGE: two of a kind refuse, one of eac
 test("a mixed-forge file validates and preserves order, and each entry keeps its own forge", () => {
 	const result = parse([CRON, LABEL, GL_LABEL, COMMENT, GL_COMMENT, PR_LABELED, GL_MR]);
 	assert.deepEqual(result.map((t) => t.run.kind), ["local", "github", "gitlab", "github", "gitlab", "github", "gitlab"]);
+});
+
+test("run.resume is an opt-IN, carried on all four trigger kinds", () => {
+	// Polarity is the OPPOSITE of run.packages, deliberately: staging a package is an operator act already
+	// performed, so a trigger opts OUT; persisting a transcript is a disclosure, so a trigger opts IN.
+	const [cron, label, comment, pr] = parse([
+		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/proj", flow: "tidy", task: "t", resume: true } },
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", resume: true } },
+		{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", resume: true } },
+		{ on: { type: "pull_request", action: ["synchronize"] }, run: { kind: "github", flow: "review", resume: true } },
+	]);
+	for (const t of [cron, label, comment, pr]) assert.equal(t.run.resume, true, `${t.on.type} must carry run.resume`);
+});
+
+test("an unflagged trigger normalizes with resume absent -- byte-identical to before the feature", () => {
+	const [t] = parse([{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix" } }]);
+	assert.equal(t.run.resume, undefined);
+	assert.equal("resume" in t.run, true, "the key is present-and-undefined like packages/image, so a consumer reads one shape");
+	const [f] = parse([{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", resume: false } }]);
+	assert.equal(f.run.resume, false, "an explicit false is preserved, not collapsed to absent");
+});
+
+test("a non-boolean run.resume is refused at load, on every kind", () => {
+	// The damaging misreading here is a truthy "false" STRING: it reads to an operator as an opt-out and
+	// would arm the disclosure instead -- validatePackagesFlag's own inversion, from the other direction.
+	for (const bad of ["true", "false", 1, 0, null, {}, []]) {
+		for (const entry of [
+			{ on: { type: "cron", id: "n", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/p", flow: "f", task: "t", resume: bad } },
+			{ on: { type: "label", any: ["l"] }, run: { kind: "github", flow: "f", resume: bad } },
+			{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "f", resume: bad } },
+			{ on: { type: "pull_request", action: ["synchronize"] }, run: { kind: "github", flow: "f", resume: bad } },
+		]) {
+			assert.throws(() => parse([entry]), /run\.resume must be true or false/, `${entry.on.type} with resume=${JSON.stringify(bad)} must refuse at load`);
+		}
+	}
 });
