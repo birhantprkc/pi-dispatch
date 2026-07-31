@@ -187,6 +187,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		dispatchRunRoots: delimitedList(env.PI_DISPATCH_RUN_ROOTS), // DES-AI-TRIGGER-FLOW-GATE: default [] fails closed — no folder passes, dispatch_run refuses everything
 		github: { ...loadGitHubAuth(env, fileExists), allowGhResume: env.PI_SESSIONS_ALLOW_GH_SOURCE === "1" },
 		gitlab: loadGitLabAuth(env),
+		forgejo: loadForgejoAuth(env),
 	};
 }
 
@@ -247,6 +248,28 @@ export function defaultSettingsFile() {
 	// allowlist (no-broad-env-into-container). Exported so the admin extension resolves the same default
 	// without calling loadConfig, which throws on unrelated env problems.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/settings.json`.replace(/\\/g, "/");
+}
+
+/**
+ * The worker's Forgejo auth config, or `null` when none is configured -- same presence rule as GitLab's.
+ *
+ * `FORGEJO_BOT_ID` rides here because a repository-scoped Forgejo token cannot call `GET /user`, so the
+ * identity the bot-loop guard needs may have to be supplied rather than asked for (forgejo-identity.mjs).
+ */
+export function loadForgejoAuth(env) {
+	const token = env.FORGEJO_TOKEN;
+	if (typeof token !== "string" || token.trim() === "") return null;
+	const source = env.FORGEJO_AUTH_SOURCE ?? "pat";
+	if (source !== "pat") {
+		throw configError(`FORGEJO_AUTH_SOURCE must be "pat" (got ${JSON.stringify(source)}) -- Forgejo has no App or installation-token equivalent, so there is no other source`);
+	}
+	const apiUrl = env.FORGEJO_URL;
+	// No default instance, deliberately: Forgejo is self-hosted by nature and there is no forgejo.com to
+	// fall back to. Guessing one would send an operator's token to a host they never named.
+	if (typeof apiUrl !== "string" || apiUrl.trim() === "") {
+		throw configError("FORGEJO_URL is required when FORGEJO_TOKEN is set -- there is no default Forgejo instance to fall back to");
+	}
+	return { source, apiUrl: apiUrl.trim(), tokenVar: "FORGEJO_TOKEN", botId: env.FORGEJO_BOT_ID ?? null };
 }
 
 /**
