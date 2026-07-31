@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { buildDockerRunArgs } from "./docker-run.mjs";
+import { buildDockerRunArgs, CONTAINER_SESSION_FILE } from "./docker-run.mjs";
 import { buildContainerEnv } from "./env-allowlist.mjs";
 import { resolveJobImage } from "./image-preflight.mjs";
 import { InfraRetry } from "./processor.mjs";
@@ -65,6 +65,10 @@ export function makeRunContainer({
 			// hand-edited string "false" never becomes job data this comparison could misread as an opt-out.
 			packagePaths: job.packages === false ? [] : packagePaths,
 			forwardEnv, // extra host var names to forward (e.g. a custom provider's key)
+			// REQ-RESUMABLE-SESSION: the fixed container path, emitted only when this job HAS a transcript.
+			// The constant is imported rather than re-typed so the mount below and this variable name one
+			// path -- two literals is how they drift with both suites green.
+			sessionFile: prepared.session ? CONTAINER_SESSION_FILE : undefined,
 			authFromPi, // source the provider key from pi's auth.json when the env has none
 		});
 
@@ -78,6 +82,9 @@ export function makeRunContainer({
 			jobDir: prepared.jobDir,
 			workspace: prepared.workspace,
 			outboxDir: prepared.outboxDir, // undefined for github jobs -> docker-run's guard skips the /outbox mount
+			// The job's OWN copy, under jobDir -- never the shared store. Undefined when the trigger did not
+			// arm run.resume or no key resolved, and docker-run's guard then skips the mount entirely.
+			sessionDir: prepared.session?.hostDir,
 			globalPiDir, // undefined/null -> docker-run's guard skips the /opt/pi-global mount
 			name,
 		});

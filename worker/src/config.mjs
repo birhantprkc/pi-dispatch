@@ -168,6 +168,16 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		settingsFile: env.PI_SETTINGS_FILE || defaultSettingsFile(), // || (not ??) so an empty string falls back; INT-CONFIG-OVERLAY-CONTRACT
 		captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1", // no-pii-in-logs: raw job-log capture is opt-in; anything but "1" is off
 		logRetentionDays: nonNegativeInt(env, "PI_LOG_RETENTION_DAYS", 30), // 0 = keep forever
+		// REQ-RESUMABLE-SESSION. NO DEFAULT, deliberately unlike logsDir/jobsDir: unset means the feature
+		// is unavailable, and a trigger that armed run.resume then refuses PRE-SPEND rather than running
+		// silently without persistence. A transcript is the most PII-bearing artifact this system holds --
+		// tool output, file contents, the agent's own reasoning -- and defaulting it into <OS temp>, which
+		// is mode 1777 on POSIX, is not a place to put that by accident.
+		sessionsDir: env.PI_SESSIONS_DIR || null,
+		sessionsTtlDays: nonNegativeInt(env, "PI_SESSIONS_TTL_DAYS", 14), // 0 = keep forever
+		// A bound on how large a transcript may be before it stops being resumed. Not disk hygiene: an
+		// oversized transcript is a prefill an operator never sized PI_MAX_TOKENS for.
+		sessionMaxBytes: nonNegativeInt(env, "PI_SESSION_MAX_BYTES", 8 * 1024 * 1024), // 0 = no cap
 		chainDepthMax: nonNegativeInt(env, "PI_CHAIN_DEPTH_MAX", 1), // DES-JOB-OUTBOX-CHAINING; 0 = chaining kill-switch (fail-closed)
 		chainMaxPerJob: nonNegativeInt(env, "PI_CHAIN_MAX_PER_JOB", 2), // INT-OUTBOX-CONTRACT: max request-<n>.json collected per parent
 		dispatchRunPerHour: nonNegativeInt(env, "PI_DISPATCH_RUN_PER_HOUR", 3), // DES-ADMIN-VIA-PI-EXTENSION; 0 = disable dispatch_run

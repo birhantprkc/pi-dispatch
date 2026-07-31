@@ -109,7 +109,7 @@ function resolveEnvName(provider, cred) {
  * `allowGlobalExtensions` defaults to TRUE here, matching loadConfig's default (REQ-GLOBAL-PI-OVERLAY): a
  * caller that says nothing gets the operator's staged setup, and only an explicit `false` withholds it.
  */
-export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, forgeKind, gitlabHost, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], authFromPi = false, agentDir, readFile = readFileSync }) {
+export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId, githubToken, forgeKind, gitlabHost, hostEnv, allowGlobalExtensions = true, packagePaths = [], forwardEnv = [], sessionFile = null, authFromPi = false, agentDir, readFile = readFileSync }) {
 	// The provider credential(s), by pi's expected variable name(s) -- from the worker env, or (when
 	// PI_AUTH_FROM_PI is set and the env has none) host-side from pi's auth.json. Throws (config) if
 	// neither source yields one, which the processor turns into a pre-spend refusal.
@@ -139,6 +139,12 @@ export function buildContainerEnv({ provider, model, maxTurns, maxTokens, jobId,
 		// never PI_PACKAGES=. The delimiter is ":" because these are CONTAINER (POSIX) paths -- never the
 		// host's path.delimiter, which is ";" on Windows.
 		PI_PACKAGES: packagePaths.length > 0 ? packagePaths.join(":") : undefined,
+		// The persisted transcript inside the /session mount (REQ-RESUMABLE-SESSION). Emitted ONLY when
+		// this job actually has one -- absent means the runner builds pi's ephemeral in-memory session,
+		// which is every job before this feature and every job whose trigger did not arm run.resume. Never
+		// an empty string, for PI_PACKAGES' reason: an empty value is a third state neither side reads the
+		// same way, and the one reading a container must not have to infer which was meant.
+		PI_SESSION_FILE: sessionFile || undefined,
 		// Kill switch for job-time package installation, UNCONDITIONAL for every job. pi's resolver shells out
 		// to a REAL `npm install` for any npm:/git: source unless offline mode is on, and `~/.pi/agent` IS
 		// writable in the container. We emit only local paths, so nothing should reach that branch -- this
