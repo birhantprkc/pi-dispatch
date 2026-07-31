@@ -187,3 +187,25 @@ test("enforceOfflineMode sets PI_OFFLINE=1 and is idempotent", () => {
 		assert.equal(env.PI_OFFLINE, "1", `PI_OFFLINE=${JSON.stringify(weak)} must be overwritten`);
 	}
 });
+
+test("PI_SESSION_FILE is optional: unset is null, so an unarmed job is byte-identical to today", () => {
+	assert.equal(parseRunnerEnv({ ...base }).sessionFile, null);
+	assert.equal(parseRunnerEnv({ ...base, PI_SESSION_FILE: "" }).sessionFile, null);
+	assert.equal(parseRunnerEnv({ ...base, PI_SESSION_FILE: "/session/current.jsonl" }).sessionFile, "/session/current.jsonl");
+});
+
+test("PI_SESSION_FILE refuses a relative path, a .. segment, and anything under /workspace", () => {
+	// Relative and `..` for parsePackagePaths' reason: the cwd is /workspace, the adversarial clone.
+	// The /workspace exclusion is this variable's own, and it is a narrowing rather than a live guard:
+	// the worker never points there, and a template bug that did would put the transcript inside the
+	// worktree the agent commits from -- one `git add -A` from a public pull request.
+	for (const bad of ["session/current.jsonl", "../session/current.jsonl", "/session/../workspace/s.jsonl", "/workspace", "/workspace/s.jsonl", "/workspace/.pi/s.jsonl"]) {
+		assert.throws(
+			() => parseRunnerEnv({ ...base, PI_SESSION_FILE: bad }),
+			(e) => e.piDispatchExit === EXIT_POLICY,
+			`PI_SESSION_FILE=${JSON.stringify(bad)} must refuse pre-spend, not be silently accepted`,
+		);
+	}
+	// A path merely NAMED like the workspace is fine -- the check is on the path boundary, not a prefix.
+	assert.equal(parseRunnerEnv({ ...base, PI_SESSION_FILE: "/workspace-sessions/s.jsonl" }).sessionFile, "/workspace-sessions/s.jsonl");
+});
