@@ -13,7 +13,7 @@
 # forgotten would be the one nobody was looking at.
 #
 # Build:
-#   docker build -f image/Dockerfile.azure -t pi-dispatch-job:azure --build-arg BASE=pi-dispatch-job:latest .
+#   docker build -f image/Dockerfile.azure -t pi-job:azure --build-arg BASE=pi-dispatch-job:latest .
 ARG BASE=ghcr.io/edgehero/pi-dispatch-job:latest
 FROM ${BASE}
 

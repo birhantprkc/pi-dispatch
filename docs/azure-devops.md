@@ -5,7 +5,7 @@ GitHub does: same queue, same container, same budget, same pause windows, same r
 
 ```jsonc
 { "on": { "type": "label", "any": ["pi:fix"] },
-  "run": { "kind": "azure", "flow": "fix", "repository": "widgets", "image": "pi-dispatch-job:azure" } }
+  "run": { "kind": "azure", "flow": "fix", "repository": "widgets", "image": "pi-job:azure" } }
 ```
 
 Two fields there are Azure-only, and both are explained below: `repository`, because a work item does not
@@ -132,7 +132,7 @@ roughly a gigabyte, with a Python runtime. Putting that in the image every job r
 majority pay for the minority, so it lives in a variant:
 
 ```bash
-docker build -f image/Dockerfile.azure -t pi-dispatch-job:azure \
+docker build -f image/Dockerfile.azure -t pi-job:azure \
   --build-arg BASE=ghcr.io/edgehero/pi-dispatch-job:latest .
 ```
 

@@ -13,8 +13,8 @@
     { "on": { "type": "comment", "phrase": "@pi" }, "run": { "kind": "forgejo", "flow": "triage" } },
     { "on": { "type": "pull_request", "action": ["label_updated"], "any": ["pi:review"] }, "run": { "kind": "forgejo", "flow": "review" } },
 
-    { "on": { "type": "label", "any": ["pi:fix"] }, "run": { "kind": "azure", "flow": "fix", "repository": "widgets", "image": "pi-dispatch-job:azure" } },
-    { "on": { "type": "comment", "phrase": "@pi" }, "run": { "kind": "azure", "flow": "triage", "repository": "widgets", "image": "pi-dispatch-job:azure" } },
-    { "on": { "type": "pull_request", "action": ["created", "updated"] }, "run": { "kind": "azure", "flow": "review", "image": "pi-dispatch-job:azure" } }
+    { "on": { "type": "label", "any": ["pi:fix"] }, "run": { "kind": "azure", "flow": "fix", "repository": "widgets", "image": "pi-job:azure" } },
+    { "on": { "type": "comment", "phrase": "@pi" }, "run": { "kind": "azure", "flow": "triage", "repository": "widgets", "image": "pi-job:azure" } },
+    { "on": { "type": "pull_request", "action": ["created", "updated"] }, "run": { "kind": "azure", "flow": "review", "image": "pi-job:azure" } }
   ]
 }
