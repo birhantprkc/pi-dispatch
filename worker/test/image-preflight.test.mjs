@@ -43,7 +43,12 @@ test("an image that inspects clean is ok, and costs exactly ONE spawn", async ()
 	// happy path must not pay for the diagnosis of a case it is not in. The pi-version label rides this
 	// same inspect for the same reason -- a second spawn would have doubled what every job pays.
 	assert.equal(calls.length, 1, "the happy path does not probe the daemon a second time");
-	assert.deepEqual(calls[0].args, ["image", "inspect", `--format={{.Id}}${FIELD_SEP}{{index .Config.Labels "dev.pi-dispatch.pi-version"}}`, "pi-job:latest"]);
+	assert.deepEqual(calls[0].args, [
+		"image",
+		"inspect",
+		`--format={{.Id}}${FIELD_SEP}{{index .Config.Labels "dev.pi-dispatch.pi-version"}}${FIELD_SEP}{{index .Config.Labels "dev.pi-dispatch.forges"}}`,
+		"pi-job:latest",
+	]);
 });
 
 test("an image that declares no pi version reports null, which downstream means never resume", async () => {
@@ -93,4 +98,61 @@ test("the preflight checks the JOB's image, not the deployment default", async (
 	const preflight = makeImagePreflight({ image: "pi-job:latest", spawnFn: fakeSpawn(calls, { image: 1, info: 0 }) });
 	assert.deepEqual(await preflight({ image: "my-python:1.2.0" }), { missing: "my-python:1.2.0" }, "the refusal names the tag the job asked for");
 	assert.ok(calls[0].args.includes("my-python:1.2.0"), "and the tag it inspected is the one it will run");
+});
+
+test("a job whose forge the image excludes is refused PRE-SPEND, with no container and no budget slot", async () => {
+	// `run.image` is optional, so a trigger for a forge whose CLI the default image does not ship would
+	// otherwise run there, find no such command, and fail INSIDE a paid container -- on every delivery,
+	// looking exactly like a bad agent run rather than a missing tool.
+	const calls = [];
+	const preflight = makeImagePreflight({
+		image: "pi-job:latest",
+		spawnFn: fakeSpawn(calls, { image: 0, info: 0 }, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}github,gitlab,forgejo\n`),
+	});
+	const r = await preflight({ kind: "azure" });
+	assert.equal(r.forgeUnsupported, "pi-job:latest");
+	assert.equal(r.kind, "azure");
+	assert.deepEqual(r.declared, ["github", "gitlab", "forgejo"]);
+	assert.equal(calls.length, 1, "one inspect, and nothing else -- the refusal costs no second spawn");
+});
+
+test("a job whose forge the image DOES declare runs, and the label rides the same single inspect", async () => {
+	const calls = [];
+	const preflight = makeImagePreflight({
+		image: "i",
+		spawnFn: fakeSpawn(calls, { image: 0, info: 0 }, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}github,gitlab,forgejo\n`),
+	});
+	for (const kind of ["github", "gitlab", "forgejo"]) {
+		assert.deepEqual(await preflight({ kind }), { ok: true, image: "i", piVersion: "0.80.7" }, kind);
+	}
+	assert.equal(calls.length, 3, "one spawn per call, still -- the forge list is a second field, not a second probe");
+});
+
+test("an image declaring NO forges admits every job -- absent is allowed, not refused", async () => {
+	// The polarity is the opposite of what "declare your capabilities" suggests, and deliberately so: every
+	// operator-built image predating this label (OQ-012) declares nothing, and refusing those would break
+	// working deployments with no warning first. Only a PRESENT list that excludes the forge refuses.
+	for (const out of [`sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}<no value>\n`, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}\n`, `sha256:abc${FIELD_SEP}0.80.7\n`, "sha256:abc\n", ""]) {
+		const preflight = makeImagePreflight({ image: "i", spawnFn: fakeSpawn([], { image: 0, info: 0 }, out) });
+		const r = await preflight({ kind: "azure" });
+		assert.equal(r.ok, true, `stdout ${JSON.stringify(out)} must admit, not refuse`);
+	}
+});
+
+test("a malformed forges label is treated as absent, not as 'serves no forge'", async () => {
+	// Refusing every job on an image whose label was merely mistyped would be a worse failure than the one
+	// the label exists to prevent.
+	const preflight = makeImagePreflight({ image: "i", spawnFn: fakeSpawn([], { image: 0, info: 0 }, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP} , ,\n`) });
+	assert.equal((await preflight({ kind: "github" })).ok, true);
+});
+
+test("a local job is never refused on forge grounds -- it has no forge to check", async () => {
+	const preflight = makeImagePreflight({ image: "i", spawnFn: fakeSpawn([], { image: 0, info: 0 }, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}github\n`) });
+	assert.equal((await preflight({ kind: "local" })).ok, true);
+	assert.equal((await preflight({})).ok, true, "and neither is a job whose kind is not set at all");
+});
+
+test("the pi version still parses now that a third field follows it", async () => {
+	const preflight = makeImagePreflight({ image: "i", spawnFn: fakeSpawn([], { image: 0, info: 0 }, `sha256:abc${FIELD_SEP}0.80.7${FIELD_SEP}github\n`) });
+	assert.equal((await preflight({ kind: "github" })).piVersion, "0.80.7");
 });

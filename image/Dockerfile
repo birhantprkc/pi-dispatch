@@ -71,6 +71,31 @@ RUN set -eu; \
 ENV GLAB_CHECK_UPDATE=false
 ENV GLAB_SEND_TELEMETRY=false
 
+
+# tea, the Forgejo/Gitea CLI, for forgejo jobs (issue #61). Same reason glab is here: `gh` speaks the
+# GitHub API and nothing else, so a forgejo job following the github envelope fails at its first
+# `gh pr create` on every run -- and Forgejo's nouns being GitHub's is exactly what would make that
+# failure look like a bad agent rather than a missing tool.
+#
+# Pinned like glab, not like gh: an exact version and a per-architecture sha256 over the release binary.
+# Issue #61 asks for this by name -- "a second CLI should not repeat that" -- and it is right to: an
+# unattended upstream change lands inside a container holding a repository credential.
+ARG TEA_VERSION=0.15.0
+ARG TEA_SHA256_AMD64=d7e47fbe7809e4db6a6d830989b0e1776ed5943bb08dccbe0ed166e2594126e2
+ARG TEA_SHA256_ARM64=6bdb9a44e0263f104fd396b690e0376d2a27a183abae557452b31e39d6f35ba3
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$TEA_SHA256_AMD64" ;; \
+      arm64) sha="$TEA_SHA256_ARM64" ;; \
+      *) echo "tea: unsupported architecture $arch" >&2; exit 1 ;; \
+    esac; \
+    wget -nv -O /tmp/tea "https://gitea.com/gitea/tea/releases/download/v${TEA_VERSION}/tea-${TEA_VERSION}-linux-${arch}"; \
+    echo "${sha}  /tmp/tea" | sha256sum -c -; \
+    install -m 0755 /tmp/tea /usr/local/bin/tea; \
+    rm -f /tmp/tea; \
+    tea --version
+
 # engine-strict is set explicitly because npm reads it from $HOME/.npmrc and
 # $PREFIX/etc/npmrc but NEVER from a project .npmrc for installs outside a project root.
 # Without this the node-floor guard silently does not cover the install that matters most.
@@ -171,6 +196,18 @@ RUN chmod +x /entrypoint.sh \
 # cannot drift silently -- the same discipline the glab and gh pins get.
 ARG PI_VERSION=0.80.7
 LABEL dev.pi-dispatch.pi-version="${PI_VERSION}"
+
+# Which forges this image can actually SERVE -- read by the worker's pre-spend image preflight, on the same
+# `docker image inspect` that reads the pin above.
+#
+# `run.image` is optional, so a trigger for a forge whose CLI this image does not ship would run on the
+# deployment default, find no such command, and fail INSIDE a paid container on every single delivery, with
+# nothing to distinguish it from a bad agent run. Declaring the list moves that to a pre-spend refusal.
+#
+# An image that declares NOTHING is allowed everything, deliberately: every operator-built image predating
+# this label (OQ-012) declares nothing, and refusing those would break working deployments with no warning.
+# `verify-image.sh` asserts this list matches the CLIs actually installed, so the label cannot lie.
+LABEL dev.pi-dispatch.forges="github,gitlab,forgejo"
 
 USER pi
 WORKDIR /workspace

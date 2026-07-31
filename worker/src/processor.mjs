@@ -95,6 +95,21 @@ export async function runJob(job, deps) {
 			// exitCode/turns/tokens null and budgetReserved false: refused pre-container AND pre-reserve.
 			return { outcome: "policy", reason: "job-image-missing", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
 		}
+		if (img.forgeUnsupported) {
+			// The image is present and says it cannot serve this forge -- it ships no CLI for it. Determinate,
+			// so a refusal rather than a retry, and pre-spend, because the alternative is a paid container
+			// that fails at step 3 on every single delivery with nothing to distinguish it from a bad run.
+			//
+			// The message names the LIKELY CAUSE rather than the label that detected it: a trigger that
+			// forgot `run.image`. The failure is upstream of the thing that noticed it, and an operator
+			// reading "the image does not declare azure" has further to walk than one reading "set run.image".
+			await comment(
+				job,
+				`Refused: the job image "${img.forgeUnsupported}" does not support ${img.kind} jobs (it declares: ${img.declared.join(", ")}). Set this trigger's \`run.image\` to an image that does. Not run.`,
+			);
+			log("refused_image_forge_unsupported", { image: img.forgeUnsupported, kind: img.kind, declared: img.declared });
+			return { outcome: "policy", reason: "job-image-forge-unsupported", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+		}
 		if (img.unavailable) {
 			// docker itself did not answer -- transient infra, NOT a determinate refusal. THROWN so BullMQ
 			// retries (CONST-RETRY-INFRA-ONLY). `container-never-started` is literally true here, and it reuses
