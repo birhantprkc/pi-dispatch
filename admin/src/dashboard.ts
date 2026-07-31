@@ -643,7 +643,10 @@ function targetColored(t: any, styler: any): string {
     const folderPart = base ? styler.fg("muted", base) + styler.fg("dim", "/") : "";
     return `${arrow} ${styler.fg("success", "local")} ${folderPart}${flow}`;
   }
-  return `${arrow} ${styler.fg("accent", "github")} ${flow}`;
+  // The forge is READ, never assumed. It was the literal "github" here, which rendered a gitlab or azure
+  // trigger as `→ github <flow>  [gitlab]` -- the row contradicting its own badge. `forge` is carried
+  // verbatim by read-model.mjs, so an unrecognised one shows as itself rather than as a plausible default.
+  return `${arrow} ${styler.fg("accent", t?.forge ?? "github")} ${flow}`;
 }
 
 /** The scheduled pause windows as colored rows, each marked `●` (paused now, with a resume countdown) or `○`. */
@@ -775,7 +778,7 @@ function renderTriggerDetail(t: any, inner: number, styler: any, sched: any = nu
     // trigger listen to" is the first question the drill-in has to answer, and guessing github would be
     // wrong for half the file.
     out.push(kv("job", t.forge ?? "-", "accent"));
-    out.push(kv("target", t.forge === "gitlab" ? "the triggering project#issue / !MR" : "the triggering repo#issue / PR", "accent"));
+    out.push(kv("target", forgeTargetLabel(t?.forge), "accent"));
     out.push(kv("model", "deployment default", "dim"));
   }
   // Same shape as the model row -- a per-trigger override of a deployment default -- and rendered on BOTH
@@ -820,29 +823,57 @@ function stagedNames(staged: any): string {
 }
 
 /** The static per-kind trust model (who authorizes it, how it dedups, which service owns it). */
+/** What the target of a forge trigger is called, in that forge's own notation. */
+function forgeTargetLabel(forge: string | null | undefined): string {
+  if (forge === "gitlab") return "the triggering project#issue / !MR";
+  if (forge === "azure") return "the triggering project/repo#work-item / !PR";
+  return "the triggering repo#issue / PR";
+}
+
+/**
+ * How this trigger is authorized, deduplicated, and where it runs — per forge, because the answers really
+ * do differ and the panel is where an operator checks them.
+ *
+ * These lines were GitHub's for every webhook kind: they said "HMAC" and "X-GitHub-Delivery GUID" on a
+ * gitlab trigger, and would have said it on an azure one, where BOTH are false -- Azure has no HMAC at all
+ * and no delivery-id header. A trust model that is wrong is worse than one that is absent, because an
+ * operator reads it to decide whether they are comfortable.
+ */
 function trustModel(t: any): string[] {
-  switch (t?.type) {
-    case "cron":
+  if (t?.type === "cron") {
+    return [
+      "authorized by the operator's triggers file, at boot",
+      "dedup by time — deterministic repeat:<id>:<millis> id",
+      "lives in the worker · task is operator-authored",
+    ];
+  }
+  const subject = t?.type === "comment" ? "adversarial comment text" : "adversarial issue/PR text";
+  const where = `lives in the receiver · task is ${subject}`;
+  switch (t?.forge) {
+    case "gitlab":
       return [
-        "authorized by the operator's triggers file, at boot",
-        "dedup by time — deterministic repeat:<id>:<millis> id",
-        "lives in the worker · task is operator-authored",
+        "authorized by the actor's resolved project access level (>= Developer) — a label is NOT approval here",
+        "HMAC over the body (19.0+) or a bare X-Gitlab-Token · dedup by webhook-id",
+        where,
       ];
-    case "label":
-    case "pull_request":
+    case "forgejo":
       return [
-        "authorized by a collaborator's label + HMAC webhook + author gate",
-        "dedup by X-GitHub-Delivery GUID (redelivery-safe)",
-        "lives in the receiver · task is adversarial issue/PR text",
+        "authorized by the actor's resolved repository permission (admin|write), on every trigger type",
+        "HMAC over the body (GitHub-compatible) · dedup by X-GitHub-Delivery GUID",
+        where,
       ];
-    case "comment":
+    case "azure":
       return [
-        "authorized by a collaborator comment (author_association) + HMAC",
-        "dedup by X-GitHub-Delivery GUID",
-        "lives in the receiver · task is adversarial comment text",
+        "authorized by the actor's resolved project membership — work items name the actor only by email",
+        "NO HMAC: a shared secret that covers no bytes · dedup by the payload's own id (OQ-015)",
+        where,
       ];
     default:
-      return [];
+      return [
+        t?.type === "comment" ? "authorized by a collaborator comment (author_association) + HMAC" : "authorized by a collaborator's label + HMAC webhook + author gate",
+        "dedup by X-GitHub-Delivery GUID (redelivery-safe)",
+        where,
+      ];
   }
 }
 

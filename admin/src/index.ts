@@ -585,6 +585,21 @@ function triggerList(paths: any): any[] {
  * `run.image` gets and for a stricter version of the same reason. The panel still DISPLAYS it, because
  * reading a disclosure and being able to arm one are different things.
  */
+/**
+ * The forge prompt and the per-forge pull-request action vocabulary, in one place each.
+ *
+ * Both were two-way ternaries naming github and gitlab. A third and fourth forge turns a ternary into a
+ * chain, and an operator offered "github or gitlab" cannot discover that two more exist -- which is a
+ * different failure from being refused: they simply never try.
+ */
+const FORGE_PROMPT = "forge — github, gitlab, forgejo or azure";
+const PR_ACTION_VOCAB: Record<string, { hint: string; dflt: string }> = {
+  github: { hint: "labeled opened synchronize reopened", dflt: "labeled" },
+  gitlab: { hint: "open update reopen approved", dflt: "update" },
+  forgejo: { hint: "label_updated opened synchronized reopened", dflt: "label_updated" },
+  azure: { hint: "created updated", dflt: "updated" },
+};
+
 function buildTriggerEntry(kind: string, f: any): any {
   if (kind === "cron") {
     // Optional per-entry provider/model/maxTurns pass through to job.data (highest precedence); omitted when
@@ -601,8 +616,14 @@ function buildTriggerEntry(kind: string, f: any): any {
     return { on: { type: "cron", id: f.id, pattern: f.pattern }, run };
   }
   const forge = optStr(f.forge) ?? "github";
-  if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: { kind: forge, flow: f.flow } };
-  if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: { kind: forge, flow: f.flow } };
+  // `run.repository` is required on an azure label/comment trigger and REFUSED on every other forge's, so
+  // it is carried only when set and `parseTriggers` decides whether it belongs. Passing it through rather
+  // than validating here keeps one validator, exactly as an unrecognised forge is passed through to be
+  // refused fail-loud at the write instead of silently rewritten to github.
+  const repository = optStr(f.repository);
+  const forgeRun = (rest: any) => ({ kind: forge, ...rest, ...(repository ? { repository } : {}) });
+  if (kind === "label") return { on: { type: "label", any: asWords(f.labels ?? f.any) }, run: forgeRun({ flow: f.flow }) };
+  if (kind === "comment") return { on: { type: "comment", phrase: f.phrase }, run: forgeRun({ flow: f.flow }) };
   if (kind === "pull_request") {
     const on: any = { type: "pull_request", action: asWords(f.action) };
     const any = asWords(f.labels ?? f.any);
@@ -934,30 +955,38 @@ async function addTriggerViaDialogs(paths: any, ui: any, notify: Notify): Promis
     entry = buildTriggerEntry("cron", { id, pattern, folder, flow, task, model, provider, maxTurns });
   } else if (kind === "label") {
     // Webhook triggers run against the triggering repo, and the issue/PR text is the task — neither is set here.
-    const forge = await ui.input("forge — github or gitlab", "github");
+    const forge = await ui.input(FORGE_PROMPT, "github");
     if (forge === undefined) return;
     const labels = await ui.input("labels — space-separated, any-of (a project member applies one to fire)", "pi:fix");
     if (labels === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the issue text is the task)", "fix");
     if (flow === undefined) return;
-    entry = buildTriggerEntry("label", { labels, flow, forge });
+    // An azure work item belongs to a PROJECT, not a repository, so nothing in the delivery says where to
+    // clone and the trigger has to name it. Asked only for azure, because the loader refuses it elsewhere.
+    const repository = forge === "azure" ? await ui.input("repository — the repo within the project to clone (azure work items name none)", "") : undefined;
+    if (repository === undefined && forge === "azure") return;
+    entry = buildTriggerEntry("label", { labels, flow, forge, repository });
   } else if (kind === "comment") {
-    const forge = await ui.input("forge — github or gitlab", "github");
+    const forge = await ui.input(FORGE_PROMPT, "github");
     if (forge === undefined) return;
     const phrase = await ui.input("trigger phrase — a comment containing this fires the flow (e.g. @pi)", "@pi");
     if (phrase === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the comment/issue text is the task)", "fix");
     if (flow === undefined) return;
-    entry = buildTriggerEntry("comment", { phrase, flow, forge });
+    const repository = forge === "azure" ? await ui.input("repository — the repo within the project to clone (azure work items name none)", "") : undefined;
+    if (repository === undefined && forge === "azure") return;
+    entry = buildTriggerEntry("comment", { phrase, flow, forge, repository });
   } else {
-    const forge = await ui.input("forge — github or gitlab", "github");
+    const forge = await ui.input(FORGE_PROMPT, "github");
     if (forge === undefined) return;
     // The action vocabulary is the forge's own, and a word from the wrong one is refused at the write --
     // so the prompt names the right set rather than offering a union that half-works.
-    const actionHint = forge === "gitlab" ? "open update reopen approved" : "labeled opened synchronize reopened";
-    const action = await ui.input(`MR/PR actions — space-separated: ${actionHint}`, forge === "gitlab" ? "update" : "labeled");
+    const vocab = PR_ACTION_VOCAB[forge] ?? PR_ACTION_VOCAB.github;
+    const action = await ui.input(`MR/PR actions — space-separated: ${vocab.hint}`, vocab.dflt);
     if (action === undefined) return;
-    const labels = await ui.input("labels for 'labeled' — space-separated (blank for the auto actions)", "pi:review");
+    // Azure attaches tags to work items and never to pull requests, so a predicate there could never match
+    // and the loader refuses one. Not asking beats asking and discarding.
+    const labels = forge === "azure" ? "" : await ui.input("labels for 'labeled' — space-separated (blank for the auto actions)", "pi:review");
     if (labels === undefined) return;
     const flow = await ui.input("flow — the .pi/skills/<name> skill to run (the PR text is the task)", "review");
     if (flow === undefined) return;
