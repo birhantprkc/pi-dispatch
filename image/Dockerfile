@@ -156,6 +156,22 @@ COPY image/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
     && chmod -R a-w /opt/pi-dispatch /app/image/runner /app/node_modules
 
+# The pi this image ships, declared where the WORKER can read it without starting a container
+# (REQ-RESUMABLE-SESSION, INT-CONTAINER-RUNTIME-CONTRACT). The image preflight already runs
+# `docker image inspect`, so this rides that call and costs no extra spawn.
+#
+# It is needed BEFORE the container starts because a persisted transcript can outlive the pi that wrote
+# it, and pi's own docs record what then breaks: an older session's stored tool-call arguments may no
+# longer match the current tool schema. The repair hook is an extension-author API and we do not own
+# pi's built-in schemas, so the only available answer is to refuse the resume -- which requires knowing
+# the version first. An image that declares nothing never resumes: null is the safe direction, not
+# "assume it matches".
+#
+# It must track the runner's pin in image/runner/package.json. The CI pin-check greps both, so they
+# cannot drift silently -- the same discipline the glab and gh pins get.
+ARG PI_VERSION=0.80.7
+LABEL dev.pi-dispatch.pi-version="${PI_VERSION}"
+
 USER pi
 WORKDIR /workspace
 
