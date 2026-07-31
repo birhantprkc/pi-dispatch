@@ -309,7 +309,10 @@ export async function startWorker(
 				packagePaths, // REQ-GLOBAL-PI-OVERLAY: staged package paths; every job receives them unless its trigger set packages:false
 				forwardEnv: config.forwardEnv,
 				authFromPi: config.authFromPi, // source the provider key from ~/.pi/agent/auth.json when env has none
-				gitlabHost: config.gitlab?.apiUrl ?? null, // so `glab` in a gitlab job's container talks to the right instance
+				// Self-hosted instance URLs, keyed by forge. A MAP rather than one scalar per forge: the table says
+				// which variable each lands in, so a forge with no self-hosted concept simply has no entry, and
+				// adding one does not widen this signature again.
+				forgeHosts: { gitlab: config.gitlab?.apiUrl ?? null },
 			}),
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,

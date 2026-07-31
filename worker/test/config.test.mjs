@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import { test } from "node:test";
 import { configError, globalExtensionsEnabled, loadConfig, loadGitLabAuth } from "../src/config.mjs";
+import { FORGES, FORGE_KINDS } from "../src/forges.mjs";
 
 test("loads conservative defaults with an empty-ish env", () => {
 	const c = loadConfig({});
@@ -337,10 +338,14 @@ test("custom GITHUB_PAT_VAR reads the named env var for the PAT", () => {
 	);
 });
 
-test("PI_FORWARD_ENV refuses every minted token name, gitlab's included", () => {
+test("PI_FORWARD_ENV refuses every name any forge's mint can write -- read off the table, not a copy of it", () => {
 	// Forwarding one would override the per-job mint with a broader, longer-lived operator credential --
 	// silently, and in the direction that matters (CONST-TOKEN-SCOPED-PER-JOB).
-	for (const name of ["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"]) {
+	//
+	// The names come FROM the forge table rather than being listed here, so this test cannot pass while
+	// the refusal set has fallen behind the mint. A hand-written list would keep passing on exactly the
+	// four names it knew about and say nothing about a fifth.
+	for (const name of FORGE_KINDS.flatMap((kind) => FORGES[kind].tokenVars)) {
 		assert.throws(
 			() => loadConfig({ PI_FORWARD_ENV: `SOME_KEY,${name}` }),
 			(e) => e.piDispatchConfig === true && e.message.includes(name),

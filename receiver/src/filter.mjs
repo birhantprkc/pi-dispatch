@@ -195,7 +195,6 @@ function routePullRequest(subset, triggers, action) {
 			packages: rule.packages, // the MATCHED rule's fields -- rules in one file may differ on them
 			image: rule.image,
 			resume: rule.resume,
-		resume: rule.resume,
 			matched: { index: rule.index, type: "pull_request", action },
 			target: buildPrTarget(pr),
 		};

@@ -7,6 +7,7 @@
 
 import { existsSync } from "node:fs";
 import { delimiter } from "node:path";
+import { MINTED_TOKEN_VARS } from "./forges.mjs";
 
 export function configError(message) {
 	const error = new Error(message);
@@ -71,13 +72,15 @@ function commaList(raw) {
 		.filter((s) => s.length > 0);
 }
 
-// PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs
-// sets GITHUB_TOKEN and GH_TOKEN from the per-job mint; forwarding either from the host would
-// silently swap which credential every job spends, so this fails loud here rather than per-job.
-// Every variable name env-allowlist.mjs assigns from a per-job mint. Forwarding one from the host would
-// override that mint with a broader, longer-lived operator credential -- silently, and in the direction
-// that matters. The list grows with each forge; it is the reason it is a set rather than two names.
-const MINTED_TOKEN_VARS = new Set(["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "GL_TOKEN"]);
+// PI_FORWARD_ENV, with the token names the worker itself owns refused at boot. env-allowlist.mjs sets
+// them from the per-job mint; forwarding one from the host would silently swap which credential every job
+// spends, so this fails loud here rather than per-job.
+//
+// Derived from the forge table rather than written out, because this list and the mint that writes those
+// names have to agree and used to be two hand-maintained lists twenty lines apart in different files. A
+// forge added to the mint but missed here is not refused -- so an operator could forward a long-lived host
+// token under that name into every container of every forge, with nothing failing and nothing logged.
+// `forges.mjs` derives both from one row, and `env-allowlist.test.mjs` binds them.
 
 function forwardEnvList(raw) {
 	const names = commaList(raw);

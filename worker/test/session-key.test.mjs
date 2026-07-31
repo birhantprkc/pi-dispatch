@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { issueBranch } from "../src/branch.mjs";
 import { keyParts, sessionKeyFor } from "../src/session-key.mjs";
+import { FORGE_KINDS } from "../src/forges.mjs";
 
 const ghIssue = { kind: "github", repo: "o/r", target: { type: "issue", number: 7 } };
 const ghPr = { kind: "github", repo: "o/r", target: { type: "pull_request", number: 8 } };
@@ -87,4 +88,29 @@ test("the key is a hash, so an attacker-chosen ref never becomes a host path seg
 
 test("the branch half comes from branch.mjs, so the key and the envelope cannot drift", () => {
 	assert.deepEqual(keyParts(ghIssue), ["github", "o/r", issueBranch(7)]);
+});
+
+test("every forge the table knows resolves a session key -- none of them cold-starts forever", () => {
+	// keyParts enumerated `github || gitlab`. A forge missing from that list did not throw: it fell to the
+	// final `return null`, so every job on it resolved no key and cold-started on every run -- which looks
+	// exactly like a deployment that simply never armed run.resume. Keyed on isForgeKind now, and looped
+	// over the table so a forge added later fails HERE rather than resuming nothing in silence.
+	for (const kind of FORGE_KINDS) {
+		assert.deepEqual(
+			keyParts({ kind, repo: "o/r", target: { type: "issue", number: 7 } }),
+			[kind, "o/r", issueBranch(7)],
+			`${kind}: an issue-triggered job must key on the branch its own envelope names`,
+		);
+	}
+});
+
+test("two forges never share a key for the same repo and number", () => {
+	const keys = FORGE_KINDS.map((kind) => sessionKeyFor({ kind, repo: "o/r", target: { type: "issue", number: 7 } }));
+	assert.equal(new Set(keys).size, keys.length, "the forge is in the key material, so one forge's transcript can never be handed to another's job");
+});
+
+test("a kind that is neither a forge nor local resolves no key, which is the safe direction", () => {
+	for (const kind of ["chained", "", undefined, null]) {
+		assert.equal(keyParts({ kind, repo: "o/r", target: { type: "issue", number: 7 } }), null, `kind ${JSON.stringify(kind)} has no trigger entry that could have armed run.resume`);
+	}
 });

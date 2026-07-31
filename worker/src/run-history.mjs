@@ -1,5 +1,6 @@
 import * as nodeFs from "node:fs";
 import { basename, join } from "node:path";
+import { isForgeKind, targetSeparator } from "./forges.mjs";
 
 /**
  * Durable per-run history.
@@ -179,17 +180,23 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 }
 
 /**
- * A stable, non-PII target label. GitHub jobs read `repo#number`; local jobs read `local:<basename>` --
+ * A stable, non-PII target label. Forge jobs read `repo<sep>number`; local jobs read `local:<basename>` --
  * basename only, so the full folder path (which on Windows carries the OS account name) never lands in
  * the record.
  *
  * `#` serves an issue AND a pull request on GitHub because they share one per-repo number sequence, so
  * `repo#7` names exactly one thing. That is a fact about GitHub, not about forges -- a forge with
  * separate sequences needs the target type in the label or `repo#7` is ambiguous.
+ *
+ * That paragraph was here, correct, and unimplemented: the function enumerated `github` and returned null
+ * for everything else, so every GitLab run since #42 recorded `target: null` while
+ * INT-RUN-HISTORY-FILE-CONTRACT documented `<project>!<iid>`. Keyed on `isForgeKind` now, with the
+ * separator from the table, so the notation a forge uses is the notation its records carry -- and a forge
+ * added later inherits a label rather than a null.
  */
 function targetFor(kind, data) {
-	if (kind === "github") return `${data.repo}#${data.target?.number}`;
 	if (kind === "local") return `local:${basename(data.folder ?? "")}`;
+	if (isForgeKind(kind)) return `${data.repo}${targetSeparator(kind, data.target?.type)}${data.target?.number}`;
 	return null;
 }
 

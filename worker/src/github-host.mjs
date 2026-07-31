@@ -145,9 +145,15 @@ export function makeGitHubHost({ octokitFor = (token) => new Octokit({ auth: tok
  */
 function splitRepo(ref) {
 	const repo = typeof ref === "object" && ref !== null ? ref.repo : ref;
-	const [owner, name] = String(repo ?? "").split("/");
-	if (!owner || !name) {
-		throw configError(`github-host: malformed repo: ${JSON.stringify(repo)} (expected "owner/name")`);
+	const segments = String(repo ?? "").split("/");
+	const [owner, name] = segments;
+	// EXACTLY two segments, not "at least two". The docstring above already describes what a longer path
+	// does to this split, and until now the code did not guard it: "org/project/repo" yields owner="org",
+	// name="project", both non-empty -- so it passes, and every call silently names a DIFFERENT repository
+	// than the job asked for. Azure DevOps is org/project/repo and GitLab is group/subgroup/project, so the
+	// wrong answer here is reachable by configuration, not only by a bug.
+	if (segments.length !== 2 || !owner || !name) {
+		throw configError(`github-host: malformed repo: ${JSON.stringify(repo)} (expected exactly "owner/name")`);
 	}
 	return [owner, name];
 }

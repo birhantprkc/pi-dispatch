@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+// Static, unlike env-allowlist itself below: forges.mjs imports nothing, so it is available even on a
+// box where pi-ai will not load and the rest of this file skips.
+import { FORGES, FORGE_KINDS } from "../src/forges.mjs";
 
 // env-allowlist imports @earendil-works/pi-ai (for findEnvKeys). That needs node >=22.19.0 and
 // installed deps, so it skips on a below-floor dev box and runs in CI, where
@@ -48,6 +51,7 @@ test("the container env is a CLOSED set: only the provider key, never the whole 
 		maxTurns: 20,
 		jobId: "abc",
 		githubToken: "ghs_scoped",
+		forgeKind: "github",
 		hostEnv: HOST,
 	});
 	assert.equal(env.ANTHROPIC_API_KEY, "sk-ant-real");
@@ -101,6 +105,7 @@ test("the minted token is mirrored into BOTH GITHUB_TOKEN and GH_TOKEN (gh prefe
 		maxTurns: 5,
 		jobId: "j",
 		githubToken: "ghs_scoped",
+		forgeKind: "github",
 		hostEnv: HOST,
 	});
 	assert.equal(env.GITHUB_TOKEN, "ghs_scoped");
@@ -114,6 +119,7 @@ test("a forwarded GH_TOKEN can never override the mint -- the token assignment s
 		maxTurns: 5,
 		jobId: "j",
 		githubToken: "minted-token",
+		forgeKind: "github",
 		hostEnv: { ...HOST, GH_TOKEN: "operator-token" },
 		forwardEnv: ["GH_TOKEN"],
 	});
@@ -241,7 +247,7 @@ test("a gitlab job's token lands in GITLAB_TOKEN/GL_TOKEN and NEVER in the githu
 		jobId: "j1",
 		githubToken: "glpat-secret",
 		forgeKind: "gitlab",
-		gitlabHost: "https://gl.internal",
+		forgeHosts: { gitlab: "https://gl.internal" },
 		hostEnv: { ANTHROPIC_API_KEY: "k" },
 	});
 	assert.equal(env.GITLAB_TOKEN, "glpat-secret");
@@ -299,4 +305,51 @@ test("PI_SESSION_FILE is emitted only when the job has a transcript, and never a
 		"and no -e reaches the argv at all",
 	);
 	assert.equal(buildContainerEnv({ ...args, sessionFile: "/session/current.jsonl" }).PI_SESSION_FILE, "/session/current.jsonl");
+});
+
+test("a job kind with no table entry refuses, rather than inheriting the github token names", { skip }, () => {
+	// This was an `if gitlab / else github`, and the `else` was the hazard: any kind the table did not name
+	// -- a forge wired up everywhere but here, a typo that survived validation -- got its credential
+	// exported as GITHUB_TOKEN and GH_TOKEN. That is a working credential handed to the wrong host, which
+	// is how a scoped token stops being scoped. Refusing costs a pre-spend config error; the alternative
+	// costs the token.
+	for (const forgeKind of ["azure", "forgejo", "", undefined, null]) {
+		assert.throws(
+			() =>
+				buildContainerEnv({
+					provider: "anthropic",
+					model: "m",
+					maxTurns: 5,
+					jobId: "j",
+					githubToken: "some-forge-token",
+					forgeKind,
+					hostEnv: HOST,
+				}),
+			(e) => e.piDispatchConfig === true,
+			`kind ${JSON.stringify(forgeKind)} must refuse rather than be handed GitHub's variable names`,
+		);
+	}
+});
+
+test("every forge in the table mints into its OWN names and no other forge's", { skip }, () => {
+	// A loop over the table rather than one case per forge, so a forge added to FORGES without a mint
+	// entry fails here instead of exporting its credential under whatever name the fallback picked.
+	const others = (kind) => FORGE_KINDS.filter((k) => k !== kind).flatMap((k) => FORGES[k].tokenVars);
+	for (const kind of FORGE_KINDS) {
+		const env = buildContainerEnv({
+			provider: "anthropic",
+			model: "m",
+			maxTurns: 5,
+			jobId: "j",
+			githubToken: "minted",
+			forgeKind: kind,
+			hostEnv: HOST,
+		});
+		for (const name of FORGES[kind].tokenVars) {
+			assert.equal(env[name], "minted", `${kind}: its CLI reads ${name}`);
+		}
+		for (const name of others(kind)) {
+			assert.equal(env[name], undefined, `${kind}: must not also export ${name} -- that is another forge's host`);
+		}
+	}
 });

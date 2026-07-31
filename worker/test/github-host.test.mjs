@@ -161,3 +161,28 @@ test("constructs a FRESH Octokit per call, each bound to that call's token (neve
 	assert.equal(octokitFor.constructions[0].token, "tokenA");
 	assert.equal(octokitFor.constructions[1].token, "tokenB");
 });
+
+test("a repo path with more than two segments refuses, instead of silently naming a different repository", async () => {
+	// The docstring on splitRepo has always described this, and the code did not guard it: "org/project/repo"
+	// destructures to owner="org", name="project" -- both non-empty, so the old check PASSED and every call
+	// went to the wrong repository. Azure DevOps is org/project/repo and GitLab is group/subgroup/project, so
+	// a longer path arrives by configuration, not only by a bug. Refusing is the only safe answer: a job that
+	// cannot say which repo it means must not pick one.
+	const host = makeGitHubHost({ octokitFor: fakeOctokitFor({}) });
+	for (const repo of ["org/project/repo", "a/b/c/d", "grp/sub/proj"]) {
+		await assert.rejects(
+			() => host.resolveDefaultBranchSha({ repo }, "t"),
+			(e) => e.piDispatchConfig === true,
+			`${repo} must refuse rather than resolve to its first two segments`,
+		);
+	}
+});
+
+test("exactly two non-empty segments is still the accepted shape", async () => {
+	const octokitFor = fakeOctokitFor({
+		"GET /repos/{owner}/{repo}": { default_branch: "main" },
+		"GET /repos/{owner}/{repo}/branches/{branch}": { commit: { sha: "s1" } },
+	});
+	const host = makeGitHubHost({ octokitFor });
+	assert.deepEqual(await host.resolveDefaultBranchSha({ repo: "o/r" }, "t"), { branch: "main", sha: "s1" });
+});
