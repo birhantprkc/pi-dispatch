@@ -58,6 +58,21 @@ jobs:
           fi
           echo "OK: pi pinned exactly"
 
+      - name: The image's pi-version LABEL matches the runner's pin
+        run: |
+          # The worker reads this label to decide whether a persisted transcript was written by the same
+          # pi (REQ-RESUMABLE-SESSION). If it drifts from the runner's actual pin the failure is silent
+          # in the worst direction: the label says the schema matches, the schema does not, and a resumed
+          # job hands pi tool-call arguments it no longer accepts. A stale label is worse than no label,
+          # because no label means "never resume" and a wrong one means "resume anyway".
+          pinned=$(node -p "require('./image/runner/package.json').dependencies['@earendil-works/pi-coding-agent']")
+          labelled=$(grep -oE 'ARG PI_VERSION=[0-9][^[:space:]]*' image/Dockerfile | cut -d= -f2)
+          if [ "$pinned" != "$labelled" ]; then
+            echo "::error::image/Dockerfile PI_VERSION=$labelled but image/runner/package.json pins $pinned"
+            exit 1
+          fi
+          echo "OK: image label and runner pin agree ($pinned)"
+
       - name: Base image is pinned by digest
         run: |
           # Same reasoning, different vendor. A floating base tag is the identical silent break.

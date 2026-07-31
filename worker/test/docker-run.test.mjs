@@ -112,3 +112,35 @@ test("ISOLATION_FLAGS is frozen intent -- the exact set the spec pins", () => {
 		"--shm-size=1g",
 	]);
 });
+
+test("the /session mount is per-job and writable, and the container learns nothing about the host layout", () => {
+	const args = buildDockerRunArgs({
+		image: "pi-job:latest",
+		env: {},
+		jobDir: "/tmp/jobs/job-abc",
+		workspace: "/tmp/jobs/job-abc/workspace",
+		sessionDir: "/tmp/jobs/job-abc/session",
+		name: "pi-job-1",
+	});
+	const mounts = args.filter((a, i) => args[i - 1] === "-v");
+	assert.deepEqual(
+		mounts.filter((m) => m.includes(":/session")),
+		["/tmp/jobs/job-abc/session:/session"],
+		"exactly one session mount, and writable -- pi appends to the transcript as the agent works",
+	);
+	// The mount is the capability. A whole-store mount would hand one job's agent every other branch's
+	// and every other repository's transcripts, which is not a weakening of container-per-job but its
+	// inversion -- and it is a one-word change, so it gets an assertion rather than a comment.
+	assert.equal(mounts.some((m) => m.endsWith(":/session:ro")), false);
+	assert.ok(mounts.every((m) => m.startsWith("/tmp/jobs/job-abc")), "every writable mount stays inside this job's own dir");
+	// Nothing key-derived crosses: the container path is a constant, so no repo, branch or host layout
+	// is legible from inside the job.
+	assert.equal(args.join(" ").includes("current.jsonl"), false);
+});
+
+test("a job with no session gets an argv byte-identical to one built before the feature existed", () => {
+	const common = { image: "pi-job:latest", env: {}, jobDir: "/j", workspace: "/w", name: "pi-job-1" };
+	assert.deepEqual(buildDockerRunArgs(common), buildDockerRunArgs({ ...common, sessionDir: undefined }));
+	assert.equal(buildDockerRunArgs(common).includes("/session"), false);
+	assert.equal(buildDockerRunArgs({ ...common, sessionDir: null }).join(" ").includes(":/session"), false);
+});

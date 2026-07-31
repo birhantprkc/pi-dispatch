@@ -93,7 +93,9 @@ Evidence convention as in `constitution.md`.
   // HOISTED: the ROOT session id must exist BEFORE the meter does. createAgentSession would otherwise
   // build its own SessionManager and the id would be readable only afterwards — too late to split
   // rootTotal from otherTotal, and an undefined root files every call as unattributed.
-  const sessionManager = SessionManager.inMemory("/workspace");
+  // CONDITIONAL since issue #48: in-memory when PI_SESSION_FILE is unset (the default, and every job
+  // before that change), a persisted manager when it is set (REQ-RESUMABLE-SESSION). See (l).
+  const { sessionManager } = openSessionManager({ sessionFile, cwd: "/workspace" });
   const rootSessionId  = sessionManager.getSessionId();
 
   // Declared BEFORE the meter so onBreach can close over it; assigned the moment the session exists.
@@ -382,6 +384,32 @@ Evidence convention as in `constitution.md`.
   `→ packages/ai/src/providers/anthropic.ts:12-14 → envApiKeyAuth("Anthropic API key", ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])`
   — the OAuth precedence is baked into the provider definition too, independently of `env-api-keys.ts`
 
+- **(l) Resume is not an option you pass, and four things about it fail quietly.** Verified against the
+  pinned `0.80.7` tarball and pi's own `docs/`, not recalled.
+  1. **There is no `resume`, `sessionId` or `continueSession` field** on `CreateAgentSessionOptions`. The
+     JSDoc example in `dist/core/sdk.d.ts` showing `continueSession: true` does not describe this version.
+     Handing `createAgentSession` a persisted `SessionManager` IS the mechanism, and pi's `docs/sdk.md`
+     documents exactly that form; it then restores `agent.state.messages` itself. pi's interactive
+     `/resume` is a **different** thing — `AgentSessionRuntime.switchSession`, which replaces the ACTIVE
+     session mid-process. The runner prompts once and exits, so there is no active session to replace.
+  2. **`SessionManager.open` THROWS on a non-empty file that does not parse** as a pi session, and the
+     agent owns that mount. Unhandled, that classifies as exit 1 = retryable, so four bad bytes would burn
+     every retry and repeat on every later job for the same key. The runner catches, quarantines and
+     degrades — and the catch is safe **only** because a pre-spend check has already proven the mount is
+     present and writable, so the sole remaining cause is content. It must never be widened to cover the
+     other two, or a dead mount becomes a fleet that is green on every job and has silently stopped
+     resuming.
+  3. **`model` must stay explicit.** `createAgentSession` restores the model from the session *only when
+     `options.model` is omitted*. The runner always passes it, so the pinned model wins — but omitting it
+     would make a stored transcript silently choose the model, and therefore the cost.
+  4. **`thinkingLevel` is NOT passed, and therefore IS restored from the transcript.** That is a live
+     behaviour change nobody asked for: a `thinking_level_change` entry crosses jobs and changes spend.
+     Named here rather than fixed, because changing it is a behaviour decision, not a bug fix.
+  Plus one documented-but-inert knob worth pinning: **`PI_CODING_AGENT_SESSION_DIR`** is documented by pi
+  (`docs/usage.md`, `docs/settings.md`) as the session-storage override and is **read by nothing in
+  `dist/`** — `getDefaultSessionDir(cwd, agentDir)` consults only its arguments. It is a CLI-layer
+  variable, so the session dir must be passed explicitly, and an operator who sets it gets silence.
+
 ## INT-RUNNER-EXIT-CODE-PROTOCOL
 
 **container → worker.**
@@ -536,6 +564,12 @@ Evidence convention as in `constitution.md`.
   is the writable checkout the agent is working in, and an agent that rewrites `AGENTS.md` mid-run has
   rewritten *its own* context — a merge-gated file it was already allowed to influence — not the
   instructions in `/job`.
+- **`/session` is deliberately NOT a `/job` input**, and the reason is the distinction this entry already
+  draws: `/job` is the **read-only, agent-untamperable** channel, read from the object store; `/session`
+  is **agent-written by design** — pi appends to the transcript as the agent works. Putting it under
+  `/job` would have required making part of that mount writable, which is the property `/job` exists to
+  have. Its own contract is `INT-SESSION-STORE-CONTRACT`, and the symlink paragraph above is the
+  precedent its `lstat` rule cites: the same attack, with the direction reversed.
 - **`/job/pi/extensions` is NOT written, and the seam is deliberate.** An earlier revision of this list
   carried it; the worker's materialiser only ever emits `pi/APPEND_SYSTEM.md` and
   `pi/skills/<name>/SKILL.md`, so the path documented a file that never existed. Repo extensions stay
@@ -650,6 +684,14 @@ Evidence convention as in `constitution.md`.
     statement that nothing in this repo enforces it.
   - Flags: `--pull=never --rm --init --cap-drop=ALL --security-opt no-new-privileges --memory=4g --cpus=2
     --pids-limit=512 --shm-size=1g`
+  - **Mounts**: `/job:ro`, `/workspace:rw`, `/outbox:rw` (local jobs only), `/opt/pi-global:ro` (when
+    configured), and `/session:rw` — the last only when a trigger armed `run.resume` and the worker
+    resolved a key (`INT-SESSION-STORE-CONTRACT`). `/session` is a **per-job** directory under the job's
+    own dir; the shared store is never bind-mounted into anything.
+  - **A conformance item, and it belongs on the "fails silently or late" list above**: an image must
+    declare its pi version as the `dev.pi-dispatch.pi-version` LABEL and its runner must honour
+    `PI_SESSION_FILE`. An image that declares no version never resumes, which is the safe direction; one
+    whose runner ignores the variable produces jobs that never resume and never say so, which is not.
   - User: non-root
   - **`--pull=never`.** `docker run` defaults to `--pull=missing`, which makes an unrecognised image name a
     **registry fetch**: a typo in the operator's image config would pull and execute a stranger's image under
@@ -942,6 +984,7 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
                "task": "<operator-authored prompt text — DATA, lands in /job/prompt.md>",
                "provider": "<optional passthrough>", "model": "<optional>", "maxTurns": <optional>,
                "github": <optional boolean>, "packages": <optional boolean>,
+               "resume": <optional boolean>,
                "image": "<optional: docker image ref; absent = PI_JOB_IMAGE>" } },
     { "on": { "type": "label", "any": [...], "all": [...], "none": [...] },
       "run": { "kind": "github", "flow": "<flow name>", "packages": <optional boolean>,
@@ -984,6 +1027,19 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
   non-boolean value is refused at load; with `GITHUB_AUTH_SOURCE=app` a `run.github` job refuses at mint
   time — an installation token is per-repo, and a local job has no repo to scope it to.
+- **`run.resume` (ALL FOUR trigger kinds, optional boolean) — an opt-IN, and the polarity is deliberate.**
+  Absent or `false` = today's behaviour: no transcript on disk, no `/session` mount, byte-identical argv.
+  `true` = this trigger's jobs continue the session the previous job for the same key produced
+  (`REQ-RESUMABLE-SESSION`, `INT-SESSION-STORE-CONTRACT`). The polarity is the **opposite** of
+  `run.packages` below, and the two flags gate different kinds of thing: staging a pi package is an
+  operator act already performed, so the set they staged is the set their jobs get and a trigger opts
+  *out*; persisting a transcript is a **disclosure** — the agent's full working history, tool output, file
+  contents and its own reasoning, written to host disk and replayed into a later job — and disclosures
+  default off. Non-boolean is refused at load, and here the damaging misreading runs the other way from
+  `run.packages`': a truthy `"false"` string reads to an operator as an opt-out and would arm the
+  disclosure instead. Carried on all four kinds rather than cron-only like `run.github`, for `run.image`'s
+  reason: continuing a conversation is a property of the FLOW. A cron job keys on its own scheduler id,
+  which is the one key in this feature chosen by nobody untrusted.
 - **`run.packages` (ALL FOUR trigger kinds, optional boolean) — an opt-OUT**: absent or `true` = the
   worker emits `PI_PACKAGES` with the container paths of the pi packages the operator staged into the
   global overlay (`INT-PI-PACKAGES-FILE-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`), so the flow gets
@@ -1218,7 +1274,10 @@ worker reads.
     "attempt":   <int>,
     "parentJobId": "<job id: same id-space as jobId>" | null,
     "chainDepth":  <int> | null,
-    "chainRefused": <int> | null }   // count of chain requests refused on this parent; 0 = none
+    "chainRefused": <int> | null,   // count of chain requests refused on this parent; 0 = none
+    "session": { "resumed": <bool>,                                                             // what pi ACTUALLY did
+                 "reason": "<fixed enum: resumed|absent|expired|too-large|unparseable|not-a-regular-file|pi-version-changed|locked|disabled>" | null,
+                 "bytes": <int> | null } | null }   // null when the job had no session at all
   ```
   Field order is the serialisation order (`JSON.stringify` emits insertion order). The filename uses the
   **sanitized** id (`:` → `_`, because `repeat:<sched>:<millis>` is NTFS-illegal); the record **body**
@@ -1268,7 +1327,16 @@ worker reads.
   compaction/summarisation calls that never surfaced as a root `turn_end`, so at identical real spend the
   counter fills faster than it used to. That is the correction the meter exists for, and `metered` is what
   lets a reader tell a corrected total from a legacy one.
-- **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `REQ-TOKEN-ACCOUNTING-AND-CAPS`
+  The `session` field is **additive and nullable** in exactly the way `tokens` and the chain fields are —
+  an explicit no-spread literal, `null` for every job that had no session. It merges the host's intent
+  with the container's report, because either alone lies: the host knows whether a key resolved and which
+  gate refused, and only the container knows what pi did with the file it was handed, so a host that
+  staged a transcript while the runner reports `resumed: false` is a real event (a corrupt file, a
+  degrade) that one number alone cannot distinguish from an ordinary cold start. **The key and the branch
+  name are deliberately ABSENT**: this record's PII-free-by-construction property rests on it holding no
+  attacker-chosen string, and a branch name is exactly that. A boolean, a fixed enum and an integer are
+  the same class as `turns` and `chainRefused`.
+- **Traces to**: `REQ-DURABLE-RUN-HISTORY`, `REQ-LOCAL-JOB-VISIBILITY`, `INT-RUNNER-EXIT-CODE-PROTOCOL`, `REQ-TOKEN-ACCOUNTING-AND-CAPS`, `REQ-RESUMABLE-SESSION`
 - **Acceptance**: Given a job reaching a terminal state, exactly one `.json` keyed by its sanitized job
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
   issue or comment body text (`target` is `repo#issue` / `local:<basename>` only); `turns` is `null` when
@@ -1317,6 +1385,65 @@ worker reads.
   exists to collect; given a symlink or an oversize `request-<n>.json`, when validated, then it is
   rejected; given a **retried** parent, when its outbox is re-collected, then the idempotent child id
   dedups and no second child is enqueued.
+
+## INT-SESSION-STORE-CONTRACT
+
+**worker <-> host store <-> container.**
+
+- **Contract**:
+  ```
+  <PI_SESSIONS_DIR>/<key>/current.jsonl   canonical transcript; mode 0700; NEVER bind-mounted
+  <PI_SESSIONS_DIR>/<key>/pi-version      the pi version that wrote it
+  <PI_SESSIONS_DIR>/<key>/lock            exclusive-create promotion lock; absent when free
+  <jobDir>/session/current.jsonl          this job's OWN copy; mounted /session:rw
+  PI_SESSION_FILE=/session/current.jsonl  emitted ONLY when the job has a transcript; never empty
+  ```
+  `key` is `sha256(kind \0 repo \0 ref)` truncated — a hash, not a path built from a branch.
+  `PI_SESSIONS_DIR` has **no default**; unset means the feature is unavailable.
+- **Read path**, host-side, fail-open at the first miss, every miss a named cold start: key resolves ->
+  canonical file exists -> **`lstat` says regular file, not a symlink** -> size <= `PI_SESSION_MAX_BYTES`
+  -> mtime within `PI_SESSIONS_TTL_DAYS` -> stamped `pi-version` matches the job image's label -> first
+  parsed line is a `{"type":"session"}` header -> copy into the per-job dir. A cold start stages a
+  **0-byte file** rather than nothing.
+- **Write path**, after a `completed` exit **only**: the same `lstat` and size checks on the container's
+  output, then an atomic rename under the per-key lock. A job that cannot take the lock discards rather
+  than clobbers. Everything else the agent left in `/session` is deleted unread with the job dir.
+- **Why**: This is the **second** agent-authored channel the host reads back, and `INT-OUTBOX-CONTRACT` is
+  the precedent for how such a channel gets described — validated on the way in, never trusted because of
+  where it came from.
+  **The canonical store is never mounted**, and three properties fall out of that one decision rather than
+  needing three mechanisms. `CONST-RETRY-INFRA-ONLY` survives, because a policy or infra exit discards the
+  container's writes and attempt 2 starts from exactly what attempt 1 did. `CONST-ISOLATION-CONTAINER-PER-JOB`'s
+  *"every one operator- or worker-supplied, none host-wide"* stays true verbatim, because `/session` is
+  per-job exactly as `/job` is. And a container can name its own copy and nothing else — the mount is the
+  capability, and the hash is not one.
+  **`lstat`, regular files only, is security rather than hygiene.** The agent owns `/session`, so a
+  symlink it plants resolves on the HOST when the worker reads it back; `stat` + `readFile` would hand the
+  next job on that key any worker-readable file. `INT-CONTAINER-JOB-INPUTS` documents this attack in the
+  other direction already, and the repo's own habit is the wrong one here: `makeLogReaper` uses `statSync`,
+  which follows.
+  **The 0-byte staging is what makes pi's own EEXIST race unreachable.** `setSessionFile` takes its
+  empty-file branch, writes a header at our exact path and marks the manager flushed, so `_persist` never
+  reaches `openSync(path, "wx")` — an exclusive create that would throw the moment two jobs shared a key.
+  The host needs no knowledge of pi's file format to get that, and a test pins the header landing, because
+  that branch is the one upstream change that would silently re-arm the race.
+  **The pi-version gate exists because a transcript outlives the pi that wrote it.** pi's own docs record
+  the consequence: an older session's stored tool-call arguments may no longer match the current tool
+  schema. The repair hook is an extension-author API and this project does not own pi's built-in schemas,
+  so the only available answer is to refuse the resume — which needs the version before the container
+  starts, hence an image LABEL read on the preflight's existing `docker image inspect`. An image that
+  declares none never resumes: `null` is the safe direction, never "assume it matches".
+  **Nothing key-derived crosses the boundary.** The container always sees the constant
+  `/session/current.jsonl`, so no repository name, no branch name and no host layout is legible from
+  inside a job.
+- **Traces to**: `REQ-RESUMABLE-SESSION`, `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-RETRY-INFRA-ONLY`,
+  `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-CONTAINER-JOB-INPUTS`, `INT-RUN-HISTORY-FILE-CONTRACT`, `OQ-014`
+- **Acceptance**: Given two jobs whose keys differ only in repository or only in branch, their `/session`
+  host paths differ and neither is `PI_SESSIONS_DIR` nor a directory under it that the other can name.
+  Given a symlink at either edge, it is refused and its target is never read. Given a non-completed exit,
+  the canonical file is byte-identical to before the run. Given a second writer holding the lock, the
+  loser leaves the canonical transcript untouched. Given an image whose pi version differs from the
+  stamped one, the job cold-starts.
 
 ## INT-CONFIG-OVERLAY-CONTRACT
 
@@ -1425,3 +1552,4 @@ worker reads.
 | 2026-07-15 | `INT-SDK-SESSION-OPTIONS` **materially corrected** before any code was written against it. The contract block was **not callable as published**: it passed `appendSystemPromptOverride` as a `createAgentSession` option (it is a `DefaultResourceLoader` option) and called `getModel` as a free function (it is a `ModelRuntime` method, and is not exported). Two further traps were found by reading source and are now recorded: `noContextFiles` is **off by default**, so `CONST-NO-CONTEXT-FILES-MANDATORY` fails **open by omission**; and `createAgentSession` **does not `reload()` a loader you pass it**, so the persona is silently empty — a second, previously-unrecorded path to this project's most-feared failure, created by the *interaction* of two constitutional constraints. The irony is the point: this block's own `Why` called it *"the only contract here that fails invisibly"*, and it was itself wrong in three ways for a month. This is the third time a doc-verified pi claim has been refuted by source — exactly what the evidence convention in `constitution.md` predicts. |
 | 2026-07-29 | Per-trigger job image (issue #41). **INT-TRIGGERS-FILE-CONTRACT**: an optional `run.image` on all four `run` shapes, with its own bullet mirroring `run.packages` — pure passthrough like `provider`/`model`/`maxTurns` (absent = `PI_JOB_IMAGE`, and resolved against **env only**, never the settings overlay), carried on all four kinds for `run.packages`' reason and not `run.github`'s (**a toolchain is a capability of the flow**, and a webhook trigger runs the same flows a cron trigger does), refused at load when not a non-empty string / when it carries whitespace / when it begins with `-`, its reference **grammar deliberately not validated** (docker's business; a regex would refuse malformed names while missing the far commoner well-formed-but-unbuilt one), and refused **pre-spend** when the tag is not on the host. The cron byte-match Acceptance admits `image` on the same terms as `github`/`packages` (absent stays absent, so an unflagged trigger's `data` is byte-identical), and the existing `PI_OFFLINE=1` env carve-out gains a **second dimension stated rather than discovered**: the env the worker *passes* is identical for every image, but the env *baked into* one is a fact about that image, so two triggers naming two images never had identical container environments. **INT-CONTAINER-RUNTIME-CONTRACT**: the real gap here — it **never named the image at all**, which was true-by-accident while there was one image this repo built. A new leading bullet makes it explicit that the contract is written against *an* image and is now the **conformance checklist** for any tag nameable in `run.image`, enumerating what the worker assumes and does not verify (non-root + writable `~/.pi/agent`, an entrypoint honouring `INT-RUNNER-EXIT-CODE-PROTOCOL`, the pinned pi version, the baked `PLAYWRIGHT_*` facts, root-owned agent-unwritable guardrails, fonts, and the **per-image** loader posture), with the note that **every one of them fails silently or late**. `--pull=never` added to the flag set with its own bullet: `docker run` defaults to `--pull=missing`, so an unknown name would be a **registry fetch** — the same make-it-unreachable move as `PI_OFFLINE=1`, one layer down. Acceptance extended to say the properties must hold for **every** nameable image, and that the assertions are ours for our tag and the operator's for theirs (`OQ-012`). **INT-SDK-SESSION-OPTIONS trap (g)** scoped: its `image/runner/package.json` claims describe an image built from **this repo's Dockerfile**; a foreign image's layout is simply not described — which costs nothing, because the trap's invariant is layout-independent by design (runtime mutation probe, `tryResolve` on both candidates). The *assertion* is what loses coverage, not the code. **INT-RUN-HISTORY-FILE-CONTRACT**: one enum token, `job-image-missing` — a policy outcome, not `container-never-started`, since the container was never attempted. |
 | 2026-07-29 | Issue #42 (GitLab triggers). Added **INT-GITLAB-PAYLOAD-SUBSET**, a SIBLING of `INT-WEBHOOK-PAYLOAD-SUBSET` rather than an extension of it — IDs are permanent addresses, and a GitLab payload is a different shape, not more of GitHub's. It names three fields with no GitHub counterpart and says why each exists: **`changes.labels`, where the DIFF is the trigger** (GitLab has no `labeled` action, so a label add arrives as `update` with a before/after pair — matching the CURRENT set, which is what the GitHub path does because there a `labeled` action already means "a label just moved", would re-fire on every later retitle, reassign or milestone change of an already-labelled issue, each one a paid run); **`noteable_type`**, which states issue-vs-merge-request where GitHub infers it from `issue.pull_request`, and getting it wrong mints a `pi/issue-<n>` branch for something that is already an MR — wrong work, no error, reads as success; and **`user.username`**, carried where GitHub's `sender.login` is deliberately dropped, because GitLab puts no access level in the payload and the member lookup needs an identity — personal data with exactly one consumer, which never reaches a log line, the job, or the run record. Also records `iid`-never-`id` and that the project rides as its numeric id, because a `group/subgroup/project` path does not merely break the `owner/name` split — it **passes** it, both halves non-empty, and the project silently becomes its own parent group. **INT-TRIGGERS-FILE-CONTRACT**: the diagonal becomes a **matrix** — the sentence "every webhook type ⟹ `run.kind:"github"`" was flatly false and is replaced — plus three new bullets: `run.kind` selects the forge while `on.type` stays shared (a label is a label anywhere); the **action vocabulary is per forge**, validated against the one the entry names, because a word from the wrong forge is not malformed and breaks nothing — it never matches an event, so the trigger loads clean and is silently dead, and refusing at load is what turns that into a message; and the positive-selector rule differs for a reason rather than by accident (a `labeled` github rule has only its predicate as the approval gate, while every gitlab trigger is additionally access-gated). The one-comment-trigger cap becomes **per forge**: it exists because the receiver holds one comment rule per forge and a second would be unreachable, so it caps ambiguity, not count. **INT-CONTAINER-RUNTIME-CONTRACT**: the minted token now goes under **its own forge's variable names and only those** (`GITHUB_TOKEN`/`GH_TOKEN`, or `GITLAB_TOKEN`/`GL_TOKEN`/`GITLAB_HOST`) — cross-forge export is refused by construction, because a GitLab credential exported as `GITHUB_TOKEN` is sent by `gh` to github.com on the agent's first invocation, which is exactly how a scoped token stops being scoped — and the `PI_FORWARD_ENV` refusal grows from a pair to a set of every minted name. **INT-RUN-HISTORY-FILE-CONTRACT**: `kind` gains `gitlab`, and the `target` grammar gains `<project>!<iid>`, GitLab's own notation, because issues and merge requests are separate per-project sequences and `repo#5` would name two different objects. **INT-CONTAINER-JOB-INPUTS** and **INT-OUTBOX-CONTRACT** are UNCHANGED and were checked: `/outbox` stays local-only, a gitlab job is driven by adversarial issue text exactly as a github one is, and it inherits `OQ-009` verbatim rather than opening a new question. |
+| 2026-07-31 | Issue #48. **NEW `INT-SESSION-STORE-CONTRACT`**: the second agent-authored channel the host reads back, described in `INT-OUTBOX-CONTRACT`'s shape. Canonical store never mounted, per-job copy, completed-only promotion, and both validation orders in full. Three clauses carry their own reasoning rather than a rule: **`lstat`, regular files only** is security not hygiene — the agent owns `/session`, so a symlink it plants resolves on the HOST, and the repo's own habit is wrong here since `makeLogReaper` uses `statSync`; the **0-byte staging** is what makes pi's `openSync(path,"wx")` EEXIST race unreachable rather than merely unlikely; and the **pi-version gate** exists because a transcript outlives the pi that wrote it and the repair hook is an extension-author API this project cannot reach. `INT-CONTAINER-RUNTIME-CONTRACT` **AMENDED ×3**: `/session:rw` joins the mount list (per-job, conditional), `PI_SESSION_FILE` joins the env list under the `PI_PACKAGES` omitted-when-absent rule, and the conformance checklist gains the pi-version LABEL — which belongs on that list precisely because both its failure modes are quiet. `INT-CONTAINER-JOB-INPUTS` **AMENDED**: says why `/session` is deliberately NOT a `/job` input — `/job` is the read-only agent-untamperable channel and `/session` is agent-written by design, so putting it there would have required making part of `/job` writable, which is the property `/job` exists to have. `INT-TRIGGERS-FILE-CONTRACT` **AMENDED ×2**: `run.resume` in the grammar and its own bullet, including why its polarity is the OPPOSITE of `run.packages` (staging is an act already performed; persisting is a disclosure) and why the damaging misreading runs the other way — a truthy `"false"` string reads as an opt-out and would arm it. `INT-RUN-HISTORY-FILE-CONTRACT` **AMENDED**: the additive nullable `session` object, and the explicit statement that the key and branch name are ABSENT BY DESIGN, since this record's PII-free-by-construction property rests on holding no attacker-chosen string. `INT-SDK-SESSION-OPTIONS` **AMENDED**: its *"`SessionManager.inMemory()` because the container is ephemeral"* sentence becomes conditional, and it gains the traps found by reading pi's own docs — `open` throws on a non-empty unparseable file, `model` must stay explicit or a transcript picks it, `thinkingLevel` is NOT passed and therefore IS restored from the transcript, and `PI_CODING_AGENT_SESSION_DIR` is documented by pi and read by nothing in `dist/`. `INT-WEBHOOK-PAYLOAD-SUBSET` **UNCHANGED, and the check matters**: the head ref is resolved from the forge API, never the payload, so its *"no `head.sha`/`head.ref` value is ever passed to a clone or fetch"* clause extends to session keys with nothing to weaken. `INT-OUTBOX-CONTRACT` **UNCHANGED, checked**: `/outbox` stays local-only; `/session` is a different channel with a different contract. |

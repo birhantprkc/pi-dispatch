@@ -377,10 +377,10 @@ test("readTriggers normalizes each on.type into its discriminated display record
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
   // Every entry omits `run.packages`, and packages is an OPT-OUT -- so all four normalize to `true`.
   assert.deepEqual(res.triggers, [
-    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: true, image: null },
-    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: true, image: null, forge: "github" },
-    { type: "comment", phrase: "@pi", flow: "fix", packages: true, image: null, forge: "github" },
-    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: true, image: null, forge: "github" },
+    { type: "cron", id: "nightly", pattern: "0 3 * * *", folder: "/srv/p", flow: "tidy", model: null, packages: true, image: null, resume: false },
+    { type: "label", any: ["pi:frontend"], all: [], none: ["wontfix"], flow: "frontend-fix", packages: true, image: null, resume: false, forge: "github" },
+    { type: "comment", phrase: "@pi", flow: "fix", packages: true, image: null, resume: false, forge: "github" },
+    { type: "pull_request", action: ["labeled"], any: ["pi:review"], all: [], none: [], flow: "review", packages: true, image: null, resume: false, forge: "github" },
   ]);
 });
 
@@ -445,7 +445,7 @@ test("readTriggers skips an entry that is not a usable { on, run } object (viewe
     }),
   };
   const res = readTriggers({ triggersPath: "/x/triggers.json", fs: fakeFs(files) });
-  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true, image: null, forge: "github" }]);
+  assert.deepEqual(res.triggers, [{ type: "label", any: ["pi:frontend"], all: [], none: [], flow: "frontend-fix", packages: true, image: null, resume: false, forge: "github" }]);
 });
 
 test("readTriggers returns { invalid } when there is no triggers array", () => {
@@ -983,4 +983,21 @@ test("normalizeTriggerForDisplay carries the forge a webhook trigger names, and 
   // and the panel echoing the operator's own value is how they see WHY.
   const odd = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "bitbucket", flow: "fix" } });
   assert.equal(odd.forge, "bitbucket");
+});
+
+test("normalizeTriggerForDisplay carries run.resume, and only an explicit true arms it", () => {
+  // The read model is where the polarity actually lives; the renderer only reads the boolean it is given.
+  // Without an ARMED fixture here, forcing this field to false would leave every test green while the
+  // panel silently stopped badging the disclosure -- which is exactly the shape of the [packages] defect.
+  const armed = normalizeTriggerForDisplay({ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", resume: true } });
+  assert.equal(armed.resume, true);
+
+  // Opt-IN, so anything short of an explicit true is a cold start -- the OPPOSITE of `packages`, which is
+  // an opt-out and therefore true unless explicitly declined. Both are asserted on one record so the two
+  // polarities cannot be "harmonised" by someone reading only one of them.
+  for (const value of [undefined, false, "true", 1, null]) {
+    const t = normalizeTriggerForDisplay({ on: { type: "label", any: ["x"] }, run: { kind: "github", flow: "f", resume: value } });
+    assert.equal(t.resume, false, `resume ${JSON.stringify(value)} must not arm the badge`);
+    assert.equal(t.packages, true, "packages is an opt-OUT and stays true here -- the polarities are deliberately opposite");
+  }
 });

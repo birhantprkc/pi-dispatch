@@ -14,6 +14,7 @@ import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
 import { containerPackagePaths, readStageManifest } from "./packages.mjs";
 import { cleanup, makeForgePreparers, makePrepareWorkspace } from "./prepare.mjs";
+import { makeSessionStore } from "./session-store.mjs";
 import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
 import { makeRunContainer } from "./run-container.mjs";
@@ -220,6 +221,23 @@ export async function startWorker(
 	// container env allowlist (no-broad-env-into-container).
 	const openJobLog = makeLogSinkFn({ logsDir: config.logsDir, enabled: config.captureJobLogs, log });
 	const writeRecord = makeRecordWriterFn({ logsDir: config.logsDir, log });
+	// REQ-RESUMABLE-SESSION. Wires into prepareWorkspace and the processor's completed branch only --
+	// never into the container env allowlist, exactly as logsDir does not. The one difference from logsDir
+	// is that a PER-JOB COPY of one key's transcript IS mounted; the store itself never is.
+	const sessionStore = makeSessionStore({
+		sessionsDir: config.sessionsDir,
+		ttlDays: config.sessionsTtlDays,
+		maxBytes: config.sessionMaxBytes,
+		log,
+	});
+	// Boot sweep, beside the log reaper and for the same reason it is beside rather than inside it: these
+	// files have a different retention policy and a different PII class. The gate that actually matters is
+	// the age check at OPEN -- a worker that never restarts would otherwise resume forever (OQ-007).
+	try {
+		sessionStore.reapSessions();
+	} catch (err) {
+		log("session_reaper_skipped", { reason: err?.message });
+	}
 	const recordRun = ({ job, result, error, startedAt, endedAt }) =>
 		writeRecord(buildRecord({ job, result, error, startedAt, endedAt }));
 
@@ -279,6 +297,9 @@ export async function startWorker(
 			// one who removes it would stay admitted. Contrast the staged-package manifest, correctly read once at
 			// boot because it is deploy-time state under a :ro mount; the host's image set is not.
 			imagePreflight: makeImagePreflightFn({ image: config.jobImage }),
+			// Completed-only, so a policy or infra exit leaves the canonical transcript byte-identical and a
+			// retry starts from what the first attempt did (CONST-RETRY-INFRA-ONLY).
+			promoteSession: sessionStore.promoteSession,
 			runContainer: makeRunContainerFn({
 				image: config.jobImage,
 				hostEnv: env,
@@ -297,6 +318,10 @@ export async function startWorker(
 				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
 				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
 				findPreviousRun: makeFindPreviousRun({ logsDir: config.logsDir }),
+				// Which transcript, if any, a job continues (REQ-RESUMABLE-SESSION). Returns null for every
+				// job whose trigger did not arm run.resume, whose key does not resolve, or when
+				// PI_SESSIONS_DIR is unset -- and a null means no mount and nothing written.
+				resolveSession: sessionStore.resolveSession,
 			}),
 			cleanup,
 			comment: async (job, text) => {

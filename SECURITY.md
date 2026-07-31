@@ -225,6 +225,28 @@ Stated openly rather than discovered later:
   dirty-tree refusal (no force option); no spend-knob parameters on the tool; a per-hour rate limit; and
   the daily cap (`CONST-BUDGET-BEFORE-TOKENS`). Do not read it as money-safe or reversible — it is neither.
 
+- **A resumed session hands one job's transcript to the next job on the same key.** With
+  `"resume": true` on a trigger, the agent's full working history — tool output, file contents, its own
+  reasoning — is written to `PI_SESSIONS_DIR` and replayed into the next job for the same repository and
+  head branch. It is **off by default**; turning it on is consent to persist that material. The key is a
+  **branch name**, and branch names are chosen by anyone who can push to the base repository — so the
+  population that can be handed a transcript is your repository's push-access population, not the issue's
+  author. **A fork pull request never resumes anything**, which is what stops a stranger naming a branch
+  `pi/issue-7` and being handed issue 7's history. Two consequences worth stating because they are not
+  obvious. With unrestricted egress (above), a single later job on that key can exfiltrate the whole
+  accumulated history in one request, where before it could only exfiltrate its own view. And a review
+  comment now arrives into a conversation that already contains the previous author's text in the
+  assistant's own voice — an injection that failed the first time gets a second, better-placed attempt.
+  **Do not arm `run.resume` on a multi-tenant deployment** — one servicing repositories whose push access
+  you do not control. That is the same carve-out context discovery carries, for the same reason, and it is
+  doctrine rather than a mechanism: nothing in the harness can tell a multi-tenant deployment from a
+  single-tenant one. `OQ-014` ratifies the risk **only** for the case where you control, or trust, who can
+  push to the repositories you service.
+  Store transcripts on a disk you would put issue text on, mode `0700`, with the shortest
+  `PI_SESSIONS_TTL_DAYS` you can work with, and **check that `PI_SESSIONS_DIR` is outside any repository
+  you commit** — the shipped `.gitignore` covers the conventional layout and cannot cover a path it has
+  never seen.
+
 ## Operator responsibilities
 
 - **Protect your default branch.** Require a pull-request review, forbid force-pushes. This is not a
@@ -312,3 +334,19 @@ Stated openly rather than discovered later:
 - Review every PR. Automation opens them; it does not land them.
 - Point local-folder jobs only at folders you can restore.
 - Keep the pinned pi version current, and let the upgrade tests gate the bump.
+
+- **With sessions enabled, "the credential reaches jobs only as env values" stops being the whole story.**
+  An env value lives in container memory and dies with the container. A **session transcript is a file**,
+  and any command the agent ran that echoed its own authorization header put your token into it,
+  permanently, on your disk, where the next job on that key will read it. Under `GITHUB_AUTH_SOURCE=gh`
+  — the shipped default — that token is your entire `gh` login and it does not expire. **Prefer the App
+  path or a short-expiry fine-grained PAT before arming `run.resume`**, so the exposure is bounded by an
+  expiry rather than by whether an agent ever ran a verbose curl. On GitLab there is no stronger option to
+  prefer, so the same warning applies with no mitigation beyond rotating the token.
+- **`PI_SESSIONS_DIR` is a PII store, and it has no default.** Unset means the feature is unavailable and
+  a trigger that asked for it is refused before it costs anything — deliberately, so nobody ends up with
+  transcripts in a temp directory they never chose. Put it on the same disk you would put
+  `PI_CAPTURE_JOB_LOGS` output on, mode `0700`, outside every git repository, and set
+  `PI_SESSIONS_TTL_DAYS`. Retention here is not disk hygiene: a stale transcript is a **live input to a
+  future job**, so an old file is a correctness problem before it is a capacity problem.
+  `pi-dispatch doctor` reports the store and warns whenever a trigger arms the flag.

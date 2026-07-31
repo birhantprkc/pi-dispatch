@@ -37,6 +37,10 @@ export async function runJob(job, deps) {
 		// this job names is on this host (image-preflight.mjs). Default admits everything, so a wiring that
 		// omits it behaves exactly as before -- the container's own failure stays the backstop.
 		imagePreflight = async () => ({ ok: true }),
+		// (session, { piVersion }) => { promoted, reason, bytes }. Promotes this job's transcript back into
+		// the store, on a COMPLETED exit only. Never throws. The default is a no-op so a wiring that omits
+		// it behaves exactly as before -- no store, no promotion, no session in the record.
+		promoteSession = () => null,
 		// (job) => scoped short-lived token. Takes the JOB, not the repo: which forge mints -- and therefore
 		// which credential the container gets -- is a property of `job.kind`, and only the wiring knows the
 		// map. Called for forge-backed jobs and for local jobs opted in via `github: true`; unflagged local
@@ -78,6 +82,11 @@ export async function runJob(job, deps) {
 		// burning a cap slot. Jobs run with --pull=never (docker-run.mjs), so an absent image is never
 		// fetched -- this refusal IS the whole diagnosis, not a race with a background pull.
 		const img = await imagePreflight(job);
+		// The image's declared pi version, read on the inspect the preflight already ran. Needed BEFORE the
+		// container starts, because a transcript written by a different pi may hold tool-call arguments the
+		// current schema no longer accepts -- so the resume has to be refused, not repaired mid-run. Null
+		// when the image declares none, which downstream means "never resume": the safe direction.
+		const piVersion = img.piVersion ?? null;
 		if (img.missing) {
 			await comment(job, `Refused: the job image "${img.missing}" is not present on the worker host. Not run.`);
 			log("refused_image_missing", { image: img.missing });
@@ -117,7 +126,7 @@ export async function runJob(job, deps) {
 			}
 		}
 
-		prepared = await prepareWorkspace(job, token); // resolves SHA, clones, materialises .pi/, writes prompt
+		prepared = await prepareWorkspace(job, token, { piVersion }); // resolves SHA, clones, materialises .pi/, writes prompt
 
 		// A determinate prepare refusal (e.g. sha-gone: the default branch advanced past the resolved
 		// tip) is POLICY -- return before reserveBudget so it burns no cap slot and is never retried.
@@ -162,7 +171,7 @@ export async function runJob(job, deps) {
 			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, tokens: null, budgetReserved: true }; // return => not retried
 		}
 
-		const { code, aborted, turns, tokens } = await runContainer({ job, token, prepared });
+		const { code, aborted, turns, tokens, session } = await runContainer({ job, token, prepared });
 		log("container_exit", { exitCode: code, aborted });
 
 		// Record token spend post-run (the check-AFTER half of the lagging token cap). The container ran,
@@ -182,7 +191,7 @@ export async function runJob(job, deps) {
 		// not the code -- an unbidden 137 (kernel OOM) carries `aborted: false`, falls to the switch, and
 		// stays infra-retryable.
 		// exitCode/turns/tokens carry the container's own exit, turn count, and usage totals; budgetReserved true post-reserve.
-		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, tokens, budgetReserved: true };
+		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, tokens, session: mergeSession(prepared, session), budgetReserved: true };
 
 		switch (code) {
 			case EXIT_COMPLETED: {
@@ -192,12 +201,29 @@ export async function runJob(job, deps) {
 				// over-budget, infra): an InfraRetry job is retried, so chaining there would double-enqueue.
 				// collectChain never throws; chainEnqueued/chainRefused are additive telemetry only.
 				const chain = await collectChain({ job, prepared });
-				return { outcome: "completed", exitCode: code, turns, tokens, budgetReserved: true, chainEnqueued: chain.enqueued, chainRefused: chain.refused };
+				// COMPLETED-ONLY PROMOTION, and the exclusivity is the point rather than an optimisation.
+				// A policy or infra exit leaves the canonical transcript byte-identical to what it was
+				// before this run, so a retry starts from exactly what the first attempt did -- promote on
+				// every exit and "retry" quietly stops meaning re-run and starts meaning continue
+				// (CONST-RETRY-INFRA-ONLY). Same completed-only rule INT-OUTBOX-CONTRACT already uses, and
+				// it sits beside the chain collection for the same reason: both must happen before the
+				// `finally` deletes jobDir. Never throws.
+				const promoted = prepared.session ? promoteSession(prepared.session, { piVersion }) : null;
+				return {
+					outcome: "completed",
+					exitCode: code,
+					turns,
+					tokens,
+					session: mergeSession(prepared, session, promoted),
+					budgetReserved: true,
+					chainEnqueued: chain.enqueued,
+					chainRefused: chain.refused,
+				};
 			}
 			case EXIT_POLICY:
-				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, budgetReserved: true };
+				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, session: mergeSession(prepared, session), budgetReserved: true };
 			case EXIT_INFRA:
-				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens });
+				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
 			case 125: // `docker run` itself failed (unusable image reference, bad flag)
 			case 126: // the entrypoint exists but is not executable
 			case 127: // the entrypoint was not found
@@ -208,9 +234,9 @@ export async function runJob(job, deps) {
 				// image) into a pre-spend policy refusal; a 125 that survives it is a race (the image was
 				// removed between the inspect and the run) or a docker-side fault we did not foresee --
 				// genuinely infra, and now with a retry that costs nothing.
-				throw new InfraRetry(`docker could not start the container, exit ${code}`, { reason: "container-never-started", exitCode: code, turns, tokens });
+				throw new InfraRetry(`docker could not start the container, exit ${code}`, { reason: "container-never-started", exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
 			default:
-				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens });
+				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
 		}
 	} catch (e) {
 		// A spawn fault (docker daemon down / binary missing) reserved a slot but never started a
@@ -231,6 +257,34 @@ export async function runJob(job, deps) {
 }
 
 /** Thrown for the retryable (infra) class only. The BullMQ processor lets this propagate to retry. */
+/**
+ * The one `session` object the run record carries, from the host's intent and the container's report
+ * (INT-RUN-HISTORY-FILE-CONTRACT).
+ *
+ * Both halves matter and neither is sufficient. The host knows whether a key resolved and which gate
+ * refused; only the container knows what pi actually did with the file it was handed. A host that staged
+ * a transcript while the runner reports `resumed: false` is a real event -- a corrupt file, a degrade --
+ * and with one number alone it is indistinguishable from an ordinary cold start.
+ *
+ * The runner's verdict WINS on `resumed`, because it is the one that observed the outcome. The host's
+ * reason is kept when the runner has none to give (a container that died before its exit line).
+ *
+ * PII-free by construction: a boolean, a fixed enum, an integer. The key and the branch name are
+ * deliberately absent -- this record holds no attacker-chosen string, and a branch name is one.
+ */
+function mergeSession(prepared, fromRunner, promoted = null) {
+	const host = prepared?.session;
+	if (!host && !fromRunner) return null;
+	return {
+		resumed: fromRunner ? fromRunner.resumed : false,
+		// A promotion that was refused is the more useful reason to surface: "locked" or
+		// "not-a-regular-file" says why the NEXT run will cold-start, which is the thing an operator
+		// chasing "it never resumes" needs. It only ever replaces a reason on the completed path.
+		reason: (promoted && !promoted.promoted ? promoted.reason : null) ?? fromRunner?.reason ?? host?.reason ?? null,
+		bytes: promoted?.bytes ?? host?.bytes ?? null,
+	};
+}
+
 export class InfraRetry extends Error {
 	constructor(message, { cause, reason, exitCode, turns, tokens, budgetReserved } = {}) {
 		super(message, cause ? { cause } : undefined);

@@ -26,13 +26,16 @@ export function makePrepareWorkspace({
 	jobsDir,
 	forgeFor,
 	findPreviousRun = () => null,
+	// REQ-RESUMABLE-SESSION. The default returns null, so an unwired dispatcher -- tests, a bare
+	// construction -- prepares exactly what it always did: no /session mount, nothing on disk.
+	resolveSession = () => null,
 	prepareLocal = prepareLocalWorkspace,
 	// Keyed by `job.kind`, so a new forge is one entry rather than a new `if`. A kind with no entry falls
 	// through to the throw below, which is what makes an unrouted job loud instead of a silent no-op.
 	preparers = { github: prepareGithubWorkspace },
 }) {
 	mkdirSync(jobsDir, { recursive: true });
-	return async function prepareWorkspace(job, token, { queueJobId } = {}) {
+	return async function prepareWorkspace(job, token, { queueJobId, piVersion = null } = {}) {
 		const jobDir = mkdtempSync(join(jobsDir, "job-"));
 		if (job.kind === "local") {
 			// Harness text above, operator DATA below: the fixed pointer line names /job/event.json so a
@@ -49,7 +52,16 @@ export function makePrepareWorkspace({
 		const prepare = preparers[job.kind];
 		if (prepare) {
 			const host = forgeFor?.(job)?.host;
-			return await prepare(job, token, { jobDir, resolveDefaultBranchSha: host?.resolveDefaultBranchSha });
+			return await prepare(job, token, {
+				jobDir,
+				resolveDefaultBranchSha: host?.resolveDefaultBranchSha,
+				// The head ref a pull/merge-request job keys on comes from the FORGE API, never the webhook
+				// payload: an issue_comment on a PR carries no head at all, and a payload-supplied head repo
+				// is attacker-controlled data that must not decide which transcript a job is handed.
+				resolvePullRequestHead: host?.resolvePullRequestHead,
+				resolveSession,
+				piVersion,
+			});
 		}
 		throw new Error(`unknown job kind: ${job.kind}`);
 	};

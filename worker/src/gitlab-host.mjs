@@ -129,7 +129,23 @@ export function makeGitLabHost({ apiUrl = "https://gitlab.com", fetchFn = fetch 
 		}
 	}
 
-	return { resolveDefaultBranchSha, isDefaultBranchProtected, postStatusComment };
+	/**
+	 * The source branch of a merge request, and whether it lives in this project (REQ-RESUMABLE-SESSION).
+	 *
+	 * GitLab's own fork test is project-id equality -- `source_project_id` vs `target_project_id` -- which
+	 * is stronger than comparing paths, since a path can be renamed and an id cannot. So the fork gate is
+	 * answered here, in the forge's own terms, and reported back as the base repo's name when the source
+	 * IS this project. That keeps session-key.mjs forge-blind: it compares two strings and never has to
+	 * learn what a project id means.
+	 */
+	async function resolvePullRequestHead(job, token) {
+		const id = projectId(job);
+		const mr = await get(`/projects/${id}/merge_requests/${encodeURIComponent(job?.target?.number)}`, token);
+		const sameProject = mr?.source_project_id != null && mr.source_project_id === mr.target_project_id;
+		return { headRef: mr?.source_branch, headRepo: sameProject ? job?.repo : null };
+	}
+
+	return { resolveDefaultBranchSha, isDefaultBranchProtected, postStatusComment, resolvePullRequestHead };
 }
 
 /**

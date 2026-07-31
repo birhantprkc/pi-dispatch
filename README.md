@@ -111,6 +111,14 @@ a rebuild — and it works the same in a per-trigger image, because a mount is a
 **cannot** deliver is a **toolchain** (apt packages, a language runtime, system libraries); that is what
 `run.image` and [`docs/job-image.md`](docs/job-image.md) are for.
 
+**Continuing a conversation instead of starting one.** A follow-up job on a pull request is a cold start
+by default: the agent re-explores the repo and re-derives what it decided an hour ago before it can act on
+a two-line comment. `"resume": true` on a trigger makes its jobs continue the session that opened the pull
+request instead. Off by default, on any trigger type, both forges — and it persists the agent's full
+working history to disk, which is a real disclosure rather than a free win. Read
+[`docs/sessions.md`](docs/sessions.md) before enabling it; it says who can be handed a transcript and what
+it costs.
+
 ```bash
 pi-dispatch import-pi          # stage a credential-free copy of ~/.pi/agent into ./pi-global
 # then set PI_GLOBAL_PI_DIR=/abs/path/to/pi-global in .env, and:

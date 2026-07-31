@@ -17,6 +17,18 @@
  */
 export const CONTAINER_GLOBAL_PI_DIR = "/opt/pi-global";
 
+/**
+ * The session mount and the file inside it, exported together and used by both the argv builder here and
+ * the env builder in env-allowlist.mjs. Two literals in two modules is how a mount and the variable
+ * naming a path inside it drift apart with both suites green -- the runner would then look for a
+ * transcript at a path nothing mounted, find none, and cold-start every job without saying so.
+ *
+ * Nothing key-derived crosses the boundary: the container always sees the same constant path, so no
+ * repository name, no branch name and no host layout is legible from inside a job.
+ */
+export const CONTAINER_SESSION_DIR = "/session";
+export const CONTAINER_SESSION_FILE = `${CONTAINER_SESSION_DIR}/current.jsonl`;
+
 /** The fixed isolation flags. Not configurable -- these ARE the boundary. */
 export const ISOLATION_FLAGS = [
 	// The image must ALREADY be on this host. `docker run` defaults to --pull=missing, so an unknown name is
@@ -45,6 +57,8 @@ export const ISOLATION_FLAGS = [
  * @param jobDir     host path to the /job inputs dir (contains prompt.md and pi/); mounted /job:ro
  * @param workspace  host path to the fresh clone / local folder (mounted /workspace:rw)
  * @param outboxDir  host path to the /outbox chain-request dir (local jobs only); mounted /outbox:rw
+ * @param sessionDir host path to this job's OWN copy of its session transcript (REQ-RESUMABLE-SESSION);
+ *                   mounted /session:rw. Per-job, like jobDir -- never the shared store.
  * @param globalPiDir host path to the operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY); mounted /opt/pi-global:ro
  * @param name       container name (for `docker stop` at the timeout)
  * @param memory     e.g. "4g"; cpus e.g. "2"
@@ -56,6 +70,7 @@ export function buildDockerRunArgs({
 	jobDir,
 	workspace,
 	outboxDir,
+	sessionDir,
 	globalPiDir,
 	name,
 	memory = "4g",
@@ -84,6 +99,15 @@ export function buildDockerRunArgs({
 	// (DES-WORKER-ON-HOST). github jobs pass no outboxDir, so the request channel does not exist for
 	// them -- an untrusted issue author cannot chain (INT-OUTBOX-CONTRACT).
 	if (outboxDir) args.push("-v", `${outboxDir}:/outbox`);
+
+	// This job's OWN copy of its session transcript (REQ-RESUMABLE-SESSION, INT-SESSION-STORE-CONTRACT).
+	// Writable, because pi appends to it as the agent works -- and per-job, exactly like jobDir, which is
+	// the whole reason CONST-ISOLATION-CONTAINER-PER-JOB's "none host-wide" clause still reads true. The
+	// shared store under PI_SESSIONS_DIR is NEVER bind-mounted: one job here would otherwise be able to
+	// read and rewrite every other branch's and every other repository's transcripts, which is not a
+	// weakening of that constraint but its inversion. Absent unless the trigger armed run.resume AND a key
+	// resolved, so an unarmed job's argv is byte-identical to one built before this feature existed.
+	if (sessionDir) args.push("-v", `${sessionDir}:${CONTAINER_SESSION_DIR}`);
 
 	// The operator's global pi overlay (REQ-GLOBAL-PI-OVERLAY): custom models, global skills, a global
 	// persona, layered UNDER each repo's own .pi/. Read-only -- it is operator-authored deploy-time config,

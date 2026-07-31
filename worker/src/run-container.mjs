@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { buildDockerRunArgs } from "./docker-run.mjs";
+import { buildDockerRunArgs, CONTAINER_SESSION_FILE } from "./docker-run.mjs";
 import { buildContainerEnv } from "./env-allowlist.mjs";
 import { resolveJobImage } from "./image-preflight.mjs";
 import { InfraRetry } from "./processor.mjs";
@@ -29,7 +29,7 @@ export function makeRunContainer({
 	image, // the DEPLOYMENT default (PI_JOB_IMAGE); a trigger's own run.image overrides it per job
 	hostEnv = process.env,
 	onOutput = (c) => process.stdout.write(c),
-	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null }) }),
+	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null, session: null }) }),
 	spawnFn = spawn,
 	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
 	allowGlobalExtensions = true, // REQ-GLOBAL-PI-OVERLAY: the staged overlay's extensions load unless PI_GLOBAL_ALLOW_EXTENSIONS=0
@@ -41,7 +41,7 @@ export function makeRunContainer({
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
 	return async function runContainer({ job, token, prepared, name, signal }) {
-		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null }; // killed before it could start
+		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null, session: null }; // killed before it could start
 
 		// Closed env allowlist: only the provider key + the declared PI_* vars. Throws (config) if
 		// the provider is unconfigured -- the processor turns that into a pre-spend refusal.
@@ -65,6 +65,10 @@ export function makeRunContainer({
 			// hand-edited string "false" never becomes job data this comparison could misread as an opt-out.
 			packagePaths: job.packages === false ? [] : packagePaths,
 			forwardEnv, // extra host var names to forward (e.g. a custom provider's key)
+			// REQ-RESUMABLE-SESSION: the fixed container path, emitted only when this job HAS a transcript.
+			// The constant is imported rather than re-typed so the mount below and this variable name one
+			// path -- two literals is how they drift with both suites green.
+			sessionFile: prepared.session ? CONTAINER_SESSION_FILE : undefined,
 			authFromPi, // source the provider key from pi's auth.json when the env has none
 		});
 
@@ -78,6 +82,9 @@ export function makeRunContainer({
 			jobDir: prepared.jobDir,
 			workspace: prepared.workspace,
 			outboxDir: prepared.outboxDir, // undefined for github jobs -> docker-run's guard skips the /outbox mount
+			// The job's OWN copy, under jobDir -- never the shared store. Undefined when the trigger did not
+			// arm run.resume or no key resolved, and docker-run's guard then skips the mount entirely.
+			sessionDir: prepared.session?.hostDir,
 			globalPiDir, // undefined/null -> docker-run's guard skips the /opt/pi-global mount
 			name,
 		});
@@ -109,13 +116,15 @@ export function makeRunContainer({
 				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns/tokens fall back to null.
 				let turns = null;
 				let tokens = null;
+				let session = null;
 				try {
-					({ turns, tokens } = await sink.close());
+					({ turns, tokens, session } = await sink.close());
 				} catch {
 					turns = null;
 					tokens = null;
+					session = null;
 				}
-				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens } : { code: code ?? 1, aborted: false, turns, tokens });
+				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens, session } : { code: code ?? 1, aborted: false, turns, tokens, session });
 			});
 		});
 	};

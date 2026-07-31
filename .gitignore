@@ -16,6 +16,18 @@ plans/
 logs/
 jobs/
 
+# Persisted agent session transcripts (PI_SESSIONS_DIR, REQ-RESUMABLE-SESSION). Strictly MORE
+# PII-bearing than logs/: a transcript holds the issue text, the file contents the agent read, its
+# tool output and its own reasoning -- and unlike the raw job log it has to exist for resume to work
+# at all. The default is no default: PI_SESSIONS_DIR is unset until an operator picks a path, so these
+# two patterns catch the conventional layout (a sessions/ dir here) and the exact filename the store
+# writes. A bare *.jsonl was considered and rejected: it would also silently swallow a future test
+# fixture, and a pattern that makes `git add` do nothing is its own trap. An operator who puts
+# PI_SESSIONS_DIR somewhere else inside a repo is covered by `pi-dispatch doctor`, which warns with the
+# path. Never commit either.
+sessions/
+current.jsonl
+
 # Node
 node_modules/
 dist/

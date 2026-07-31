@@ -74,6 +74,40 @@ export function parseExitTurns(text) {
  * classification (INT-RUNNER-EXIT-CODE-PROTOCOL). A malformed or non-object `tokens` (or one missing a
  * numeric `total`) is `null`, never a partial that could poison the daily token counter.
  */
+/**
+ * The runner's `session` object off the exit line: `{ resumed: <bool>, reason: "<enum>" }` or null when
+ * the container died before emitting one (REQ-RESUMABLE-SESSION).
+ *
+ * A sibling of parseExitTokens rather than a widening of it, and it reports what pi ACTUALLY did. The
+ * host records its own intent separately, and the pair is the point: a host that staged a transcript
+ * while the container reports `resumed: false` is a real event -- a corrupt file, a degrade -- and
+ * without both numbers it is indistinguishable from an ordinary cold start. A feature that fails open
+ * must still say that it did.
+ *
+ * PII-free by construction: a boolean and a fixed enum. No key, no branch name, no path.
+ */
+export function parseExitSession(text) {
+	if (typeof text !== "string") return null;
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i].trim();
+		if (line === "") continue;
+		let parsed;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue; // docker/agent noise or a truncated final line
+		}
+		if (parsed?.event !== "exit") continue;
+		const sess = parsed?.session;
+		if (sess && typeof sess === "object" && !Array.isArray(sess) && typeof sess.resumed === "boolean") {
+			return { resumed: sess.resumed, reason: typeof sess.reason === "string" ? sess.reason : null };
+		}
+		return null;
+	}
+	return null;
+}
+
 export function parseExitTokens(text) {
 	if (typeof text !== "string") return null;
 	const lines = text.split("\n");
@@ -136,6 +170,11 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 		parentJobId: data.parentJobId ?? null,
 		chainDepth: data.chainDepth ?? null,
 		chainRefused: source.chainRefused ?? null,
+		// Session telemetry (INT-RUN-HISTORY-FILE-CONTRACT): additive, nullable, an explicit literal, no
+		// spread. `{ resumed, reason, bytes }` -- a boolean, a fixed enum and an integer. THE KEY AND THE
+		// BRANCH NAME ARE DELIBERATELY ABSENT: this record's PII-free-by-construction property rests on it
+		// holding no attacker-chosen string, and a branch name is exactly that.
+		session: source.session ?? null,
 	};
 }
 
@@ -209,6 +248,7 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 			// Capture turns and tokens from the tail first, so they survive even if the flush errors or times out.
 			const turns = parseExitTurns(tail);
 			const tokens = parseExitTokens(tail);
+			const session = parseExitSession(tail);
 			try {
 				if (stream !== null) {
 					const s = stream;
@@ -232,7 +272,7 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 			} catch (err) {
 				log("log_sink_error", { jobId, reason: err?.message });
 			}
-			return { turns, tokens };
+			return { turns, tokens, session };
 		}
 
 		return { write, close };

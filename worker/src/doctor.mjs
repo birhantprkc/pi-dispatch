@@ -83,7 +83,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 	// image checks just below, and `optingOut`/`requiring` colour the staged-packages lines further down.
 	// `optingOut` counts the only value that withholds the staged set; `requiring` counts an explicit
 	// run.packages: true, which arms nothing any more but is still an operator statement of intent.
-	const { requiring, optingOut, images, forges } = readTriggerFacts(env, fileExists);
+	const { requiring, optingOut, resuming, images, forges } = readTriggerFacts(env, fileExists);
 
 	// Only meaningful if docker itself responds; otherwise the image check is noise on top of a down daemon.
 	const imageCode = dockerCode === 0 ? await runCmd(spawn, "docker", ["image", "inspect", jobImage]) : null;
@@ -378,6 +378,35 @@ export async function runDoctor(env = process.env, deps = {}) {
 		});
 	}
 
+	// REQ-RESUMABLE-SESSION. Only reported when a trigger actually asked for it: a deployment that does
+	// not use resume should not be told about a directory it has no reason to create.
+	if (resuming > 0) {
+		const sessionsDir = env.PI_SESSIONS_DIR;
+		if (!sessionsDir) {
+			checks.push({
+				ok: false,
+				label: `${resuming} trigger(s) set run.resume but PI_SESSIONS_DIR is unset`,
+				fix: "set PI_SESSIONS_DIR to a private directory (mode 0700, OUTSIDE any git repo) -- these jobs refuse pre-spend until you do, deliberately, rather than running unpersisted and looking like they worked",
+			});
+		} else {
+			const exists = fileExists(sessionsDir);
+			checks.push({
+				ok: exists,
+				label: `Session store ${exists ? "exists" : "does not exist"} (${sessionsDir})`,
+				fix: `create it: mkdir -p ${sessionsDir} && chmod 700 ${sessionsDir}`,
+			});
+			// Not a failure -- a warning, because it is a disclosure the operator may have accepted
+			// knowingly. A transcript holds tool output, file contents and the agent's own reasoning, which
+			// is strictly more than logs/<jobId>.log holds, and that one is opt-in for this reason.
+			checks.push({
+				ok: true,
+				warn: true,
+				label: `${resuming} trigger(s) persist agent transcripts to ${sessionsDir} -- PII-bearing, host-only, never committed`,
+				fix: "confirm it is outside every git repo and on a disk you would put issue text on; PI_SESSIONS_TTL_DAYS bounds how long a transcript stays resumable",
+			});
+		}
+	}
+
 	let failed = false;
 	for (const c of checks) {
 		out(`${c.ok ? "✓" : c.warn ? "⚠" : "✗"} ${c.label}\n`);
@@ -419,13 +448,14 @@ function nodeCheck(version) {
  * own findings under a second copy of a diagnosis the operator already gets.
  */
 function readTriggerFacts(env, fileExists) {
-	const none = { requiring: 0, optingOut: 0, images: [], forges: [] };
+	const none = { requiring: 0, optingOut: 0, resuming: 0, images: [], forges: [] };
 	try {
 		const path = env.PI_TRIGGERS_FILE; // config.mjs's own default is null -- unset means no triggers at all
 		if (!path || !fileExists(path)) return none;
 		const triggers = parseTriggers(readFileSync(path, "utf8"), path);
 		return {
 			requiring: triggers.filter((t) => t.run.packages === true).length,
+			resuming: triggers.filter((t) => t.run.resume === true).length,
 			optingOut: triggers.filter((t) => t.run.packages === false).length,
 			images: [...new Set(triggers.map((t) => t.run.image).filter((i) => typeof i === "string"))].sort(),
 			// The forges this file actually needs credentials for. Read from the triggers rather than from

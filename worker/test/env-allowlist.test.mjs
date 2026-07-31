@@ -279,3 +279,24 @@ test("a local run.github job still gets the github names -- the opt-in names git
 	assert.equal(env.GH_TOKEN, "ghs_x");
 	assert.equal("GITLAB_TOKEN" in env, false);
 });
+
+test("PI_SESSION_FILE is emitted only when the job has a transcript, and never as an empty string", { skip }, async () => {
+	const args = { provider: "anthropic", model: "m", maxTurns: 10, jobId: "j", hostEnv: HOST };
+
+	// Absent means pi's ephemeral in-memory session -- every job before this feature, and every job whose
+	// trigger did not arm run.resume. The variable is omitted entirely rather than emitted empty, for
+	// PI_PACKAGES' reason: an empty value is a third state the two sides of the mount need not agree on,
+	// and the one reading a container must not have to infer which was meant.
+	// `undefined`, not "" -- buildDockerRunArgs skips undefined/null and would pass an empty string
+	// through as `-e PI_SESSION_FILE=`. Same shape as PI_MAX_TOKENS and PI_PACKAGES.
+	for (const sessionFile of [undefined, null, ""]) {
+		assert.equal(buildContainerEnv({ ...args, sessionFile }).PI_SESSION_FILE, undefined, `sessionFile ${JSON.stringify(sessionFile)} must not become a value`);
+	}
+	const { buildDockerRunArgs } = await import("../src/docker-run.mjs");
+	assert.equal(
+		buildDockerRunArgs({ image: "i", name: "n", workspace: "/w", env: buildContainerEnv({ ...args, sessionFile: null }) }).includes("PI_SESSION_FILE="),
+		false,
+		"and no -e reaches the argv at all",
+	);
+	assert.equal(buildContainerEnv({ ...args, sessionFile: "/session/current.jsonl" }).PI_SESSION_FILE, "/session/current.jsonl");
+});

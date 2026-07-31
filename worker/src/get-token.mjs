@@ -44,6 +44,9 @@ import { InfraRetry } from "./processor.mjs";
  * unresolvable identity throws before returning, so a misconfigured worker refuses to boot.
  */
 export async function makeGitHubAuth(cfg, deps = {}) {
+	// The explicit, named opt-out for the gh-source resume refusal below (PI_SESSIONS_ALLOW_GH_SOURCE).
+	// Read once at construction, and strictly `=== true` so a hand-set string cannot arm it.
+	const allowGhResume = cfg?.allowGhResume === true;
 	const {
 		Octokit = RealOctokit,
 		createAppAuth = realCreateAppAuth,
@@ -69,7 +72,10 @@ export async function makeGitHubAuth(cfg, deps = {}) {
 		// Resolve identity from a token minted once here; each job mints its own below.
 		const octokit = new Octokit({ auth: await ghToken() });
 		const selfId = await resolveSelfId({ source: "gh", octokit });
-		const mintToken = async () => ghToken();
+		const mintToken = async (job) => {
+			assertResumeAllowedOnGhSource(job, allowGhResume);
+			return ghToken();
+		};
 		return { mintToken, selfId, source };
 	}
 
@@ -188,4 +194,33 @@ function classifyAppMintError(error) {
 	// No HTTP status -> network-level fault. Retry per INT-RUNNER-EXIT-CODE-PROTOCOL.
 	const detail = error?.code ? `${error.code}: ` : "";
 	return new InfraRetry(`app token mint: network fault: ${detail}${error?.message ?? "unknown"}`);
+}
+
+/**
+ * Refuse to mint the `gh` source's credential for a job that will persist its transcript
+ * (REQ-RESUMABLE-SESSION x CONST-TOKEN-SCOPED-PER-JOB). Pure and total so the decision is testable
+ * offline -- the gh path itself shells out to a real `gh`, and a security gate that needs a live CLI to
+ * exercise is a gate nobody re-tests.
+ *
+ * Every property CONST-TOKEN-SCOPED-PER-JOB relies on assumes the credential is an ENV VALUE: it lives in
+ * container memory and dies with the container, which is what makes `short-lived` do real work. A
+ * persisted transcript is a FILE, and any command the agent ran that echoed its own authorization header
+ * wrote the token into it -- on host disk, replayed into the next job on that key, for as long as
+ * PI_SESSIONS_TTL_DAYS allows. This source is the operator's whole `gh` login: full-scope and
+ * NON-EXPIRING, so the one bound that would have contained that exposure is absent exactly where the
+ * exposure is most durable. The app and fine-grained-pat paths both carry an expiry.
+ *
+ * REFUSED rather than warned, and the asymmetry is the whole argument: a warning is read once at setup,
+ * the disclosure is permanent and silent, and nothing downstream ever notices. The escape hatch is
+ * explicit and named, following PI_GLOBAL_ALLOW_EXTENSIONS -- an operator who has read this can still take
+ * the trade, but has to say so rather than miss a line in SECURITY.md.
+ *
+ * Refused at MINT time, the same shape and moment as the app-source refusal above, so it costs no budget
+ * slot and no clone.
+ */
+export function assertResumeAllowedOnGhSource(job, allowGhResume) {
+	if (job?.resume !== true || allowGhResume === true) return;
+	throw configError(
+		"GITHUB_AUTH_SOURCE=gh is a full-scope, non-expiring credential, and run.resume writes the agent's transcript to disk -- any command that echoed an auth header would persist it. Use GITHUB_AUTH_SOURCE=app or a short-expiry fine-grained PAT, drop run.resume from this trigger, or set PI_SESSIONS_ALLOW_GH_SOURCE=1 to accept the trade explicitly (docs/sessions.md, SECURITY.md)",
+	);
 }

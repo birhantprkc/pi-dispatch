@@ -82,6 +82,9 @@ test("a valid cron trigger normalizes to the scheduler shape; omitted provider/m
 		// and JSON serialization still drops it, so the upserted schedule stays byte-identical to today's.
 		packages: undefined,
 		image: undefined,
+		// Same present-and-undefined shape, for the same reason. An unflagged schedule stays byte-identical
+		// to today's once serialized, so a cron trigger that never asked to resume writes nothing to disk.
+		resume: undefined,
 		// The cron-only field carried into the local /job/event.json (INT-CONTAINER-JOB-INPUTS).
 		trigger: { id: "nightly-tidy", pattern: "0 3 * * *" },
 	});

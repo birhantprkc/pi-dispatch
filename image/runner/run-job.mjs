@@ -4,10 +4,9 @@ import {
 	createAgentSession,
 	getAgentDir,
 	ModelRegistry,
-	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { assertPackagePathsExist, enforceOfflineMode, parseRunnerEnv } from "./src/config.mjs";
+import { assertPackagePathsExist, assertSessionMountReady, enforceOfflineMode, parseRunnerEnv } from "./src/config.mjs";
 import { buildLoadedResourceLoader, GLOBAL_PI_DIR, JOB_PI_DIR, WORKSPACE } from "./src/loader.mjs";
 import {
 	captureTerminal,
@@ -17,6 +16,7 @@ import {
 	EXIT_INFRA,
 } from "./src/outcome.mjs";
 import { countPackageResources, findShadowedSkills, owningRoot } from "./src/packages.mjs";
+import { openSessionManager } from "./src/session.mjs";
 import { attachTokenBudget } from "./src/token-budget.mjs";
 import { attachTurnBudget } from "./src/turn-budget.mjs";
 // NOTE: usage-meter.mjs reaches pi-ai's module-level api-provider registry through a RUNTIME-probed
@@ -55,6 +55,10 @@ async function main() {
 	// tools the flow was written for, and report success for work it could not have done.
 	// INT-CONTAINER-JOB-INPUTS.
 	assertPackagePathsExist(cfg.packages);
+	// Same reason, same moment, same exit code: the host ALWAYS stages the session file when a trigger
+	// armed run.resume -- as a 0-byte file even on a cold start -- so an absent one means the /session
+	// bind mount did not land, not that there is nothing to resume. INT-SESSION-STORE-CONTRACT.
+	assertSessionMountReady(cfg.sessionFile);
 	// Offline is a property of the RUNNER, not of whoever started it. Set before the loader is built,
 	// because the loader is what resolves package sources: with offline off, an unresolved source is a
 	// live `npm install` at agent runtime, from inside the job, against a network the job's own input
@@ -154,7 +158,9 @@ async function main() {
 	// build its own SessionManager and the id would only be readable afterwards -- too late, because
 	// createUsageMeter must know which session is the root to split rootTotal from otherTotal, and an
 	// undefined root would file every call as unattributed and hide the fanout the meter exists to see.
-	const sessionManager = SessionManager.inMemory(WORKSPACE);
+	// Persisted when the trigger armed run.resume and the host resolved a key, in-memory otherwise --
+	// and openSessionManager is TOTAL, so the hoist below holds on every path including a degraded one.
+	const { sessionManager, resumed: sessionResumed, reason: sessionReason } = openSessionManager({ sessionFile: cfg.sessionFile, cwd: WORKSPACE, log });
 	const rootSessionId = sessionManager.getSessionId();
 
 	// Declared before the meter so onBreach can close over it; assigned the moment the session exists.
@@ -250,7 +256,11 @@ async function main() {
 	// `metered: true` on the process-wide snapshot is what tells the daily token counter that this
 	// total includes every in-process session, not just the root's turns.
 	const tokens = usageMeter.ok ? meter.snapshot() : { ...pickTotals(tokenBudget.state), metered: false };
-	log("exit", { ...outcome, turns: budget.state.turns, tokens });
+	// `session` reports what pi ACTUALLY did, not what the host intended. The host records its own
+	// intent separately, and the pair is what makes a degrade visible: a host that resolved a key while
+	// the container reports resumed:false is a real event, and without both numbers it is indist-
+	// inguishable from an ordinary cold start. A feature that fails open must still say that it did.
+	log("exit", { ...outcome, turns: budget.state.turns, tokens, session: { resumed: sessionResumed, reason: sessionReason } });
 	return outcome.code;
 }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { makeGitHubAuth } from "../src/get-token.mjs";
+import { assertResumeAllowedOnGhSource, makeGitHubAuth } from "../src/get-token.mjs";
 
 /**
  * All collaborators are injected. Fakes are hand-rolled (no mocking library), matching the
@@ -265,4 +265,27 @@ test("missing source is a config error", async () => {
 		() => makeGitHubAuth({}, {}),
 		(e) => e.piDispatchConfig === true,
 	);
+});
+
+test("the gh source refuses to mint for a run.resume job, and the escape hatch is explicit", () => {
+	// CONST-TOKEN-SCOPED-PER-JOB assumes the credential is an ENV VALUE that dies with the container. A
+	// transcript is a FILE: any command that echoed an auth header persists the token to host disk, replayed
+	// into the next job on that key. This source is the operator's whole gh login -- full-scope and
+	// NON-EXPIRING -- so the one bound that would contain that is absent exactly where it lasts longest.
+	assert.throws(
+		() => assertResumeAllowedOnGhSource({ kind: "github", repo: "o/r", resume: true }, false),
+		(e) => e.piDispatchConfig === true && /non-expiring/.test(e.message),
+		"refused at MINT time, so it costs no budget slot and no clone -- the app-source refusal's shape",
+	);
+
+	// This must NOT become a general gh-source refusal: only an armed job is affected.
+	for (const job of [{ kind: "github", repo: "o/r" }, { kind: "github", repo: "o/r", resume: false }, { kind: "local" }, undefined, null]) {
+		assert.doesNotThrow(() => assertResumeAllowedOnGhSource(job, false), `job ${JSON.stringify(job)} is unarmed and must mint exactly as before`);
+	}
+
+	// The escape hatch is strictly `=== true`, so a hand-set string cannot arm it by accident.
+	assert.doesNotThrow(() => assertResumeAllowedOnGhSource({ resume: true }, true), "PI_SESSIONS_ALLOW_GH_SOURCE=1 lets an operator take the trade explicitly");
+	for (const weak of ["1", "true", 1, {}]) {
+		assert.throws(() => assertResumeAllowedOnGhSource({ resume: true }, weak), (e) => e.piDispatchConfig === true, `allowGhResume ${JSON.stringify(weak)} must not open the hatch`);
+	}
 });

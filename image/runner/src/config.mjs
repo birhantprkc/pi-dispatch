@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { configError } from "./outcome.mjs";
 
 /**
@@ -28,6 +29,10 @@ export function parseRunnerEnv(env) {
 		// INT-CONTAINER-JOB-INPUTS: the staged pi packages this job loads, as ABSOLUTE container paths under
 		// /opt/pi-global/packages. Empty when nothing is staged, or when the trigger opted out.
 		packages: parsePackagePaths(env, "PI_PACKAGES"),
+		// INT-SESSION-STORE-CONTRACT: the persisted transcript this job runs on, as an ABSOLUTE container
+		// path under the per-job /session mount. `null` when the trigger did not arm run.resume, which is
+		// the default and is byte-identical to every job before the feature existed.
+		sessionFile: parseSessionFile(env, "PI_SESSION_FILE"),
 		retry: {
 			maxRetries: parsePositiveInt(env, "PI_RETRY_MAX", 2),
 			baseDelayMs: parsePositiveInt(env, "PI_RETRY_BASE_MS", 2000),
@@ -125,6 +130,69 @@ function parsePackagePaths(env, name) {
 		paths.push(entry);
 	}
 	return paths;
+}
+
+/**
+ * Parse the persisted-session path (INT-SESSION-STORE-CONTRACT).
+ *
+ * Unset or empty is `null` -- the trigger did not arm `run.resume`, which is the default. A present
+ * value must be an ABSOLUTE container path with no `..` segment and must not live under `/workspace`,
+ * or it is a configError (exit 2, not retried).
+ *
+ * The absolute-and-no-`..` rules are parsePackagePaths' rules for parsePackagePaths' reason: a relative
+ * path resolves against the cwd, which is `/workspace` -- the adversarial clone.
+ *
+ * The `/workspace` exclusion is the one that is specific to this variable, and it is a narrowing rather
+ * than a guard against anything we do today. The worker never points here; a worker-template bug that
+ * did would put the transcript inside the worktree the agent commits from, one `git add -A` away from a
+ * public pull request. Refusing the shape makes that unreachable rather than merely unlikely -- the same
+ * move `--pull=never` makes one layer up.
+ */
+function parseSessionFile(env, name) {
+	const raw = env[name];
+	if (raw === undefined || raw === "") return null;
+	if (!raw.startsWith("/")) {
+		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (want an absolute container path)`);
+	}
+	if (raw.split("/").includes("..")) {
+		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (must not contain a ".." segment)`);
+	}
+	if (raw === "/workspace" || raw.startsWith("/workspace/")) {
+		throw configError(`invalid ${name}: ${JSON.stringify(raw)} (must not be under /workspace -- the transcript would land in the worktree the agent commits from)`);
+	}
+	return raw;
+}
+
+/**
+ * Assert the /session mount actually landed, before any spend.
+ *
+ * Separate from parseRunnerEnv for assertPackagePathsExist's reason: parseRunnerEnv promises to be PURE.
+ * Collaborators are injected so this is unit-testable without a container.
+ *
+ * The file MUST exist, and that is not a quirk -- the host stages it, always, as a 0-byte file even on a
+ * cold start (INT-SESSION-STORE-CONTRACT). So absence does not mean "nothing to resume"; it means the
+ * bind mount did not land. Distinguishing those two is the entire value of the check, and it is the same
+ * inference assertPackagePathsExist makes about an unmounted package root.
+ *
+ * The writability probe earns its place separately. `createAgentSession` appends a thinking-level entry
+ * BEFORE the first prompt, so a uid mismatch on the mount surfaces as an EACCES thrown from inside pi --
+ * which classifyThrow files as exit 1, retryable, for a fault no retry can fix. Probing here turns that
+ * into a readable pre-spend exit 2 naming the path.
+ */
+export function assertSessionMountReady(sessionFile, { fileExists = existsSync, checkWritable = defaultCheckWritable } = {}) {
+	if (!sessionFile) return;
+	if (!fileExists(sessionFile)) {
+		throw configError(`session mount did not land: ${sessionFile} (PI_SESSION_FILE)`);
+	}
+	try {
+		checkWritable(dirname(sessionFile));
+	} catch (err) {
+		throw configError(`session mount is not writable: ${dirname(sessionFile)} (PI_SESSION_FILE): ${err?.message}`);
+	}
+}
+
+function defaultCheckWritable(dir) {
+	accessSync(dir, constants.W_OK);
 }
 
 /**

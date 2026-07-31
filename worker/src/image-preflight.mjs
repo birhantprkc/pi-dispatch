@@ -47,30 +47,81 @@ export function makeImagePreflight({ image, spawnFn = spawn }) {
 	return async function imagePreflight(job) {
 		const wanted = resolveJobImage(job, image);
 		// --format keeps docker from serialising the whole image manifest to a pipe we ignore.
-		if ((await runDocker(spawnFn, ["image", "inspect", "--format={{.Id}}", wanted])) === 0) {
-			return { ok: true, image: wanted };
+		//
+		// The pi version rides the SAME inspect rather than a second one, so the happy path still costs
+		// exactly one spawn. It is needed pre-spend because a transcript outlives the pi that wrote it and
+		// pi's own docs say what then breaks: an older session's stored tool-call arguments may not match
+		// the current schema (docs/extensions.md, on prepareArguments). We cannot fix that mid-run -- the
+		// repair hook is an extension-author API and we do not own pi's built-in tool schemas -- so the
+		// answer is to refuse the resume, which needs the version before the container starts.
+		const probe = await runDocker(spawnFn, ["image", "inspect", `--format={{.Id}}${FIELD_SEP}${PI_VERSION_TEMPLATE}`, wanted], true);
+		if (probe.code === 0) {
+			return { ok: true, image: wanted, piVersion: parsePiVersion(probe.stdout) };
 		}
-		if ((await runDocker(spawnFn, ["info"])) === 0) return { missing: wanted };
+		if ((await runDocker(spawnFn, ["info"])).code === 0) return { missing: wanted };
 		return { unavailable: wanted };
 	};
 }
 
 /**
- * A spawned docker command's exit code; `null` when it could not be launched at all. `null !== 0` falls
- * through to the same branch a non-zero exit does, which is what we want: no docker binary is no answer.
- * Same shape as doctor.mjs's own runCmd -- the two probes below are literally the two doctor already runs,
- * so doctor and the worker agree on what "present" means.
+ * Exported so the test cannot drift from the format string above. `|` because an image id is
+ * `sha256:<hex>` and a version is a version, so neither can contain one -- and because a literal control
+ * character in source is the kind of thing that survives a copy/paste and then does not.
  */
-function runDocker(spawnFn, args) {
+export const FIELD_SEP = "|";
+const PI_VERSION_LABEL = "dev.pi-dispatch.pi-version";
+const PI_VERSION_TEMPLATE = `{{index .Config.Labels "${PI_VERSION_LABEL}"}}`;
+
+/**
+ * The image's declared pi version, or `null` when it declares none.
+ *
+ * `null` is the SAFE answer and is treated as "never resume" downstream, not as "assume it matches". An
+ * operator-built image (OQ-012) that omits the label therefore runs every job cold rather than resuming
+ * into a pi whose tool schemas may have moved -- the conformance checklist in
+ * INT-CONTAINER-RUNTIME-CONTRACT gains this item, and like every other item on it, the failure it
+ * prevents is a silent one.
+ *
+ * Go's text/template renders a missing map key as the literal "<no value>", which is why that string is
+ * not a version rather than being compared as one.
+ */
+function parsePiVersion(stdout) {
+	const raw = String(stdout ?? "").trim();
+	const at = raw.indexOf(FIELD_SEP);
+	if (at === -1) return null;
+	const value = raw.slice(at + FIELD_SEP.length).trim();
+	if (value === "" || value === "<no value>") return null;
+	return value;
+}
+
+/**
+ * A spawned docker command's `{ code, stdout }`; `code` is `null` when it could not be launched at all.
+ * `null !== 0` falls through to the same branch a non-zero exit does, which is what we want: no docker
+ * binary is no answer. Same shape as doctor.mjs's own runCmd -- the two probes here are literally the two
+ * doctor already runs, so doctor and the worker agree on what "present" means.
+ *
+ * `capture` is opt-in so the `docker info` disambiguation keeps its `stdio: "ignore"`: it exists only to
+ * answer "did the daemon reply", and piping output we would not read is how a probe becomes a place a
+ * large payload can arrive.
+ */
+function runDocker(spawnFn, args, capture = false) {
 	return new Promise((resolve) => {
 		let child;
 		try {
-			child = spawnFn("docker", args, { stdio: "ignore" });
+			child = spawnFn("docker", args, { stdio: capture ? ["ignore", "pipe", "ignore"] : "ignore" });
 		} catch {
-			resolve(null);
+			resolve({ code: null, stdout: "" });
 			return;
 		}
-		child.on("error", () => resolve(null)); // ENOENT etc. -- docker is not on PATH
-		child.on("close", (code) => resolve(code));
+		let stdout = "";
+		if (capture && child.stdout) {
+			child.stdout.setEncoding?.("utf8");
+			// Bounded: a --format string we control produces one short line, and a runaway pipe on a money
+			// gate should not become the worker's memory problem.
+			child.stdout.on("data", (chunk) => {
+				if (stdout.length < 4096) stdout += chunk;
+			});
+		}
+		child.on("error", () => resolve({ code: null, stdout: "" })); // ENOENT etc. -- docker is not on PATH
+		child.on("close", (code) => resolve({ code, stdout }));
 	});
 }

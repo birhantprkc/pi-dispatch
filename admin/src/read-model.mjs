@@ -581,6 +581,10 @@ export function normalizeTriggerForDisplay(entry) {
   const flow = typeof run.flow === "string" ? run.flow : null;
   const packages = run.packages !== false;
   const image = typeof run.image === "string" && run.image.trim() !== "" ? run.image : null;
+  // An opt-IN, so `=== true` and not `!== false` -- the opposite test from `packages` directly above, and
+  // the difference is the whole point. Getting this polarity wrong is the defect 0.1.4 shipped a fix for:
+  // the riskiest triggers rendered with no badge and no warning, quiet exactly where the risk was.
+  const resume = run.resume === true;
   const forge = typeof run.kind === "string" && run.kind.trim() !== "" ? run.kind : null;
   switch (on.type) {
     case "cron":
@@ -595,11 +599,12 @@ export function normalizeTriggerForDisplay(entry) {
         model: typeof run.model === "string" ? run.model : null,
         packages,
         image,
+        resume,
       };
     case "label":
-      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image, forge };
+      return { type: "label", any: normalizeSelector(on.any), all: normalizeSelector(on.all), none: normalizeSelector(on.none), flow, packages, image, resume, forge };
     case "comment":
-      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image, forge };
+      return { type: "comment", phrase: typeof on.phrase === "string" ? on.phrase : null, flow, packages, image, resume, forge };
     case "pull_request":
       return {
         type: "pull_request",
@@ -610,6 +615,7 @@ export function normalizeTriggerForDisplay(entry) {
         flow,
         packages,
         image,
+        resume,
         forge,
       };
     default:
