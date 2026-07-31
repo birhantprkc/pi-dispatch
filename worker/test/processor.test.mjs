@@ -501,3 +501,58 @@ test("an unrecognised container exit still falls to the unknown-exit InfraRetry 
 	);
 	assert.equal(redis.decrCalls, 0, "an unknown exit is not assumed to have spent nothing");
 });
+
+test("a completed run promotes its transcript; a policy or infra exit does NOT", async () => {
+	// Completed-only promotion is what keeps CONST-RETRY-INFRA-ONLY true: promote on every exit and a
+	// retry inherits the failed attempt's residue, so attempt 2 stops being the same run as attempt 1.
+	const calls = [];
+	const prepared = { workspace: "/w", jobDir: "/j", session: { key: "abc", hostDir: "/j/session", resume: true, reason: "resumed", bytes: 42 } };
+	const { deps: base } = deps({
+		prepareWorkspace: async () => prepared,
+		promoteSession: (s, opts) => {
+			calls.push({ key: s.key, piVersion: opts.piVersion });
+			return { promoted: true, reason: "promoted", bytes: 99 };
+		},
+		imagePreflight: async () => ({ ok: true, piVersion: "0.80.7" }),
+	});
+
+	const ok = await runJob(ghJob, { ...base, runContainer: async () => ({ code: 0, aborted: false, turns: 3, tokens: null, session: { resumed: true, reason: "resumed" } }) });
+	assert.equal(ok.outcome, "completed");
+	assert.deepEqual(calls, [{ key: "abc", piVersion: "0.80.7" }], "the promotion must carry the image's pi version, or the next run cannot tell whether the schema moved");
+	assert.equal(ok.session.resumed, true);
+
+	calls.length = 0;
+	const policy = await runJob(ghJob, { ...base, runContainer: async () => ({ code: 2, aborted: false, turns: 1, tokens: null, session: { resumed: true, reason: "resumed" } }) });
+	assert.equal(policy.outcome, "policy");
+	assert.deepEqual(calls, [], "a policy exit must leave the canonical transcript byte-identical");
+
+	calls.length = 0;
+	await assert.rejects(() => runJob(ghJob, { ...base, runContainer: async () => ({ code: 1, aborted: false, turns: 1, tokens: null, session: null }) }));
+	assert.deepEqual(calls, [], "an infra exit must not promote either -- the retry would otherwise continue rather than re-run");
+});
+
+test("the record's session merges host intent with what the container actually did", async () => {
+	// Both halves, because either alone lies. A host that staged a transcript while the runner reports
+	// resumed:false is a degrade, and with one number it is indistinguishable from an ordinary cold start.
+	const prepared = { workspace: "/w", jobDir: "/j", session: { key: "k", hostDir: "/j/session", resume: true, reason: "resumed", bytes: 7 } };
+	const { deps: d } = deps({ prepareWorkspace: async () => prepared, imagePreflight: async () => ({ ok: true, piVersion: "0.80.7" }) });
+
+	const degraded = await runJob(ghJob, { ...d, runContainer: async () => ({ code: 0, aborted: false, turns: 1, tokens: null, session: { resumed: false, reason: "unparseable" } }) });
+	assert.equal(degraded.session.resumed, false, "the runner observed the outcome, so its verdict wins");
+	assert.equal(degraded.session.reason, "unparseable");
+
+	// PII-free by construction: a boolean, a fixed enum, an integer. No key, no branch, no path.
+	assert.deepEqual(Object.keys(degraded.session).sort(), ["bytes", "reason", "resumed"]);
+	// The KEY and the branch name must never reach the record: its PII-free-by-construction property
+	// rests on holding no attacker-chosen string, and a branch name is exactly that.
+	assert.equal("key" in degraded.session, false);
+	assert.equal(JSON.stringify(degraded.session).includes(prepared.session.key), false);
+});
+
+test("a job with no session records session:null and never calls the store", async () => {
+	let promoted = 0;
+	const { deps: d } = deps({ prepareWorkspace: async () => ({ workspace: "/w", jobDir: "/j" }), promoteSession: () => { promoted += 1; return null; } });
+	const r = await runJob(ghJob, { ...d, runContainer: async () => ({ code: 0, aborted: false, turns: 1, tokens: null, session: null }) });
+	assert.equal(r.session, null, "an unarmed job's record must look exactly as it did before this feature");
+	assert.equal(promoted, 0);
+});

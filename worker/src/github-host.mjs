@@ -107,7 +107,32 @@ export function makeGitHubHost({ octokitFor = (token) => new Octokit({ auth: tok
 		});
 	}
 
-	return { resolveDefaultBranchSha, isDefaultBranchProtected, postStatusComment };
+	/**
+	 * The head ref of a pull request, and the repository that ref lives in, from ONE fresh API call
+	 * (REQ-RESUMABLE-SESSION, INT-SESSION-STORE-CONTRACT).
+	 *
+	 * Fresh rather than off the payload, for two reasons that are not the same. An `issue_comment` on a
+	 * pull request -- which is how review feedback actually arrives -- carries no head at all, so the
+	 * payload route simply cannot answer for the case this feature exists to serve. And
+	 * `head.repo.full_name` in a webhook body is attacker-supplied: it decides the fork gate, so it must
+	 * come from the forge rather than from the sender.
+	 *
+	 * Both fields are returned together deliberately. A caller that got the ref without the repo could
+	 * key a session on a stranger's branch name; returning the pair makes the fork check available
+	 * wherever the ref is.
+	 */
+	async function resolvePullRequestHead(job, token) {
+		const [owner, name] = splitRepo(job);
+		const octokit = octokitFor(token);
+		const { data } = await octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+			owner,
+			repo: name,
+			pull_number: job?.target?.number,
+		});
+		return { headRef: data?.head?.ref, headRepo: data?.head?.repo?.full_name };
+	}
+
+	return { resolveDefaultBranchSha, isDefaultBranchProtected, postStatusComment, resolvePullRequestHead };
 }
 
 /**

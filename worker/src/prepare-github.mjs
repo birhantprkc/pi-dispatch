@@ -119,6 +119,10 @@ export async function prepareGithubWorkspace(
 		// git and this project, not GitHub, and a second copy is a second place to fix a clone bug.
 		remoteUrlFor = (j) => `https://github.com/${String(j.repo).split("/")[0]}/${String(j.repo).split("/")[1]}.git`,
 		buildPrompt = buildGithubPrompt,
+		// REQ-RESUMABLE-SESSION. Both default to inert, so an unwired caller prepares what it always did.
+		resolvePullRequestHead = null,
+		resolveSession = () => null,
+		piVersion = null,
 	} = {},
 ) {
 	// Fresh API resolve of the commit to clone at — never a webhook field, never the triggering branch.
@@ -163,10 +167,24 @@ export async function prepareGithubWorkspace(
 		// .pi/ is read by object id from the pinned SHA — symlink/submodule/exec safe, no working tree.
 		const materialised = await materialize({ gitDir: workspace, sha, destDir: jobDir });
 
+		// Which transcript, if any, this job continues. The head ref for a pull/merge-request target is
+		// resolved from the FORGE, not the payload -- an issue_comment on a PR carries no head at all, and
+		// head.repo.full_name in a webhook body is attacker-supplied. Both this lookup and the store itself
+		// degrade to a cold start rather than failing the job: a cache miss must never cost a run.
+		let resolved = {};
+		if (job.resume === true && job.target?.type === "pull_request" && resolvePullRequestHead) {
+			try {
+				resolved = (await resolvePullRequestHead(job, token)) ?? {};
+			} catch {
+				resolved = {};
+			}
+		}
+		const session = job.resume === true ? resolveSession(job, { jobDir, resolved, piVersion }) : null;
+
 		// Issue text is DATA: it enters the USER prompt (buildGithubPrompt), never a system prompt.
 		writeFile(
 			join(jobDir, "prompt.md"),
-			buildPrompt({ flow: job.flow, target: job.target, comment: job.trigger?.comment }),
+			buildPrompt({ flow: job.flow, target: job.target, comment: job.trigger?.comment, resumed: session?.resume === true }),
 			{ mode: 0o444 },
 		);
 
@@ -184,7 +202,7 @@ export async function prepareGithubWorkspace(
 		};
 		writeFile(join(jobDir, "event.json"), JSON.stringify(subset, null, 2), { mode: 0o444 });
 
-		return { workspace, jobDir, sha, materialised };
+		return { workspace, jobDir, sha, materialised, ...(session ? { session } : {}) };
 	} finally {
 		// The askpass machinery must not outlive the prepare, and must never be agent-reachable.
 		rmSync(askpass.dir, { recursive: true, force: true });

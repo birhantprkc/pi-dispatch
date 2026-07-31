@@ -29,7 +29,7 @@ export function makeRunContainer({
 	image, // the DEPLOYMENT default (PI_JOB_IMAGE); a trigger's own run.image overrides it per job
 	hostEnv = process.env,
 	onOutput = (c) => process.stdout.write(c),
-	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null }) }),
+	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null, session: null }) }),
 	spawnFn = spawn,
 	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
 	allowGlobalExtensions = true, // REQ-GLOBAL-PI-OVERLAY: the staged overlay's extensions load unless PI_GLOBAL_ALLOW_EXTENSIONS=0
@@ -41,7 +41,7 @@ export function makeRunContainer({
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
 	return async function runContainer({ job, token, prepared, name, signal }) {
-		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null }; // killed before it could start
+		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null, session: null }; // killed before it could start
 
 		// Closed env allowlist: only the provider key + the declared PI_* vars. Throws (config) if
 		// the provider is unconfigured -- the processor turns that into a pre-spend refusal.
@@ -116,13 +116,15 @@ export function makeRunContainer({
 				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns/tokens fall back to null.
 				let turns = null;
 				let tokens = null;
+				let session = null;
 				try {
-					({ turns, tokens } = await sink.close());
+					({ turns, tokens, session } = await sink.close());
 				} catch {
 					turns = null;
 					tokens = null;
+					session = null;
 				}
-				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens } : { code: code ?? 1, aborted: false, turns, tokens });
+				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens, session } : { code: code ?? 1, aborted: false, turns, tokens, session });
 			});
 		});
 	};
