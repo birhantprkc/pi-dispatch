@@ -24,7 +24,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { configError, loadGitHubAuth, positiveInt } from "@pi-dispatch/worker/config";
-import { parseTriggers } from "@pi-dispatch/worker/triggers";
+import { FORGE_KINDS, parseTriggers } from "@pi-dispatch/worker/triggers";
 
 const DEFAULT_TRIGGERS_PATH = "deploy/triggers.json";
 
@@ -124,7 +124,13 @@ function loadTriggers(env, readFile, fileExists) {
 
 	// Every forge gets a group whether or not the file names it, so the filter can read
 	// `cfg.triggers[kind].label` without a presence check and an unconfigured forge simply matches nothing.
-	const groups = { github: emptyGroup(), gitlab: emptyGroup() };
+	//
+	// Built FROM the forge table rather than written out, because the failure of forgetting one is unusually
+	// quiet: `groups[run.kind]` would be undefined, `group.label.push` would throw, and `reloadTriggers`
+	// below catches everything and KEEPS the previously-loaded triggers. The operator would see one
+	// "invalid" message and their old rules would go on firing indefinitely. A test asserts this object's
+	// keys are exactly FORGE_KINDS, so the two can never drift.
+	const groups = Object.fromEntries(FORGE_KINDS.map((kind) => [kind, emptyGroup()]));
 	const knownFlows = new Set();
 
 	for (const [index, { on, run }] of parsed.entries()) {

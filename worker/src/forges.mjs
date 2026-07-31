@@ -1,0 +1,99 @@
+/**
+ * THE FORGE TABLE -- the one place that says which forges exist and what differs between them.
+ *
+ * Before this file, "which forges are there" was written down in nine places: two enumerations in
+ * `triggers.mjs`, a `groups` literal in the receiver's config, a filter in `doctor.mjs`, two
+ * near-identical `enqueue*Job` bodies, two near-identical `*DeliveryJobId` bodies, and a token-variable
+ * set that had to agree with a mint written twenty lines away. Adding a forge meant finding all nine.
+ *
+ * Some of those fail LOUDLY when you miss one -- `triggers.mjs` refuses the file and names the bad kind,
+ * which is a fine way to find out. The reason this file exists is the ones that fail SILENTLY: a missing
+ * entry in the receiver's `groups` throws inside a reload that catches everything and keeps yesterday's
+ * rules; a missing token-variable name is simply not refused in `PI_FORWARD_ENV`. Deriving them all from
+ * one table does not make the table correct, but it makes "did I miss one" a question with a single
+ * answer, and lets a test assert that answer (`Object.keys(x)` against `FORGE_KINDS`).
+ *
+ * This module imports NOTHING, deliberately. It is the leaf of the worker's module graph -- `triggers.mjs`
+ * needs it and `triggers.mjs` is itself imported by the receiver's config, so anything this file reached
+ * for would be pulled into both services. That also means it cannot use `configError`: a lookup returns
+ * `undefined` for an unknown kind and the CALLER decides how loudly to fail, which is right anyway,
+ * because the answer differs (a trigger file refuses to load; a container env refuses to build).
+ */
+
+/**
+ * What differs per forge. Every field here is a fact this codebase branched on somewhere before it was
+ * a table.
+ *
+ * - `jobIdPrefix` keeps the forges' delivery-id spaces disjoint, so a delivery id that happened to
+ *   collide across two forges could never suppress the other's job (REQ-DEDUP-BY-DELIVERY-GUID).
+ * - `deliveryIdName` is only ever used in an error message, and is here so the message names the header
+ *   the operator has to go and look at rather than a generic "missing id".
+ * - `pullRequestSep` is the notation the forge itself uses for a pull/merge request, and it is load-bearing
+ *   twice: in the semantic dedup key and in the durable run record's `target`. GitHub numbers issues and
+ *   pull requests from ONE per-repo sequence, so `#` serves both and `repo#7` names exactly one thing.
+ *   GitLab numbers them separately, so `!` has to distinguish them or issue #5 and merge request !5
+ *   collide. That is a fact about each forge, not a style choice.
+ * - `tokenVars` are the variable names this forge's CLI reads its credential from. They are also the
+ *   names that must be refused in `PI_FORWARD_ENV`, and those two lists being derived from one entry is
+ *   the point: a forge added to the mint but not to the refusal set is a long-lived host token forwarded
+ *   into every container, and nothing would have said so.
+ * - `hostVar` is where a self-hosted instance URL lands in the container, or `null` for a forge that has
+ *   no instance concept in this codebase yet.
+ */
+export const FORGES = {
+	github: {
+		jobIdPrefix: "gh-",
+		deliveryIdName: "X-GitHub-Delivery GUID",
+		pullRequestSep: "#",
+		tokenVars: ["GITHUB_TOKEN", "GH_TOKEN"],
+		hostVar: null,
+	},
+	gitlab: {
+		jobIdPrefix: "gl-",
+		deliveryIdName: "webhook-id / Idempotency-Key",
+		pullRequestSep: "!",
+		tokenVars: ["GITLAB_TOKEN", "GL_TOKEN"],
+		hostVar: "GITLAB_HOST",
+	},
+};
+
+/**
+ * The forge kinds, in table order. An ARRAY rather than a Set because most consumers want to iterate it
+ * to build something keyed by kind, and the two that want membership say `in FORGES` instead.
+ */
+export const FORGE_KINDS = Object.freeze(Object.keys(FORGES));
+
+/** Every job kind a trigger may name: the forges, plus `local`, which has no forge at all. */
+export const RUN_KINDS = Object.freeze(["local", ...FORGE_KINDS]);
+
+/** Whether `kind` names a forge. `local` is not one, and that distinction IS the on x run matrix. */
+export function isForgeKind(kind) {
+	return typeof kind === "string" && Object.hasOwn(FORGES, kind);
+}
+
+/**
+ * The table row for `kind`, or `undefined`. Total, and never throws -- see the module header for why the
+ * caller owns the failure.
+ */
+export function forgeSpec(kind) {
+	return isForgeKind(kind) ? FORGES[kind] : undefined;
+}
+
+/**
+ * Every environment variable name any forge's mint can write. This is the set `PI_FORWARD_ENV` must
+ * refuse: a forwarded host value under one of these names would shadow the per-job scoped token with a
+ * long-lived one, which is the whole of CONST-TOKEN-SCOPED-PER-JOB defeated by a config line.
+ */
+export const MINTED_TOKEN_VARS = new Set(FORGE_KINDS.flatMap((kind) => FORGES[kind].tokenVars));
+
+/**
+ * The separator between a repo label and a target number, for this forge and this target type: the
+ * forge's own notation for a pull/merge request, and `#` for an issue everywhere.
+ *
+ * Unknown kinds get `#` rather than a throw, because both callers are LABEL builders -- a run record's
+ * `target` and a dedup key. Neither is a gate, and neither should be able to fail a job over punctuation.
+ */
+export function targetSeparator(kind, targetType) {
+	if (targetType !== "pull_request") return "#";
+	return forgeSpec(kind)?.pullRequestSep ?? "#";
+}

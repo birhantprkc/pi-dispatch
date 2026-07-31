@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadReceiverConfig, reloadTriggers } from "../src/config.mjs";
+import { FORGE_KINDS } from "@pi-dispatch/worker/triggers";
 
 // A valid unified triggers file, injected: exists and parses to one of each webhook type. The exhaustive
 // schema validation lives in the shared validator's own suite (worker/test/triggers.test.mjs); here we
@@ -53,6 +54,27 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 
 	// knownFlows spans every webhook flow (the comment `<phrase> <flow>` override allowlist).
 	assert.deepEqual([...c.triggers.knownFlows].sort(), ["frontend-fix", "review", "triage"]);
+});
+
+test("the trigger groups cover exactly FORGE_KINDS -- a forge with no group is a silently stale receiver", () => {
+	// The failure this guards is not a crash. `groups[run.kind]` on a missing forge is undefined,
+	// `group.label.push` throws, and `reloadTriggers` catches everything and KEEPS the previous triggers --
+	// so the operator edits their file, sees one "invalid" message, and yesterday's rules go on firing.
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers);
+	const grouped = Object.keys(c.triggers).filter((k) => k !== "knownFlows");
+	assert.deepEqual(grouped.sort(), [...FORGE_KINDS].sort(), "every forge the schema accepts must have a group here");
+});
+
+test("a trigger on EVERY forge the schema accepts groups without throwing", () => {
+	// Written as a loop over the table rather than one case per forge, so adding a forge to FORGE_KINDS and
+	// forgetting the group fails HERE, at load, instead of inside a live reload that swallows it.
+	const json = JSON.stringify({
+		triggers: FORGE_KINDS.map((kind) => ({ on: { type: "label", any: ["pi:go"] }, run: { kind, flow: "fix" } })),
+	});
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
+	for (const kind of FORGE_KINDS) {
+		assert.equal(c.triggers[kind].label.length, 1, `${kind}: its label rule must reach the filter, not vanish`);
+	}
 });
 
 test("no comment trigger in the file -> c.triggers.github.comment is null (comment path disabled)", () => {

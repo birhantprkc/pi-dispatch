@@ -24,11 +24,16 @@
  */
 
 import { configError } from "./config.mjs";
+import { FORGE_KINDS, RUN_KINDS, isForgeKind } from "./forges.mjs";
 
 const ON_TYPES = new Set(["cron", "label", "comment", "pull_request"]);
-const RUN_KINDS = new Set(["local", "github", "gitlab"]);
-// The kinds a webhook trigger may produce. `local` is deliberately absent -- that is the matrix.
-const FORGE_KINDS = new Set(["github", "gitlab"]);
+
+// `RUN_KINDS` and `FORGE_KINDS` come from the forge table (forges.mjs) rather than being written out
+// here. They differ by exactly `local`, and that difference IS the on x run matrix below: a webhook
+// trigger produces a forge job, a cron trigger produces a local one. Re-exported because the receiver's
+// config builds one trigger group per forge and a group it forgot would throw inside a reload that keeps
+// the previous rules -- so the two have to be derived from one list, and a test asserts they are.
+export { FORGE_KINDS };
 
 /**
  * The `pull_request` action vocabulary, per forge, in each forge's OWN words -- so an operator writes
@@ -90,8 +95,11 @@ function normalizeTrigger(entry, index, path, state) {
 	if (!ON_TYPES.has(on.type)) {
 		throw configError(`${at}: on.type must be one of cron|label|comment|pull_request (got ${JSON.stringify(on.type)}): ${path}`);
 	}
-	if (!RUN_KINDS.has(run.kind)) {
-		throw configError(`${at}: run.kind must be one of local|github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
+	// The legal-values half of every message below is JOINED from the table rather than typed out, so a
+	// forge added to the table can never be refused by a message that does not mention it -- which reads
+	// to an operator as a bug in their file rather than in ours.
+	if (!RUN_KINDS.includes(run.kind)) {
+		throw configError(`${at}: run.kind must be one of ${RUN_KINDS.join("|")} (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 
 	// The on x run matrix -- the trust boundary, fail-loud (mirrors the old schedules kind:github refusal).
@@ -101,8 +109,8 @@ function normalizeTrigger(entry, index, path, state) {
 		}
 		return normalizeCron(on, run, index, path, state);
 	}
-	if (!FORGE_KINDS.has(run.kind)) {
-		throw configError(`${at}: a ${on.type} trigger is webhook-driven and produces a forge job; run.kind must be one of github|gitlab (got ${JSON.stringify(run.kind)}): ${path}`);
+	if (!isForgeKind(run.kind)) {
+		throw configError(`${at}: a ${on.type} trigger is webhook-driven and produces a forge job; run.kind must be one of ${FORGE_KINDS.join("|")} (got ${JSON.stringify(run.kind)}): ${path}`);
 	}
 	if (on.type === "label") return normalizeLabel(on, run, index, path);
 	if (on.type === "comment") return normalizeComment(on, run, index, path, state);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { configError } from "./config.mjs";
+import { forgeSpec } from "./forges.mjs";
 
 /**
  * A deterministic jobId for a local job. BullMQ's dedup is `EXISTS jobId`, so a double-invoke of
@@ -48,10 +49,7 @@ export function chainedJobId({ parentJobId, flow, task }) {
  * id, which would silently defeat dedup and let a redelivery double-spend.
  */
 export function deliveryJobId(guid) {
-	if (typeof guid !== "string" || guid === "") {
-		throw configError("deliveryJobId requires a non-empty X-GitHub-Delivery GUID");
-	}
-	return `gh-${guid}`;
+	return forgeDeliveryJobId("github", guid);
 }
 
 /**
@@ -59,13 +57,31 @@ export function deliveryJobId(guid) {
  * prefixed `gl-`. GitLab keeps that value CONSTANT across its own retries, which is the exact property
  * REQ-DEDUP-BY-DELIVERY-GUID needs, so the guarantee is the same one -- and retention-bounded in the same
  * way.
- *
- * The prefix is not decoration: it keeps the two forges' id spaces disjoint, so a GitLab delivery id that
- * happened to collide with a GitHub GUID could never silently suppress the other forge's job.
  */
 export function gitlabDeliveryJobId(id) {
-	if (typeof id !== "string" || id === "") {
-		throw configError("gitlabDeliveryJobId requires a non-empty webhook-id / Idempotency-Key");
+	return forgeDeliveryJobId("gitlab", id);
+}
+
+/**
+ * The general form the two above are now spellings of: a forge kind plus that forge's own per-delivery
+ * id, prefixed from the forge table.
+ *
+ * The prefix is not decoration -- it keeps every forge's id space disjoint, so a delivery id that happened
+ * to collide across two forges could never silently suppress the other's job. One body rather than one per
+ * forge because the *policy* here (a missing id throws rather than inventing a random one, which would
+ * defeat dedup and let a redelivery double-spend) is a property of REQ-DEDUP-BY-DELIVERY-GUID, not of any
+ * one forge, and four copies of a policy is four chances to weaken it in three places.
+ *
+ * An unknown kind throws for a different reason than an empty id, and says so: reaching here with one
+ * means a forge was added to the trigger schema and not to the table.
+ */
+export function forgeDeliveryJobId(kind, id) {
+	const spec = forgeSpec(kind);
+	if (!spec) {
+		throw configError(`forgeDeliveryJobId: ${JSON.stringify(kind)} is not a known forge -- add it to FORGES in worker/src/forges.mjs`);
 	}
-	return `gl-${id}`;
+	if (typeof id !== "string" || id === "") {
+		throw configError(`forgeDeliveryJobId requires a non-empty ${spec.deliveryIdName} for a ${kind} delivery`);
+	}
+	return `${spec.jobIdPrefix}${id}`;
 }

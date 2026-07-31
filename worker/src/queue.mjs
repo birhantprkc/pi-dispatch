@@ -1,8 +1,9 @@
 import { Queue } from "bullmq";
-import { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId } from "./job-id.mjs";
+import { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId, forgeDeliveryJobId } from "./job-id.mjs";
+import { targetSeparator } from "./forges.mjs";
 
 export const QUEUE = "pi-jobs";
-export { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId };
+export { chainedJobId, localJobId, deliveryJobId, gitlabDeliveryJobId, forgeDeliveryJobId };
 
 export function makeQueue(connection) {
 	return new Queue(QUEUE, { connection });
@@ -67,48 +68,65 @@ const SEMANTIC_WINDOW_MS = 10 * 60 * 1000;
  *     re-labels or repeated PR pushes coalesce to one active job. It coexists with jobId; it does not
  *     replace it.
  */
-export async function enqueueGitHubJob(queue, { repo, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
-	const jobId = deliveryJobId(trigger.deliveryId);
-	// `packages` (whether to load the operator-staged pi packages) and `image` (which container image to run)
-	// come off the MATCHED trigger (INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) and land on `data`
-	// only when the filter resolved one, exactly like chainDepth/parentJobId above, so an unflagged trigger's
-	// job data is byte-identical. Both sit at JOB level, never inside `trigger` -- that object is descriptive
-	// and is copied verbatim into /job/event.json, where an execution knob has no business.
-	const data = { kind: "github", repo, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }), ...(resume !== undefined && { resume }) };
-	await queue.add("github", data, {
-		jobId,
-		deduplication: { id: `${repo}#${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
-		attempts: 2,
-		backoff: { type: "exponential", delay: 60_000 },
-		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above
-		removeOnFail: { age: 31 * 24 * 3600 },
-	});
-	return jobId;
+export async function enqueueGitHubJob(queue, fields) {
+	return await enqueueForgeJob(queue, "github", fields);
 }
 
 /**
- * Enqueue a GitLab-triggered job. Structurally the twin of `enqueueGitHubJob` -- same two additive dedup
- * layers, same retention, same retry policy -- with two deliberate differences.
+ * Enqueue a GitLab-triggered job. Structurally the twin of `enqueueGitHubJob` -- and now literally the
+ * same body, because everything that differs between them turned out to be two table entries.
  *
  * `projectId` rides the data because every GitLab API path the worker needs takes the numeric project id.
  * A GitLab project path is `group/subgroup/project` with no fixed segment count, so the `owner/name` split
  * the GitHub path uses does not merely fail on one, it SUCCEEDS wrongly: both halves come back non-empty
  * and the project silently becomes its own parent group. Carrying the id sidesteps the grammar entirely;
  * `repo` stays as the human-readable label for logs, run history and pause-window scopes.
- *
- * The semantic dedup key encodes the TARGET TYPE, which the GitHub key does not need to. GitLab numbers
- * issues and merge requests in separate per-project sequences, so issue #5 and merge request !5 are
- * different objects that would collide on `project#5:flow` -- one of them silently coalescing into the
- * other's 10-minute window and never running. The separator is GitLab's own notation: `#` for an issue,
- * `!` for a merge request.
  */
-export async function enqueueGitLabJob(queue, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
-	const jobId = gitlabDeliveryJobId(trigger.deliveryId);
-	const data = { kind: "gitlab", repo, projectId, target, flow, trigger, provider, model, maxTurns, ...(packages !== undefined && { packages }), ...(image !== undefined && { image }), ...(resume !== undefined && { resume }) };
-	const sep = target.type === "pull_request" ? "!" : "#";
-	await queue.add("gitlab", data, {
+export async function enqueueGitLabJob(queue, fields) {
+	return await enqueueForgeJob(queue, "gitlab", fields);
+}
+
+/**
+ * Enqueue a forge-triggered job of any kind. Returns the jobId.
+ *
+ * The two named wrappers above are spellings of this. They were separate bodies until a third and fourth
+ * forge made that four copies of the retention window, the retry policy, the backoff and BOTH dedup
+ * layers -- four places for one of them to be quietly weakened while every test stayed green.
+ *
+ * The semantic dedup key encodes the TARGET TYPE through `targetSeparator`, which GitHub alone does not
+ * need: it numbers issues and pull requests from one per-repo sequence, so `repo#7` names exactly one
+ * thing. GitLab numbers them separately, so issue #5 and merge request !5 would collide on `project#5:flow`
+ * -- one silently coalescing into the other's 10-minute window and never running. The separator is each
+ * forge's own notation, and it lives in the table because it is a fact about the forge.
+ *
+ * Forge-specific data fields are listed EXPLICITLY rather than collected with a rest spread. A spread
+ * would persist whatever a caller happened to pass into durable job data, and this object is copied
+ * verbatim into `/job/event.json` -- a place where an unreviewed field has no business.
+ */
+export async function enqueueForgeJob(queue, kind, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
+	const jobId = forgeDeliveryJobId(kind, trigger?.deliveryId);
+	// `packages` (whether to load the operator-staged pi packages) and `image` (which container image to run)
+	// come off the MATCHED trigger (INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) and land on `data`
+	// only when the filter resolved one, exactly like chainDepth/parentJobId above, so an unflagged trigger's
+	// job data is byte-identical. Both sit at JOB level, never inside `trigger` -- that object is descriptive
+	// and is copied verbatim into /job/event.json, where an execution knob has no business.
+	const data = {
+		kind,
+		repo,
+		...(projectId !== undefined && { projectId }),
+		target,
+		flow,
+		trigger,
+		provider,
+		model,
+		maxTurns,
+		...(packages !== undefined && { packages }),
+		...(image !== undefined && { image }),
+		...(resume !== undefined && { resume }),
+	};
+	await queue.add(kind, data, {
 		jobId,
-		deduplication: { id: `${repo}${sep}${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
+		deduplication: { id: `${repo}${targetSeparator(kind, target?.type)}${target.number}:${flow}`, ttl: SEMANTIC_WINDOW_MS }, // ttl in ms
 		attempts: 2,
 		backoff: { type: "exponential", delay: 60_000 },
 		removeOnComplete: { age: 31 * 24 * 3600 }, // age in seconds -- do not cross units with the ms ttl above

@@ -30,6 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
 import { globalExtensionsEnabled } from "./config.mjs";
+import { isForgeKind } from "./forges.mjs";
 import { findLiteralSecret, ADMIN_RE } from "./import-pi.mjs";
 import { PACKAGES_SUBDIR, readStageManifest } from "./packages.mjs";
 import { parseTriggers } from "./triggers.mjs";
@@ -461,7 +462,11 @@ function readTriggerFacts(env, fileExists) {
 			// The forges this file actually needs credentials for. Read from the triggers rather than from
 			// the env, so the check answers "is what you configured enough for what you wrote" instead of
 			// "did you set some variables".
-			forges: [...new Set(triggers.map((t) => t.run.kind).filter((k) => k === "github" || k === "gitlab"))].sort(),
+			//
+			// `isForgeKind` rather than a written-out pair: this whole function is wrapped in `catch { return
+			// none }`, so a forge missing from a hand-written filter would not merely be unchecked -- doctor
+			// would report all-green and never mention that the credential it needs was never looked for.
+			forges: [...new Set(triggers.map((t) => t.run.kind).filter(isForgeKind))].sort(),
 		};
 	} catch {
 		return none;

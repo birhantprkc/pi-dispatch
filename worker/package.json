@@ -17,6 +17,7 @@
     "./queue": "./src/queue.mjs",
     "./connection": "./src/connection.mjs",
     "./job-id": "./src/job-id.mjs",
+    "./forges": "./src/forges.mjs",
     "./triggers": "./src/triggers.mjs",
     "./packages": "./src/packages.mjs",
     "./pause-windows": "./src/pause-windows.mjs",
