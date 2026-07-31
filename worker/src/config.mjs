@@ -188,6 +188,7 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		github: { ...loadGitHubAuth(env, fileExists), allowGhResume: env.PI_SESSIONS_ALLOW_GH_SOURCE === "1" },
 		gitlab: loadGitLabAuth(env),
 		forgejo: loadForgejoAuth(env),
+		azure: loadAzureAuth(env),
 	};
 }
 
@@ -248,6 +249,24 @@ export function defaultSettingsFile() {
 	// allowlist (no-broad-env-into-container). Exported so the admin extension resolves the same default
 	// without calling loadConfig, which throws on unrelated env problems.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/settings.json`.replace(/\\/g, "/");
+}
+
+/**
+ * The worker's Azure DevOps auth config, or `null` when none is configured -- same presence rule as the
+ * other two optional forges.
+ */
+export function loadAzureAuth(env) {
+	const token = env.AZURE_TOKEN;
+	if (typeof token !== "string" || token.trim() === "") return null;
+	const source = env.AZURE_AUTH_SOURCE ?? "pat";
+	if (source !== "pat") {
+		throw configError(`AZURE_AUTH_SOURCE must be "pat" (got ${JSON.stringify(source)}) -- Azure DevOps has no App or installation-token equivalent, so there is no other source`);
+	}
+	const orgUrl = env.AZURE_ORG_URL;
+	if (typeof orgUrl !== "string" || orgUrl.trim() === "") {
+		throw configError("AZURE_ORG_URL is required when AZURE_TOKEN is set (e.g. https://dev.azure.com/your-org)");
+	}
+	return { source, orgUrl: orgUrl.trim().replace(/\/+$/, ""), tokenVar: "AZURE_TOKEN" };
 }
 
 /**

@@ -85,6 +85,25 @@ export const FORGES = {
 		// redundant belt-and-braces but the only claim about Forgejo this project is willing to make.
 		prLabelAction: "label_updated",
 	},
+	azure: {
+		// Azure Service Hooks send NO delivery-id header at all, so this id comes from the body's top-level
+		// `id` GUID -- the one departure `verify-gitlab.mjs` explicitly refuses to make, taken here because
+		// the refusal is right for a forge that HAS a header and inapplicable to one that has none.
+		// (Issue #43 proposes `notificationId`, which is a per-subscription integer sequence: two
+		// subscriptions collide on delivery 1.)
+		jobIdPrefix: "az-",
+		deliveryIdName: "service hook payload id",
+		// Azure numbers work items and pull requests from SEPARATE sequences -- work item ids are
+		// organization-scoped, pull request ids are not -- so `project/repo#123` and `project/repo!123` are
+		// different objects and would collide on one separator, exactly as GitLab's issue #5 and MR !5 do.
+		pullRequestSep: "!",
+		// `az repos` reads AZURE_DEVOPS_EXT_PAT; SYSTEM_ACCESSTOKEN is what a pipeline-shaped script expects.
+		tokenVars: ["AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN"],
+		hostVar: "AZURE_DEVOPS_ORG_URL",
+		// Azure attaches no labels to a pull request at all, so there is no action to attach the rule to and
+		// a predicated PR rule could never match. The loader refuses one rather than letting it load dead.
+		prLabelAction: null,
+	},
 };
 
 /**

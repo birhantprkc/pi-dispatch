@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { prepareGithubWorkspace } from "./prepare-github.mjs";
 import { gitlabRemoteUrl } from "./gitlab-host.mjs";
 import { forgejoRemoteUrl } from "./forgejo-host.mjs";
+import { azureRemoteUrl } from "./azure-host.mjs";
 import { buildGitLabPrompt } from "./gitlab-prompt.mjs";
 import { buildForgejoPrompt } from "./forgejo-prompt.mjs";
+import { buildAzurePrompt } from "./azure-prompt.mjs";
 import { prepareLocalWorkspace } from "./prepare-local.mjs";
 
 /**
@@ -119,7 +121,7 @@ export async function cleanup(prepared) {
  * Exported so the wiring is assertable: a job cloning from the wrong forge is a silent failure -- the URL
  * simply would not exist, or worse, would.
  */
-export function makeForgePreparers({ gitlabApiUrl = null, forgejoApiUrl = null, prepareForge = prepareGithubWorkspace } = {}) {
+export function makeForgePreparers({ gitlabApiUrl = null, forgejoApiUrl = null, azureOrgUrl = null, prepareForge = prepareGithubWorkspace } = {}) {
 	return {
 		github: prepareForge,
 		gitlab: (job, token, opts) =>
@@ -133,6 +135,15 @@ export function makeForgePreparers({ gitlabApiUrl = null, forgejoApiUrl = null, 
 				...opts,
 				remoteUrlFor: (j) => forgejoRemoteUrl(forgejoApiUrl, j.repo),
 				buildPrompt: buildForgejoPrompt,
+			}),
+		azure: (job, token, opts) =>
+			prepareForge(job, token, {
+				...opts,
+				// Azure's clone URL is `<org>/<project>/_git/<repo>` -- built from the job's structured scope,
+				// not from its `repo` label, because that label is `project/repo` and reassembling a URL from
+				// a display string is how the wrong repository gets cloned.
+				remoteUrlFor: (j) => azureRemoteUrl(azureOrgUrl, j),
+				buildPrompt: buildAzurePrompt,
 			}),
 	};
 }

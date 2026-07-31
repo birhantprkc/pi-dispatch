@@ -52,6 +52,11 @@ const PR_ACTIONS = {
 	// never fires. `label_cleared` is deliberately ABSENT and always will be: REMOVING a label must never
 	// start a paid run, and it has no GitHub counterpart to inherit that rule from.
 	forgejo: new Set(["label_updated", "opened", "synchronized", "reopened"]),
+	// Azure's Service Hook events reduced to the two that leave something to act on. `git.pullrequest.merged`
+	// is omitted for the same reason GitLab's `merge` and `close` are: a job started by a merge has nothing
+	// left to do. There is no label action at all -- Azure attaches tags to WORK ITEMS, never to pull
+	// requests -- which is why azure's `prLabelAction` is null and a predicated PR rule is refused below.
+	azure: new Set(["created", "updated"]),
 };
 
 // A cron id flows into BullMQ's deterministic `repeat:<id>:<nextMillis>` jobId, so a `:` corrupts that
@@ -305,6 +310,34 @@ function validatePredicate(on, index, path, requirePositive) {
 	return { any: on.any, all: on.all, none: on.none };
 }
 
+
+/**
+ * `run.repository` -- WHICH repository a job clones, for a forge whose trigger subject does not name one.
+ *
+ * Azure DevOps is the only such forge so far, and the gap is real rather than cosmetic: a work item belongs
+ * to a PROJECT, and a project may hold many repositories, so `workitem.updated` says nothing about where
+ * the agent should work. A pull request names its own repository and needs none.
+ *
+ * REQUIRED on exactly the azure trigger types a work item can fire (`label`, `comment`) and REFUSED on the
+ * others, rather than accepted-and-ignored. A field that is silently unused is a field an operator will set
+ * and then trust; refusing it is how they find out it does nothing here.
+ */
+function validateRepository(run, onType, at, path) {
+	const needed = run.kind === "azure" && (onType === "label" || onType === "comment");
+	const raw = run.repository;
+	if (raw === undefined) {
+		if (!needed) return undefined;
+		throw configError(`${at}: an azure ${onType} trigger must set run.repository -- a work item belongs to a project, not a repository, so nothing in the delivery says where to clone: ${path}`);
+	}
+	if (!needed) {
+		throw configError(`${at}: run.repository is only meaningful on an azure label or comment trigger (a pull request names its own repository): ${path}`);
+	}
+	if (!isNonEmptyString(raw) || raw !== raw.trim() || raw.includes("/")) {
+		throw configError(`${at}: run.repository must be a non-empty repository NAME within the project, with no slashes and no surrounding whitespace (got ${JSON.stringify(raw)}): ${path}`);
+	}
+	return raw;
+}
+
 function normalizeLabel(on, run, index, path) {
 	const at = `trigger at index ${index}`;
 	const predicate = validatePredicate(on, index, path, true);
@@ -314,7 +347,11 @@ function normalizeLabel(on, run, index, path) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
-	return { on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
+	const repository = validateRepository(run, "label", at, path);
+	return {
+		on: { type: "label", any: predicate.any, all: predicate.all, none: predicate.none },
+		run: { kind: run.kind, flow: run.flow, packages, image, resume, ...(repository !== undefined && { repository }) },
+	};
 }
 
 function normalizeComment(on, run, index, path, state) {
@@ -335,7 +372,11 @@ function normalizeComment(on, run, index, path, state) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
-	return { on: { type: "comment", phrase: on.phrase }, run: { kind: run.kind, flow: run.flow, packages, image, resume } };
+	const repository = validateRepository(run, "comment", at, path);
+	return {
+		on: { type: "comment", phrase: on.phrase },
+		run: { kind: run.kind, flow: run.flow, packages, image, resume, ...(repository !== undefined && { repository }) },
+	};
 }
 
 function normalizePullRequest(on, run, index, path) {
@@ -365,6 +406,13 @@ function normalizePullRequest(on, run, index, path) {
 	// so there is no action for the rule to attach to. Forgejo's is `label_updated`.
 	const labelAction = forgeSpec(run.kind)?.prLabelAction;
 	const requirePositive = typeof labelAction === "string" && actions.includes(labelAction);
+
+	// Azure attaches tags to WORK ITEMS and never to pull requests, so a predicate on an azure pull_request
+	// rule cannot match anything. Refusing it is the same fail-loud call the action vocabulary gets: a rule
+	// that loads clean and can never fire reads to an operator as a harness that is broken.
+	if (run.kind === "azure" && (on.any !== undefined || on.all !== undefined || on.none !== undefined)) {
+		throw configError(`${at}: an azure pull_request trigger cannot carry a label predicate -- Azure DevOps attaches tags to work items, never to pull requests, so any/all/none could never match: ${path}`);
+	}
 	const predicate = validatePredicate(on, index, path, requirePositive);
 	if (!isNonEmptyString(run.flow)) {
 		throw configError(`${at}: pull_request trigger run.flow must be a non-empty string: ${path}`);
@@ -372,6 +420,7 @@ function normalizePullRequest(on, run, index, path) {
 	const packages = validatePackagesFlag(run, at, path);
 	const image = validateImageRef(run, at, path);
 	const resume = validateResumeFlag(run, at, path);
+	validateRepository(run, "pull_request", at, path);
 	return {
 		on: { type: "pull_request", action: [...actions], any: predicate.any, all: predicate.all, none: predicate.none },
 		run: { kind: run.kind, flow: run.flow, packages, image, resume },

@@ -1,0 +1,65 @@
+# The Azure DevOps job image: the default image, plus the Azure CLI.
+#
+# WHY THIS IS A SEPARATE IMAGE AND NOT A BLOCK IN THE DEFAULT ONE. Every other forge's CLI is a single
+# static binary -- `gh`, `glab` (~15 MB), `tea` (28 MB). Azure DevOps has no such thing: `az repos` lives
+# in the Azure CLI, which is a Python distribution and its dependency tree, and adding it to the image
+# every job runs would put roughly a gigabyte and a second language runtime into containers that will
+# never call it. `run.image` (issue #62) already lets a trigger name its own image, so the cost lands on
+# the deployments that asked for it and nowhere else.
+#
+# FROM the default image rather than the base, deliberately: the pinned base digest, the pinned pi, the
+# runner, the entrypoint and the `dev.pi-dispatch.pi-version` label are all INHERITED rather than
+# re-declared. A second copy of those pins is a second thing to forget to bump, and the one that got
+# forgotten would be the one nobody was looking at.
+#
+# Build:
+#   docker build -f image/Dockerfile.azure -t pi-dispatch-job:azure --build-arg BASE=pi-dispatch-job:latest .
+ARG BASE=ghcr.io/edgehero/pi-dispatch-job:latest
+FROM ${BASE}
+
+USER root
+
+# Pinned to an exact version, like glab and tea and unlike gh. The Azure CLI is installed from Microsoft's
+# apt repository, so the pin is the package version rather than a sha256 over a release binary -- apt
+# verifies the repository signature, which is the equivalent guarantee at this layer.
+ARG AZURE_CLI_VERSION=2.77.0-1~bookworm
+ARG AZURE_DEVOPS_EXT_VERSION=1.0.2
+RUN set -eu; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+      | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg; \
+    chmod go+r /etc/apt/keyrings/microsoft.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ bookworm main" \
+      > /etc/apt/sources.list.d/azure-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends "azure-cli=${AZURE_CLI_VERSION}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    az --version
+
+# The devops extension, pinned and installed into a SYSTEM directory so the unprivileged job user finds it
+# without a writable home extension dir -- an agent that could write there could replace the CLI it is
+# about to run.
+ENV AZURE_EXTENSION_DIR=/usr/local/lib/azure-cli-extensions
+RUN set -eu; \
+    mkdir -p "$AZURE_EXTENSION_DIR"; \
+    az extension add --name azure-devops --version "${AZURE_DEVOPS_EXT_VERSION}" --system; \
+    chmod -R a+rX "$AZURE_EXTENSION_DIR"; \
+    az repos -h >/dev/null
+
+# The Azure CLI phones home on invocation and writes a first-run survey prompt to stdout. Both are off for
+# the reasons glab's are: an outbound call from a container running adversarial input (OQ-004), and a
+# notice landing in the agent's own stdout where a flow parsing command output has to know to ignore it.
+ENV AZURE_CORE_COLLECT_TELEMETRY=0
+ENV AZURE_CORE_SURVEY_MESSAGE=false
+ENV AZURE_CORE_ONLY_SHOW_ERRORS=true
+
+# This image serves every forge the base does, PLUS azure. The worker's pre-spend preflight reads this
+# label and refuses a job whose forge is not in it, so an azure trigger that forgot `run.image` is refused
+# before a budget slot rather than failing at step 3 inside a paid container. `verify-image.sh` checks the
+# list against the CLIs actually installed, so it cannot lie.
+LABEL dev.pi-dispatch.forges="github,gitlab,forgejo,azure"
+
+USER pi
+WORKDIR /workspace
+
+ENTRYPOINT ["/entrypoint.sh"]

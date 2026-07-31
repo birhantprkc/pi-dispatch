@@ -55,8 +55,11 @@ test("the pull-request separator is each forge's own notation, and an issue is a
 test("targetSeparator is total -- an unknown kind labels rather than throws, because both callers are labels", () => {
 	// A run record's `target` and a dedup key are not gates. Failing a paid job over punctuation for a
 	// forge the table has not heard of would be a worse answer than a slightly wrong label.
-	assert.equal(targetSeparator("azure", "pull_request"), "#");
+	// Deliberately not the name of a forge that might later be added -- `chained` is a real non-forge job
+	// kind, and the rest is junk.
+	assert.equal(targetSeparator("chained", "pull_request"), "#");
 	assert.equal(targetSeparator(undefined, "pull_request"), "#");
+	assert.equal(targetSeparator("", "pull_request"), "#");
 });
 
 test("forgeSpec is total and never throws, so the caller owns how loudly an unknown forge fails", () => {
@@ -96,7 +99,7 @@ test("a delivery id that is missing or empty refuses, rather than inventing one 
 
 test("an unknown forge names the table it is missing from, because that is the actual repair", () => {
 	assert.throws(
-		() => forgeDeliveryJobId("azure", "abc"),
+		() => forgeDeliveryJobId("chained", "abc"),
 		(e) => e.piDispatchConfig === true && /forges\.mjs/.test(e.message),
 		"reaching here means a forge was added to the trigger schema and not to the table",
 	);

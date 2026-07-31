@@ -24,6 +24,7 @@
     "./identity": "./src/identity.mjs",
     "./gitlab-identity": "./src/gitlab-identity.mjs",
     "./forgejo-identity": "./src/forgejo-identity.mjs",
+    "./azure-identity": "./src/azure-identity.mjs",
     "./get-token": "./src/get-token.mjs",
     "./runtime-settings": "./src/runtime-settings.mjs",
     "./run-history": "./src/run-history.mjs",

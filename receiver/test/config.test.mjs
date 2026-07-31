@@ -43,7 +43,7 @@ test("a valid secret + triggers file yields conservative defaults and grouped we
 
 	// the single comment trigger. `packages` is asserted present-and-undefined: the grouper builds the key
 	// by construction and this whole-object deepEqual (assert/strict) counts an own undefined-valued key.
-	assert.deepEqual(c.triggers.github.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined, image: undefined, resume: undefined });
+	assert.deepEqual(c.triggers.github.comment, { index: 1, phrase: "@pi", defaultFlow: "triage", packages: undefined, image: undefined, resume: undefined, repository: undefined });
 
 	// pull_request rules: actions is a Set, predicate carries the label selectors.
 	assert.equal(c.triggers.github.pullRequest.length, 1);
@@ -69,7 +69,12 @@ test("a trigger on EVERY forge the schema accepts groups without throwing", () =
 	// Written as a loop over the table rather than one case per forge, so adding a forge to FORGE_KINDS and
 	// forgetting the group fails HERE, at load, instead of inside a live reload that swallows it.
 	const json = JSON.stringify({
-		triggers: FORGE_KINDS.map((kind) => ({ on: { type: "label", any: ["pi:go"] }, run: { kind, flow: "fix" } })),
+		// `run.repository` is required on an azure label trigger and refused on every other forge's: an Azure
+		// work item belongs to a project, not a repository, so nothing in the delivery says where to clone.
+		triggers: FORGE_KINDS.map((kind) => ({
+			on: { type: "label", any: ["pi:go"] },
+			run: { kind, flow: "fix", ...(kind === "azure" ? { repository: "widgets" } : {}) },
+		})),
 	});
 	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
 	for (const kind of FORGE_KINDS) {

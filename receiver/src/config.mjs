@@ -47,6 +47,7 @@ export function loadReceiverConfig(env = process.env, { readFile = readFileSync,
 		github: loadGitHubAuth(env, fileExists),
 		gitlab: loadGitLabConfig(env),
 		forgejo: loadForgejoConfig(env),
+		azure: loadAzureConfig(env),
 	};
 }
 
@@ -121,6 +122,45 @@ function loadForgejoConfig(env) {
 }
 
 /**
+ * The Azure DevOps block, or `null` when nothing names it.
+ *
+ * `AZURE_WEBHOOK_MODE` is REQUIRED once any AZURE_* variable is set and is deliberately not defaulted --
+ * the same rule GitLab's mode gets, and for a sharper reason. Azure offers no HMAC at all, so BOTH modes
+ * are shared-secret compares that cover no bytes; which header carries the secret is a deployment fact
+ * somebody has to have decided, and defaulting it would mean an operator could arm an endpoint without
+ * ever noticing that its gate proves only that the sender knew a string.
+ */
+function loadAzureConfig(env) {
+	const mode = env.AZURE_WEBHOOK_MODE;
+	const secret = env.AZURE_WEBHOOK_SECRET;
+	const token = env.AZURE_TOKEN;
+	const orgUrl = env.AZURE_ORG_URL;
+	const headerName = env.AZURE_WEBHOOK_HEADER ?? null;
+	if (!mode && !secret && !token && !orgUrl) return null;
+
+	if (mode !== "basic" && mode !== "header") {
+		throw configError(`AZURE_WEBHOOK_MODE must be "basic" (HTTP Basic on the subscription) or "header" (a custom header); got ${JSON.stringify(mode)}`);
+	}
+	if (mode === "header" && (typeof headerName !== "string" || headerName.trim() === "")) {
+		throw configError("AZURE_WEBHOOK_HEADER is required when AZURE_WEBHOOK_MODE=header -- there is no default header name to guess");
+	}
+	if (typeof secret !== "string" || secret.trim() === "") {
+		throw configError("AZURE_WEBHOOK_SECRET is required; refusing to start an azure endpoint that cannot authenticate deliveries");
+	}
+	// No default organization URL: guessing one would send an operator's token to an organization they
+	// never named.
+	if (typeof orgUrl !== "string" || orgUrl.trim() === "") {
+		throw configError("AZURE_ORG_URL is required for azure triggers (e.g. https://dev.azure.com/your-org)");
+	}
+	// Needed BEFORE any job runs: project membership is what authorises an azure trigger at all
+	// (CONST-TRIGGER-AUTHOR-GATE), and without a token every lookup is indeterminate and every delivery 503s.
+	if (typeof token !== "string" || token.trim() === "") {
+		throw configError("AZURE_TOKEN is required for azure triggers -- the receiver resolves the actor's project membership before it may enqueue");
+	}
+	return { mode, secret, headerName: headerName?.trim() ?? null, token, orgUrl: orgUrl.trim().replace(/\/+$/, "") };
+}
+
+/**
  * Load, validate, and group the receiver's webhook triggers from the unified triggers file. The file is
  * the reviewed, committed source of truth for which events trigger which flow; a missing, unparseable, or
  * malformed file fails loud rather than degrading to an empty (silently trigger-nothing) allowlist.
@@ -175,9 +215,9 @@ function loadTriggers(env, readFile, fileExists) {
 		knownFlows.add(run.flow);
 		const group = groups[run.kind];
 		if (on.type === "label") {
-			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image, resume: run.resume });
+			group.label.push({ index, predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image, resume: run.resume, repository: run.repository });
 		} else if (on.type === "comment") {
-			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image, resume: run.resume }; // parseTriggers guarantees at most one per forge
+			group.comment = { index, phrase: on.phrase, defaultFlow: run.flow, packages: run.packages, image: run.image, resume: run.resume, repository: run.repository }; // parseTriggers guarantees at most one per forge
 		} else if (on.type === "pull_request") {
 			group.pullRequest.push({ index, actions: new Set(on.action), predicate: { any: on.any, all: on.all, none: on.none }, flow: run.flow, packages: run.packages, image: run.image, resume: run.resume });
 		}

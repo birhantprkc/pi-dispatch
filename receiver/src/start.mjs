@@ -28,8 +28,10 @@ import { makeReceiver } from "./receiver.mjs";
 import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
 import { resolveGitLabSelfId } from "@pi-dispatch/worker/gitlab-identity";
 import { resolveForgejoSelfId } from "@pi-dispatch/worker/forgejo-identity";
+import { resolveAzureSelfId } from "@pi-dispatch/worker/azure-identity";
 import { makeResolveAuthority } from "./gitlab-members.mjs";
 import { makeResolveForgejoAuthority } from "./forgejo-members.mjs";
+import { makeResolveAzureAuthority } from "./azure-members.mjs";
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { parseConnection } from "@pi-dispatch/worker/connection";
 
@@ -47,6 +49,8 @@ export async function startReceiver(
 		makeResolveAuthority: makeResolveAuthorityFn = makeResolveAuthority,
 		resolveForgejoSelfId: resolveForgejoSelfIdFn = resolveForgejoSelfId,
 		makeResolveForgejoAuthority: makeResolveForgejoAuthorityFn = makeResolveForgejoAuthority,
+		resolveAzureSelfId: resolveAzureSelfIdFn = resolveAzureSelfId,
+		makeResolveAzureAuthority: makeResolveAzureAuthorityFn = makeResolveAzureAuthority,
 	} = {},
 ) {
 	// Single-object log line: `makeReceiver` calls `log?.({ event, ... })`, so the sink takes ONE object.
@@ -95,7 +99,23 @@ export async function startReceiver(
 		};
 	}
 
-	const handler = makeReceiver({ queue, selfId, cfg, log, gitlab, forgejo });
+	// The Azure arm, when configured. Identity resolution is HARD-FAIL here too, and it resolves BOTH forms
+	// of the harness's identity in one call: a pull-request delivery names an actor by GUID and a work item
+	// names them only by email address, so a guard that knew one form would be blind on half the events.
+	let azure = null;
+	if (cfg.azure) {
+		const azureSelfId = await resolveAzureSelfIdFn({ orgUrl: cfg.azure.orgUrl, token: cfg.azure.token });
+		log({ event: "self_identity", forge: "azure", id: azureSelfId.id, hasAccountName: azureSelfId.email !== null, mode: cfg.azure.mode });
+		azure = {
+			mode: cfg.azure.mode,
+			secret: cfg.azure.secret,
+			headerName: cfg.azure.headerName,
+			selfId: azureSelfId,
+			resolveAuthority: makeResolveAzureAuthorityFn({ orgUrl: cfg.azure.orgUrl, token: cfg.azure.token }),
+		};
+	}
+
+	const handler = makeReceiver({ queue, selfId, cfg, log, gitlab, forgejo, azure });
 	const server = createServer(handler);
 	server.listen(cfg.port, cfg.bind, () =>
 		log({ event: "receiver_started", port: cfg.port, bind: cfg.bind, valkey: cfg.valkeyUrl }),

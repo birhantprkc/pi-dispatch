@@ -103,7 +103,7 @@ export async function enqueueGitLabJob(queue, fields) {
  * would persist whatever a caller happened to pass into durable job data, and this object is copied
  * verbatim into `/job/event.json` -- a place where an unreviewed field has no business.
  */
-export async function enqueueForgeJob(queue, kind, { repo, projectId, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
+export async function enqueueForgeJob(queue, kind, { repo, projectId, azure, target, flow, trigger, provider, model, maxTurns, packages, image, resume }) {
 	const jobId = forgeDeliveryJobId(kind, trigger?.deliveryId);
 	// `packages` (whether to load the operator-staged pi packages) and `image` (which container image to run)
 	// come off the MATCHED trigger (INT-TRIGGERS-FILE-CONTRACT / REQ-GLOBAL-PI-OVERLAY) and land on `data`
@@ -114,6 +114,10 @@ export async function enqueueForgeJob(queue, kind, { repo, projectId, target, fl
 		kind,
 		repo,
 		...(projectId !== undefined && { projectId }),
+		// Azure's org/project/repository triple, alongside the human-readable `repo` -- the same split gitlab
+		// makes with `projectId`, and for the same reason: every Azure API path takes ids and names this label
+		// cannot be reassembled into without guessing.
+		...(azure !== undefined && { azure }),
 		target,
 		flow,
 		trigger,
