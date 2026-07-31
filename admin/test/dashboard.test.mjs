@@ -665,6 +665,15 @@ async function renderTrigger(trigger) {
   return { list, detail: stripAnsi(comp.render(100).join("\n")) };
 }
 
+test("a trigger's row names its forge ONCE -- the target says it, so no badge repeats it", async () => {
+  // The badge existed because the target read `-> github` for every forge, so a gitlab row contradicted its
+  // own badge. Fixing the target removed the badge's REASON to exist, not merely its wrongness. render.mjs
+  // keeps its badge, and its own suite still pins it, because that line never names the forge at all.
+  const { list } = await renderTrigger({ type: "label", forge: "gitlab", any: ["pi:go"], all: [], none: [], flow: "fix" });
+  assert.ok(list.includes("gitlab"), "the forge is named");
+  assert.equal(list.includes("[gitlab]"), false, "and not named a second time as a badge");
+});
+
 test("a trigger's row names ITS forge, never github by default", async () => {
   // The row read `-> github <flow>  [gitlab]` before this: the line contradicting its own badge. The forge
   // is carried verbatim by read-model.mjs, so an unrecognised one shows as itself rather than as a

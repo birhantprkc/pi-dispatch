@@ -599,10 +599,11 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // running third-party code with open network egress renders identically to one that does not. Loading is
   // the default (`run.packages` is an opt-out), so the badge is present unless the trigger declined.
   // Amber, and appended AFTER the layout parts, so color stays post-layout.
-  // Which forge a webhook trigger listens to. Unmarked for github, so existing deployments render
-  // byte-identically; `accent` because, like a pinned model or a non-default image, it says "this entry
-  // departs from the deployment default" rather than "this entry is risky".
-  const forge = t?.forge && t.forge !== "github" ? " " + styler.fg("accent", `[${t.forge}]`) : "";
+  // NO forge badge here, deliberately -- unlike render.mjs, which still needs one. This row's target now
+  // NAMES the forge (`-> gitlab fix`), so a badge would say it twice. The badge existed because the target
+  // used to read `-> github` for every forge, which made a gitlab row contradict its own badge; fixing the
+  // target removed the badge's reason to exist rather than merely its wrongness. render.mjs keeps its badge
+  // because its line goes straight to the flow (`-> fix`) and never names the forge at all.
   const pkgs = t?.packages === true ? " " + styler.fg("warning", "[packages]") : "";
   // A non-default image, in `accent` rather than `warning`: amber is reserved for the risk badge (third-party
   // code), and an operator-built image is not third-party. `accent` is already this file's colour for "this
@@ -613,7 +614,7 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // contents, tool output, its own reasoning -- is a disclosure, not a preference. Same class as
   // [packages], which is the badge whose inverted polarity 0.1.4 had to fix.
   const res = t?.resume === true ? " " + styler.fg("warning", "[resume]") : "";
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${forge}${pkgs}${img}${res}`, inner, styler);
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}${img}${res}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
