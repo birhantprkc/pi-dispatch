@@ -39,6 +39,8 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 |---|---|---|
 | **GitHub webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
 | **GitLab webhook** — label, `@pi` comment, or MR activity | A project member with **Developer access or above**, resolved from the API on every delivery. The label is **not** the approval step — see below. | Decline the MR |
+| **Forgejo webhook** — label, `@pi` comment, or PR activity | A collaborator with **admin or write** permission, resolved from the API on every delivery — labels included. | Decline the PR |
+| **Azure DevOps service hook** — work-item tag, `@pi` comment, or PR activity | A **project member**, resolved from the Graph API on every delivery. A work item names the actor only by email address. | Decline the PR |
 | **CLI** — manual run (`pi-dispatch run`) | Whoever has shell on the host / can run the CLI | Decline the PR, or **nothing** for a folder |
 | **Cron** — a schedule | **Nobody, at the time it runs.** It fires unattended. | As above |
 | **AI tool** — `dispatch_run` (operator session) | Whoever can prompt-inject the operator's model | **Nothing** — it enqueues a paid run that edits a folder in place |
@@ -115,6 +117,15 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Spend.** A daily cap checked *before* tokens are spent, a per-job turn budget enforced by our runner
   (pi has no turn limit of its own), and a 30-minute container wall-clock timeout. An agent that concluded
   "I can't fix this" is a success and is never blind-retried.
+
+- **Azure DevOps webhook authenticity is weaker than every other arm's, and this is not a footnote.**
+  Service Hooks offer no HMAC of any kind — only HTTP Basic or a static header — so the credential proves
+  the sender knew a secret and says **nothing about whether the body arrived as it was sent**. Anyone
+  holding it can compose an arbitrary delivery. Two things follow: the dedup key is read from the body
+  (Azure sends no delivery-id header), and there is no signed timestamp and therefore no replay window, so
+  a captured delivery replays as new paid work once the job key ages out. HTTPS is mandatory, the author
+  gate still runs, and every money gate still applies — but if that trade is not acceptable to you, do not
+  enable the Azure arm. `OQ-015` records the full reasoning.
 
 ## What is NOT defended (v1)
 
