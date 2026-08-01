@@ -562,7 +562,7 @@ test("the live tail reports unavailable when no tail capability is injected", as
   assert.match(out, /unavailable/, "an absent tail capability renders as unavailable in this build");
 });
 
-test("PageDown scrolls the live tail window past the first viewport", async () => {
+test("the live tail opens at the bottom in follow mode; scrolling up pauses, the bottom re-arms", async () => {
   const comp = makeDashboard({
     paths: {},
     done() {},
@@ -578,14 +578,58 @@ test("PageDown scrolls the live tail window past the first viewport", async () =
   comp.handleInput("\r");
   await flush();
   await flush();
-  const before = comp.render(80).join("\n");
-  assert.match(before, /\[20\/50\]/, "the first frame windows the first viewport of 50 lines");
+  const opened = comp.render(80).join("\n");
+  // The newest lines are what the view is opened for: the first frame is pinned to the bottom, and the
+  // footer names the state so a paused tail can never masquerade as a live one.
+  assert.match(opened, /\[50\/50\] follow/, "the tail opens pinned to the bottom, following");
+  assert.match(opened, /L49/, "the newest line is on screen at open");
 
-  comp.handleInput("\x1b[6~");
+  comp.handleInput("\x1b[5~"); // PageUp pauses follow at the scrolled window
   await flush();
-  const after = comp.render(80).join("\n");
+  const paused = comp.render(80).join("\n");
+  assert.match(paused, /\[30\/50\] paused/, "PageUp scrolls a viewport back and pauses following");
+
+  comp.handleInput("\x1b[6~"); // PageDown back to the bottom re-arms follow
+  await flush();
+  const rearmed = comp.render(80).join("\n");
   await comp.dispose();
-  assert.match(after, /\[40\/50\]/, "PageDown advances the window a full viewport past line 20");
+  assert.match(rearmed, /\[50\/50\] follow/, "reaching the bottom re-arms follow mode");
+});
+
+test("'l' in the list jumps straight to the live tail of the active job, and is inert without one", async () => {
+  const calls = [];
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }),
+      tailLog: (args) => {
+        calls.push(args);
+        return { lines: ["HELLO_TAIL"] };
+      },
+    }),
+  });
+  await flush();
+
+  comp.handleInput("l");
+  await flush();
+  await flush();
+  const out = comp.render(80).join("\n");
+  await comp.dispose();
+  assert.match(out, /live jA/, "the advertised logs key opens the tail without arrowing to the ACTIVE row");
+  assert.equal(calls[0].jobId, "jA", "the tail is keyed by the id-only active job id");
+
+  // Without an active job the key is inert: there is no log to open, and no view change happens.
+  const idle = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  idle.handleInput("l");
+  await flush();
+  const still = idle.render(80).join("\n");
+  await idle.dispose();
+  assert.match(still, /pi-dispatch/, "the list frame is still up");
+  assert.doesNotMatch(still, /live /, "no tail view opened without an active job");
 });
 
 // --- CRUD signaling: overlay keys close with an action the command loop drives via ctx.ui dialogs ---
@@ -630,9 +674,10 @@ test("Enter on a trigger opens TRIGGER_DETAIL (trust model); e/x signal edit/del
   assert.deepEqual(actions, [{ action: "editTrigger", index: 0 }], "e signals editTrigger with the file index");
 });
 
-test("x in TRIGGER_DETAIL signals deleteTrigger; Esc backs out without signaling", async () => {
+test("x in TRIGGER_DETAIL arms an in-frame y/n; y signals a pre-confirmed delete, n stands down", async () => {
   const snap = triggerSnap([{ type: "cron", id: "n", pattern: "0 3 * * *", folder: "/p", flow: "tidy" }]);
-  // delete path
+  // y path: the overlay's own footer asked the question, so the action carries `confirmed` and the
+  // command loop must not ask it again.
   const delActions = [];
   const c1 = makeDashboard({ paths: {}, done: (v) => delActions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
   await flush();
@@ -640,18 +685,32 @@ test("x in TRIGGER_DETAIL signals deleteTrigger; Esc backs out without signaling
   await flush();
   c1.handleInput("x");
   await flush();
+  assert.deepEqual(delActions, [], "x alone deletes nothing -- it only arms the question");
+  assert.match(stripAnsi(c1.render(80).join("\n")), /delete this trigger\?/, "the footer becomes the y/n question");
+  c1.handleInput("y");
   await flush();
-  assert.deepEqual(delActions, [{ action: "deleteTrigger", index: 0 }]);
+  await flush();
+  assert.deepEqual(delActions, [{ action: "deleteTrigger", index: 0, confirmed: true }]);
 
-  // esc path: no action, back to LIST
-  const escActions = [];
-  const c2 = makeDashboard({ paths: {}, done: (v) => escActions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  // n path: stands down to the ordinary detail footer, still in TRIGGER_DETAIL, no action signaled.
+  const nActions = [];
+  const c2 = makeDashboard({ paths: {}, done: (v) => nActions.push(v), tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
   await flush();
   c2.handleInput("\r");
   await flush();
-  c2.handleInput("\x1b"); // Esc
+  c2.handleInput("x");
   await flush();
-  assert.deepEqual(escActions, [], "Esc from the trigger detail signals no CRUD action");
+  c2.handleInput("n");
+  await flush();
+  const detail = stripAnsi(c2.render(80).join("\n"));
+  assert.deepEqual(nActions, [], "a declined delete signals no CRUD action");
+  assert.match(detail, /x delete/, "the ordinary footer is back");
+  assert.match(detail, /TRUST MODEL/i, "still in the trigger detail, not popped to the list");
+
+  // esc path: no action, back to LIST (unchanged from before the confirm existed)
+  c2.handleInput("\x1b");
+  await flush();
+  assert.deepEqual(nActions, [], "Esc from the trigger detail signals no CRUD action");
   await c2.dispose();
 });
 
@@ -870,4 +929,206 @@ test("TRIGGER_DETAIL states the multiplier for a replicating trigger, and 'one r
   const plain = await open(null);
   assert.match(plain, /replicas\s+one run per delivery/);
   assert.doesNotMatch(plain, /budget slots reserved/);
+});
+
+// --- runs viewport, section jump, detail navigation, sort (dashboard usability, issue #71) ---
+
+/** A snapshot with `n` runs named r0..r(n-1), newest-first like listRuns serves them. */
+const manyRuns = (n) => ({
+  ...SNAPSHOT,
+  activeJobId: null,
+  runs: Array.from({ length: n }, (_, i) => ({
+    jobId: `r${i}`,
+    target: "o/r#1",
+    flow: "f",
+    outcome: "completed",
+    reason: null,
+    turns: 1,
+    tokens: { input: 1, output: 1, total: 100 + i, cost: (100 + i) / 1000 },
+    endedAt: `2026-07-21T00:00:${String(59 - i).padStart(2, "0")}.000Z`,
+  })),
+});
+
+test("the runs list is a cursor-following viewport with edge markers, not a 50-row wall", async () => {
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => manyRuns(15) }) });
+  await flush();
+
+  const first = stripAnsi(comp.render(80).join("\n"));
+  assert.match(first, /r0/, "the window opens at the top of the list");
+  assert.match(first, /r9/, "a full viewport of rows is visible");
+  assert.doesNotMatch(first, /\br12\b/, "rows past the viewport are not rendered");
+  assert.match(first, /↓ 5 more/, "the lower edge marker counts what is out of view");
+  assert.doesNotMatch(first, /↑ \d+ more/, "no upper marker at the top");
+
+  for (let i = 0; i < 12; i++) comp.handleInput("\x1b[B");
+  await flush();
+  const scrolled = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(scrolled, /↑ 5 more/, "the window followed the cursor down");
+  assert.match(scrolled, /\br14\b/, "the last records are reachable now");
+  assert.match(scrolled, /› .*r12/, "the cursor row is inside the window");
+});
+
+test("Tab jumps between the trigger and run section heads instead of arrowing through every row", async () => {
+  const snap = { ...manyRuns(3), triggers: { triggers: [{ type: "label", any: ["bug"], all: [], none: [], flow: "fix" }] } };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+
+  comp.handleInput("\t"); // from the trigger head to the first run row
+  comp.handleInput("\r");
+  await flush();
+  const runDetail = stripAnsi(comp.render(80).join("\n"));
+  assert.match(runDetail, /run r0/, "Tab then Enter opens the first run, not the trigger");
+
+  comp.handleInput("\x1b"); // back to LIST
+  await flush();
+  comp.handleInput("\t"); // and back to the trigger head
+  comp.handleInput("\r");
+  await flush();
+  const trgDetail = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(trgDetail, /TRUST MODEL/i, "Tab wraps back to the triggers section");
+});
+
+test("←/→ walk the run records inside RUN_DETAIL and re-read sandbox state through the seam", async () => {
+  const seen = [];
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({
+      fetchSnapshot: async () => manyRuns(3),
+      sandboxInfo: ({ jobId }) => {
+        seen.push(jobId);
+        return null;
+      },
+    }),
+  });
+  await flush();
+
+  comp.handleInput("\r"); // open r0
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /run r0/);
+
+  comp.handleInput("\x1b[C"); // → r1
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /run r1/, "right steps to the next record in place");
+
+  comp.handleInput("\x1b[C"); // → r2
+  comp.handleInput("\x1b[C"); // → past the end: stays put
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /run r2/, "the last record is a wall, not a wrap");
+
+  comp.handleInput("\x1b[D"); // ← r1
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /run r1/, "left steps back");
+  assert.deepEqual(seen, ["r0", "r1", "r2", "r1"], "sandbox state is one read per record shown, through the seam");
+
+  // The LIST cursor followed, so Esc lands on the run being read rather than where the walk began.
+  comp.handleInput("\x1b");
+  await flush();
+  const list = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(list, /› .*\br1\b/, "the list cursor is on the record the walk ended at");
+});
+
+test("'o' cycles the runs sort; absent numbers sort last and the divider names the order", async () => {
+  const snap = {
+    ...SNAPSHOT,
+    activeJobId: null,
+    runs: [
+      { jobId: "rA", target: "o/r#1", flow: "f", outcome: "completed", turns: 1, tokens: { total: 100, cost: 0.9 }, endedAt: "2026-07-21T00:00:03.000Z" },
+      { jobId: "rB", target: "o/r#1", flow: "f", outcome: "failed", reason: "error", turns: 1, tokens: { total: 900, cost: 0.1 }, endedAt: "2026-07-21T00:00:02.000Z" },
+      { jobId: "rC", target: "o/r#1", flow: "f", outcome: "completed", turns: 1, tokens: null, endedAt: "2026-07-21T00:00:01.000Z" },
+    ],
+  };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+
+  const order = (out) => ["rA", "rB", "rC"].sort((a, b) => out.indexOf(a) - out.indexOf(b)).join(",");
+  const time = stripAnsi(comp.render(80).join("\n"));
+  assert.match(time, /o time/, "the divider names the default order");
+  assert.equal(order(time), "rA,rB,rC", "time is listRuns' own order");
+
+  comp.handleInput("o");
+  await flush();
+  const tokens = stripAnsi(comp.render(80).join("\n"));
+  assert.match(tokens, /o tokens/);
+  assert.equal(order(tokens), "rB,rA,rC", "tokens descending, and a null tokens record sorts LAST -- unknown is not cheap");
+
+  comp.handleInput("o");
+  await flush();
+  const cost = stripAnsi(comp.render(80).join("\n"));
+  assert.equal(order(cost), "rA,rB,rC", "cost descending, null still last");
+
+  comp.handleInput("o");
+  await flush();
+  const outcome = stripAnsi(comp.render(80).join("\n"));
+  assert.equal(order(outcome), "rB,rA,rC", "outcome puts failures first -- the triage order");
+
+  comp.handleInput("o");
+  await flush();
+  const wrapped = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(wrapped, /o time/, "the cycle wraps back to time");
+});
+
+test("Enter opens the row the sorted list shows, not the row the unsorted list had there", async () => {
+  const snap = {
+    ...SNAPSHOT,
+    activeJobId: null,
+    runs: [
+      { jobId: "rA", target: "o/r#1", flow: "f", outcome: "completed", turns: 1, tokens: { total: 100, cost: 0.1 }, endedAt: "2026-07-21T00:00:02.000Z" },
+      { jobId: "rB", target: "o/r#1", flow: "f", outcome: "completed", turns: 1, tokens: { total: 900, cost: 0.9 }, endedAt: "2026-07-21T00:00:01.000Z" },
+    ],
+  };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  comp.handleInput("o"); // tokens sort: rB now leads
+  comp.handleInput("\r");
+  await flush();
+  const detail = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(detail, /run rB/, "the cursor and the rendered order share one rows model");
+});
+
+test("a cron trigger whose scheduler is overdue or stall-capped carries an amber badge in LIST", async () => {
+  const open = async (schedulers, stalls, stallMax) => {
+    const snap = {
+      ...SNAPSHOT,
+      activeJobId: null,
+      runs: [],
+      triggers: { triggers: [{ type: "cron", id: "s1", pattern: "0 3 * * *", folder: "/p", flow: "tidy" }] },
+      schedulers,
+      schedulerStalls: stalls,
+      schedulerStallMax: stallMax,
+    };
+    const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+    await flush();
+    const out = stripAnsi(comp.render(80).join("\n"));
+    await comp.dispose();
+    return out;
+  };
+
+  const overdue = await open([{ key: "s1", next: 1, overdueMs: 60000 }], {}, 2);
+  assert.match(overdue, /⚠ overdue/, "an overdue scheduler is a LIST-level fact, not only a drill-in one");
+
+  const stalled = await open([{ key: "s1", next: 1, overdueMs: 0 }], { s1: 2 }, 2);
+  assert.match(stalled, /⚠ stalled/, "a stall counter at the backstop max badges the row");
+
+  const healthy = await open([{ key: "s1", next: 1, overdueMs: 0 }], {}, 2);
+  assert.doesNotMatch(healthy, /⚠/, "a healthy row renders byte-identically to before");
+});
+
+test("the viewport, markers and badges keep every colored line at exactly the frame width", async () => {
+  const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
+  const snap = { ...manyRuns(15), triggers: { triggers: [{ type: "cron", id: "s1", pattern: "0 3 * * *", folder: "/p", flow: "tidy" }] } };
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), theme, intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => snap }) });
+  await flush();
+  for (let i = 0; i < 9; i++) comp.handleInput("\x1b[B");
+  await flush();
+  const lines = comp.render(80);
+  await comp.dispose();
+  for (const l of lines) assert.equal(visibleLen(l), 80, `every line is exactly 80 visible cols: ${JSON.stringify(l)}`);
 });

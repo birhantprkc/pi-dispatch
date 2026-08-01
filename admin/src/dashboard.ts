@@ -30,7 +30,13 @@ import { box, meter, clip } from "./panel.mjs";
 import { makeStyler, frame, RULE } from "./style.mjs";
 
 const KEY_HINTS = "[p]ause  [r]esume  [q]uit";
-const RUNS_ON_DASHBOARD = 10;
+// Fetch the read-model's full window (listRuns clamps at 50) but render a cursor-following viewport of
+// RUNS_VIEWPORT rows -- runs 11..50 must be reachable without the frame growing 40 rows taller.
+const RUNS_ON_DASHBOARD = 50;
+const RUNS_VIEWPORT = 10;
+// The runs-list orderings `o` cycles through. "time" is listRuns' own endedAt-descending order; the other
+// three re-sort the records already in the snapshot and never re-read.
+const RUN_SORTS = ["time", "tokens", "cost", "outcome"];
 const REFRESH_MS = 1000;
 // Lines requested per tail fetch, and the on-screen window of them the LIVE_TAIL view scrolls through.
 const TAIL_LINES = 200;
@@ -155,6 +161,17 @@ export function makeDashboard({
   let tailJobId: any = null;
   let tail: any = null;
   let tailTop = 0;
+  // Follow mode: the tail opens pinned to the BOTTOM (the newest lines are what the view is opened for)
+  // and stays pinned as the log grows. Scrolling up pauses following; scrolling back to the bottom
+  // re-arms it. The footer names the state, so a paused tail cannot masquerade as a live one.
+  let tailFollow = true;
+  // The active runs-list ordering (`o` cycles RUN_SORTS); named in the runs divider so the list is never
+  // silently re-ordered.
+  let runSort = "time";
+  // TRIGGER_DETAIL: `x` armed a y/n confirm rendered in the frame's own footer, so the question costs a
+  // keystroke rather than a dispose/reopen cycle of the whole overlay. Only the `y` closes the overlay,
+  // carrying `confirmed: true` so the command loop does not ask the same question twice.
+  let pendingDelete = false;
 
   const refresh = async () => {
     if (fetching || disposed) return;
@@ -205,13 +222,14 @@ export function makeDashboard({
     render(width: number): string[] {
       // Clamp the cursor here so a rows list that shrank between ticks can never leave `selected` pointing
       // past the end. `rows` spans the optional ACTIVE row plus the run records.
-      const rows = buildRows(snapshot);
+      const rows = buildRows(snapshot, runSort);
       if (selected > rows.length - 1) selected = Math.max(0, rows.length - 1);
-      // Clamp the tail scroll so a shrinking log can never scroll past the end.
+      // Clamp the tail scroll so a shrinking log can never scroll past the end; follow mode instead pins
+      // the window to the bottom of every fresh tail.
       if (view === "LIVE_TAIL") {
         const len = Array.isArray(tail?.lines) ? tail.lines.length : 0;
         const maxTop = Math.max(0, len - TAIL_VIEWPORT);
-        tailTop = Math.min(Math.max(0, tailTop), maxTop);
+        tailTop = tailFollow ? maxTop : Math.min(Math.max(0, tailTop), maxTop);
       }
       return renderPanel(snapshot, width, {
         view,
@@ -221,9 +239,12 @@ export function makeDashboard({
         tailJobId,
         tail,
         tailTop,
+        tailFollow,
         tailAvailable: typeof deps?.tailLog === "function",
         detailSandbox,
         sandboxAvailable: typeof deps?.launchSandbox === "function",
+        pendingDelete,
+        runSort,
       }, styler);
     },
     invalidate(): void {
@@ -235,6 +256,22 @@ export function makeDashboard({
         if (matchesKey(data, "escape")) {
           view = "LIST";
           detailSandbox = null;
+          tui?.requestRender?.();
+          return;
+        }
+        // ←/→ walk the run records in place: post-mortems are read in sequence, and Esc-arrow-Enter per
+        // record is the tax this removes. The LIST cursor follows, so Esc lands on the run being read.
+        if (matchesKey(data, "left") || matchesKey(data, "right")) {
+          const rows = buildRows(snapshot, runSort);
+          const i = rows.findIndex((r) => r.kind === "run" && r.record?.jobId && r.record.jobId === detailRun?.jobId);
+          if (i === -1) return;
+          const step = matchesKey(data, "left") ? -1 : 1;
+          const next = rows[i + step];
+          if (!next || next.kind !== "run") return;
+          detailRun = next.record;
+          // Same one-read-on-entry rule as Enter: sandbox state through the injected seam, never per tick.
+          detailSandbox = typeof deps?.sandboxInfo === "function" ? deps.sandboxInfo({ jobId: detailRun?.jobId }) : null;
+          selected = i + step;
           tui?.requestRender?.();
           return;
         }
@@ -268,8 +305,22 @@ export function makeDashboard({
         return;
       }
       if (view === "TRIGGER_DETAIL") {
-        // Read-only trust-model view. `e` edits the flow, `x` deletes -- both close the overlay with a CRUD
-        // action the command loop drives via ctx.ui dialogs, then reopens; Esc backs out to the list.
+        // Read-only trust-model view. `e` edits the flow via the command loop's dialogs; `x` arms an
+        // in-frame y/n whose `y` alone closes the overlay with the delete action (carrying `confirmed`,
+        // so the command loop does not ask the same question twice); Esc backs out to the list.
+        if (pendingDelete) {
+          if (data === "y" || data === "Y") {
+            void dispose().finally(() => done({ action: "deleteTrigger", index: detailTrigger?.index, confirmed: true }));
+            return;
+          }
+          // An explicit decline (or Esc) stands down; every other key is inert while the question is up,
+          // so a buffered keystroke cannot answer it by accident.
+          if (data === "n" || data === "N" || matchesKey(data, "escape")) {
+            pendingDelete = false;
+            tui?.requestRender?.();
+          }
+          return;
+        }
         if (matchesKey(data, "escape")) {
           view = "LIST";
           detailTrigger = null;
@@ -281,7 +332,8 @@ export function makeDashboard({
           return;
         }
         if (data === "x" || data === "X") {
-          void dispose().finally(() => done({ action: "deleteTrigger", index: detailTrigger?.index }));
+          pendingDelete = true;
+          tui?.requestRender?.();
           return;
         }
         return;
@@ -294,22 +346,28 @@ export function makeDashboard({
           tailJobId = null;
           tail = null;
           tailTop = 0;
+          tailFollow = true;
           tui?.requestRender?.();
           return;
         }
+        // Scrolling up pauses follow mode at the current window; reaching the bottom again re-arms it.
         const len = Array.isArray(tail?.lines) ? tail.lines.length : 0;
         const maxTop = Math.max(0, len - TAIL_VIEWPORT);
         if (matchesKey(data, "up")) {
+          tailFollow = false;
           tailTop = Math.max(0, tailTop - 1);
           tui?.requestRender?.();
         } else if (matchesKey(data, "down")) {
           tailTop = Math.min(maxTop, tailTop + 1);
+          if (tailTop >= maxTop) tailFollow = true;
           tui?.requestRender?.();
         } else if (matchesKey(data, "pageUp")) {
+          tailFollow = false;
           tailTop = Math.max(0, tailTop - TAIL_VIEWPORT);
           tui?.requestRender?.();
         } else if (matchesKey(data, "pageDown")) {
           tailTop = Math.min(maxTop, tailTop + TAIL_VIEWPORT);
+          if (tailTop >= maxTop) tailFollow = true;
           tui?.requestRender?.();
         }
         return;
@@ -319,17 +377,19 @@ export function makeDashboard({
         return;
       }
       if (data === "\r" || data === "\n") {
-        const rows = buildRows(snapshot);
+        const rows = buildRows(snapshot, runSort);
         const row = rows[selected];
         if (!row) return;
         if (row.kind === "trigger") {
           detailTrigger = { record: row.trigger, index: row.index };
+          pendingDelete = false;
           view = "TRIGGER_DETAIL";
           tui?.requestRender?.();
         } else if (row.kind === "active") {
           // Opening the tail: fire an immediate fetch so the first frame carries the tail, not the next tick.
           tailJobId = row.jobId;
           tailTop = 0;
+          tailFollow = true;
           view = "LIVE_TAIL";
           void refresh();
         } else {
@@ -339,6 +399,33 @@ export function makeDashboard({
           view = "RUN_DETAIL";
           tui?.requestRender?.();
         }
+        return;
+      }
+      // `l` -- the footer's logs key: jump straight to the live tail when a job is running (the same path
+      // Enter takes on the ACTIVE row); inert otherwise, because there is no log to open.
+      if (data === "l" || data === "L") {
+        if (!snapshot?.activeJobId) return;
+        tailJobId = snapshot.activeJobId;
+        tailTop = 0;
+        tailFollow = true;
+        view = "LIVE_TAIL";
+        void refresh();
+        return;
+      }
+      // Tab jumps between the two section heads (triggers <-> runs) instead of arrowing through every row.
+      if (data === "\t") {
+        const rows = buildRows(snapshot, runSort);
+        if (rows.length === 0) return;
+        const trgCount = (snapshot?.triggers?.triggers ?? []).length;
+        selected = selected < trgCount && trgCount < rows.length ? trgCount : 0;
+        tui?.requestRender?.();
+        return;
+      }
+      // `o` cycles the runs-list order; the runs divider names the active one, so the list is never
+      // silently re-ordered. Sorting reads the records already in the snapshot -- no re-read.
+      if (data === "o" || data === "O") {
+        runSort = RUN_SORTS[(RUN_SORTS.indexOf(runSort) + 1) % RUN_SORTS.length];
+        tui?.requestRender?.();
         return;
       }
       // CRUD (operator-typed, live via the reload watchers): add a trigger, or edit the limits/settings.
@@ -361,7 +448,7 @@ export function makeDashboard({
         return;
       }
       if (matchesKey(data, "down")) {
-        selected = Math.min(Math.max(0, buildRows(snapshot).length - 1), selected + 1);
+        selected = Math.min(Math.max(0, buildRows(snapshot, runSort).length - 1), selected + 1);
         tui?.requestRender?.();
         return;
       }
@@ -416,7 +503,7 @@ function budgetMeters(budget: any, settings: any, width: number): string[] {
  * the same content with `box`, its inner column count driving every meter and clip.
  */
 function renderPanel(snapshot: any, width: number, state: any, styler: any): string[] {
-  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailAvailable, detailSandbox, sandboxAvailable } = state;
+  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailFollow, tailAvailable, detailSandbox, sandboxAvailable, pendingDelete, runSort } = state;
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
@@ -427,8 +514,8 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
     const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
     const sched = cronSchedInfo(t, snapshot);
     const lines = renderTriggerDetail(t, framed ? dw - 4 : 24, styler, sched, snapshot?.stagedPackages);
-    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "e edit · x delete · esc back"];
-    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: triggerDetailHints(dw - 4, styler) });
+    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", pendingDelete ? "delete this trigger? y/n" : "e edit · x delete · esc back"];
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: triggerDetailHints(dw - 4, styler, pendingDelete) });
     return centerBlock(boxed, Math.trunc(width), dw);
   }
 
@@ -438,13 +525,13 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
     const allRuns = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
     const canOpen = Boolean(sandboxAvailable && detailSandbox?.retained);
     const lines = renderRunDetail(detailRun, framed ? dw - 4 : 24, styler, allRuns, detailSandbox);
-    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", canOpen ? "b sandbox · esc back" : "esc back"];
+    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", canOpen ? "←→ prev/next · b sandbox · esc back" : "←→ prev/next · esc back"];
     const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler, canOpen) });
     return centerBlock(boxed, Math.trunc(width), dw);
   }
 
   if (view === "LIVE_TAIL") {
-    return renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailAvailable });
+    return renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable });
   }
 
   if (snapshot === null) {
@@ -460,7 +547,7 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
   // LIST — the colored dashboard. Content is composed on PLAIN text (widths via styler.cell/visibleLen)
   // and colored last, so pi's ANSI-aware visibleWidth frames it correctly.
   if (framed) {
-    const lines = buildListLines(snapshot, selected, inner, styler);
+    const lines = buildListLines(snapshot, selected, inner, styler, runSort);
     return frame(styler, { title, width, lines, footer: keyHints(inner, styler) });
   }
 
@@ -475,7 +562,7 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
       ],
     },
     { title: "TRIGGERS", lines: toLines(renderTriggers({ schedulers: snapshot.schedulers, triggers: snapshot.triggers })) },
-    { title: "RUNS", lines: renderRunList(buildRows(snapshot), selected, 24) },
+    { title: "RUNS", lines: renderRunList(buildRows(snapshot, runSort), selected, 24) },
     { title: "SETTINGS", lines: toLines(renderSettingsView(snapshot.settings)) },
   ];
   const plain = [title];
@@ -498,7 +585,7 @@ function fitLine(line: string, inner: number, styler: any): string {
 }
 
 /** Compose the colored LIST body lines (RULE marks a `├──┤` separator). */
-function buildListLines(snapshot: any, selected: number, inner: number, styler: any): any[] {
+function buildListLines(snapshot: any, selected: number, inner: number, styler: any, runSort = "time"): any[] {
   const lines: any[] = [];
   lines.push(statusHeader(snapshot.queue, inner, styler));
   lines.push(RULE);
@@ -508,7 +595,7 @@ function buildListLines(snapshot: any, selected: number, inner: number, styler: 
   lines.push(RULE);
 
   // Triggers are selectable and come FIRST in buildRows, so a trigger's file index == its selection index.
-  const trg = triggerLines(snapshot.triggers, selected, inner, styler);
+  const trg = triggerLines(snapshot, selected, inner, styler);
   lines.push(styler.divider("triggers", `${trg.count} standing · a add · ↵ open`, inner));
   for (const l of trg.lines) lines.push(l);
   lines.push(RULE);
@@ -519,9 +606,9 @@ function buildListLines(snapshot: any, selected: number, inner: number, styler: 
   lines.push(RULE);
 
   // Active + run rows follow the triggers in buildRows, so offset the selection index by the trigger count.
-  const runRows = buildRows(snapshot).slice(trg.count);
+  const runRows = buildRows(snapshot, runSort).slice(trg.count);
   const runCount = Array.isArray(snapshot.runs) ? snapshot.runs.length : 0;
-  lines.push(styler.divider("runs", `last ${runCount}`, inner));
+  lines.push(styler.divider("runs", `last ${runCount} · o ${runSort}`, inner));
   for (const l of runLines(runRows, selected - trg.count, inner, styler)) lines.push(l);
   lines.push(RULE);
 
@@ -617,18 +704,20 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
-/** The configured triggers as colored rows: `<kind>  <match>  → <target> <flow>`. */
-function triggerLines(triggers: any, selected: number, inner: number, styler: any): { count: number; lines: string[] } {
+/** The configured triggers as colored rows: `<kind>  <match>  → <target> <flow>`. Takes the whole snapshot
+ * (not just `snapshot.triggers`) so each cron row can join its resident scheduler for the health badge. */
+function triggerLines(snapshot: any, selected: number, inner: number, styler: any): { count: number; lines: string[] } {
+  const triggers = snapshot?.triggers;
   const lines: string[] = [];
   if (triggers && triggers.missing) { lines.push(styler.cell("(triggers file not found · a to add)", inner, { color: "dim" })); return { count: 0, lines }; }
   if (triggers && triggers.invalid) { lines.push(styler.cell(`(triggers file invalid: ${triggers.invalid})`, inner, { color: "error" })); return { count: 0, lines }; }
   const list = (triggers && triggers.triggers) ?? [];
   if (list.length === 0) { lines.push(styler.cell("(no triggers · a to add)", inner, { color: "dim" })); return { count: 0, lines }; }
-  list.forEach((t: any, i: number) => lines.push(triggerRow(t, i === selected, inner, styler)));
+  list.forEach((t: any, i: number) => lines.push(triggerRow(t, i === selected, inner, styler, cronSchedInfo(t, snapshot))));
   return { count: list.length, lines };
 }
 
-function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
+function triggerRow(t: any, sel: boolean, inner: number, styler: any, sched: any = null): string {
   const cursor = sel ? styler.fg("accent", "›") : " ";
   const kind = t?.type ?? "?";
   const badge = styler.cell(kind, KIND_WIDTH, { color: KIND_COLOR[kind] ?? "muted" });
@@ -654,7 +743,13 @@ function triggerRow(t: any, sel: boolean, inner: number, styler: any): string {
   // `warning` for the same reason [resume] is: a spend multiplier is a risk badge, not a preference. A
   // trigger without it renders byte-identically -- the badge is purely additive, appended last.
   const rep = t?.replicas > 1 ? " " + styler.fg("warning", `[x${t.replicas}]`) : "";
-  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}${img}${res}${rep}`, inner, styler);
+  // Health is a LIST-level fact, not only a drill-in one: an overdue scheduler or a stall counter at the
+  // backstop max is exactly the row an operator must notice without opening it. Amber, appended last like
+  // the other risk badges; a healthy or non-cron row renders byte-identically to before.
+  const health = sched && (sched.overdueMs || (sched.stallMax > 0 && sched.stalls >= sched.stallMax))
+    ? " " + styler.fg("warning", sched.overdueMs ? "⚠ overdue" : "⚠ stalled")
+    : "";
+  return fitLine(`${cursor} ${badge} ${matchColored(t, styler)} ${targetColored(t, styler)}${pkgs}${img}${res}${rep}${health}`, inner, styler);
 }
 
 function matchColored(t: any, styler: any): string {
@@ -715,10 +810,27 @@ function pauseRow(w: any, now: number, inner: number, styler: any): string {
   return fitLine(bits.join(styler.fg("dim", "  ")), inner, styler);
 }
 
-/** The interactive RUNS list, colored: cursor, id, target, flow, outcome (✔/⚠/✘), turns, tokens. */
+/** The interactive RUNS list, colored: cursor, id, target, flow, outcome (✔/⚠/✘), turns, tokens.
+ * A cursor-following viewport of RUNS_VIEWPORT rows over the (up to 50) records, with `↑/↓ N more` edge
+ * markers -- the frame stays the same height no matter how many records the read model served. */
 function runLines(rows: any[], selected: number, inner: number, styler: any): string[] {
   if (!Array.isArray(rows) || rows.length === 0) return [styler.cell("(no runs)", inner, { color: "dim" })];
-  return rows.map((row, i) => runRow(row, i === selected, inner, styler));
+  const { top, count } = runsWindow(rows.length, selected);
+  const out: string[] = [];
+  if (top > 0) out.push(styler.cell(`↑ ${top} more`, inner, { color: "dim" }));
+  for (let i = top; i < top + count; i++) out.push(runRow(rows[i], i === selected, inner, styler));
+  const below = rows.length - top - count;
+  if (below > 0) out.push(styler.cell(`↓ ${below} more`, inner, { color: "dim" }));
+  return out;
+}
+
+/** The viewport over the run rows: centered on the cursor, clamped to the ends. A cursor outside the runs
+ * section (negative `selected`, i.e. still up in the triggers) anchors the window at the top. */
+function runsWindow(len: number, selected: number): { top: number; count: number } {
+  const count = Math.min(len, RUNS_VIEWPORT);
+  const want = selected >= 0 ? selected - Math.floor(RUNS_VIEWPORT / 2) : 0;
+  const top = Math.min(Math.max(0, want), len - count);
+  return { top, count };
 }
 
 function runRow(row: any, sel: boolean, inner: number, styler: any): string {
@@ -935,9 +1047,12 @@ function trustModel(t: any): string[] {
   }
 }
 
-/** The TRIGGER_DETAIL footer hints. */
-function triggerDetailHints(inner: number, styler: any): string {
+/** The TRIGGER_DETAIL footer hints; with a delete armed, the footer IS the question. */
+function triggerDetailHints(inner: number, styler: any, pendingDelete = false): string {
   const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
+  if (pendingDelete) {
+    return fitLine(styler.fg("warning", "delete this trigger?") + "  " + [k("y", "confirm"), k("n", "cancel")].join(styler.fg("dim", "  ·  ")), inner, styler);
+  }
   return fitLine([k("e", "edit flow"), k("x", "delete"), k("esc", "back")].join(styler.fg("dim", "  ·  ")), inner, styler);
 }
 
@@ -982,13 +1097,28 @@ function countdownText(ms: number): string {
  * dispatches on `kind`. A null or malformed snapshot yields an empty list. No `.log`, no `.data` -- the
  * ACTIVE row carries only the id-only job id.
  */
-function buildRows(snapshot: any): any[] {
+function buildRows(snapshot: any, runSort = "time"): any[] {
   // Triggers lead the selectable list (Enter -> TRIGGER_DETAIL), then the optional ACTIVE row, then runs.
   // A trigger row carries its file `index` so a CRUD action can target the right entry in triggers.json.
+  // The ACTIVE row stays pinned above the runs whatever the sort: it is the one row that is not history.
   const triggers = (snapshot?.triggers?.triggers ?? []).map((t: any, i: number) => ({ kind: "trigger", trigger: t, index: i }));
   const active = snapshot?.activeJobId ? [{ kind: "active", jobId: snapshot.activeJobId }] : [];
   const runs = (Array.isArray(snapshot?.runs) ? snapshot.runs : []).map((record: any) => ({ kind: "run", record }));
-  return [...triggers, ...active, ...runs];
+  return [...triggers, ...active, ...sortRuns(runs, runSort)];
+}
+
+/** Re-order the run rows for the `o` cycle. Absent numbers sort LAST under tokens/cost (a pre-metering
+ * record is not a cheap one, it is an unknown one); "outcome" puts failures first, the triage order.
+ * "time" returns the rows untouched -- listRuns' endedAt-descending order is already the time sort. */
+function sortRuns(rows: any[], runSort: string): any[] {
+  if (runSort === "time" || rows.length < 2) return rows;
+  const num = (v: any) => (typeof v === "number" && Number.isFinite(v) ? v : -1);
+  const outcomeRank = (r: any) => (r?.outcome === "completed" ? 2 : r?.outcome === "policy" ? 1 : 0);
+  const sorted = [...rows];
+  if (runSort === "tokens") sorted.sort((a, b) => num(b.record?.tokens?.total) - num(a.record?.tokens?.total));
+  else if (runSort === "cost") sorted.sort((a, b) => num(b.record?.tokens?.cost) - num(a.record?.tokens?.cost));
+  else if (runSort === "outcome") sorted.sort((a, b) => outcomeRank(a.record) - outcomeRank(b.record));
+  return sorted;
 }
 
 /**
@@ -999,9 +1129,18 @@ function buildRows(snapshot: any): any[] {
  */
 function renderRunList(rows: any[], selected: number, w: number): string[] {
   if (!Array.isArray(rows) || rows.length === 0) return [clip("(no runs)", w)];
-  return rows.map((row, i) => {
+  // The plain twin of runLines' viewport, with ASCII edge markers -- the windowing is a fact about which
+  // rows are visible, and the monochrome panel must not silently show a different set than the colored one.
+  const { top, count } = runsWindow(rows.length, selected);
+  const out: string[] = [];
+  if (top > 0) out.push(clip(`^ ${top} more`, w));
+  for (let i = top; i < top + count; i++) {
+    const row = rows[i];
     const cursor = i === selected ? "›" : " ";
-    if (row.kind === "active") return clip(`${cursor} * ACTIVE ${row.jobId} running`, w);
+    if (row.kind === "active") {
+      out.push(clip(`${cursor} * ACTIVE ${row.jobId} running`, w));
+      continue;
+    }
     const run = row.record;
     // The plain twin of the colored badge in `runRow`. It has to be here too: this is the renderer a
     // non-TTY/no-color panel uses, and "one of two racing runs" must not be a fact only the pretty one tells.
@@ -1009,8 +1148,11 @@ function renderRunList(rows: any[], selected: number, w: number): string[] {
     const cells = [run?.jobId, run?.target, run?.flow, run?.outcome, run?.turns, run?.tokens?.total]
       .map((f) => (f === null || f === undefined ? "-" : String(f)))
       .join(" · ");
-    return clip(`${cursor} ${rep}${cells}`, w);
-  });
+    out.push(clip(`${cursor} ${rep}${cells}`, w));
+  }
+  const below = rows.length - top - count;
+  if (below > 0) out.push(clip(`v ${below} more`, w));
+  return out;
 }
 
 /**
@@ -1020,7 +1162,7 @@ function renderRunList(rows: any[], selected: number, w: number): string[] {
  * Four states: capability absent, no captured log, the windowed tail, and the tail after the job left the
  * active slot. `tailTop` is clamped to `[0, maxTop]` so a shrunk log cannot scroll past the end.
  */
-function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailAvailable }: any): string[] {
+function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable }: any): string[] {
   const boxTitle = `live ${tailJobId}`;
   let lines: string[];
   let footer: string;
@@ -1038,7 +1180,8 @@ function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tai
     lines = [`live ${tailJobId} -- ${len} line(s)`, ...all.slice(top, top + TAIL_VIEWPORT)];
     // The job left the active slot (ended, or a different job now runs): keep showing the last tail.
     if (snapshot?.activeJobId !== tailJobId) lines.push("(run ended -- Esc to go back)");
-    footer = `[${Math.min(top + TAIL_VIEWPORT, len)}/${len}]  Up/Down PgUp/PgDn scroll, Esc back`;
+    // The state is named, not implied: a paused tail reads "paused", so stale lines cannot pass as live.
+    footer = `[${Math.min(top + TAIL_VIEWPORT, len)}/${len}] ${tailFollow ? "follow" : "paused"} · Up/Down PgUp/PgDn scroll, Esc back`;
   }
   if (!framed) return [boxTitle, "", ...lines, "", footer];
   return box({ title: boxTitle, footer, width, sections: [{ lines }] });
@@ -1187,6 +1330,7 @@ function formatDuration(ms: number): string {
  */
 function runDetailHints(inner: number, styler: any, canOpen = false): string {
   const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
-  const bits = canOpen ? [k("b", "sandbox"), k("esc", "back")] : [k("esc", "back")];
+  const nav = k("←→", "prev/next");
+  const bits = canOpen ? [nav, k("b", "sandbox"), k("esc", "back")] : [nav, k("esc", "back")];
   return fitLine(bits.join(styler.fg("dim", "  ·  ")), inner, styler);
 }

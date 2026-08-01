@@ -911,7 +911,7 @@ export async function handleDashboardAction(result: any, paths: any, ctx: any): 
     case "editTrigger":
       return editTriggerFlow(paths, ui, notify, result.index);
     case "deleteTrigger":
-      return deleteTriggerEntry(paths, ui, notify, result.index);
+      return deleteTriggerEntry(paths, ui, notify, result.index, result.confirmed === true);
     case "editSettings":
       return editSettingsViaDialogs(paths, ui, notify);
     case "managePauses":
@@ -1086,11 +1086,18 @@ async function editTriggerFlow(paths: any, ui: any, notify: Notify, index: numbe
   notify?.(res.ok ? `flow updated (live) → ${flow.trim()}` : `edit rejected: ${res.invalid}`, res.ok ? "info" : "error");
 }
 
-/** Delete a trigger after an explicit confirm. */
-async function deleteTriggerEntry(paths: any, ui: any, notify: Notify, index: number): Promise<void> {
+/**
+ * Delete a trigger after an explicit confirm. `confirmed` marks a y/n the operator already answered inside
+ * the overlay's own frame (TRIGGER_DETAIL arms `x`, `y` executes) — asking again through `ui.confirm` would
+ * be the same question twice, so it is skipped. The write path is identical either way: the shared
+ * validate-then-rename `writeTriggers`, never a second door.
+ */
+async function deleteTriggerEntry(paths: any, ui: any, notify: Notify, index: number, confirmed = false): Promise<void> {
   if (typeof index !== "number") return;
-  const ok = await ui.confirm("Delete trigger", `Remove trigger #${index + 1} from triggers.json?`);
-  if (!ok) return;
+  if (!confirmed) {
+    const ok = await ui.confirm("Delete trigger", `Remove trigger #${index + 1} from triggers.json?`);
+    if (!ok) return;
+  }
   const res = writeTriggers({ triggersPath: paths.triggersPath, mutate: (list: any[]) => list.filter((_, i) => i !== index) });
   notify?.(res.ok ? `trigger #${index + 1} deleted (live)` : `delete rejected: ${res.invalid}`, res.ok ? "info" : "error");
 }
