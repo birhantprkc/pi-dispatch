@@ -540,6 +540,47 @@ export function listRuns({ logsDir, limit = 10, fs = nodeFs }) {
   return records.slice(0, cap);
 }
 
+// scanRunRecords' hard cap on how far back a fold may reach. The scan exists for the cost fold, and the
+// one deployment that needs the cap most is the one that turned retention OFF (PI_LOG_RETENTION_DAYS=0,
+// keep forever): without it, the scan's work grows without bound exactly where the reaper was disabled
+// deliberately. 92 days ~= a quarter -- more than any spend view needs, small enough to stay a file walk.
+const SCAN_WINDOW_MAX_DAYS = 92;
+
+/**
+ * Scan run records for the cost fold: every `*.json` whose `endedAt` (or `startedAt`, for a record that
+ * never ended) falls at or after `sinceMs`. The `listRuns` sibling WITHOUT the 1..50 display clamp --
+ * and, like `makeFindPreviousRun` (worker/src/run-history.mjs), explicitly NOT a query surface: a
+ * bounded, filename-keyed, read-only walk over the flat sidecar files, upholding
+ * DES-RUN-HISTORY-FLAT-FILES-NO-DB's no-database stance (the fold happens in memory at read time;
+ * nothing here indexes, caches, or writes). `sinceMs` is clamped to at most SCAN_WINDOW_MAX_DAYS before
+ * `nowMs`, so even a keep-forever deployment folds at most a quarter. Records come back in directory
+ * order -- bucketing and sorting are the fold's business, not the scan's. A missing logs dir is a normal
+ * empty history `[]`; any other readdir error is `{ unreachable }`; an unparseable or mid-read-deleted
+ * entry (the boot reaper may unlink between scan and read) is skipped, exactly as in `listRuns`.
+ */
+export function scanRunRecords({ logsDir, sinceMs, nowMs = Date.now(), fs = nodeFs }) {
+  const oldestMs = nowMs - SCAN_WINDOW_MAX_DAYS * 24 * 60 * 60 * 1000;
+  const cutoffMs = Math.max(Number.isFinite(sinceMs) ? sinceMs : oldestMs, oldestMs);
+  let names;
+  try {
+    names = fs.readdirSync(logsDir);
+  } catch (err) {
+    if (err?.code === "ENOENT") return [];
+    return { unreachable: `logs dir unreadable (${err?.code ?? "read-error"})` };
+  }
+
+  const records = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const record = readJsonFile(join(logsDir, name), fs);
+    if (!record || typeof record !== "object") continue;
+    const at = Date.parse(record.endedAt ?? record.startedAt ?? "");
+    if (!Number.isFinite(at) || at < cutoffMs) continue; // no usable timestamp, or outside the window
+    records.push(record);
+  }
+  return records;
+}
+
 /** Read one run record by (raw) job id via its sanitized filename, or `null` when absent/unreadable. */
 export function readRun({ logsDir, jobId, fs = nodeFs }) {
   return readJsonFile(join(logsDir, `${sanitizeJobId(jobId)}.json`), fs);
