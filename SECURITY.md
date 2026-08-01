@@ -361,6 +361,13 @@ Stated openly rather than discovered later:
   It is operator-present, processes no adversarial input, and holds no harness credentials — which is why
   pi running here is scoped out of the container-per-job constraint. Raw job logs are untrusted container
   output, and the extension never routes them into model context.
+- **The dashboard writes to your terminal's clipboard only on your keystroke.** The `y`/`Y` copy keys in
+  the run drill-in emit an OSC 52 sequence — the standard way a terminal application hands text to the
+  local clipboard, including over SSH. What crosses is a host-assigned job id or a target URL derived
+  from id-only fields, never log bytes or issue text; nothing is ever read back from the clipboard; and
+  the sequence is emitted only in direct response to the keypress, through the same injected seam
+  discipline as every other side effect. Run-target hyperlinks (OSC 8) are display-only escapes carrying
+  the same id-derived URLs.
 - Review every PR. Automation opens them; it does not land them.
 - Point local-folder jobs only at folders you can restore.
 - Keep the pinned pi version current, and let the upgrade tests gate the bump.

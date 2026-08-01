@@ -944,6 +944,17 @@ async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void
         // the argv and runs it attached to the terminal.
         sandboxInfo: ({ jobId }: { jobId: string }) => readSandboxInfo(paths, jobId),
         launchSandbox: ({ jobId }: { jobId: string }) => openSandboxSession(paths, jobId),
+        // OSC 52 clipboard write. This hands the terminal the operator's OWN selection: it fires only on
+        // an explicit y/Y keypress in RUN_DETAIL, carries id-only strings (a jobId or a derived public
+        // URL, never log bytes), and nothing is ever read back. The escape rides the stdout pi already
+        // owns, which is exactly why it works over SSH where a spawned pbcopy/xclip would not. The write
+        // lives HERE for the same reason tailLog's read does: dashboard.ts touches no process streams.
+        copyText: (text: string) => {
+          process.stdout.write(`\x1b]52;c;${Buffer.from(String(text)).toString("base64")}\x07`);
+        },
+        // The terminal's row count for the LIST/COSTS collapse budget. Null -- not a guess -- when stdout
+        // is not a TTY (rows undefined), which renders the full panel exactly as before.
+        terminalRows: () => process.stdout.rows ?? null,
       },
     });
   const opts = { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } };
