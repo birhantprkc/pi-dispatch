@@ -303,7 +303,7 @@ function buildByModel(runs) {
   const groups = new Map();
   for (const r of runs) {
     for (const row of r.contribution.rows) {
-      const key = `${row.provider} ${row.model}`;
+      const key = `${row.provider}\u0000${row.model}`;
       if (!groups.has(key)) {
         groups.set(key, { provider: row.provider, model: row.model, runs: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tokens: 0, rows: [] });
       }
