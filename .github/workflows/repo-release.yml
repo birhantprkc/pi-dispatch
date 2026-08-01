@@ -58,6 +58,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
+          # Which artifact is being described. release.yml passes its own — the script used to name the
+          # admin extension unconditionally, so every tool release described the wrong thing.
+          PRODUCT: pi-dispatch
+          PRODUCT_DESC: a self-hosted service that runs pi coding-agent jobs, one isolated container per job
         run: |
           # Range since the previous tool release (v*); the whole repo, not just one workspace.
           PREV=$(git tag --list 'v*' --sort=-v:refname | head -n1)
@@ -68,7 +72,21 @@ jobs:
             echo "release notes: AI-written"
           else
             echo "release notes: AI unavailable ($(head -n1 /tmp/notes.err 2>/dev/null)) — using commit list"
-            { echo "### Changes"; echo; printf '%s\n' "$COMMITS"; } > /tmp/notes.md
+            # Capped for the same reason the AI notes are: eighty commit subjects is a diff, not notes. The
+            # count is stated rather than trimmed silently — a truncated list that looks complete is worse
+            # than a long one.
+            TOTAL=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
+            {
+              echo "### Changes"; echo
+              printf '%s\n' "$COMMITS" | head -n 12
+              if [ "$TOTAL" -gt 12 ]; then printf -- '- …and %s more\n' "$((TOTAL - 12))"; fi
+            } > /tmp/notes.md
+          fi
+          # The detail escape hatch, appended on BOTH paths. This link is what earns the brevity above:
+          # nothing is hidden, it is one click away instead of in the body.
+          if [ -n "$PREV" ]; then
+            printf '\n**Full changelog**: %s/%s/compare/%s...v%s\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.v.outputs.version }}" >> /tmp/notes.md
           fi
 
       - name: Create GitHub Release

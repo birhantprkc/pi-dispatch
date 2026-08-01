@@ -84,6 +84,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
+          # This pipeline ships the EXTENSION; repo-release.yml passes the tool's own name for the v* line.
+          PRODUCT: "@edgehero/pi-dispatch-admin"
+          PRODUCT_DESC: the operator console for pi-dispatch, shipped as a pi extension
         run: |
           PREV=$(git tag --list 'admin-v*' --sort=-v:refname | head -n1)
           RANGE=${PREV:+$PREV..HEAD}
@@ -93,7 +96,18 @@ jobs:
             echo "release notes: AI-written"
           else
             echo "release notes: AI unavailable ($(head -n1 /tmp/notes.err 2>/dev/null)) — using commit list"
-            { echo "### Changes"; echo; printf '%s\n' "$COMMITS"; } > /tmp/notes.md
+            # Capped like the AI notes are, and the remainder counted rather than dropped silently.
+            TOTAL=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
+            {
+              echo "### Changes"; echo
+              printf '%s\n' "$COMMITS" | head -n 12
+              if [ "$TOTAL" -gt 12 ]; then printf -- '- …and %s more\n' "$((TOTAL - 12))"; fi
+            } > /tmp/notes.md
+          fi
+          # Appended on BOTH paths -- this link is what earns the brevity above.
+          if [ -n "$PREV" ]; then
+            printf '\n**Full changelog**: %s/%s/compare/%s...admin-v%s\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.v.outputs.version }}" >> /tmp/notes.md
           fi
 
       - name: Create GitHub Release
