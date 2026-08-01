@@ -1,6 +1,8 @@
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { resolveJobImage } from "./image-preflight.mjs";
+import { retainJobDir } from "./sandbox-store.mjs";
 import { prepareGithubWorkspace } from "./prepare-github.mjs";
 import { gitlabRemoteUrl } from "./gitlab-host.mjs";
 import { forgejoRemoteUrl } from "./forgejo-host.mjs";
@@ -29,6 +31,12 @@ import { prepareLocalWorkspace } from "./prepare-local.mjs";
 export function makePrepareWorkspace({
 	jobsDir,
 	forgeFor,
+	// REQ-RESURRECTABLE-SANDBOX. The DEPLOYMENT default image, resolved per job against the trigger's own
+	// `run.image` through the SAME function the pre-spend preflight and run-container use -- so the tag that
+	// was checked, the tag that ran and the tag a sandbox later re-opens are one answer by construction
+	// rather than three call sites that happen to agree. Null leaves the stamp imageless, and
+	// `resolveSandbox` then refuses rather than guessing.
+	jobImage = null,
 	findPreviousRun = () => null,
 	// REQ-RESUMABLE-SESSION. The default returns null, so an unwired dispatcher -- tests, a bare
 	// construction -- prepares exactly what it always did: no /session mount, nothing on disk.
@@ -41,6 +49,10 @@ export function makePrepareWorkspace({
 	mkdirSync(jobsDir, { recursive: true });
 	return async function prepareWorkspace(job, token, { queueJobId, piVersion = null } = {}) {
 		const jobDir = mkdtempSync(join(jobsDir, "job-"));
+		// What `cleanup` needs to retain this run's directory, stamped here because this is the only place
+		// that holds all three at once. Applied to the RESULT rather than mutated in, so a preparer's
+		// `{ outcome: "policy" }` refusal -- which carries no jobDir -- is passed through untouched.
+		const sandbox = { jobId: queueJobId ?? null, kind: job.kind ?? null, image: resolveJobImage(job, jobImage) };
 		if (job.kind === "local") {
 			// Harness text above, operator DATA below: the fixed pointer line names /job/event.json so a
 			// flow can discover the trigger context (mirroring the github prompt, which names the same
@@ -51,21 +63,24 @@ export function makePrepareWorkspace({
 				? `Use the "${job.flow}" skill for this task.\n\n${pointer}${job.task ?? ""}`
 				: `${pointer}${job.task ?? ""}`;
 			const event = localEventContext(job, queueJobId, findPreviousRun);
-			return await prepareLocal({ folder: job.folder, task, jobDir, event });
+			return stampSandbox(await prepareLocal({ folder: job.folder, task, jobDir, event }), sandbox);
 		}
 		const prepare = preparers[job.kind];
 		if (prepare) {
 			const host = forgeFor?.(job)?.host;
-			return await prepare(job, token, {
-				jobDir,
-				resolveDefaultBranchSha: host?.resolveDefaultBranchSha,
-				// The head ref a pull/merge-request job keys on comes from the FORGE API, never the webhook
-				// payload: an issue_comment on a PR carries no head at all, and a payload-supplied head repo
-				// is attacker-controlled data that must not decide which transcript a job is handed.
-				resolvePullRequestHead: host?.resolvePullRequestHead,
-				resolveSession,
-				piVersion,
-			});
+			return stampSandbox(
+				await prepare(job, token, {
+					jobDir,
+					resolveDefaultBranchSha: host?.resolveDefaultBranchSha,
+					// The head ref a pull/merge-request job keys on comes from the FORGE API, never the webhook
+					// payload: an issue_comment on a PR carries no head at all, and a payload-supplied head repo
+					// is attacker-controlled data that must not decide which transcript a job is handed.
+					resolvePullRequestHead: host?.resolvePullRequestHead,
+					resolveSession,
+					piVersion,
+				}),
+				sandbox,
+			);
 		}
 		throw new Error(`unknown job kind: ${job.kind}`);
 	};
@@ -104,9 +119,44 @@ function scheduledForMillis(queueJobId) {
 	return Number.isFinite(millis) ? millis : null;
 }
 
+/**
+ * Attach the sandbox stamp to a successful prepare, and to nothing else.
+ *
+ * A preparer's determinate refusal (`{ outcome: "policy", reason: "sha-gone" }`) carries no `jobDir`, so
+ * it is returned verbatim: there is no directory to retain and the processor's policy branch reads the
+ * same object it always did.
+ */
+function stampSandbox(prepared, sandbox) {
+	if (!prepared?.jobDir) return prepared;
+	return { ...prepared, sandbox };
+}
+
 /** Remove a per-job dir after the run. The workspace (the operator's folder) is never touched here. */
 export async function cleanup(prepared) {
 	if (prepared?.jobDir) await rm(prepared.jobDir, { recursive: true, force: true });
+}
+
+/**
+ * The teardown the worker injects: retain this run's directory for a bounded window instead of deleting
+ * it, so `pi-dispatch sandbox` can re-open it (REQ-RESURRECTABLE-SANDBOX).
+ *
+ * With the window at 0 -- the documented "off" -- this IS `cleanup`, by the same `rm` on the same path,
+ * so a deployment that does not want retention keeps today's behaviour exactly rather than a
+ * near-equivalent of it. `retainJobDir` owns the other branch entirely, including removing `jobDir` on
+ * every failure path, which is why there is no `rm` here to pair with it.
+ *
+ * NEVER THROWS -- the processor already swallows this in a `finally`, and a retention fault must not be
+ * the thing that turns a paid, completed run into a failure.
+ */
+export function makeCleanup({ sandboxDir, retentionHours = 0, log = () => {} } = {}) {
+	return async function cleanupWithRetention(prepared) {
+		if (!prepared?.jobDir) return;
+		if (!sandboxDir || retentionHours <= 0) {
+			await cleanup(prepared);
+			return;
+		}
+		retainJobDir(prepared, { sandboxDir, log });
+	};
 }
 
 /**

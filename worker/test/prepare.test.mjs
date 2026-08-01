@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -237,5 +237,80 @@ test("every forge the table knows has a preparer -- a kind with none throws 'unk
 	const preparers = makeForgePreparers({ prepareForge: async () => ({ ok: true }) });
 	for (const kind of FORGE_KINDS) {
 		assert.equal(typeof preparers[kind], "function", `${kind}: a forge with no preparer burns a budget slot before it fails`);
+	}
+});
+
+test("a prepared job carries the stamp cleanup needs to retain it (REQ-RESURRECTABLE-SANDBOX)", async () => {
+	const { jobsDir, cleanup } = withJobsDir();
+	try {
+		const prepareWorkspace = makePrepareWorkspace({
+			jobsDir,
+			jobImage: "pi-job:deployment-default",
+			preparers: { github: async (_j, _t, { jobDir }) => ({ jobDir, workspace: join(jobDir, "workspace"), sha: "s" }) },
+			forgeFor: () => ({ host: { resolveDefaultBranchSha: async () => ({ sha: "s" }) } }),
+		});
+
+		const plain = await prepareWorkspace({ kind: "github", repo: "a/b" }, "tok", { queueJobId: "gh-7" });
+		assert.deepEqual(plain.sandbox, { jobId: "gh-7", kind: "github", image: "pi-job:deployment-default" });
+
+		// A trigger's own run.image wins, resolved through the SAME function the preflight and the runner
+		// use -- so the tag that was checked, the tag that ran and the tag a sandbox re-opens are one answer.
+		const perTrigger = await prepareWorkspace({ kind: "github", repo: "a/b", image: "pi-job:custom" }, "tok", { queueJobId: "gh-8" });
+		assert.equal(perTrigger.sandbox.image, "pi-job:custom");
+	} finally {
+		cleanup();
+	}
+});
+
+test("a preparer's policy refusal carries no jobDir, so it is passed through unstamped", async () => {
+	const { jobsDir, cleanup } = withJobsDir();
+	try {
+		const prepareWorkspace = makePrepareWorkspace({
+			jobsDir,
+			jobImage: "pi-job:latest",
+			preparers: { github: async () => ({ outcome: "policy", reason: "sha-gone" }) },
+			forgeFor: () => ({ host: {} }),
+		});
+		const refused = await prepareWorkspace({ kind: "github", repo: "a/b" }, "tok", { queueJobId: "gh-9" });
+		// The processor's policy branch reads exactly the object it always did -- no extra key, and nothing
+		// that could make a refusal look retainable.
+		assert.deepEqual(refused, { outcome: "policy", reason: "sha-gone" });
+	} finally {
+		cleanup();
+	}
+});
+
+test("with retention OFF, cleanup is the rm it always was", async () => {
+	const { jobsDir, cleanup } = withJobsDir();
+	try {
+		const { makeCleanup } = await import("../src/prepare.mjs");
+		const jobDir = mkdtempSync(join(jobsDir, "job-"));
+		const prepared = { jobDir, workspace: join(jobDir, "workspace"), sandbox: { jobId: "gh-1", kind: "github", image: "i" } };
+
+		await makeCleanup({ sandboxDir: join(jobsDir, "sandboxes"), retentionHours: 0 })(prepared);
+		assert.equal(existsSync(jobDir), false, "the per-job dir is deleted, exactly as before the feature");
+		assert.equal(existsSync(join(jobsDir, "sandboxes")), false, "and nothing is retained anywhere");
+	} finally {
+		cleanup();
+	}
+});
+
+test("with retention ON, cleanup retains the directory under the sandbox root", async () => {
+	const { jobsDir, cleanup } = withJobsDir();
+	try {
+		const { makeCleanup } = await import("../src/prepare.mjs");
+		const sandboxDir = join(jobsDir, "sandboxes");
+		const jobDir = mkdtempSync(join(jobsDir, "job-"));
+		mkdirSync(join(jobDir, "workspace"), { recursive: true });
+		writeFileSync(join(jobDir, "prompt.md"), "task");
+		const prepared = { jobDir, workspace: join(jobDir, "workspace"), sandbox: { jobId: "gh-1", kind: "github", image: "pi-job:latest" } };
+
+		await makeCleanup({ sandboxDir, retentionHours: 24 })(prepared);
+		assert.equal(existsSync(jobDir), false, "the original per-job dir is gone -- moved, not copied");
+		assert.equal(existsSync(join(sandboxDir, "gh-1", "prompt.md")), true, "the run's /job inputs travelled with it");
+		const manifest = JSON.parse(readFileSync(join(sandboxDir, "gh-1", "manifest.json"), "utf8"));
+		assert.equal(manifest.workspace, join(sandboxDir, "gh-1", "workspace"), "the workspace path follows the rename");
+	} finally {
+		cleanup();
 	}
 });

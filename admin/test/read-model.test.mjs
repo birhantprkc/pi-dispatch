@@ -131,12 +131,18 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     PI_CAPTURE_JOB_LOGS: "1",
     PI_DISPATCH_RUN_ROOTS: "/root-a",
     PI_DISPATCH_RUN_PER_HOUR: "5",
+    // Pinned so the sandbox default does not drag the OS temp dir into this equality
+    // (REQ-RESURRECTABLE-SANDBOX); the defaulting itself is asserted in its own test below.
+    PI_SANDBOX_DIR: "/sbx",
   });
   assert.deepEqual(p, {
     valkeyUrl: "redis://h:1",
     logsDir: "/l",
     settingsFile: "/s.json",
     triggersPath: "/f.json",
+    sandboxDir: "/sbx",
+    sandboxRetentionHours: 24,
+    sandboxIdleMinutes: 30,
     globalPiDir: "/srv/pi-global",
     captureJobLogs: true,
     dispatchRunRoots: ["/root-a"],

@@ -56,7 +56,9 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 | A local folder's `.pi/` | **Whatever can write that folder** | No merge gate, no reviewer, no history |
 | The job image (`PI_JOB_IMAGE`, or a trigger's `run.image`) | **Operator — the same trust as baking it** | It *is* the code every job executes: the pi version, the runner and its exit codes, the guardrail floor, the loader's discovery posture and the non-root user all come from it. Nothing here verifies an image this project did not build. The isolation flags are applied by the worker's argv and hold for **any** image; the **contents** do not. |
 | The job container | **None** — it is the untrusted side | It runs the agent |
-| A job container's `/outbox` request file | **None** — agent-authored | The container's **only** signal channel back to the host; validated host-side before anything is enqueued |
+| A job container's `/outbox` request file | **None** — agent-authored | An agent-initiated signal channel back to the host; validated host-side before anything is enqueued. **Local jobs only** — a github job has no `/outbox` mount at all |
+| A job container's `/session` transcript | **None** — agent-authored | The **second** agent-initiated channel, and this row exists because the line above used to say "only". Written by the agent, read back host-side on a `completed` exit, `lstat`-checked and regular-files-only on both edges |
+| A **resurrected sandbox**'s operator shell (`pi-dispatch sandbox`) | **Operator — the same trust as a terminal on this host** | A third channel, and the first the **operator** opens rather than the agent. Not a job container: no minted token, no provider key, no agent running, started only by a keypress. It re-mounts a finished run's workspace, which for a forge job holds attacker-influenced code — the same trust shape as checking out a stranger's pull request locally. Every isolation flag still applies; ports it publishes are `127.0.0.1`-only and last only while it does |
 | Receiver, worker, queue, admin extension | Trusted | They never execute agent-authored content — the admin extension feeds only PII-free, fixed-enum run records to the model; raw container output stays in the overlay viewer |
 
 ## What is defended
@@ -83,6 +85,13 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.
+  **An operator can re-open a finished run's sandbox** (`pi-dispatch sandbox`, `docs/sandbox.md`), and
+  that does not weaken this: the *job* container is still single-use and still gone the moment it exits.
+  A sandbox is a **new** container, built from the same argv builder so it carries every flag above by
+  construction, holding **no credential of any kind**, started by an operator at a keyboard and never by
+  a trigger, an agent or a model tool. What it re-mounts is the run's workspace, retained on the host for
+  a bounded window (`PI_SANDBOX_RETENTION_HOURS`, 24h by default, `0` to disable). Its container name is
+  outside the `pi-job-*` namespace the boot reaper clears, so a worker restart cannot kill it.
 - **Credential scope.** A repo-scoped, short-lived token minted per job — a GitHub App installation
   token, or a single-owner fine-grained PAT. Its narrow scope and short expiry bound **where** and for
   **how long** an injected agent can act within that repo. See *What is NOT defended*.

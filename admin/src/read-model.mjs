@@ -18,7 +18,7 @@
 import * as nodeFs from "node:fs";
 import { join, delimiter, sep } from "node:path";
 import { execFileSync } from "node:child_process";
-import { defaultLogsDir } from "@pi-dispatch/worker/config";
+import { defaultLogsDir, defaultSandboxDir } from "@pi-dispatch/worker/config";
 import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
 import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
@@ -52,6 +52,13 @@ export function resolvePaths(env = process.env) {
     // normal deployment, in which no trigger can arm any package.
     globalPiDir: env.PI_GLOBAL_PI_DIR || null,
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
+    // REQ-RESURRECTABLE-SANDBOX: where finished runs' directories are retained, and for how long. Read
+    // from env for the same reason as everything above -- never loadConfig. The `0` here means retention
+    // OFF (the panel then says so rather than offering a key that always refuses), which is the opposite
+    // of the log/session sentinels; worker/src/config.mjs carries the full reasoning.
+    sandboxDir: env.PI_SANDBOX_DIR || defaultSandboxDir(env),
+    sandboxRetentionHours: parseNonNegInt(env.PI_SANDBOX_RETENTION_HOURS, 24),
+    sandboxIdleMinutes: parseNonNegInt(env.PI_SANDBOX_IDLE_MINUTES, 30),
     // The two dispatch_run bounds the extension enforces producer-side, read DIRECTLY from env (never
     // loadConfig, which throws on unrelated GitHub-auth problems). `delimitedList`/`nonNegativeInt` are
     // private to the worker's config, so the same shapes are reimplemented here. Default roots [] fails

@@ -878,6 +878,78 @@ Evidence convention as in `constitution.md`.
   `run.image` naming an image absent from the host, `docker run` is never reached: the pre-spend inspect
   refuses first and `--pull=never` forecloses the fetch.
 
+## INT-SANDBOX-CONTRACT
+
+**operator → docker daemon.** A SIBLING of `INT-CONTAINER-RUNTIME-CONTRACT`, never an amendment to it.
+That contract governs the container the harness launches against untrusted input and says **"No TTY
+(`-it` absent)"**; this one governs a container an operator launches with no agent in it. IDs are
+permanent addresses, and the repo has made this call once already — `INT-GITLAB-PAYLOAD-SUBSET` is a
+sibling rather than an extension of the GitHub one for the same reason.
+
+- **Contract**:
+  - **The argv is built by the SAME builder.** `buildSandboxRunArgs` calls `buildDockerRunArgs` through
+    its `extraFlags` seam, so `ISOLATION_FLAGS`, `--memory` and `--cpus` reach this container **by
+    construction**: `--pull=never --rm --init --cap-drop=ALL --security-opt no-new-privileges
+    --pids-limit=512 --shm-size=1g --memory=4g --cpus=2`. This is the load-bearing sentence of the whole
+    contract. A leaner hand-written argv here would be a second place for the boundary to live, and the
+    copy that did not get the next flag would be the one nobody was looking at.
+  - **Adds exactly**: `-i -t --entrypoint bash`, and `-p 127.0.0.1:<host>:<container>` per `--publish`.
+  - **Mounts**: the retained per-job directory at `/job:ro` and its workspace at `/workspace:rw` — the
+    same two the run itself had, from the same paths. **No `/outbox`** (nothing to chain: no agent),
+    **no `/session`** (the transcript is deleted before retention), **no `/opt/pi-global`** (pi is not
+    running).
+  - **Env is exactly `TERM` and `TMOUT`.** No minted forge token under any forge's variable names, no
+    provider key, no `PI_FORWARD_ENV` pass-through, none of the `PI_*` job variables. `buildContainerEnv`
+    is NOT reused and cannot be: it writes the mint (`env-allowlist.mjs`) and throws when no provider
+    credential resolves, so it has no credential-free output to produce.
+  - **Name**: `pi-sandbox-<sanitizeJobId(jobId)>`. Docker matches `--filter name=` as a **substring**, and
+    the boot reaper filters `name=pi-job-`; `pi-sandbox-` shares no substring with it, which is the whole
+    reason a worker restart cannot `docker rm -f` a shell an operator is sitting in.
+  - **Retained directory layout**, under `PI_SANDBOX_DIR` (default `<PI_JOBS_DIR>/sandboxes`, mode `0700`):
+    ```
+    <sandboxDir>/<sanitizeJobId(jobId)>/
+      manifest.json          mode 0600
+      prompt.md  event.json  pi/     the run's /job inputs, mounted :ro
+      workspace/                     forge jobs only; a local job's workspace is the operator's folder
+    ```
+    ```jsonc
+    { "jobId": "gh-12345", "kind": "github", "image": "pi-job:latest",
+      "workspace": "/abs/host/path", "createdAt": "2026-08-01T10:00:00.000Z", "keepUntil": null }
+    ```
+    `image` is resolved through `resolveJobImage` — the same function the pre-spend preflight and
+    `run-container.mjs` use — so the tag that was checked, the tag that ran and the tag re-opened are one
+    answer rather than three call sites that agree by luck. `workspace` is rebased onto the retained
+    directory when the run's workspace lived inside it, and recorded verbatim when it did not; decided by
+    path containment, never by `kind`, so a preparer that moves its clone cannot record a path that does
+    not exist.
+  - **NOT the run-history record.** `INT-RUN-HISTORY-FILE-CONTRACT` is PII-free by construction, and that
+    property is what lets the admin extension feed those records to a model. This manifest holds a host
+    path — which on Windows embeds the operator's account name — so it is a separate file that never goes
+    near a prompt. The panel renders the retention *verdict*, never the path.
+  - **Retention**: `createdAt + PI_SANDBOX_RETENTION_HOURS`, or `keepUntil` when pinned. Swept at worker
+    boot. `0` = OFF: nothing retained, and the sweep's cutoff becomes `now`, so it also clears what an
+    earlier setting kept. There is no keep-forever value.
+  - **Age comes from `createdAt`, never mtime.** `makeLogReaper` calls mtime "the authority" and is right
+    about an append-once log file. An operator working inside a resurrected sandbox writes into the
+    directory, so mtime would keep moving and the window would never close — for exactly the directories
+    most likely to be large.
+  - **The sweep asks docker first.** `listRunningSandboxes` yields the job ids of live sandboxes and
+    **throws** when docker cannot be reached, because "none are running" and "I could not find out" must
+    not arrive as the same empty array in front of a `rm -rf`. A failed lookup skips the whole sweep.
+- **Why**: The 5% case (`REQ-RESURRECTABLE-SANDBOX`). Every choice above exists to keep the *job*
+  contract untouched while serving it: a second container shape rather than a longer-lived first one, a
+  second env builder rather than a credential-optional one, a second name namespace rather than a
+  reaper exemption, and a second reaper rather than a widened log sweep.
+- **Traces to**: `REQ-RESURRECTABLE-SANDBOX`, `CONST-ISOLATION-CONTAINER-PER-JOB`,
+  `CONST-TOKEN-SCOPED-PER-JOB`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SESSION-STORE-CONTRACT`,
+  `DES-SANDBOX-IS-A-FRESH-CONTAINER`
+- **Acceptance**: The sandbox argv contains every member of `ISOLATION_FLAGS` (asserted against the
+  imported array, not a copy), contains `-i`, `-t` and `--entrypoint bash`, ends with the image, and
+  contains no member of `MINTED_TOKEN_VARS` and no provider key variable. The container name contains no
+  `pi-job-`. `--publish 3000` yields `127.0.0.1:3000:3000` and an explicit bind address is refused. A
+  retained directory contains no `session/`. A directory whose sandbox is running is not swept, and a
+  sweep whose docker lookup failed removes nothing.
+
 ## INT-WEBHOOK-PAYLOAD-SUBSET
 
 **GitHub → receiver.** *(GitLab's is a separate contract — `INT-GITLAB-PAYLOAD-SUBSET`. This ID keeps
@@ -1633,6 +1705,7 @@ worker reads.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Added **`INT-SANDBOX-CONTRACT`** (issue #55, `REQ-RESURRECTABLE-SANDBOX`) — the operator-session container shape, plus the retained-directory layout and its manifest. **A SIBLING of `INT-CONTAINER-RUNTIME-CONTRACT`, not an amendment to it**, and the reasoning is the same one `INT-GITLAB-PAYLOAD-SUBSET` recorded: IDs are permanent addresses, and a container an operator opens with no agent in it is a different object, not more of the job one. That entry is **UNCHANGED, and was checked rather than forgotten** — its `No TTY (-it absent)` line still describes every container the harness launches, which is precisely why the new shape needed its own address instead of a qualifier on that one. Three decisions written down because a later reader would otherwise re-litigate them: the sandbox argv comes from `buildDockerRunArgs` through the previously-unused `extraFlags` seam, so the isolation flags are inherited **by construction** rather than re-listed; the retained-directory manifest is a **separate file from the run-history sidecar**, because `INT-RUN-HISTORY-FILE-CONTRACT`'s PII-free-by-construction property is what lets the admin extension feed those records to a model and this one holds a host path (that entry likewise **UNCHANGED and checked**); and expiry reads the manifest's `createdAt` rather than mtime, inverting `makeLogReaper`'s documented "mtime is the authority" for the one case where it fails — an operator working inside a sandbox moves mtime, so the window would never close. `INT-SESSION-STORE-CONTRACT` **UNCHANGED, and checked**: the per-job `/session` copy is deleted **before** retention, so no transcript ever enters a directory whose lifetime `--pin` can extend. |
 | 2026-07-28 | **The pi-normal discovery posture** (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended in the same change). **INT-SDK-SESSION-OPTIONS**: the contract block showed all three suppression flags `true` and was two flags and two options behind the runner — it now mirrors the shipped loader (`noContextFiles: false`, `noExtensions: false`, `noSkills: true`, the `settingsManager`, `extensionsOverride`, and the `outboxProtocol` entry in `appendSystemPromptOverride` that a local job's `/outbox` mount adds). Trap **(c)** rewritten from "`noContextFiles: true` is the SDK equivalent of `-nc`, and it is OFF BY DEFAULT" to the amended posture, keeping the point that the value is written out **because** it is the decision on the record, and naming the inverted trap it leaves (the loader is not forgiving elsewhere). Trap **(f)** rewritten and this is the correction worth reading twice: it said "Project trust is never granted, and is not needed", which conflated *we never call `resolveProjectTrust`* (true) with *the project is untrusted* (false — `SettingsManager.fromStorage` takes `options.projectTrusted ?? true` and `inMemory` forwards no options). The distinction was **inert** while both discovery flags were `true` and is now **load-bearing**: that default is exactly what makes `addAutoDiscoveredResources`' `if (projectTrusted)` branch load `/workspace/.pi/extensions`, so if a future pi flips it, repo extensions stop loading **silently** — which is why the loader tests pin the outcome (the factory ran) and never the flag. Trap **(e)** flagged as MORE reachable, not historical. Two new traps: **(j)** the `extensionsOverride` recursion guard — two signals (entry-NAME pattern, and the `^dispatch_` TOOL-SURFACE check that actually catches this repo's `.pi/extensions/dispatch.ts`), applied before the loader stores the set so a dropped extension registers no tool and receives no event, with the honest limits recorded (the factory has already run; a repo's own `dispatch_*` tool is lost, logged and rename-able; a renamed re-export under other tool names is out of reach); **(k)** why `noSkills` STAYS `true` — mechanical, not caution: discovery double-registers every repo skill under `/workspace/.pi/skills` ahead of `additionalSkillPaths` and first-path-wins demotes the pinned-sha read-only mount to a collision diagnostic. Acceptance inverted to match (the `AGENTS.md` sentinel must now be **present** in `getAgentsFiles()` and **absent** from the append block), and a pinned-artifact evidence block added for the trust default and the two merge branches. **INT-CONTAINER-JOB-INPUTS**: a new bullet for what the container now reads from `/workspace` (`AGENTS.md`, `.pi/extensions`) and why neither is a `/job` input; the "why materialise" rationale re-grounded — it had claimed the checkout "for a PR-triggered job may be a fork", which `prepare-github.mjs` contradicts (always the base repo's default-branch sha, detached), so the surviving reasons are `:ro` untamperability and symlink-safety, both independent of trust. **INT-TRIGGERS-FILE-CONTRACT**: `run.packages` inverted to an **opt-OUT** (absent or `true` load; only `false` withholds), recording that the strictness which used to live in the worker's `=== true` moved to `parseTriggers`' load-time boolean validation, and that the damaging misreading flipped from a truthy `"true"` arming a trigger to a `"false"` string that looks like an opt-out and is not one. |
 | 2026-07-28 | **Corrected INT-SDK-SESSION-OPTIONS trap (g)**, which the row below stated as a flat, unconditional fact ("pi-ai is installed TWICE"). It is not unconditional — it is a property of the **install**, not of pi. The dual layout appears wherever the **worker's** dependencies are installed as well (a dev checkout, the contract-tests job), because the hoisted copy IS the worker's declared dependency, and that layout is what makes a bare specifier bind the wrong registry and meter nothing while reporting success. The **job image** installs the **runner's** dependencies only (`image/runner/package.json` declares `@earendil-works/pi-coding-agent` and `@playwright/cli`, never pi-ai), so there the nested copy is the ONLY copy and the same bare specifier does not resolve at all — `ERR_MODULE_NOT_FOUND`, not a wrong binding. The trap now leads with the invariant that holds in BOTH and is the thing worth remembering: **never reach pi-ai by bare specifier** — register through `modelRegistry.registerProvider` and let the **runtime mutation probe** decide which module object the registry actually writes to — and records that `resolvePiAiCompat` wraps **both** lookups in `tryResolve` for exactly this reason, so an unresolvable candidate is skipped rather than thrown and one implementation is correct in both environments. Found by the `image` CI job, whose pi-ai step asserted the dual layout *inside the container* and failed there while the code it was guarding was correct in both places; that step now runs `resolvePiAiCompat` inside the built image and asserts the NESTED copy is offered first with the compat surface the probe and the wrapper need, and the dual-copy fact stays pinned by `image/runner/test/pinned-api.test.mjs` in the contract-tests job, which is the environment where it is true. |
 | 2026-07-28 | Process-wide metering + operator-staged packages (issue #58). **INT-SDK-SESSION-OPTIONS**: the contract block now mirrors the shipped wiring — a HOISTED `sessionManager` so `rootSessionId` exists before the meter, the meter installed after `ModelRegistry.create` and before `createAgentSession`, a deterministic `arm()` after it (extensions register their own api providers during the call), `packagePaths` appended LAST to `additionalExtensionPaths`, and a `skillsOverride` that re-imposes protected-root skill precedence. Three new traps: **(g)** pi-ai is installed TWICE with separate module-level registries and pi-coding-agent uses the NESTED one, so a bare specifier binds the hoisted copy and meters nothing while reporting success — `import.meta.resolve` names the wrong path, and only a runtime mutation probe can decide it; **(h)** `resetApiProviders()` (what `AgentSession.reload()` calls) WIPES the registry, so registration goes through `modelRegistry.registerProvider` (which `refresh()` re-applies) plus a re-arm, and a wrapped entry is recognised by object identity because `refresh()` returns fresh objects; **(i)** skill precedence is decided by `skillsOverride`, NOT by path order — pi puts a staged package's skill paths first in `skillPaths` and `loadSkills` is first-path-wins, but the loader's declared `skillsOverride` runs on that result before anything is stored, and pi's public `loadSkillsFromDir` supplies the substitute, so `REQ-GLOBAL-PI-OVERLAY`'s "repo wins on conflict" is enforced rather than asserted. **INT-CONTAINER-RUNTIME-CONTRACT**: env gains `PI_PACKAGES` (conditional, fail-closed, `":"`-delimited container paths, omitted when empty) and `PI_OFFLINE=1` — flagged as the ONE env addition that is not opt-in, because it is a narrowing that makes pi's job-time `npm install` branch unreachable rather than merely unused; the `/opt/pi-global` sentence now names `packages/` as a fourth thing the overlay carries, and states that **the mount list itself is unchanged**. **INT-CONTAINER-JOB-INPUTS**: DELETED the `/job/pi/extensions/...` line — the materialiser only ever writes `APPEND_SYSTEM.md` and `skills/<name>/SKILL.md`, so it documented a path the worker never writes — with a note that the seam is kept deliberately (repo extensions are arbitrary merged-branch code and are not materialised), that it already yields a permanent unread `"path does not exist"` error on every job, and that this permanence is precisely why the staged-package existence check is scoped to package roots instead of surfacing pi's error list. **INT-TRIGGERS-FILE-CONTRACT**: `run.packages` (optional boolean) on all four `run` shapes with its own bullet mirroring `run.github`, and the cron byte-match acceptance extended for `packages` plus an explicit `PI_OFFLINE=1` env carve-out (same precedent as the cron `trigger:{id,pattern}` carve-out). **NEW INT-PI-PACKAGES-FILE-CONTRACT**: the `pi-packages.json` shape, the exact-version rule citing `CONST-PI-VERSION-PINNED`, the npm name charset, the `dir` sanitisation and uniqueness rule, the admin-name refusal, the `..`/absolute manifest refusal, the npm flag set with the reason for each, the staged layout, and `packages.json` as the never-throwing worker/doctor read model. The install target travels as the exec's **`cwd`**, not `--prefix`, so argv carries **no filesystem path at all** — recorded as a load-bearing safety property, because it is what makes the win32 `shell: true` (required since Node 18.20.2 refuses to spawn `npm.cmd` without one) safe: everything left in argv is a literal flag or a pre-validated `name@version`. **INT-RUNNER-EXIT-CODE-PROTOCOL**: the eight new `tokens` telemetry keys, restating that none of them feeds classification, plus a row for a process-wide breach mid-fanout (exit `2` / `token_budget`, deliberately the same row — one flag, one code). **INT-RUN-HISTORY-FILE-CONTRACT**: the widened `tokens` object, still additive and nullable-as-a-whole, noting `parseExitTokens` and `buildRecord` are unchanged and that `recordTokenSpend` now charges process-wide spend. |

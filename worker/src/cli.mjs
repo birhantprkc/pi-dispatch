@@ -16,6 +16,12 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch run <folder> --task "<what to do>" [--flow <name>]
                            [--provider <p>] [--model <m>] [--max-turns <n>] [--image <ref>] [--force]
+  pi-dispatch sandbox <jobId>
+                           re-open a finished run's sandbox as a shell — same image, same workspace,
+                           no credentials  [--publish <port>[:<containerPort>]] [--pin]
+  pi-dispatch sandbox --list
+                           what is still re-openable, for how long, and what is running now
+
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
   pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
   pi-dispatch resume       resume taking jobs
@@ -39,6 +45,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 	if (cmd === "import-pi") {
 		const { runImportPi } = await import("./import-pi.mjs");
 		return runImportPi(argv.slice(1), { env });
+	}
+
+	if (cmd === "sandbox") {
+		const { runSandbox } = await import("./sandbox-cli.mjs");
+		return runSandbox(argv.slice(1), { env });
 	}
 
 	if (cmd === "worker") {

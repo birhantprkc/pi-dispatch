@@ -59,6 +59,8 @@ import {
   enqueueDispatchRun,
   KNOWN_KEYS,
 } from "./read-model.mjs";
+import { buildSandboxRunArgs, launchSandbox as spawnSandbox, resolveSandbox, sandboxContainerName } from "@pi-dispatch/worker/sandbox";
+import { readManifest } from "@pi-dispatch/worker/sandbox-store";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { makeDashboard, createDashboardDeps } from "./dashboard.ts";
 import { matchesKey } from "./keys.mjs";
@@ -791,6 +793,12 @@ async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void
         ...createDashboardDeps(paths),
         // log read stays here; overlay-only, returns readLogTail's result verbatim
         tailLog: ({ jobId, lines }: { jobId: string; lines: number }) => readLogTail({ logsDir: paths.logsDir, jobId, lines }),
+        // REQ-RESURRECTABLE-SANDBOX, both seams. The fs read and the spawn live HERE for the same reason
+        // tailLog does: dashboard.ts renders and holds the tui, and touches no filesystem and no child
+        // process of its own. It brackets the launch with tui.stop()/tui.start(); this side only builds
+        // the argv and runs it attached to the terminal.
+        sandboxInfo: ({ jobId }: { jobId: string }) => readSandboxInfo(paths, jobId),
+        launchSandbox: ({ jobId }: { jobId: string }) => openSandboxSession(paths, jobId),
       },
     });
   const opts = { overlay: true, overlayOptions: { width: "75%", maxHeight: "90%", anchor: "center" } };
@@ -804,6 +812,76 @@ async function openDashboard(paths: any, ctx: any, notify: Notify): Promise<void
     if (!result || !result.action) return;
     await handleDashboardAction(result, paths, ctx);
   }
+}
+
+/**
+ * Whether this run is still re-openable, as a VERDICT rather than a path (REQ-RESURRECTABLE-SANDBOX).
+ *
+ * Synchronous on purpose: RUN_DETAIL reads it once on entry, inside a key handler, and one small
+ * `readFileSync` there is cheaper than making the overlay's state a promise. Whether a sandbox is
+ * currently running is deliberately NOT asked -- that needs docker and `pi-dispatch sandbox --list`
+ * already answers it.
+ */
+function readSandboxInfo(paths: any, jobId: string): any {
+  if (!jobId) return null;
+  if (!paths?.sandboxRetentionHours) return { retained: false, reason: "retention off" };
+  const manifest = readManifest({ sandboxDir: paths.sandboxDir, jobId });
+  if (!manifest) return { retained: false, reason: "swept" };
+  const keepUntil = Date.parse(manifest.keepUntil ?? "");
+  const createdAt = Date.parse(manifest.createdAt ?? "");
+  const until = Number.isFinite(keepUntil) ? keepUntil : createdAt + paths.sandboxRetentionHours * 3600000;
+  if (!Number.isFinite(until)) return { retained: true };
+  const hours = Math.max(0, Math.round((until - Date.now()) / 3600000));
+  return { retained: true, pinned: Number.isFinite(keepUntil), expiresIn: hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d` };
+}
+
+/**
+ * Open one run's sandbox attached to this terminal.
+ *
+ * The caller (dashboard.ts) has already suspended pi's TUI, so stdout is ours and `stdio: "inherit"` hands
+ * the terminal to the container until the operator exits. A refusal prints and returns rather than
+ * throwing: the panel is mid-suspend, and an exception here would surface as a broken screen instead of a
+ * sentence.
+ */
+async function openSandboxSession(paths: any, jobId: string): Promise<void> {
+  const resolved = resolveSandbox({
+    jobId,
+    sandboxDir: paths.sandboxDir,
+    retentionHours: paths.sandboxRetentionHours,
+  });
+  if (resolved.refused) {
+    process.stdout.write(`\ncannot open a sandbox for ${jobId}: ${resolved.message}\n`);
+    await pauseForMessage();
+    return;
+  }
+  const args = buildSandboxRunArgs({
+    image: resolved.manifest.image,
+    name: resolved.name,
+    workspace: resolved.manifest.workspace,
+    jobDir: resolved.manifest.dir,
+    term: process.env.TERM,
+    idleSeconds: (paths.sandboxIdleMinutes ?? 0) * 60,
+  });
+  process.stdout.write(`\nopening ${sandboxContainerName(jobId)} — image ${resolved.manifest.image}\n`);
+  process.stdout.write("no credentials are set in this container. exit the shell to return to the panel.\n\n");
+  const { error } = await spawnSandbox({ args });
+  if (error) {
+    process.stdout.write(`\ncould not start docker: ${error.message}\n`);
+    await pauseForMessage();
+  }
+}
+
+/**
+ * Hold the suspended terminal open long enough to read a refusal, then return.
+ *
+ * A TIMER, deliberately, and not a keypress. pi's `terminal.stop()` calls `process.stdin.pause()`, so a
+ * `stdin.once("data")` here would never fire and the panel would hang suspended forever -- waiting on
+ * input from a stream the suspend just paused. Resuming stdin to read one key would mean re-entering the
+ * input handling that the suspend exists to hand away. A fixed pause cannot deadlock, and this path is
+ * only reached when a workspace disappears between opening RUN_DETAIL and pressing the key.
+ */
+function pauseForMessage(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 2500));
 }
 
 /** Split a space-separated dialog answer into trimmed, non-empty words (label/action lists). */

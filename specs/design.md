@@ -1234,6 +1234,46 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `REQ-RESUMABLE-SESSION`, `INT-SESSION-STORE-CONTRACT`, `DES-RUN-HISTORY-FLAT-FILES-NO-DB`;
   implemented in `worker/src/session-key.mjs`.
 
+## DES-SANDBOX-IS-A-FRESH-CONTAINER
+
+- **Decision**: To let an operator inspect what a run built, **retain the run's inputs and start a new
+  container**, rather than preserving the original one in any form. The job container stays single-use,
+  `--rm`, TTY-less and port-less; `pi-dispatch sandbox <jobId>` launches a second, differently-named
+  container from the same image with the same mounts and no credentials
+  (`REQ-RESURRECTABLE-SANDBOX`, `INT-SANDBOX-CONTRACT`).
+- **Why**: The thing an operator actually wants is *the app running against the files the agent wrote*.
+  That needs the image and the workspace — both of which already exist and are already cheap to keep. It
+  does not need the original process tree, and every design that tries to keep one trades away a property
+  the whole security model rests on. Framing it as "make it reproducible" rather than "make it survive"
+  is what keeps the change confined to how long a directory lives.
+- **Rejected**:
+  - *Keep the job container alive and `docker exec` into it.* A job container with an open operator
+    channel is a different security object from the one every isolation flag was chosen for: it is alive
+    while adversarial code has run in it, it still holds the minted forge token and the provider key in
+    its environment, and `--rm` — the flag that makes leakage between mutually-untrusting issue authors
+    structurally impossible rather than merely unlikely — has to go. The convenience is real and it is
+    not worth reopening `CONST-ISOLATION-CONTAINER-PER-JOB` for.
+  - *A stdin channel to the running agent.* Same objection plus a worse one: it makes the operator an
+    input to a session whose prompt already carries untrusted issue text, so the two trust classes meet
+    inside a running agent rather than at a boundary.
+  - *`docker commit` the container at exit.* This preserves strictly more — installed packages, process
+    residue — and costs gigabytes per run to do it. It serves a 5% case that image+workspace already
+    serves, and the extra it preserves is mostly the part that should have been in the image. The honest
+    version of the contract ("same image, same workspace, fresh processes") is the one that stays cheap.
+  - *Publish a port on job containers, gated by config.* An always-available network surface on the
+    untrusted side, live for every run, to serve the runs an operator is watching. The publish flag
+    exists only on an operator-started sandbox and only while it is up, bound to `127.0.0.1`.
+  - *Exempt `pi-sandbox-*` from the boot reaper by editing its filter.* The reaper's `name=pi-job-`
+    filter is a substring match, so a **separate namespace** already achieves this with no change to the
+    reaper at all. Editing the filter would put the guarantee in the reaper's code; keeping the names
+    disjoint puts it in the names, where a test can pin it.
+  - *Widen `makeLogReaper` to sweep retained directories too.* Its `.log`/`.json` filter and `logsDir`
+    scope are a documented contract, and these directories have a different retention policy, a
+    different PII class, and one requirement neither sibling has — asking docker what is live before
+    deleting. `session-store.mjs`'s `reapSessions` already set this precedent for the same reasons.
+- **Traces to**: `REQ-RESURRECTABLE-SANDBOX`, `CONST-ISOLATION-CONTAINER-PER-JOB`,
+  `CONST-TOKEN-SCOPED-PER-JOB`, `INT-SANDBOX-CONTRACT`, `DES-RUN-HISTORY-FLAT-FILES-NO-DB`
+
 ## Rejected alternatives (whole-project)
 
 Considered and declined. Recorded so they are not re-proposed.
@@ -1305,6 +1345,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Added **`DES-SANDBOX-IS-A-FRESH-CONTAINER`** (issue #55, `REQ-RESURRECTABLE-SANDBOX`): to let an operator inspect what a run built, retain the run's inputs and start a **new** container, never preserve the original. Six rejected alternatives recorded, and the first three are the ones that would otherwise be re-proposed — keeping the job container alive for `docker exec`, a stdin channel to the running agent, and `docker commit` snapshots. The first two reopen `CONST-ISOLATION-CONTAINER-PER-JOB` (a live container that has run adversarial code, still holding the minted token, with `--rm` removed); the third costs gigabytes per run to preserve mostly what belonged in the image. The other three are the smaller near-misses that each looked cheaper than the shipped answer and were not: publishing a port on job containers, editing the boot reaper's filter instead of using a disjoint name namespace, and widening `makeLogReaper` instead of adding a sibling. `DES-RUN-HISTORY-FLAT-FILES-NO-DB` **UNCHANGED, and checked** — the sandbox lookup is a filename-keyed read of one directory, adding no index and no query surface. |
 | 2026-07-28 | **The pi-normal discovery posture** (`CONST-NO-CONTEXT-FILES-MANDATORY`, amended). `DES-OPERATOR-GLOBAL-OVERLAY`: overlay extensions are staged and loaded **by default** — `--no-extensions` is the escape hatch, every staged extension is **printed by name**, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives inverted as the `"0"` opt-out — and staged packages load for every job except one whose trigger set `run.packages: false`. The "gated four times, not two" framing is restated honestly as **three gates that refuse by default** (exact pin, all-or-nothing host stage, runner pre-spend path check) **plus one withdrawal**, since the per-trigger switch now defaults open. The *Rejected* entry "load overlay extensions by default" is **superseded rather than deleted**: it is rewritten in place to record that this is what shipped first, that the arming flag sat behind two gates the operator had already passed, and that its failure mode was silent in the expensive direction — a present-but-dormant overlay is a deployment quietly missing the setup its flows were written against. The "copy `~/.pi` wholesale" rejection lost its stale justification (it argued host-global discovery was off anyway) and now rests on the curated-subset argument, which is the one that was always doing the work. Two cross-references de-staled elsewhere in the file: `DES-PERSONA-VIA-APPEND-SYSTEM-MD`'s *Rejected* `AGENTS.md` bullet said **"forbidden"** and now records that it loads but is rejected as the *persona channel* on **placement** (pi emits context files into `<project_context>` after the append block, so it can never be the floor); and `DES-AI-TRIGGER-FLOW-GATE`'s trust-doctrine parenthetical, which cited the constraint as "a cloned repo's `AGENTS.md` … must not load", now cites it as amended — the doctrine it was actually appealing to, reading committed content at a **fixed SHA** rather than the live tree, is unchanged. `DES-USAGE-METER-VIA-API-PROVIDER-REGISTRY` was **checked and needed no change**: it asserts nothing about the discovery flags. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted) §2, §3, §4, §5, §9, §11. That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — **verified against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points. `DES-PERSONA-VIA-APPEND-SYSTEM-MD` is materially rewritten: the source doc's decisions #1 and #2 were mutually exclusive as written. `DES-NAME-KEEP-PI-DISPATCH` is new. `pi-harness` and `pi-sentry` were absent from the source doc's alternatives and are added. §5.7's "caches roll at midnight" caveat is **dropped** — 0.80.7 removed the date from the default system prompt. |
 | 2026-07-15 | An admin panel and cross-platform (Windows/macOS/Linux + Docker) added to scope. Two new decisions and one **security correction**. `DES-PANEL-SEPARATE-FROM-RECEIVER`: the source doc mounted Bull Board on the receiver — defensible for a read-only dashboard, **not** once the same surface sets the model and rewrites flows, because the receiver is the one process that must be internet-reachable. The panel and the receiver have opposite reachability requirements and cannot share a port. `DES-FLOWS-ARE-DATA-PERSONA-IS-CODE`: the panel requirement collided with keeping flows as reviewed repo markdown; resolved by observing that one file was carrying two jobs — hard rules need immutability, task recipes need editability. Architecture diagram and repo layout updated; the public edge is now drawn explicitly. Build order extended with panel and deploy. |

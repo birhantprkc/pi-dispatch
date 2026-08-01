@@ -703,3 +703,101 @@ test("the trust model is per forge -- an azure trigger must not claim HMAC or a 
   const github = (await renderTrigger({ type: "label", forge: "github", any: ["pi:go"], all: [], none: [], flow: "fix" })).detail;
   assert.match(github, /X-GitHub-Delivery/);
 });
+
+/** Open RUN_DETAIL on the single canned run, with sandbox seams wired as given. */
+async function openRunDetail(deps = {}, tui = fakeTui()) {
+  const comp = makeDashboard({ paths: {}, done() {}, tui, intervalMs: 100000, deps: cannedDeps(deps) });
+  await flush();
+  comp.handleInput("\r"); // row 0 is the only run
+  await flush();
+  return comp;
+}
+
+test("RUN_DETAIL shows a run's retention state, and offers `b` only when there is something to open", async () => {
+  const retained = await openRunDetail({
+    sandboxInfo: () => ({ retained: true, expiresIn: "19h" }),
+    launchSandbox: async () => {},
+  });
+  const out = stripAnsi(retained.render(80).join("\n"));
+  await retained.dispose();
+  assert.match(out, /sandbox\s+retained · 19h left/);
+  assert.match(out, /b\s+sandbox/, "the footer advertises the key");
+
+  const swept = await openRunDetail({ sandboxInfo: () => ({ retained: false, reason: "swept" }), launchSandbox: async () => {} });
+  const sweptOut = stripAnsi(swept.render(80).join("\n"));
+  await swept.dispose();
+  assert.match(sweptOut, /sandbox\s+swept/);
+  assert.equal(/b\s+sandbox/.test(sweptOut), false, "a key that would refuse is not advertised");
+});
+
+test("`b` suspends pi's TUI around the launch, and resumes it even when the launch fails", async () => {
+  // The whole contract of the handoff: docker owns the terminal only BETWEEN stop and start, and start is
+  // in a `finally` so a failed launch cannot leave the panel suspended with no way back.
+  const order = [];
+  const tui = {
+    requestRender: (force) => order.push(force ? "requestRender(true)" : "requestRender"),
+    stop: () => order.push("stop"),
+    start: () => order.push("start"),
+  };
+  const comp = await openRunDetail(
+    {
+      sandboxInfo: () => ({ retained: true }),
+      launchSandbox: async ({ jobId }) => {
+        order.push(`launch:${jobId}`);
+      },
+    },
+    tui,
+  );
+  order.length = 0; // drop the renders from opening the view
+  comp.handleInput("b");
+  await flush();
+  await comp.dispose();
+  assert.deepEqual(order, ["stop", "launch:j1", "start", "requestRender(true)"]);
+
+  const failOrder = [];
+  const failTui = {
+    requestRender: (force) => failOrder.push(force ? "requestRender(true)" : "requestRender"),
+    stop: () => failOrder.push("stop"),
+    start: () => failOrder.push("start"),
+  };
+  const failing = await openRunDetail(
+    {
+      sandboxInfo: () => ({ retained: true }),
+      launchSandbox: async () => {
+        failOrder.push("launch");
+        throw new Error("docker exploded");
+      },
+    },
+    failTui,
+  );
+  failOrder.length = 0;
+  failing.handleInput("b");
+  await flush();
+  await failing.dispose();
+  assert.deepEqual(failOrder, ["stop", "launch", "start", "requestRender(true)"], "the finally is the whole guarantee");
+});
+
+test("`b` is inert without the seam, and inert on a swept run -- it never suspends the panel for nothing", async () => {
+  for (const [deps, why] of [
+    [{ sandboxInfo: () => ({ retained: true }) }, "an unwired build has no launchSandbox"],
+    [{ sandboxInfo: () => ({ retained: false, reason: "swept" }), launchSandbox: async () => {} }, "there is nothing retained to open"],
+  ]) {
+    const order = [];
+    const tui = { requestRender() {}, stop: () => order.push("stop"), start: () => order.push("start") };
+    const comp = await openRunDetail(deps, tui);
+    comp.handleInput("b");
+    await flush();
+    await comp.dispose();
+    assert.deepEqual(order, [], why);
+  }
+});
+
+test("escape still backs out of RUN_DETAIL and drops the sandbox state it read on entry", async () => {
+  const comp = await openRunDetail({ sandboxInfo: () => ({ retained: true, expiresIn: "19h" }), launchSandbox: async () => {} });
+  assert.match(stripAnsi(comp.render(80).join("\n")), /sandbox\s+retained/);
+  comp.handleInput("\x1b");
+  await flush();
+  const out = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(out, /TRIGGERS|PAUSED/, "back on the list");
+});
