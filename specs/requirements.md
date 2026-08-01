@@ -378,11 +378,12 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
 - **Statement**: The admin surface shall ship as a pi extension in `admin/`, loaded into the operator's
   interactive pi session. It provides operator slash commands for observability (`status`, `runs`, `logs`,
-  `budget`, `triggers`), queue on/off (`pause`/`resume`, backed by the same durable `queue.pause()`), and
+  `budget`, `triggers`, `costs` — the last with a `whatif` form, `REQ-COST-ANALYTICS`), queue on/off
+  (`pause`/`resume`, backed by the same durable `queue.pause()`), and
   settings editing (`set`/`unset`, writing the `settings.json` overlay), plus **operator-typed trigger CRUD**
   from the overlay (add / edit-flow / delete, writing `triggers.json` — validated by the shared
   `parseTriggers`, atomic — and reloaded **live** by both services, `OQ-008`). The model-callable tools are
-  **reads (`status`/`runs`/`triggers`), `pause`/`resume`, `dispatch_run`** (a gated enqueue), and the
+  **reads (`status`/`runs`/`triggers`/`costs`), `pause`/`resume`, `dispatch_run`** (a gated enqueue), and the
   **confirm-gated writes** `dispatch_set` and `dispatch_trigger_add`/`_edit`/`_delete`. A write tool applies
   its change **only after a human operator approves a `ctx.ui.confirm` dialog showing the concrete
   before→after**, and **refuses — writing nothing — when no interactive operator is present** (`ctx.hasUI`
@@ -587,6 +588,56 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   log, not on the meter's totals) and the run exits `2` with `reason: "token_budget"`; given the meter
   **could not install**, then the `subscribe()` fallback is attached instead, the exit line reports
   `metered: false`, and the exit codes and record shape are unchanged.
+
+## REQ-COST-ANALYTICS
+
+- **Statement**: The harness shall make recorded spend **analyzable**: a **COSTS view** in the admin
+  dashboard (fifth view, `c`), a `/dispatch costs` command for the degraded path, and a `dispatch_costs`
+  read tool — all rendering ONE retention-bounded fold (`DES-COST-FOLD-BY-SCAN`) of the run-history
+  sidecars: spend per **flow**, per **model**, and per **day**; subscription burn context from the
+  operator's declarations (`INT-SUBSCRIPTIONS-FILE-CONTRACT`): amortized effective $/run, peak-window
+  consumption, and the API-rate comparison line per plan; and a **what-if** that re-prices a flow's
+  recorded token profiles under another model through the pricing façade
+  (`INT-PRICING-EXPORT-CONTRACT`). The screen informs; it changes nothing — no auto-switching, no new
+  network surface, no database. The **labeling rules are requirements, not conventions**:
+  (a) every displayed dollar carries its class — metered, plan, zero-rated, estimated, seeded, or
+  unknown — and is rendered only through the one shared formatter;
+  (b) a run covered by a declared plan **never renders as `$0.00`**, and an uncovered zero-rate run
+  renders `$0 (unrated)`, **never the word "free"**;
+  (c) an estimate is **always visibly marked** (`~`/`est.`/`seeded`) and never silently mixes with
+  metered numbers — a sum containing one estimated addend is itself marked estimated, with its coverage;
+  (d) a floor (`unpriced`/`unresolved`/fallback-metered/pre-meter records) renders `≥`, and the marker is
+  never dropped by aggregation;
+  (e) a quota window whose vendor discloses no limit shows **facts only** (peak runs/tokens) — never an
+  invented burn-down or "remaining";
+  (f) what-if seeding uses the flow's own **measured median** first and the `OQ-002` `$0.5–$5/job` band
+  **only as a clearly-labeled last resort** (`unmeasured (OQ-002)`), always as a band, never a point;
+  (g) the surface states its window and that retention (`PI_LOG_RETENTION_DAYS`) bounds the series.
+- **Why**: Metering existed; analysis did not (issue #53). Which model a flow should run on, and whether
+  a subscription is saving money, are exactly the decisions this repo already got burned making from
+  unmeasured guesses — the `$0.5–$5/job` non-requirement is *recorded as unmeasured* at `OQ-002` — so the
+  screen's first duty is not more numbers but honest ones: the class system exists so that no rendering
+  path, human or model-facing (`dispatch_costs` carries the class on every value), can launder an
+  estimate into a fact. Attribution and re-pricing are possible at all because the ledger records what
+  each model spent (`REQ-TOKEN-ACCOUNTING-AND-CAPS`) and pricing stays pi-ai's
+  (`INT-PRICING-EXPORT-CONTRACT`) — pi-dispatch still owns no rate table.
+- **Scope**: Read-only over the run history and operator declarations; bounded by retention and the
+  92-day scan cap; the residual unmetered `pi`-subprocess spend (`OQ-011`) makes every total a floor and
+  is surfaced, not hidden.
+- **Traces to**: `REQ-TOKEN-ACCOUNTING-AND-CAPS`, `REQ-ADMIN-VIA-PI-EXTENSION`,
+  `INT-RUN-HISTORY-FILE-CONTRACT`, `INT-SUBSCRIPTIONS-FILE-CONTRACT`, `INT-PRICING-EXPORT-CONTRACT`,
+  `DES-COST-FOLD-BY-SCAN`, `DES-SUBSCRIPTIONS-ARE-COUNTERFACTUAL-ONLY`,
+  `DES-RUN-HISTORY-FLAT-FILES-NO-DB`, `CONST-BUDGET-BEFORE-TOKENS`, `OQ-002`, `OQ-011`
+- **Acceptance**: Given ledgered runs across two models and a declared plan, when the COSTS view opens,
+  then per-flow and per-model spend render over the window, the plan's runs show `plan:<id>` (never
+  `$0.00`), and the plan block shows amortized $/run and the API-equivalent comparison marked `~ est.`;
+  given a window with `limit: null`, then no burn-down renders anywhere; given a what-if on a flow with
+  ledgered history, then the estimate derives from repriced recorded quads, is marked estimated, names
+  its rates version, and reports coverage; given a flow with no ledgered history, then the only offer is
+  the labeled `unmeasured (OQ-002)` band; given `/dispatch costs` with no TTY, then the same fold renders
+  plain with identical labeling; given `dispatch_costs`, then every monetary value in the returned JSON
+  carries its `class`; given a run recorded under an older pi-ai pin, then it is counted as
+  rates-drifted, and its stored cost is never rewritten.
 
 ## REQ-SCOPED-PAUSE-WINDOWS
 
@@ -902,6 +953,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Added **`REQ-COST-ANALYTICS`** (issue #53): the COSTS view, `/dispatch costs` (+`whatif`), and the `dispatch_costs` read tool over one retention-bounded fold — per-flow/per-model/per-day spend, subscription verdicts with the API-rate comparison, and what-if re-pricing through the pricing façade. The **labeling rules are requirements, not conventions**: every dollar carries its class through one shared formatter; plan-covered runs never render `$0.00` and uncovered zero-rate runs render `$0 (unrated)`, never "free"; estimates are always marked and demote any sum they enter, with coverage; floors keep their `≥`; undisclosed quota limits produce facts only, never burn-down; seeding is measured-median-first with the `OQ-002` band as the labeled last resort, always a band; the surface names its window and retention bound. The screen informs and changes nothing — no auto-switching, no new network surface, no database. **`REQ-ADMIN-VIA-PI-EXTENSION` amended**: `costs` joins the command inventory and `dispatch_costs` the read tools; the confirm-gate posture is **UNCHANGED, checked** (costs is a read; the write gates neither grew nor moved). `CONST-BUDGET-BEFORE-TOKENS` **UNCHANGED, checked**: analytics reads what enforcement recorded and touches no reservation path. |
 | 2026-08-01 | **`REQ-TOKEN-ACCOUNTING-AND-CAPS` amended** (issue #53, gap 1): obligation (a) grows the per-(provider,model) **ledger** — the meter keeps the full cache split (`cacheRead`/`cacheWrite`/`cacheWrite1h`/`reasoning`) per model that the flat totals collapse, emits it as the exit line's `usage` block (8 named rows max + an `other` row absorbing overflow and model-less calls; rows sum to `total`; stamped with the pricing pi-ai's version), and the worker persists it beside host-effective `provider`/`model` on every terminal path. The statement records the two honesty rules: a model-less call lands on `other`, **never guessed onto a model**, and the fallback meter keeps **no** ledger — `usage: null` is the reader's signal, not an error. Enforcement (`maxTokens`, `dailyTokenCap`) is **UNCHANGED, checked**: the ledger is accounting only, and the number `recordTokenSpend` charges is still the flat billed total. |
 | 2026-08-01 | Added **`REQ-REPLICA-RUNS`** (issue #56): an opt-in `run.replicas: 2..3` on github webhook triggers turns one delivery into that many independent jobs, branches and pull requests. The entry is framed as **punching a replica discriminator through four layers that each correctly collapse N into 1** — the delivery-GUID job id, the 10-minute semantic window, the deterministic `pi/issue-<n>` branch, and the derived session key — rather than as "adding parallelism", because the layers are not obstacles and none of them is loosened for an unflagged run. Three things went on the record because a later reader would get them wrong. The **`resume` refusal is load-bearing, not tidiness**: it is the only reason `session-key.mjs` may keep deriving from the unsuffixed branch, and without it every replica of one issue resolves the SAME key, shares a transcript and contends for the one-writer lock — the resumed envelope even says *"Do not open a second pull request"*. The **semantic key gains `:r<i>` only when a replica is set**, which is what keeps re-deliveries of each replica coalescing while replicas never coalesce against each other; distinct job ids alone would not have sufficed, since a duplicate `queue.add` under a taken id is *silently ignored* and the second replica would simply vanish. And the **branch is the only host-enforced replica identity** — the PR title marker is agent-honored prompt text, and on a pull_request-typed target there is no second branch to hand out at all (`OQ-017`). `CONST-BUDGET-BEFORE-TOKENS` **UNCHANGED, and checked**: N replicas are N honest reservations, each before its own tokens in its own processor, so the caps stay the ceiling and simply divide by N — softening them would have turned a cost multiplier into a cap bypass. `REQ-RESUMABLE-SESSION` **UNCHANGED, checked**: refused in combination, so nothing about what resumes moved. `REQ-DEDUP-BY-DELIVERY-GUID` **UNCHANGED, checked**: the GUID is still the exact-per-delivery key; the suffix extends its id space rather than weakening the guarantee. `REQ-DURABLE-RUN-HISTORY` **UNCHANGED, checked**: the two new record fields are host-assigned integers, so the PII-free-by-construction property is untouched, and the branch name they imply is deliberately not stored. |
 | 2026-08-01 | Added **`REQ-RESURRECTABLE-SANDBOX`** (issue #55): a finished run's per-job directory is retained for a bounded window and `pi-dispatch sandbox <jobId>` re-opens it as a credential-free operator shell. The job container is **UNCHANGED and was checked rather than assumed** — `--rm`, no TTY, no published port, and with `PI_SANDBOX_RETENTION_HOURS=0` the argv and the teardown are byte-identical to pre-feature. Three things went on the record because they are the ones a later reader would get wrong: retention covers **every job kind**, not just forge jobs, which is why the unit is the per-job *directory* rather than a workspace; `0` means **off** here, the inverse of `PI_LOG_RETENTION_DAYS`/`PI_SESSIONS_TTL_DAYS`, and there is deliberately no keep-forever value; and the per-job `/session` copy is **deleted before** retention, because `--pin` can extend this window and cannot extend `PI_SESSIONS_TTL_DAYS`, so carrying a transcript across would end-run that policy rather than merely weaken it. `REQ-RESUMABLE-SESSION` **UNCHANGED, and checked** — the retained directory holds no transcript, so nothing about what resumes moved. |

@@ -8,9 +8,10 @@
  * renders the last one, so a slow or unreachable queue degrades the panel rather than freezing it. A
  * fetch already in flight suppresses the next tick's fetch, so a stall cannot stack overlapping reads.
  *
- * Three in-component views share this one overlay: LIST -- a framed monochrome panel of status, spend,
- * the unified TRIGGERS pane and an interactive runs list; RUN_DETAIL -- a drill-in of one run's PII-free
- * `.json` fields; and LIVE_TAIL -- a tail of a running job's `.log`.
+ * The in-component views sharing this one overlay: LIST -- a framed panel of status, spend, the unified
+ * TRIGGERS pane and an interactive runs list; RUN_DETAIL -- a drill-in of one run's PII-free `.json`
+ * fields; LIVE_TAIL -- a tail of a running job's `.log`; TRIGGER_DETAIL -- one trigger's trust model;
+ * and COSTS (issue #53) -- the read-time cost fold over the run sidecars and declared subscriptions.
  *
  * PII discipline (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT): LIST and RUN_DETAIL surface only
  * PII-free run records, counts, budget, schedulers and the settings overlay. LIVE_TAIL renders tail bytes
@@ -23,11 +24,16 @@ import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection
 import { makeQueue } from "@pi-dispatch/worker/queue";
 import { STALL_KEY } from "@pi-dispatch/worker/scheduler-stall-guard";
 import { windowEndAt } from "@pi-dispatch/worker/pause-windows";
-import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows, readStagedPackages } from "./read-model.mjs";
+// The pricing façade is imported HERE and wired into the deps factory alone: dashboard views call
+// injected seams (`fetchCosts`/`listPricedModels`/`whatIf`), never the façade, so tests stay fully
+// canned and the one worker/pricing coupling sits beside the queue and redis this module already owns.
+import * as pricing from "@pi-dispatch/worker/pricing";
+import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows, readStagedPackages, readSubscriptions, scanRunRecords } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";
-import { box, meter, clip } from "./panel.mjs";
+import { box, meter, clip, fmtUsd, makeLineInput } from "./panel.mjs";
 import { makeStyler, frame, RULE } from "./style.mjs";
+import { foldCosts, whatIfFlow } from "./costs.mjs";
 
 const KEY_HINTS = "[p]ause  [r]esume  [q]uit";
 // Fetch the read-model's full window (listRuns clamps at 50) but render a cursor-following viewport of
@@ -47,6 +53,12 @@ const MIN_WIDTH = 8;
 // Drill-in views (TRIGGER_DETAIL, RUN_DETAIL) are small; they frame to a compact width and center within
 // the wider overlay rather than stretching a handful of key/value lines across the full LIST width.
 const DRILL_WIDTH = 70;
+// COSTS: the spend windows `t` cycles through, and the staleness bound the poll tick refreshes against.
+// The fold itself is cheap, but the scan behind fetchCosts reads EVERY run sidecar in the window -- a
+// per-second full-directory read is the kind of quiet load a dashboard must not add, so while the view
+// is open a poll tick refreshes the fold only once the last fetch is older than this.
+const COSTS_WINDOWS = ["7d", "30d", "mtd"];
+const COSTS_STALE_MS = 10_000;
 
 /** Left-pad each line to center a `blockWidth`-wide frame within the `overlayWidth` overlay. */
 function centerBlock(lines: string[], overlayWidth: number, blockWidth: number): string[] {
@@ -102,6 +114,30 @@ export function createDashboardDeps(paths: any) {
         // never enters the snapshot (no-pii-in-logs, INT-RUN-HISTORY-FILE-CONTRACT).
         activeJobId: activeList?.[0]?.id ?? null,
       };
+    },
+    /**
+     * One COSTS read: scan the run sidecars for the window, read the declared subscriptions, and fold
+     * them at the REAL pricing façade's rates (pinned by its own piAiVersion). A scan error degrades to
+     * `{ unreachable }` so the view renders it in-frame; the subscriptions file missing or invalid
+     * degrades to no plans -- the fold still prices what it can. `records` ride along in the result
+     * because the what-if seam re-folds them per target.
+     */
+    fetchCosts({ windowKey }: any) {
+      const nowMs = Date.now();
+      const records = scanRunRecords({ logsDir: paths.logsDir, sinceMs: costsWindowSinceMs(windowKey, nowMs), nowMs });
+      if (!Array.isArray(records)) return { unreachable: (records as any)?.unreachable ?? "scan failed" };
+      const subsView: any = readSubscriptions({ subscriptionsPath: paths.subscriptionsPath });
+      const subscriptions = Array.isArray(subsView?.subscriptions) ? subsView.subscriptions : [];
+      const fold = foldCosts({ records, subscriptions, pricing, nowMs, piAiPin: pricing.piAiVersion() });
+      return { fold, records, subscriptions };
+    },
+    /** The priced-model catalog for the what-if `/` filter -- the façade stays behind this seam. */
+    listPricedModels() {
+      return pricing.listPricedModels();
+    },
+    /** One what-if estimate at the real rates, over the records the last fetchCosts served. */
+    whatIf({ records, flow, target }: any) {
+      return whatIfFlow({ records, flow, target, pricing });
     },
     async pause() {
       await queue.pause();
@@ -172,6 +208,14 @@ export function makeDashboard({
   // keystroke rather than a dispose/reopen cycle of the whole overlay. Only the `y` closes the overlay,
   // carrying `confirmed: true` so the command loop does not ask the same question twice.
   let pendingDelete = false;
+  // COSTS (issue #53): the last fetchCosts result and the view's own layers. `data` is whatever the seam
+  // returned ({ fold, records, subscriptions } or { unreachable }); `fetchedAt` drives the poll-tick
+  // staleness gate; `table` picks the by-flow or by-model rollup; `whatIf` is the layered estimate state
+  // (null when closed) -- the flow it targets, the target shortlist and its cursor, and the optional `/`
+  // filter input over the priced-model catalog. `costsSel` is the table's row cursor (the LIST idiom).
+  let costs: any = { data: null, windowKey: "mtd", fetchedAt: 0, table: "flow", whatIf: null };
+  let costsSel = 0;
+  let costsFetching = false;
 
   const refresh = async () => {
     if (fetching || disposed) return;
@@ -182,6 +226,11 @@ export function makeDashboard({
       // by the id-only `tailJobId`. `await` unwraps a synchronous return too. The bytes stay in `tail`.
       if (view === "LIVE_TAIL" && tailJobId && deps.tailLog) {
         tail = await deps.tailLog({ jobId: tailJobId, lines: TAIL_LINES });
+      }
+      // COSTS piggyback (the policy lives on fetchCostsNow): only while the view is open, and only once
+      // the last fold has gone stale -- never a full sidecar scan per poll tick.
+      if (view === "COSTS" && Date.now() - costs.fetchedAt > COSTS_STALE_MS) {
+        await fetchCostsNow();
       }
     } catch (err: any) {
       snapshot = { unreachable: err?.message ?? String(err) };
@@ -198,6 +247,46 @@ export function makeDashboard({
       // A failed pause/resume surfaces as the next snapshot's paused state; never crash the overlay.
     }
     await refresh();
+  };
+
+  // COSTS refresh policy: fetch on view entry and on every windowKey change (both call this directly);
+  // while the view is open the 1s poll piggybacks a refresh ONLY once the last fetch is older than
+  // COSTS_STALE_MS (see `refresh`). Errors degrade to an in-frame message, never a throw, and an
+  // in-flight fetch suppresses the next so a slow scan cannot stack directory reads.
+  const fetchCostsNow = async () => {
+    if (typeof deps?.fetchCosts !== "function" || costsFetching || disposed) return;
+    costsFetching = true;
+    try {
+      costs.data = await deps.fetchCosts({ windowKey: costs.windowKey });
+    } catch (err: any) {
+      costs.data = { unreachable: err?.message ?? String(err) };
+    } finally {
+      costs.fetchedAt = Date.now();
+      costsFetching = false;
+      if (costs.whatIf) computeWhatIf(); // fresh records re-price an open estimate
+      tui?.requestRender?.();
+    }
+  };
+
+  /** Re-run the injected what-if seam for the current target and stash the result for render(). The
+   * estimate is computed at key time, not per frame -- render() stays a pure read of component state. */
+  const computeWhatIf = () => {
+    const wi = costs.whatIf;
+    if (!wi) return;
+    wi.target = wi.targets[wi.index] ?? null;
+    wi.result =
+      wi.target !== null && typeof deps?.whatIf === "function"
+        ? deps.whatIf({ records: costs.data?.records ?? [], flow: wi.flow, target: wi.target })
+        : null;
+  };
+
+  /** Re-filter the priced-model catalog against the `/` input (a `provider/id` substring match). */
+  const refreshWhatIfMatches = () => {
+    const wi = costs.whatIf;
+    if (!wi || !wi.input) return;
+    const query = wi.input.value().toLowerCase();
+    const catalog = typeof deps?.listPricedModels === "function" ? deps.listPricedModels() : [];
+    wi.matches = catalog.filter((m: any) => `${m.provider}/${m.id}`.toLowerCase().includes(query));
   };
 
   const dispose = async () => {
@@ -231,6 +320,11 @@ export function makeDashboard({
         const maxTop = Math.max(0, len - TAIL_VIEWPORT);
         tailTop = tailFollow ? maxTop : Math.min(Math.max(0, tailTop), maxTop);
       }
+      // Same clamp for the COSTS table cursor: a table that shrank on refresh (or the `f` flip to a
+      // shorter rollup) can never leave the cursor pointing past the end.
+      if (view === "COSTS" && costsSel > costsTableRows(costs).length - 1) {
+        costsSel = Math.max(0, costsTableRows(costs).length - 1);
+      }
       return renderPanel(snapshot, width, {
         view,
         selected,
@@ -245,6 +339,9 @@ export function makeDashboard({
         sandboxAvailable: typeof deps?.launchSandbox === "function",
         pendingDelete,
         runSort,
+        costs,
+        costsSel,
+        costsAvailable: typeof deps?.fetchCosts === "function",
       }, styler);
     },
     invalidate(): void {
@@ -372,6 +469,97 @@ export function makeDashboard({
         }
         return;
       }
+      if (view === "COSTS") {
+        const wi = costs.whatIf;
+        // The `/` filter input is the innermost layer, routed BEFORE every view key: typing "f" or "t"
+        // into the filter must narrow the model list, not flip the table under the operator's cursor.
+        if (wi && wi.filter && wi.input) {
+          if (matchesKey(data, "escape")) {
+            wi.filter = false;
+            wi.input = null;
+            tui?.requestRender?.();
+            return;
+          }
+          if (data === "\r" || data === "\n") {
+            // Enter applies the top match as the active target: an already-listed pick moves the cycle
+            // cursor onto it; a new one is spliced in AT the cursor so `w` keeps cycling from there.
+            const pick = wi.matches?.[0];
+            if (pick) {
+              const target = { provider: pick.provider, id: pick.id };
+              const at = wi.targets.findIndex((t: any) => t.provider === target.provider && t.id === target.id);
+              if (at >= 0) wi.index = at;
+              else wi.targets.splice(wi.index, 0, target);
+              computeWhatIf();
+            }
+            wi.filter = false;
+            wi.input = null;
+            tui?.requestRender?.();
+            return;
+          }
+          if (matchesKey(data, "backspace")) wi.input.backspace();
+          else if (matchesKey(data, "left")) wi.input.left();
+          else if (matchesKey(data, "right")) wi.input.right();
+          else if (matchesKey(data, "home")) wi.input.home();
+          else if (matchesKey(data, "end")) wi.input.end();
+          else if (!data.startsWith("\x1b") && data >= " ") wi.input.insert(data);
+          else return; // any other control sequence is inert while the filter is up
+          refreshWhatIfMatches();
+          tui?.requestRender?.();
+          return;
+        }
+        // Esc pops ONE layer at a time: what-if -> COSTS -> LIST (the filter layer popped above).
+        if (matchesKey(data, "escape")) {
+          if (costs.whatIf) costs.whatIf = null;
+          else view = "LIST";
+          tui?.requestRender?.();
+          return;
+        }
+        if (matchesKey(data, "up") || matchesKey(data, "down")) {
+          const step = matchesKey(data, "up") ? -1 : 1;
+          costsSel = Math.min(Math.max(0, costsTableRows(costs).length - 1), Math.max(0, costsSel + step));
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "f" || data === "F") {
+          costs.table = costs.table === "flow" ? "model" : "flow";
+          costsSel = 0;
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "t" || data === "T") {
+          costs.windowKey = COSTS_WINDOWS[(COSTS_WINDOWS.indexOf(costs.windowKey) + 1) % COSTS_WINDOWS.length];
+          void fetchCostsNow(); // a window change is a different scan cutoff -- fetch now, not on the tick
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "w" || data === "W") {
+          // What-if targets FLOWS (whatIfFlow's grain), so on the model table the key is inert.
+          if (costs.table !== "flow") return;
+          if (costs.whatIf) {
+            costs.whatIf.index = (costs.whatIf.index + 1) % costs.whatIf.targets.length;
+            computeWhatIf();
+            tui?.requestRender?.();
+            return;
+          }
+          const row = (costs.data?.fold?.byFlow ?? [])[costsSel];
+          const targets = whatIfTargets(costs.data);
+          if (!row || targets.length === 0) return;
+          costs.whatIf = { flow: row.flow, targets, index: 0, filter: false, input: null };
+          computeWhatIf();
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "/") {
+          if (!costs.whatIf) return; // the filter refines an open what-if; it is not a view of its own
+          costs.whatIf.filter = true;
+          costs.whatIf.input = makeLineInput("");
+          refreshWhatIfMatches();
+          tui?.requestRender?.();
+          return;
+        }
+        // Everything else -- including q/p/r -- is inert in COSTS; leaving is Esc's job alone.
+        return;
+      }
       if (matchesKey(data, "escape") || data === "q" || data === "Q") {
         void dispose().finally(() => done(undefined));
         return;
@@ -410,6 +598,17 @@ export function makeDashboard({
         tailFollow = true;
         view = "LIVE_TAIL";
         void refresh();
+        return;
+      }
+      // `c` -- the COSTS view (issue #53): the read-time fold over the window's run sidecars and the
+      // declared subscriptions. Fetch on entry (the poll only piggybacks once the data is stale); the
+      // window key survives re-entry on purpose -- an operator flipping back is asking the same question.
+      if (data === "c" || data === "C") {
+        view = "COSTS";
+        costsSel = 0;
+        costs.whatIf = null;
+        void fetchCostsNow();
+        tui?.requestRender?.();
         return;
       }
       // Tab jumps between the two section heads (triggers <-> runs) instead of arrowing through every row.
@@ -503,7 +702,7 @@ function budgetMeters(budget: any, settings: any, width: number): string[] {
  * the same content with `box`, its inner column count driving every meter and clip.
  */
 function renderPanel(snapshot: any, width: number, state: any, styler: any): string[] {
-  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailFollow, tailAvailable, detailSandbox, sandboxAvailable, pendingDelete, runSort } = state;
+  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailFollow, tailAvailable, detailSandbox, sandboxAvailable, pendingDelete, runSort, costs, costsSel, costsAvailable } = state;
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
@@ -532,6 +731,10 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
 
   if (view === "LIVE_TAIL") {
     return renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable });
+  }
+
+  if (view === "COSTS") {
+    return renderCosts({ costs, costsSel, costsAvailable, framed, width: Math.trunc(width), styler });
   }
 
   if (snapshot === null) {
@@ -1056,11 +1259,314 @@ function triggerDetailHints(inner: number, styler: any, pendingDelete = false): 
   return fitLine([k("e", "edit flow"), k("x", "delete"), k("esc", "back")].join(styler.fg("dim", "  ·  ")), inner, styler);
 }
 
-/** The colored key-hint footer. */
+/** The colored key-hint footer. The labels stay COMPRESSED -- the select/open pair shares one hint --
+ * so the full row plus `c costs` fits a width-80 frame (inner 76) with no ellipsis; the fit is pinned
+ * by the dashboard test, so a new hint here must pay for itself in label characters. */
 function keyHints(inner: number, styler: any): string {
   const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
-  const hints = [k("↑↓", "select"), k("↵", "open"), k("a", "add"), k("w", "pauses"), k("l", "logs"), k("p", "pause"), k("r", "resume"), k("q", "quit")].join(styler.fg("dim", " · "));
+  const hints = [k("↑↓↵", "open"), k("a", "add"), k("w", "pauses"), k("l", "logs"), k("c", "costs"), k("p", "pause"), k("r", "resume"), k("q", "quit")].join(styler.fg("dim", " · "));
   return fitLine(hints, inner, styler);
+}
+
+// ── COSTS view (issue #53): full-width like LIST, every body line exactly `inner` visible columns ──────
+
+/** The scan cutoff for a COSTS window key: a fixed span for "7d"/"30d", the start of the current UTC
+ * month for "mtd" -- the calendar month is the unit subscriptions are priced in, so "how is this month
+ * going" needs the month's own left edge, not a sliding 30 days. */
+function costsWindowSinceMs(windowKey: string, nowMs: number): number {
+  const day = 24 * 60 * 60 * 1000;
+  if (windowKey === "7d") return nowMs - 7 * day;
+  if (windowKey === "30d") return nowMs - 30 * day;
+  const now = new Date(nowMs);
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** The frame-title window label: `Aug 2026 (mtd)` for the calendar window, `last 7d`/`last 30d` else. */
+function costsWindowLabel(windowKey: string): string {
+  if (windowKey !== "mtd") return `last ${windowKey}`;
+  const now = new Date();
+  return `${MONTHS[now.getUTCMonth()]} ${now.getUTCFullYear()} (mtd)`;
+}
+
+/** The active COSTS table's rows -- the array `costsSel` and ↑↓ span. */
+function costsTableRows(costs: any): any[] {
+  const fold = costs?.data?.fold;
+  const rows = costs?.table === "model" ? fold?.byModel : fold?.byFlow;
+  return Array.isArray(rows) ? rows : [];
+}
+
+/** The what-if target shortlist: every (provider,model) pair the window actually ran (byModel order,
+ * deduped, minus the honest "unknown" attribution rows -- there is nothing to price there), then every
+ * subscription's declared counterfactualModel. */
+function whatIfTargets(data: any): any[] {
+  const seen = new Set<string>();
+  const out: any[] = [];
+  const add = (provider: any, id: any) => {
+    if (typeof provider !== "string" || typeof id !== "string") return;
+    if (provider === "unknown" || id === "unknown") return;
+    const key = `${provider}/${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ provider, id });
+  };
+  for (const m of data?.fold?.byModel ?? []) add(m.provider, m.model);
+  for (const s of data?.subscriptions ?? []) add(s.counterfactualModel?.provider, s.counterfactualModel?.id);
+  return out;
+}
+
+/** The provider that carried most of a flow's tokens in the scanned window (ledger rows preferred, the
+ * host-effective provider as the pre-ledger fallback), or null when nothing attributes. The what-if
+ * cross-provider caveat keys off this: same-provider re-pricing is arithmetic, cross-provider assumes a
+ * token profile survives a tokenizer change. Flow matching mirrors whatIfFlow's own (`flow ?? null`). */
+function dominantProvider(records: any, flow: any): string | null {
+  const totals = new Map<string, number>();
+  const bump = (provider: any, tokens: any) => {
+    if (typeof provider !== "string" || provider === "unknown") return;
+    totals.set(provider, (totals.get(provider) ?? 0) + (Number.isFinite(tokens) ? tokens : 0));
+  };
+  for (const r of Array.isArray(records) ? records : []) {
+    if ((r?.flow ?? null) !== flow) continue;
+    const rows = r?.usage?.models;
+    if (Array.isArray(rows) && rows.length > 0) for (const m of rows) bump(m?.provider, m?.total ?? 0);
+    else bump(r?.provider, r?.tokens?.total ?? 0);
+  }
+  let best: string | null = null;
+  let bestTokens = -1;
+  for (const [provider, tokens] of totals) {
+    if (tokens > bestTokens) {
+      best = provider;
+      bestTokens = tokens;
+    }
+  }
+  return best;
+}
+
+/**
+ * The COSTS view: full-width like LIST (DRILL_WIDTH would waste the table's columns), composed with the
+ * same fitLine/styler discipline -- every body line exactly `inner` visible columns, RULE sentinels
+ * between sections, and the same unframed degrade below MIN_WIDTH. Everything rendered is the injected
+ * fetchCosts snapshot; every money surface funnels through styler.fmtCost, so a plan-covered row can
+ * never read as $0.00 and an estimate can never pass as a metered figure.
+ */
+function renderCosts({ costs, costsSel, costsAvailable, framed, width, styler }: any): string[] {
+  const inner = framed ? width - 4 : Math.max(24, width);
+  const title = `COSTS · ${costsWindowLabel(costs.windowKey)}`;
+  const lines = buildCostsLines(costs, costsSel, inner, styler, costsAvailable);
+  const footer = costsHints(inner, styler);
+  if (!framed) {
+    const plain = lines.filter((l: any) => l !== RULE).map((l: any) => styler.stripAnsi(l));
+    return [title, "", ...plain, "", styler.stripAnsi(footer)];
+  }
+  return frame(styler, { title, width, lines, footer });
+}
+
+/** The COSTS body: verdicts, the daily sparkline, the selectable rollup table, the optional what-if
+ * block, the plans facts and the provenance footer -- or the loading/unreachable degrades. */
+function buildCostsLines(costs: any, costsSel: number, inner: number, styler: any, available: boolean): any[] {
+  if (costs.data === null) {
+    return [fitLine(styler.fg("dim", available ? "loading costs…" : "costs unavailable in this build"), inner, styler)];
+  }
+  if (costs.data.unreachable) {
+    return [fitLine(styler.fg("error", `costs unreachable (${costs.data.unreachable})`), inner, styler)];
+  }
+  const fold = costs.data.fold ?? {};
+  const out: any[] = [];
+  for (const l of verdictLines(fold, costs.windowKey, inner, styler)) out.push(l);
+  out.push(dailyLine(fold, inner, styler));
+  out.push(RULE);
+  for (const l of costsTableLines(fold, costs.table, costsSel, inner, styler)) out.push(l);
+  if (costs.whatIf) {
+    out.push(RULE);
+    for (const l of whatIfLines(costs.whatIf, costs.data, inner, styler)) out.push(l);
+  }
+  out.push(RULE);
+  for (const l of planLines(fold, inner, styler)) out.push(l);
+  out.push(provenanceLine(fold, inner, styler));
+  return out;
+}
+
+/**
+ * One verdict line per declared plan, owned before hypothetical -- the fold already scored them, this
+ * only phrases the kinds. The dollar inside every phrasing is styler.fmtCost of the fold's typed delta,
+ * so a verdict figure always wears its `~`/`est.` provisional dress. The owned second line shows the
+ * arithmetic the verdict came from: declared price -> window proration, and the covered runs' API-rate
+ * equivalent. NO_BASELINE names the missing declaration instead of inventing a baseline.
+ */
+function verdictLines(fold: any, windowKey: string, inner: number, styler: any): string[] {
+  const plans = Array.isArray(fold.plans) ? fold.plans : [];
+  if (plans.length === 0) {
+    return [fitLine(styler.fg("dim", "no subscriptions declared · edit subscriptions.json"), inner, styler)];
+  }
+  const noun = windowKey === "mtd" ? "this month" : `over last ${windowKey}`;
+  const days = Number(fold.window?.days ?? 0);
+  const label = styler.bold(styler.fg("muted", "VERDICT")) + "  ";
+  const indent = " ".repeat(9);
+  const out: string[] = [];
+  for (const p of [...plans].sort((a, b) => (a.hypothetical ? 1 : 0) - (b.hypothetical ? 1 : 0))) {
+    const kind = p.verdict?.kind;
+    if (kind === "SAVING" || kind === "LOSING") {
+      const color = kind === "SAVING" ? "success" : "warning";
+      out.push(fitLine(label + styler.fg(color, `${p.id} is ${kind} `) + styler.fmtCost(p.verdict.usd) + styler.fg(color, ` ${noun}`), inner, styler));
+      // Display math only, mirroring the fold's own 30-day-month proration proxy (buildPlans) -- the
+      // same coarse-on-purpose number, shown so the verdict's inputs are checkable at a glance.
+      const prorated = Number(p.price?.amount ?? 0) * (days / 30);
+      out.push(fitLine(indent + styler.fg("dim", `plan price (prorated) ${fmtUsd(Number(p.price?.amount ?? 0))} → ${fmtUsd(prorated)} · plan runs @ API `) + styler.fmtCost(p.apiEquiv), inner, styler));
+    } else if (kind === "WOULD_SAVE" || kind === "WOULD_LOSE") {
+      const color = kind === "WOULD_SAVE" ? "success" : "warning";
+      const word = kind === "WOULD_SAVE" ? "WOULD SAVE" : "WOULD LOSE";
+      out.push(fitLine(label + styler.fg(color, `${p.id} ${word} `) + styler.fmtCost(p.verdict.usd) + styler.fg(color, ` ${noun}`) + styler.fg("dim", " (hypothetical)"), inner, styler));
+    } else {
+      out.push(fitLine(label + styler.fg("dim", `${p.id}: no API-rate baseline declared — set counterfactualModel to compare`), inner, styler));
+    }
+  }
+  return out;
+}
+
+/** `daily  <sparkline>  Σ <total> · max $x/d`. Zero-run days ARE zero cells (the fold keeps gap days as
+ * zero-run entries, and a quiet day must render quiet, never compress away); the ceiling is the window's
+ * own max day, and the Σ is the provenance total -- the one typed dollar for the whole window. */
+function dailyLine(fold: any, inner: number, styler: any): string {
+  const daily = Array.isArray(fold.daily) ? fold.daily : [];
+  const values = daily.map((d: any) => (typeof d?.cost?.usd === "number" ? d.cost.usd : null));
+  const maxDay = values.reduce((m: number, v: any) => (typeof v === "number" && v > m ? v : m), 0);
+  const label = styler.fg("muted", "daily") + "  ";
+  const suffix = styler.fg("muted", "  Σ ") + styler.fmtCost(fold.provenance?.total) + styler.fg("dim", ` · max ${fmtUsd(maxDay)}/d`);
+  const sparkW = Math.max(8, inner - styler.visibleLen(label) - styler.visibleLen(suffix));
+  return fitLine(label + styler.sparkline(values, sparkW) + suffix, inner, styler);
+}
+
+/**
+ * The selectable rollup table -- two shapes behind one cursor: by-flow (with the plan rows' API-rate
+ * equivalent column) and by-model. Every money cell is styler.fmtCost, the ONLY renderer of a typed
+ * dollar, so a plan-covered row reads `plan:<id>` (never $0.00) and a zero-rated one `$0 (unrated)`
+ * (never "free"); a null api-equiv is an em dash, not a guess.
+ */
+function costsTableLines(fold: any, table: string, costsSel: number, inner: number, styler: any): string[] {
+  const gap = "  ";
+  const wRuns = 5;
+  const wTok = 7;
+  const head = (text: string, w: number, align = "left") => styler.cell(text, w, { color: "muted", align });
+  const cursor = (sel: boolean) => (sel ? styler.fg("accent", "›") : " ");
+  const out: string[] = [];
+  if (table === "model") {
+    const wName = 30;
+    const wCost = Math.max(8, inner - 2 - wName - wRuns - wTok - 3 * gap.length);
+    out.push(fitLine("  " + [head("PROVIDER/MODEL", wName), head("RUNS", wRuns, "right"), head("TOKENS", wTok, "right"), head("COST", wCost)].join(gap), inner, styler));
+    const rows = Array.isArray(fold.byModel) ? fold.byModel : [];
+    if (rows.length === 0) return [...out, fitLine(styler.fg("dim", "  (no runs in this window)"), inner, styler)];
+    rows.forEach((r: any, i: number) => {
+      const cells = [
+        styler.cell(`${r.provider}/${r.model}`, wName),
+        styler.cell(String(r.runs ?? 0), wRuns, { align: "right" }),
+        styler.cell(fmtTokens(r.tokens ?? 0), wTok, { align: "right" }),
+        styler.fmtCost(r.cost, wCost),
+      ];
+      out.push(fitLine(cursor(i === costsSel) + " " + cells.join(gap), inner, styler));
+    });
+    return out;
+  }
+  const wFlow = 18;
+  const wCost = 14;
+  const wApi = Math.max(8, inner - 2 - wFlow - wRuns - wTok - wCost - 4 * gap.length);
+  out.push(fitLine("  " + [head("FLOW", wFlow), head("RUNS", wRuns, "right"), head("TOKENS", wTok, "right"), head("COST", wCost), head("API-EQUIV", wApi)].join(gap), inner, styler));
+  const rows = Array.isArray(fold.byFlow) ? fold.byFlow : [];
+  if (rows.length === 0) return [...out, fitLine(styler.fg("dim", "  (no runs in this window)"), inner, styler)];
+  rows.forEach((r: any, i: number) => {
+    const cells = [
+      styler.cell(r.flow ?? "-", wFlow),
+      styler.cell(String(r.runs ?? 0), wRuns, { align: "right" }),
+      styler.cell(fmtTokens(r.tokens ?? 0), wTok, { align: "right" }),
+      styler.fmtCost(r.cost, wCost),
+      styler.fmtCost(r.apiEquiv, wApi),
+    ];
+    out.push(fitLine(cursor(i === costsSel) + " " + cells.join(gap), inner, styler));
+  });
+  return out;
+}
+
+/**
+ * The what-if delta block under the table. The estimate came from the injected seam (whatIfFlow at the
+ * real rates); this only phrases the two shapes it returns: a measured-median estimate with the delta
+ * against the flow's current window cost and its coverage honesty line, or the seeded requirements band
+ * when no ledgered run has ever measured the flow. The cross-provider caveat renders ONLY when the
+ * target provider differs from the flow's dominant one -- same-provider re-pricing is arithmetic,
+ * cross-provider assumes the token profile survives a tokenizer change, and that assumption is stated
+ * rather than silently priced in.
+ */
+function whatIfLines(wi: any, data: any, inner: number, styler: any): string[] {
+  const out: string[] = [];
+  const t = wi.target;
+  const header = styler.bold(styler.fg("accent", `WHAT-IF ${wi.flow} → ${t ? `${t.provider}/${t.id}` : "?"}`)) +
+    styler.fg("dim", `  (${wi.index + 1}/${wi.targets.length} · w next · / search)`);
+  out.push(fitLine(header, inner, styler));
+  const r = wi.result;
+  if (!r) {
+    out.push(fitLine(styler.fg("dim", "no estimate available"), inner, styler));
+  } else if (r.class === "seeded") {
+    // The zero-knowledge band: requirements.md's unmeasured $0.5-$5/job seed, never a $0 that looks
+    // like an answer. The note names the tracking id so the band cannot pass as a measurement.
+    out.push(fitLine(styler.fg("warning", `~~${fmtUsd(r.low)}–${fmtUsd(r.high)} seeded`) + styler.fg("dim", ` · ${r.note ?? "unmeasured (OQ-002)"}`), inner, styler));
+  } else {
+    const current = (data?.fold?.byFlow ?? []).find((x: any) => x.flow === wi.flow)?.cost?.usd;
+    const delta = typeof current === "number" ? r.usd - current : null;
+    const deltaPart = delta === null ? "" : ` (${delta <= 0 ? "−" : "+"}${fmtUsd(Math.abs(delta))} vs current)`;
+    out.push(fitLine(styler.fmtCost({ usd: r.usd, class: "estimated", floor: false }) + styler.fg("dim", `${deltaPart} · rates@${r.ratesVersion ?? "?"}`), inner, styler));
+    const dom = dominantProvider(data?.records, wi.flow);
+    if (t && dom !== null && t.provider !== dom) {
+      out.push(fitLine(styler.fg("dim", "cross-provider: same token profile, tokenizers differ — directional only"), inner, styler));
+    }
+    out.push(fitLine(styler.fg("dim", `coverage ${Math.round((r.coverage ?? 0) * 100)}% (${r.excluded ?? 0} runs excluded)`), inner, styler));
+  }
+  if (wi.filter && wi.input) {
+    const count = Array.isArray(wi.matches) ? wi.matches.length : 0;
+    const top = wi.matches?.[0];
+    const note = styler.fg("dim", ` ${count} match${count === 1 ? "" : "es"}${top ? ` → ${top.provider}/${top.id}` : ""}`);
+    const inputW = Math.max(8, inner - 2 - styler.visibleLen(note));
+    out.push(fitLine(styler.fg("accent", "/ ") + styler.lineInput(wi.input, inputW) + note, inner, styler));
+  }
+  return out;
+}
+
+/**
+ * The plans block, FACTS only: the declared price, the window's attributed runs and the amortized
+ * per-run figure, then each declared vendor window's OBSERVED peak. No remaining, no burn-down: the
+ * fold reports what happened, and where the vendor discloses no limit the line says exactly that
+ * rather than inventing a denominator -- the same refusal the spend meter makes on an unknown cap.
+ */
+function planLines(fold: any, inner: number, styler: any): string[] {
+  const plans = Array.isArray(fold.plans) ? fold.plans : [];
+  if (plans.length === 0) return [];
+  const out: string[] = [];
+  plans.forEach((p: any, i: number) => {
+    const label = i === 0 ? styler.fg("muted", "plans") + "  " : " ".repeat(7);
+    const price = `$${p.price?.amount ?? "?"}/${p.price?.per === "month" ? "mo" : p.price?.per ?? "mo"}`;
+    const amortized = p.amortizedPerRun
+      ? styler.fmtCost(p.amortizedPerRun) + styler.fg("dim", "/run amortized")
+      : styler.fg("dim", "no runs attributed");
+    out.push(fitLine(label + styler.fg("text", `${p.id}${p.hypothetical ? " (hypothetical)" : ""} ${price} · ${p.attributedRuns ?? 0} runs · `) + amortized, inner, styler));
+    for (const w of p.windows ?? []) {
+      const limit = w.limit === null || w.limit === undefined ? "limit undisclosed by vendor" : `limit ${w.limit} ${w.unit ?? ""}`.trim();
+      out.push(fitLine(" ".repeat(7) + styler.fg("dim", `peak ${w.per}${w.rolling ? " rolling" : ""} window: ${w.peakRuns} runs, ${fmtTokens(w.peakTokens ?? 0)} tok — ${limit}`), inner, styler));
+    }
+  });
+  return out;
+}
+
+/** The honesty ledger beside the numbers: which pi-ai priced them, how many runs were never measured or
+ * cannot be re-priced, and (only when it happened) how many were priced under a different pi-ai. */
+function provenanceLine(fold: any, inner: number, styler: any): string {
+  const prov = fold.provenance ?? {};
+  let text = `~ estimates at pi-ai ${prov.piAiPin ?? "?"} · ${prov.runsUnmetered ?? 0} runs unmetered · ${prov.runsUnledgered ?? 0} not repriceable`;
+  if ((prov.ratesDrifted ?? 0) > 0) text += ` · ${prov.ratesDrifted} priced under older rates`;
+  return fitLine(styler.fg("dim", text), inner, styler);
+}
+
+/** The COSTS footer hints -- one line, every layer's keys named. */
+function costsHints(inner: number, styler: any): string {
+  const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
+  return fitLine([k("[↑↓]", "row"), k("[f]", "flow/model"), k("[t]", "7d/30d/mtd"), k("[w]", "what-if"), k("[esc]", "back")].join(" "), inner, styler);
 }
 
 /** ms until the next UTC midnight / Monday 00:00 UTC / month-1 00:00 UTC. */

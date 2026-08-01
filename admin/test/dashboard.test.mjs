@@ -1121,6 +1121,351 @@ test("a cron trigger whose scheduler is overdue or stall-capped carries an amber
   assert.doesNotMatch(healthy, /⚠/, "a healthy row renders byte-identically to before");
 });
 
+// --- the COSTS view (issue #53): the canned fold rendered, the window/table keys, the what-if layers ---
+
+/** A typed dollar literal (the costs.mjs shape) -- these tests hand-build the fold rather than run it,
+ * because the view's contract is the SHAPES foldCosts documents, and canned shapes keep every assertion
+ * hand-computable. */
+const usd = (n, cls, over = {}) => ({ usd: n, class: cls, floor: false, ...over });
+
+/**
+ * One realistic canned fold: two plans (an owned SAVING one and a hypothetical WOULD_SAVE one), a daily
+ * series with a zero-run gap day, by-flow rows including a plan-covered and a metered one, a zero-rated
+ * by-model row, and a provenance carrying unmetered/unledgered/drifted counts plus the pi-ai pin.
+ * Window: 12 days, so the owned plan prorates $99 * 12/30 = $39.60 against its $44.49 api-equiv.
+ */
+const CANNED_FOLD = {
+  window: { fromMs: Date.parse("2026-07-20T00:00:00.000Z"), toMs: Date.parse("2026-08-01T00:00:00.000Z"), days: 12 },
+  daily: [
+    { day: "2026-07-29", cost: usd(1.1, "metered"), runs: 3 },
+    { day: "2026-07-30", cost: usd(0, "metered"), runs: 0 }, // the gap day: zero runs, a zero cell -- never compressed away
+    { day: "2026-07-31", cost: usd(0.15, "estimated", { coverage: 0.5 }), runs: 2 },
+  ],
+  byFlow: [
+    { flow: "fix", runs: 12, tokens: 5_400_000, cost: usd(0, "plan", { planId: "kimi" }), apiEquiv: usd(44.49, "estimated") },
+    { flow: "tidy", runs: 3, tokens: 90_000, cost: usd(1.25, "metered"), apiEquiv: null },
+  ],
+  byModel: [
+    { provider: "kimi-coding", model: "kimi-k2", runs: 12, calls: 24, input: 4_000_000, output: 1_400_000, cacheRead: 0, cacheWrite: 0, tokens: 5_400_000, cost: usd(0, "plan", { planId: "kimi" }) },
+    { provider: "anthropic", model: "claude-sonnet-4", runs: 3, calls: 6, input: 60_000, output: 30_000, cacheRead: 0, cacheWrite: 0, tokens: 90_000, cost: usd(1.25, "metered") },
+    { provider: "zai", model: "glm-4.7", runs: 1, calls: 1, input: 800, output: 200, cacheRead: 0, cacheWrite: 0, tokens: 1_000, cost: usd(0, "zero-rated") },
+  ],
+  plans: [
+    {
+      id: "kimi",
+      vendor: "Moonshot AI",
+      hypothetical: false,
+      price: { amount: 99, currency: "USD", per: "month" },
+      attributedRuns: 12,
+      attributedTokens: 5_400_000,
+      amortizedPerRun: usd(3.3, "estimated"),
+      apiEquiv: usd(44.49, "estimated"),
+      verdict: { kind: "SAVING", usd: usd(4.89, "estimated") },
+      windows: [{ per: "5h", rolling: true, unit: "tokens", limit: null, peakRuns: 4, peakTokens: 1_200_000 }],
+    },
+    {
+      id: "zai-max",
+      vendor: "Z.ai",
+      hypothetical: true,
+      price: { amount: 15, currency: "USD", per: "month" },
+      attributedRuns: 1,
+      attributedTokens: 1_000,
+      amortizedPerRun: usd(6, "estimated"),
+      apiEquiv: null,
+      verdict: { kind: "WOULD_SAVE", usd: usd(2.4, "estimated") },
+      windows: [{ per: "month", rolling: false, unit: "tokens", limit: 5_000_000, peakRuns: 1, peakTokens: 1_000 }],
+    },
+  ],
+  provenance: {
+    total: usd(1.25, "estimated", { floor: true, coverage: 0.5 }),
+    runsTotal: 16,
+    runsUnmetered: 1,
+    runsUnledgered: 2,
+    ratesDrifted: 1,
+    piAiPin: "0.9.7",
+  },
+};
+
+/** The records behind that fold, as far as the view reads them: the flow "fix" is dominated by
+ * kimi-coding tokens, so a kimi-coding what-if target is same-provider and an anthropic one is not. */
+const CANNED_COST_RECORDS = [
+  { jobId: "c1", flow: "fix", provider: "kimi-coding", model: "kimi-k2", tokens: { total: 450_000 }, usage: { models: [{ provider: "kimi-coding", model: "kimi-k2", total: 450_000 }] } },
+  { jobId: "c2", flow: "tidy", provider: "anthropic", model: "claude-sonnet-4", tokens: { total: 90_000 }, usage: null },
+];
+
+const CANNED_SUBS = [
+  { id: "kimi", vendor: "Moonshot AI", provider: "kimi-coding", models: ["*"], hypothetical: false, price: { amount: 99, currency: "USD", per: "month" }, counterfactualModel: { provider: "anthropic", id: "claude-sonnet-4" }, windows: [] },
+];
+
+/** Deps with the three COSTS seams faked: a canned fold snapshot, a 3-model priced catalog, and a
+ * deterministic what-if estimate. Individual tests override the seams with spies. */
+function costsDeps(over = {}) {
+  return cannedDeps({
+    fetchCosts: async () => ({ fold: CANNED_FOLD, records: CANNED_COST_RECORDS, subscriptions: CANNED_SUBS }),
+    listPricedModels: () => [
+      { provider: "anthropic", id: "claude-sonnet-4", cost: {} },
+      { provider: "anthropic", id: "haiku-cheap", cost: {} },
+      { provider: "zai", id: "glm-4.7", cost: {} },
+    ],
+    whatIf: () => ({ class: "estimated", usd: 4.05, perRun: 0.34, coverage: 0.83, excluded: 2, ratesVersion: "1.2.3" }),
+    ...over,
+  });
+}
+
+/** A dashboard with the COSTS view opened (`c` from LIST) and its entry fetch flushed. */
+async function openCosts(deps, { theme, intervalMs = 100000 } = {}) {
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), theme, intervalMs, deps });
+  await flush();
+  comp.handleInput("c");
+  await flush();
+  return comp;
+}
+
+test("'c' opens COSTS and Esc returns; the compressed LIST footer carries the hint unclipped at 80", async () => {
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: costsDeps() });
+  await flush();
+
+  // The width-80 frame's inner width is 76 and the compressed hint row is exactly that: the footer must
+  // end with its last hint, not an ellipsis -- a clipped footer is how a key silently disappears.
+  const footer = comp.render(80).map(stripAnsi).find((l) => l.includes("q quit"));
+  assert.ok(footer, "the LIST footer renders");
+  assert.match(footer, /c costs/, "the costs key is advertised");
+  assert.ok(!footer.includes("…"), "the width-80 footer fits with no ellipsis glyph");
+
+  comp.handleInput("c");
+  await flush();
+  const costsOut = stripAnsi(comp.render(80).join("\n"));
+  assert.match(costsOut, /COSTS · /, "the frame titles on the view and its window");
+  assert.match(costsOut, /\(mtd\)/, "the default window is month-to-date");
+
+  comp.handleInput("\x1b");
+  await flush();
+  const back = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(back, /pi-dispatch/, "Esc returns to the LIST frame");
+  assert.doesNotMatch(back, /VERDICT/, "the costs body is gone");
+});
+
+test("the canned fold renders: verdicts, plan cells that never read $0.00, and the provenance pin", async () => {
+  const comp = await openCosts(costsDeps());
+  const out = stripAnsi(comp.render(100).join("\n"));
+  await comp.dispose();
+
+  assert.match(out, /VERDICT {2}kimi is SAVING ~\$4\.89 est\. this month/, "the owned verdict wears its provisional dress");
+  assert.match(out, /plan price \(prorated\) \$99\.00 → \$39\.60 · plan runs @ API ~\$44\.49 est\./, "the verdict's arithmetic is checkable");
+  assert.match(out, /zai-max WOULD SAVE ~\$2\.40 est\. this month \(hypothetical\)/, "the hypothetical plan is scored, and labeled as such");
+
+  assert.match(out, /plan:kimi/, "a plan-covered row names its plan");
+  assert.ok(!out.includes("$0.00"), "a covered row must NEVER read as $0.00 -- prepaid is not free, and free is not a claim this view can make");
+
+  assert.match(out, /daily {2}/, "the daily sparkline row renders");
+  assert.match(out, /Σ ~≥\$1\.25 est\./, "the window total is the typed provenance dollar, floor marker and all");
+  assert.match(out, /max \$1\.10\/d/);
+
+  assert.match(out, /kimi \$99\/mo · 12 runs · ~\$3\.30 est\.\/run amortized/, "the plans block states the declared price and the amortized figure");
+  assert.match(out, /peak 5h rolling window: 4 runs, 1\.2M tok — limit undisclosed by vendor/, "facts only -- no remaining, no burn-down");
+  assert.match(out, /peak month window: 1 runs, 1k tok — limit 5000000 tokens/, "a declared limit rides through verbatim");
+
+  assert.match(out, /~ estimates at pi-ai 0\.9\.7 · 1 runs unmetered · 2 not repriceable · 1 priced under older rates/, "the provenance names the pin and every honesty count");
+});
+
+test("a fold with no baseline and one with no plans degrade to their stated lines", async () => {
+  const noBaseline = {
+    ...CANNED_FOLD,
+    plans: [{ ...CANNED_FOLD.plans[0], apiEquiv: null, verdict: { kind: "NO_BASELINE", usd: null } }],
+  };
+  const c1 = await openCosts(costsDeps({ fetchCosts: async () => ({ fold: noBaseline, records: CANNED_COST_RECORDS, subscriptions: CANNED_SUBS }) }));
+  const out1 = stripAnsi(c1.render(100).join("\n"));
+  await c1.dispose();
+  assert.match(out1, /kimi: no API-rate baseline declared — set counterfactualModel to compare/);
+
+  const noPlans = { ...CANNED_FOLD, plans: [] };
+  const c2 = await openCosts(costsDeps({ fetchCosts: async () => ({ fold: noPlans, records: [], subscriptions: [] }) }));
+  const out2 = stripAnsi(c2.render(100).join("\n"));
+  await c2.dispose();
+  assert.match(out2, /no subscriptions declared · edit subscriptions\.json/);
+  assert.doesNotMatch(out2, /VERDICT/, "no plan, no verdict -- never a scored nothing");
+});
+
+test("'t' cycles the window and re-fetches; the poll tick never re-scans while the fold is fresh", async () => {
+  const seen = [];
+  const deps = costsDeps({
+    fetchCosts: async ({ windowKey }) => {
+      seen.push(windowKey);
+      return { fold: CANNED_FOLD, records: CANNED_COST_RECORDS, subscriptions: CANNED_SUBS };
+    },
+  });
+  // A fast poll on purpose: several ticks land between open and the first `t`, and the 10s staleness
+  // gate must swallow ALL of them -- the scan reads every sidecar, and the poll must not multiply that.
+  const comp = await openCosts(deps, { intervalMs: 10 });
+  assert.deepEqual(seen, ["mtd"], "entry fetches once, with the default window");
+
+  await delay(35);
+  assert.deepEqual(seen, ["mtd"], "poll ticks piggyback no fetch while the fold is fresh");
+
+  comp.handleInput("t");
+  await flush();
+  comp.handleInput("t");
+  await flush();
+  assert.deepEqual(seen, ["mtd", "7d", "30d"], "each window change is its own immediate fetch");
+  const out = stripAnsi(comp.render(80).join("\n"));
+  await comp.dispose();
+  assert.match(out, /COSTS · last 30d/, "the title names the active window");
+});
+
+test("'f' toggles the by-flow and by-model tables; the zero-rated model row says unrated, never free", async () => {
+  const comp = await openCosts(costsDeps());
+  const flow = stripAnsi(comp.render(100).join("\n"));
+  assert.match(flow, /FLOW\s+RUNS\s+TOKENS\s+COST\s+API-EQUIV/, "the by-flow header");
+  assert.match(flow, /› fix/, "the cursor sits on the top flow row");
+
+  comp.handleInput("f");
+  await flush();
+  const model = stripAnsi(comp.render(100).join("\n"));
+  await comp.dispose();
+  assert.match(model, /PROVIDER\/MODEL\s+RUNS\s+TOKENS\s+COST/, "the by-model header");
+  assert.doesNotMatch(model, /API-EQUIV/, "the api-equiv column belongs to the flow table alone");
+  assert.match(model, /zai\/glm-4\.7/);
+  assert.match(model, /\$0 \(unrated\)/, "a zero-rated row says a table rated it zero");
+  assert.doesNotMatch(model, /free/, "'free' is a claim no money surface here can make");
+});
+
+test("'w' opens the what-if on the selected flow, cycles targets, and the caveat is cross-provider only", async () => {
+  const calls = [];
+  const deps = costsDeps({
+    whatIf: (args) => {
+      calls.push(args);
+      return { class: "estimated", usd: 4.05, perRun: 0.34, coverage: 0.83, excluded: 2, ratesVersion: "1.2.3" };
+    },
+  });
+  const comp = await openCosts(deps);
+
+  comp.handleInput("w"); // opens on row 0 -- flow "fix", first shortlist target kimi-coding/kimi-k2
+  await flush();
+  let out = stripAnsi(comp.render(100).join("\n"));
+  assert.match(out, /WHAT-IF fix → kimi-coding\/kimi-k2/);
+  assert.match(out, /~\$4\.05 est\./, "the estimate wears its provisional dress");
+  assert.match(out, /vs current/, "the delta against the flow's current window cost");
+  assert.match(out, /rates@1\.2\.3/, "the rates version is named");
+  assert.match(out, /coverage 83% \(2 runs excluded\)/, "the honesty line");
+  assert.doesNotMatch(out, /cross-provider/, "same provider as the flow's dominant one -- no caveat");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].flow, "fix");
+  assert.deepEqual(calls[0].target, { provider: "kimi-coding", id: "kimi-k2" });
+  assert.ok(Array.isArray(calls[0].records), "the seam re-prices the records the fetch served");
+
+  comp.handleInput("w"); // cycles to the next shortlist target: anthropic/claude-sonnet-4
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  await comp.dispose();
+  assert.match(out, /WHAT-IF fix → anthropic\/claude-sonnet-4/);
+  assert.deepEqual(calls[1].target, { provider: "anthropic", id: "claude-sonnet-4" });
+  assert.match(out, /cross-provider: same token profile, tokenizers differ — directional only/, "a tokenizer change is stated, not priced in");
+});
+
+test("'/' filters the priced catalog (typed keys route to the input first); Enter applies; Esc pops layer by layer", async () => {
+  const calls = [];
+  const deps = costsDeps({
+    whatIf: (args) => {
+      calls.push(args);
+      return { class: "estimated", usd: 4.05, perRun: 0.34, coverage: 0.83, excluded: 2, ratesVersion: "1.2.3" };
+    },
+  });
+  const comp = await openCosts(deps);
+  comp.handleInput("w");
+  comp.handleInput("/");
+  await flush();
+
+  // "t" is a COSTS view key (window cycle) -- typed into the open filter it must narrow the list instead.
+  comp.handleInput("t");
+  await flush();
+  let out = stripAnsi(comp.render(100).join("\n"));
+  assert.match(out, /2 matches/, "both anthropic ids contain 't'; the window key did not fire");
+  assert.match(out, /COSTS · .*\(mtd\)/, "the window is untouched by the typed 't'");
+
+  comp.handleInput("\x7f"); // backspace
+  for (const ch of "haiku") comp.handleInput(ch);
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  assert.match(out, /1 match\b/, "the substring filter narrowed the catalog");
+  assert.match(out, /anthropic\/haiku-cheap/, "the top match is shown");
+
+  comp.handleInput("\r"); // Enter applies the top match as the active target
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  assert.match(out, /WHAT-IF fix → anthropic\/haiku-cheap/);
+  assert.deepEqual(calls.at(-1).target, { provider: "anthropic", id: "haiku-cheap" }, "the seam was called with the applied pick");
+  assert.doesNotMatch(out, /\d+ match/, "Enter closed the filter");
+
+  // Esc pops ONE layer at a time: filter -> what-if -> COSTS -> LIST.
+  comp.handleInput("/");
+  await flush();
+  comp.handleInput("\x1b");
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  assert.doesNotMatch(out, /\d+ match/, "first Esc closes the filter only");
+  assert.match(out, /WHAT-IF/, "the what-if survives");
+
+  comp.handleInput("\x1b");
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  assert.doesNotMatch(out, /WHAT-IF/, "second Esc closes the what-if");
+  assert.match(out, /COSTS ·/, "still in COSTS");
+
+  comp.handleInput("\x1b");
+  await flush();
+  out = stripAnsi(comp.render(100).join("\n"));
+  await comp.dispose();
+  assert.match(out, /pi-dispatch/, "third Esc is back on the LIST");
+});
+
+test("a flow no ledgered run ever measured renders the seeded band, named as unmeasured", async () => {
+  const deps = costsDeps({ whatIf: () => ({ class: "seeded", low: 0.5, high: 5, note: "unmeasured (OQ-002)" }) });
+  const comp = await openCosts(deps);
+  comp.handleInput("w");
+  await flush();
+  const out = stripAnsi(comp.render(100).join("\n"));
+  await comp.dispose();
+  assert.match(out, /~~\$0\.50–\$5\.00 seeded/, "the band, in the seeded dress no measurement wears");
+  assert.ok(out.includes("unmeasured (OQ-002)"), "the note names the open question verbatim");
+  assert.doesNotMatch(out, /coverage \d+%/, "a band has no coverage to claim");
+});
+
+test("COSTS under a real-SGR theme at 80: every line, filter input and all, is exactly 80 visible cols", async () => {
+  const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
+  const comp = await openCosts(costsDeps(), { theme });
+  comp.handleInput("w");
+  comp.handleInput("/");
+  for (const ch of "ha") comp.handleInput(ch);
+  await flush();
+  const lines = comp.render(80);
+  await comp.dispose();
+  assert.ok(lines.some((l) => l.includes("\x1b[")), "the view is colored");
+  for (const l of lines) {
+    assert.equal(visibleLen(l), 80, `every framed line is exactly 80 visible cols: ${JSON.stringify(stripAnsi(l))}`);
+  }
+});
+
+test("COSTS degrades to plain unframed lines at a tiny width", async () => {
+  const comp = await openCosts(costsDeps());
+  const tiny = comp.render(4).join("\n");
+  await comp.dispose();
+  assert.doesNotMatch(tiny, /[┌┐└┘│─]/, "below MIN_WIDTH the view drops the frame rather than emitting a ragged box");
+  assert.match(tiny, /COSTS/, "the plain title still names the view");
+});
+
+test("a throwing or unreachable fetchCosts degrades to an in-frame message, never a crash", async () => {
+  const throwing = await openCosts(costsDeps({ fetchCosts: async () => { throw new Error("scan died"); } }));
+  const out1 = stripAnsi(throwing.render(80).join("\n"));
+  await throwing.dispose();
+  assert.match(out1, /costs unreachable \(scan died\)/);
+
+  const unreachable = await openCosts(costsDeps({ fetchCosts: async () => ({ unreachable: "logs dir unreadable (EACCES)" }) }));
+  const out2 = stripAnsi(unreachable.render(80).join("\n"));
+  await unreachable.dispose();
+  assert.match(out2, /costs unreachable \(logs dir unreadable \(EACCES\)\)/);
+});
+
 test("the viewport, markers and badges keep every colored line at exactly the frame width", async () => {
   const theme = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
   const snap = { ...manyRuns(15), triggers: { triggers: [{ type: "cron", id: "s1", pattern: "0 3 * * *", folder: "/p", flow: "tidy" }] } };

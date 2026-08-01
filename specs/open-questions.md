@@ -34,6 +34,13 @@ Status values: `OPEN` (unanswered) · `WATCH` (not a question — a known-incomi
 - **Blocks**: `DES-CONCURRENCY-3` being evidenced rather than assumed. Blocks nothing from shipping.
 - **How to answer**: run a representative frontend job; measure peak RSS of the container.
 - **May also get an issue**: yes — this is schedulable work. The row stays regardless.
+- **Update (2026-08-01, issue #53)**: the row's *cost* twin — the `$0.5–$5/job` figure recorded beside
+  the RAM estimate in requirements.md's Notes — is now load-bearing in exactly one place: the cost
+  what-if's **seeding fallback of last resort**, offered only for a flow with zero ledgered history,
+  always as a band, always labeled `unmeasured (OQ-002)` (`REQ-COST-ANALYTICS`). Every flow that has run
+  since the per-model ledger landed seeds from its own **measured median** instead, so the band's reach
+  shrinks as history accrues. Once a full retention cycle of ledgered runs exists, replace the band with
+  measured per-flow distributions and narrow this row to the RAM question alone.
 
 ## OQ-003 — Does the assembled system prompt survive compaction and session reload byte-identically?
 
