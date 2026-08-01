@@ -4,8 +4,8 @@
  * Idempotent and non-destructive: an existing file is reported and left as-is, so re-running init
  * never overwrites operator edits. The scaffolds mirror the empty templates the worker validates
  * against — an empty triggers list disables cron/label/comment/PR, an empty windows list means no
- * scoped pauses, an empty packages list stages nothing — so a fresh deployment starts inert and is
- * opted into feature by feature.
+ * scoped pauses, an empty packages list stages nothing, an empty subscriptions list declares no plan
+ * prices — so a fresh deployment starts inert and is opted into feature by feature.
  */
 import { existsSync, copyFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,9 @@ const EMPTY_PAUSE_WINDOWS = `${JSON.stringify({ windows: [] }, null, 2)}\n`;
 // Pinned third-party pi packages staged into the global overlay (issue #58). Empty by default: staging
 // runs third-party code inside jobs, so it is opted into package by package, never scaffolded populated.
 const EMPTY_PACKAGES = `${JSON.stringify({ packages: [] }, null, 2)}\n`;
+// Operator-declared subscription plans (issue #53), read by the admin extension only — never at job
+// time. Versioned because a newer file must fail loud, and that cannot be retrofitted into a v1 reader.
+const EMPTY_SUBSCRIPTIONS = `${JSON.stringify({ version: 1, subscriptions: [] }, null, 2)}\n`;
 
 export function runInit(cwd = process.cwd(), deps = {}) {
 	const { fs = { existsSync, copyFileSync, writeFileSync }, out = (s) => process.stdout.write(s) } = deps;
@@ -38,6 +41,7 @@ export function runInit(cwd = process.cwd(), deps = {}) {
 	scaffold(fs, results, join(cwd, "triggers.json"), EMPTY_TRIGGERS, "empty triggers list");
 	scaffold(fs, results, join(cwd, "pause-windows.json"), EMPTY_PAUSE_WINDOWS, "empty pause-windows list");
 	scaffold(fs, results, join(cwd, "pi-packages.json"), EMPTY_PACKAGES, "empty pi package list (stage with import-pi --with-packages)");
+	scaffold(fs, results, join(cwd, "subscriptions.json"), EMPTY_SUBSCRIPTIONS, "empty subscription list (declare plan prices for the admin's cost analytics)");
 
 	for (const [verb, name, note] of results) {
 		out(`${verb.padEnd(7)} ${name.padEnd(20)} ${note}\n`);

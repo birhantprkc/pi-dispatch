@@ -51,6 +51,17 @@ coverage/
 /pause-windows.json
 !pause-windows.example.json
 
+# Pinned third-party pi packages (issue #58). init scaffolds pi-packages.json into the
+# cwd, so without this rule the scaffold is committable by accident; the committed
+# pi-packages.example.json is the template.
+/pi-packages.json
+!pi-packages.example.json
+
+# Operator-declared subscription plans (issue #53). Prices only — counterfactual cost
+# analytics for the admin, never job behavior; subscriptions.example.json is the template.
+/subscriptions.json
+!subscriptions.example.json
+
 # Python — bytecode and tool caches from the skill scripts under .claude/skills/
 __pycache__/
 *.py[cod]

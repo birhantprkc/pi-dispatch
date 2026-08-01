@@ -22,6 +22,8 @@ import {
   writeTriggers,
   readPauseWindows,
   writePauseWindows,
+  readSubscriptions,
+  writeSubscriptions,
   enqueueDispatchRun,
   revParseHead,
 } from "../src/read-model.mjs";
@@ -131,6 +133,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     PI_CAPTURE_JOB_LOGS: "1",
     PI_DISPATCH_RUN_ROOTS: "/root-a",
     PI_DISPATCH_RUN_PER_HOUR: "5",
+    PI_SUBSCRIPTIONS_FILE: "/subs.json",
     // Pinned so the sandbox default does not drag the OS temp dir into this equality
     // (REQ-RESURRECTABLE-SANDBOX); the defaulting itself is asserted in its own test below.
     PI_SANDBOX_DIR: "/sbx",
@@ -149,6 +152,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     dispatchRunPerHour: 5,
     schedulerStallMax: 2,
     pauseWindowsPath: "deploy/pause-windows.json",
+    subscriptionsPath: "/subs.json",
   });
 });
 
@@ -163,6 +167,7 @@ test("resolvePaths falls back to defaults on empty env (no worker config require
   assert.ok(typeof p.settingsFile === "string" && p.settingsFile.length > 0);
   assert.deepEqual(p.dispatchRunRoots, [], "default roots [] fails closed");
   assert.equal(p.dispatchRunPerHour, 3, "default per-hour cap");
+  assert.equal(p.subscriptionsPath, "deploy/subscriptions.json", "the deployed default, like triggers/pause-windows");
 });
 
 test("resolvePaths reimplements the non-negative-int parse: invalid PI_DISPATCH_RUN_PER_HOUR falls back", () => {
@@ -367,6 +372,58 @@ test("writePauseWindows validates through the shared parser and writes atomicall
   const bad = writePauseWindows({ pauseWindowsPath: "pw.json", fs, mutate: (list) => [...list, { scope: "x", from: "09:00", to: "09:00" }] });
   assert.match(bad.invalid, /from and to must differ/);
   assert.equal(JSON.parse(fs.files["pw.json"]).windows.length, 1, "a rejected edit leaves the file unchanged");
+});
+
+// A valid declared plan, reused across the subscriptions read/write tests below.
+const kimiPlan = {
+  id: "kimi-for-coding",
+  vendor: "Moonshot AI",
+  provider: "kimi-coding",
+  price: { amount: 99, currency: "USD", per: "month" },
+  windows: [{ per: "5h", rolling: true, unit: null, limit: null }],
+};
+
+test("readSubscriptions returns normalized entries via the shared parser, and degrades on missing/invalid", () => {
+  const fs = triggerFs({ "subs.json": JSON.stringify({ version: 1, subscriptions: [kimiPlan] }) });
+  const ok = readSubscriptions({ subscriptionsPath: "subs.json", fs });
+  assert.equal(ok.version, 1);
+  assert.equal(ok.subscriptions.length, 1);
+  assert.equal(ok.subscriptions[0].sharedWithOtherProducts, false, "defaults applied by the worker's own normalizer");
+  assert.deepEqual(ok.subscriptions[0].models, ["*"]);
+  assert.deepEqual(readSubscriptions({ subscriptionsPath: "absent.json", fs }), { missing: true });
+  assert.deepEqual(readSubscriptions({ subscriptionsPath: null, fs }), { missing: true }, "an unconfigured path is a normal deployment");
+  const bad = readSubscriptions({ subscriptionsPath: "b.json", fs: triggerFs({ "b.json": JSON.stringify({ version: 1, subscriptions: [{ id: "x" }] }) }) });
+  assert.match(bad.invalid, /vendor/);
+});
+
+test("readSubscriptions surfaces the fail-loud newer-version refusal as { invalid }, naming both versions", () => {
+  const fs = triggerFs({ "subs.json": JSON.stringify({ version: 2, subscriptions: [] }) });
+  const res = readSubscriptions({ subscriptionsPath: "subs.json", fs });
+  assert.match(res.invalid, /newer pi-dispatch/);
+  assert.match(res.invalid, /version 2/);
+  assert.match(res.invalid, /understands 1/);
+});
+
+test("writeSubscriptions validates through the shared parser and writes atomically; rejects a bad edit", () => {
+  const fs = triggerFs({ "subs.json": JSON.stringify({ version: 1, subscriptions: [] }) });
+  const add = writeSubscriptions({ subscriptionsPath: "subs.json", fs, mutate: (list) => [...list, kimiPlan] });
+  assert.deepEqual(add, { ok: true });
+  const written = JSON.parse(fs.files["subs.json"]);
+  assert.equal(written.version, 1, "the write re-stamps the version this build understands");
+  assert.equal(written.subscriptions[0].id, "kimi-for-coding");
+  assert.ok(!("subs.json.tmp" in fs.files), "the tmp file was renamed away (atomic)");
+  const bad = writeSubscriptions({ subscriptionsPath: "subs.json", fs, mutate: (list) => [...list, { ...kimiPlan, vendor: "Twice" }] });
+  assert.match(bad.invalid, /already used/);
+  assert.equal(JSON.parse(fs.files["subs.json"]).subscriptions.length, 1, "a rejected edit leaves the file unchanged");
+});
+
+test("writeSubscriptions on a missing or unparseable file starts from the empty v1 shape and repairs it", () => {
+  const missing = triggerFs({});
+  assert.deepEqual(writeSubscriptions({ subscriptionsPath: "subs.json", fs: missing, mutate: (l) => [...l, kimiPlan] }), { ok: true });
+  assert.equal(JSON.parse(missing.files["subs.json"]).subscriptions.length, 1);
+  const garbled = triggerFs({ "subs.json": "{ not json" });
+  assert.deepEqual(writeSubscriptions({ subscriptionsPath: "subs.json", fs: garbled, mutate: (l) => l }), { ok: true });
+  assert.deepEqual(JSON.parse(garbled.files["subs.json"]), { version: 1, subscriptions: [] }, "the validated write repaired the file");
 });
 
 test("readTriggers normalizes each on.type into its discriminated display record", () => {
