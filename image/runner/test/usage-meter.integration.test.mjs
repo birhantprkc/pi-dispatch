@@ -266,6 +266,33 @@ test("two concurrent sessions: the process-wide meter sees both, the session bus
 			"the three-way split must partition the total exactly",
 		);
 
+		// The per-model ledger, driven through the REAL dispatch chain (issue #53): both sessions' calls
+		// must land on the ONE (provider, model) pair the fixture declares -- read off the Model object
+		// compat dispatched on, not off the settled message -- with the cache split intact that the flat
+		// totals above collapse. And `piAi` must carry a real version, because in THIS test the installer
+		// read it from the accepted copy's own package.json on disk: the one claim the injected-readText
+		// tests in usage-meter.test.mjs cannot make.
+		const ledger = meter.usageSnapshot();
+		assert.equal(ledger.v, 1);
+		assert.equal(ledger.truncated, 0);
+		assert.match(ledger.piAi ?? "", /^\d+\.\d+\.\d+/, "piAi must be the accepted copy's on-disk version");
+		assert.deepEqual(ledger.models, [
+			{
+				provider: PROVIDER,
+				model: MODEL_ID,
+				calls: 2,
+				input: 2 * SENTINEL_USAGE.input,
+				output: 2 * SENTINEL_USAGE.output,
+				cacheRead: 2 * SENTINEL_USAGE.cacheRead,
+				cacheWrite: 0,
+				cacheWrite1h: 0,
+				reasoning: 0,
+				total: 2 * SENTINEL_TOTAL,
+				cost: 2 * SENTINEL_COST,
+				unpriced: 0,
+			},
+		]);
+
 		// ...and the control, which is the negative half: the old mechanism saw HALF the spend, because
 		// the second session never emitted on the first session's bus. A cap built on this number would
 		// let a job spend twice its budget and a run record built on it would understate by the same.

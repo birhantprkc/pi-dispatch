@@ -48,7 +48,7 @@ export async function runJob(job, deps) {
 		mintToken,
 		isDefaultBranchProtected, // (job, token) => boolean; same reason -- the forge is the job's, not the process's
 		prepareWorkspace, // (job, token) => { workspaceDir, jobDir }  (clone+materialise+prompt)
-		// runContainer({ job, token, prepared, name, signal }) => { code, aborted, turns }. It MUST honour
+		// runContainer({ job, token, prepared, name, signal }) => { code, aborted, turns, tokens, session, usage }. It MUST honour
 		// `signal`: stop the container on abort, and reject/exit promptly if `signal.aborted` is already
 		// true at entry (the timeout can fire during a slow prepare). The wiring injects name + signal.
 		runContainer,
@@ -93,7 +93,13 @@ export async function runJob(job, deps) {
 			// The image ref is operator-authored config (PI_JOB_IMAGE), never payload, so naming it is PII-safe
 			// -- the same class as `repo` above.
 			// exitCode/turns/tokens null and budgetReserved false: refused pre-container AND pre-reserve.
-			return { outcome: "policy", reason: "job-image-missing", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+			// provider/model ride every terminal result from here down (INT-RUN-HISTORY-FILE-CONTRACT):
+			// runJob's `job` IS the effectiveJob (index.mjs), so these are the HOST-effective,
+			// overlay-resolved dispatch facts -- never anything a container printed -- and even a
+			// pre-container refusal attributes which (provider, model) it was dispatched for. There is
+			// deliberately NO `usage` key on the pre-container branches: no run, no ledger, and
+			// buildRecord defaults the absent field to null.
+			return { outcome: "policy", reason: "job-image-missing", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 		}
 		if (img.forgeUnsupported) {
 			// The image is present and says it cannot serve this forge -- it ships no CLI for it. Determinate,
@@ -108,7 +114,7 @@ export async function runJob(job, deps) {
 				`Refused: the job image "${img.forgeUnsupported}" does not support ${img.kind} jobs (it declares: ${img.declared.join(", ")}). Set this trigger's \`run.image\` to an image that does. Not run.`,
 			);
 			log("refused_image_forge_unsupported", { image: img.forgeUnsupported, kind: img.kind, declared: img.declared });
-			return { outcome: "policy", reason: "job-image-forge-unsupported", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+			return { outcome: "policy", reason: "job-image-forge-unsupported", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 		}
 		if (img.replicaUnsupported) {
 			// The image is present and does not declare replica support (REQ-REPLICA-RUNS), so its baked
@@ -125,13 +131,14 @@ export async function runJob(job, deps) {
 				`Refused: the job image "${img.replicaUnsupported}" does not declare replica support (\`dev.pi-dispatch.capabilities\` ${img.declared.length > 0 ? `declares: ${img.declared.join(", ")}` : "is absent"}), so its baked guardrails would name the wrong branch. Rebuild the image from a version that has this feature. Not run.`,
 			);
 			log("refused_image_replicas_unsupported", { image: img.replicaUnsupported, declared: img.declared });
-			return { outcome: "policy", reason: "job-image-replicas-unsupported", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+			return { outcome: "policy", reason: "job-image-replicas-unsupported", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 		}
 		if (img.unavailable) {
 			// docker itself did not answer -- transient infra, NOT a determinate refusal. THROWN so BullMQ
 			// retries (CONST-RETRY-INFRA-ONLY). `container-never-started` is literally true here, and it reuses
 			// the refund path below: a no-op pre-reserve, and still honest if this gate ever moves.
-			throw new InfraRetry("docker unavailable, image preflight could not run", { reason: "container-never-started" });
+			// provider/model attribute even this pre-container death; no usage -- nothing ran to emit one.
+			throw new InfraRetry("docker unavailable, image preflight could not run", { reason: "container-never-started", provider: job.provider ?? null, model: job.model ?? null });
 		}
 
 		if (wantsForgeToken) {
@@ -154,7 +161,7 @@ export async function runJob(job, deps) {
 				await comment(job, "Refused: the default branch is not protected. See SECURITY.md.");
 				log("refused_unprotected", { repo: job.repo });
 				// exitCode/turns/tokens null: refused pre-container, so no container exit, turn, or token count exists.
-				return { outcome: "policy", reason: "unprotected-branch", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+				return { outcome: "policy", reason: "unprotected-branch", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 			}
 		}
 
@@ -162,9 +169,11 @@ export async function runJob(job, deps) {
 
 		// A determinate prepare refusal (e.g. sha-gone: the default branch advanced past the resolved
 		// tip) is POLICY -- return before reserveBudget so it burns no cap slot and is never retried.
-		// Mirrors the branch-protection policy return above.
+		// Mirrors the branch-protection policy return above. Spread-plus-attribution: the prepare
+		// result keeps its own reason and fields, and the host-effective provider/model land beside
+		// them exactly as on every other terminal result.
 		if (prepared?.outcome === "policy") {
-			return prepared;
+			return { ...prepared, provider: job.provider ?? null, model: job.model ?? null };
 		}
 
 		// Daily TOKEN cap (issue #25): the deliberate check-AFTER control. Token cost is only known
@@ -181,7 +190,7 @@ export async function runJob(job, deps) {
 			await comment(job, `Over the daily token cap (${tokenGate.spent}/${tokenGate.cap} tokens). Not run.`);
 			log("over_token_budget", { spent: tokenGate.spent, cap: tokenGate.cap });
 			// budgetReserved false: refused before reserveBudget, so no job-count slot was consumed.
-			return { outcome: "policy", reason: "daily-token-cap", exitCode: null, turns: null, tokens: null, budgetReserved: false }; // return => not retried
+			return { outcome: "policy", reason: "daily-token-cap", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 		}
 
 		// Budget last-but-before-container. A refusal here spends nothing (no container starts). Reserves across
@@ -200,10 +209,10 @@ export async function runJob(job, deps) {
 			}
 			// budgetReserved true: the slot is reserved above and kept (a refused reservation still counts). Both
 			// over-budget and soft-hold are POLICY, RETURNED (not retried) -- the agent never ran.
-			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, tokens: null, budgetReserved: true }; // return => not retried
+			return { outcome: "policy", reason: budget.reason, exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: true }; // return => not retried
 		}
 
-		const { code, aborted, turns, tokens, session } = await runContainer({ job, token, prepared });
+		const { code, aborted, turns, tokens, session, usage } = await runContainer({ job, token, prepared });
 		log("container_exit", { exitCode: code, aborted });
 
 		// Record token spend post-run (the check-AFTER half of the lagging token cap). The container ran,
@@ -223,7 +232,7 @@ export async function runJob(job, deps) {
 		// not the code -- an unbidden 137 (kernel OOM) carries `aborted: false`, falls to the switch, and
 		// stays infra-retryable.
 		// exitCode/turns/tokens carry the container's own exit, turn count, and usage totals; budgetReserved true post-reserve.
-		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, tokens, session: mergeSession(prepared, session), budgetReserved: true };
+		if (aborted) return { outcome: "policy", reason: "worker-abort", exitCode: code, turns, tokens, provider: job.provider ?? null, model: job.model ?? null, session: mergeSession(prepared, session), budgetReserved: true };
 
 		switch (code) {
 			case EXIT_COMPLETED: {
@@ -246,6 +255,12 @@ export async function runJob(job, deps) {
 					exitCode: code,
 					turns,
 					tokens,
+					// The validated per-model ledger the sink rebuilt off the exit line (parseExitUsage), or
+					// null for a fallback-metered or pre-ledger runner. `?? null` keeps the result shape
+					// stable under an injected runContainer that predates the field.
+					usage: usage ?? null,
+					provider: job.provider ?? null,
+					model: job.model ?? null,
 					session: mergeSession(prepared, session, promoted),
 					budgetReserved: true,
 					chainEnqueued: chain.enqueued,
@@ -253,9 +268,11 @@ export async function runJob(job, deps) {
 				};
 			}
 			case EXIT_POLICY:
-				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, session: mergeSession(prepared, session), budgetReserved: true };
+				// A policy exit still ran a paid container, so it carries the ledger like the completed
+				// branch does -- the spend is real whichever way the runner classified itself.
+				return { outcome: "policy", reason: "runner-policy", exitCode: code, turns, tokens, usage: usage ?? null, provider: job.provider ?? null, model: job.model ?? null, session: mergeSession(prepared, session), budgetReserved: true };
 			case EXIT_INFRA:
-				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
+				throw new InfraRetry(`infra failure, container exit ${code}`, { exitCode: code, turns, tokens, usage, provider: job.provider ?? null, model: job.model ?? null, session: mergeSession(prepared, session) });
 			case 125: // `docker run` itself failed (unusable image reference, bad flag)
 			case 126: // the entrypoint exists but is not executable
 			case 127: // the entrypoint was not found
@@ -266,9 +283,9 @@ export async function runJob(job, deps) {
 				// image) into a pre-spend policy refusal; a 125 that survives it is a race (the image was
 				// removed between the inspect and the run) or a docker-side fault we did not foresee --
 				// genuinely infra, and now with a retry that costs nothing.
-				throw new InfraRetry(`docker could not start the container, exit ${code}`, { reason: "container-never-started", exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
+				throw new InfraRetry(`docker could not start the container, exit ${code}`, { reason: "container-never-started", exitCode: code, turns, tokens, usage, provider: job.provider ?? null, model: job.model ?? null, session: mergeSession(prepared, session) });
 			default:
-				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens, session: mergeSession(prepared, session) });
+				throw new InfraRetry(`unknown container exit ${code}`, { exitCode: code, turns, tokens, usage, provider: job.provider ?? null, model: job.model ?? null, session: mergeSession(prepared, session) });
 		}
 	} catch (e) {
 		// A spawn fault (docker daemon down / binary missing) reserved a slot but never started a
@@ -318,7 +335,7 @@ function mergeSession(prepared, fromRunner, promoted = null) {
 }
 
 export class InfraRetry extends Error {
-	constructor(message, { cause, reason, exitCode, turns, tokens, budgetReserved } = {}) {
+	constructor(message, { cause, reason, exitCode, turns, tokens, session, usage, provider, model, budgetReserved } = {}) {
 		super(message, cause ? { cause } : undefined);
 		this.name = "InfraRetry";
 		this.piDispatchRetry = true;
@@ -326,6 +343,16 @@ export class InfraRetry extends Error {
 		this.exitCode = exitCode ?? null;
 		this.turns = turns ?? null;
 		this.tokens = tokens ?? null;
+		// A deliberate in-passing repair: the EXIT_INFRA throw has passed `session` since the resume
+		// feature landed, but this destructure never read it, so every infra-retry record silently
+		// recorded session:null and a degrade seen only on a retried attempt left no trace. Latent
+		// because buildRecord's `?? null` made the drop indistinguishable from an honest absence.
+		this.session = session ?? null;
+		// The usage-ledger trio (INT-RUN-HISTORY-FILE-CONTRACT): carried on the throw path so a
+		// catch-path record attributes exactly what the return path would have.
+		this.usage = usage ?? null;
+		this.provider = provider ?? null;
+		this.model = model ?? null;
 		this.budgetReserved = budgetReserved ?? null;
 	}
 }

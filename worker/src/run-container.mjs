@@ -6,7 +6,7 @@ import { InfraRetry } from "./processor.mjs";
 
 /**
  * The real `runContainer` the processor injects. Launches one job container and returns
- * `{ code, aborted }`, where `aborted` records whether the WORKER initiated the stop (docker stop on
+ * `{ code, aborted, turns, tokens, session, usage }`, where `aborted` records whether the WORKER initiated the stop (docker stop on
  * the 30-min timeout or graceful shutdown), which the processor classifies as POLICY (no retry) per
  * INT-RUNNER-EXIT-CODE-PROTOCOL. The numeric `code` alone cannot say this: a worker SIGKILL and a
  * kernel OOM both surface as 137, so the abort FLAG -- not the code -- is the discriminator.
@@ -29,7 +29,7 @@ export function makeRunContainer({
 	image, // the DEPLOYMENT default (PI_JOB_IMAGE); a trigger's own run.image overrides it per job
 	hostEnv = process.env,
 	onOutput = (c) => process.stdout.write(c),
-	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null, session: null }) }),
+	openJobLog = () => ({ write() {}, close: async () => ({ turns: null, tokens: null, session: null, usage: null }) }),
 	spawnFn = spawn,
 	globalPiDir = null, // REQ-GLOBAL-PI-OVERLAY: operator's global pi overlay dir, mounted :ro; null = off
 	allowGlobalExtensions = true, // REQ-GLOBAL-PI-OVERLAY: the staged overlay's extensions load unless PI_GLOBAL_ALLOW_EXTENSIONS=0
@@ -41,7 +41,7 @@ export function makeRunContainer({
 	// async so a synchronous throw (e.g. buildContainerEnv on an unconfigured provider) surfaces as
 	// a rejection, uniformly awaitable by the processor and by tests.
 	return async function runContainer({ job, token, prepared, name, signal }) {
-		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null, session: null }; // killed before it could start
+		if (signal?.aborted) return { code: 137, aborted: true, turns: null, tokens: null, session: null, usage: null }; // killed before it could start
 
 		// Closed env allowlist: only the provider key + the declared PI_* vars. Throws (config) if
 		// the provider is unconfigured -- the processor turns that into a pre-spend refusal.
@@ -113,18 +113,20 @@ export function makeRunContainer({
 			});
 			child.on("close", async (code) => {
 				const aborted = signal?.aborted === true; // capture BEFORE the await
-				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns/tokens fall back to null.
+				// A rejecting sink.close is swallowed so a misbehaving sink cannot hang the run; turns/tokens/session/usage fall back to null.
 				let turns = null;
 				let tokens = null;
 				let session = null;
+				let usage = null;
 				try {
-					({ turns, tokens, session } = await sink.close());
+					({ turns, tokens, session, usage } = await sink.close());
 				} catch {
 					turns = null;
 					tokens = null;
 					session = null;
+					usage = null;
 				}
-				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens, session } : { code: code ?? 1, aborted: false, turns, tokens, session });
+				resolve(aborted ? { code: code ?? 137, aborted: true, turns, tokens, session, usage } : { code: code ?? 1, aborted: false, turns, tokens, session, usage });
 			});
 		});
 	};

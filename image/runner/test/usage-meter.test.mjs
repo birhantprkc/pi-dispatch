@@ -49,10 +49,18 @@ class FakeStream {
 	}
 }
 
-/** Same shape as token-budget.test.mjs's helper -- one usage object per billed provider call. */
-const usage = ({ input = 0, output = 0, total = input + output, cost = 0 }) => ({
+/**
+ * Same shape as token-budget.test.mjs's helper -- one usage object per billed provider call. The
+ * cache-split fields default to 0 so the flat-total tests read exactly as before, while the ledger
+ * tests can exercise the split the flat totals deliberately collapse.
+ */
+const usage = ({ input = 0, output = 0, cacheRead = 0, cacheWrite = 0, cacheWrite1h = 0, reasoning = 0, total = input + output, cost = 0 }) => ({
 	input,
 	output,
+	cacheRead,
+	cacheWrite,
+	cacheWrite1h,
+	reasoning,
 	totalTokens: total,
 	cost: { total: cost },
 });
@@ -238,6 +246,152 @@ test("counts unpriced calls instead of pricing them at zero", async () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// usageSnapshot -- the per-(provider,model) ledger (issue #53)
+// ---------------------------------------------------------------------------------------------
+
+test("lands every call on its (provider, model) row and keeps the rows a partition of the total", async () => {
+	const meter = createUsageMeter({ maxTokens: null });
+
+	// Two calls on one pair, carrying the cache split the flat totals collapse; one on a second pair.
+	meter.observe(
+		streamOf(usage({ input: 10, output: 5, cacheRead: 80, cacheWrite: 4, cacheWrite1h: 2, reasoning: 3, total: 101, cost: 0.25 })),
+		{ sessionId: "s1", provider: "anthropic", modelId: "claude-x" },
+	);
+	meter.observe(streamOf(usage({ input: 1, output: 2, total: 49, cost: 0.5 })), { sessionId: "s2", provider: "anthropic", modelId: "claude-x" });
+	meter.observe(streamOf(usage({ input: 3, output: 4, total: 30, cost: 0.125 })), { provider: "openai", modelId: "gpt-y" });
+	// A call with no model ctx at all, and one with only HALF a pair: both must land on "other" --
+	// counted, never guessed onto a model.
+	meter.observe(streamOf(usage({ total: 7 })));
+	meter.observe(streamOf(usage({ total: 5 })), { provider: "anthropic" });
+	await flush();
+
+	const snap = meter.usageSnapshot();
+	assert.equal(snap.v, 1);
+	assert.equal(snap.piAi, null, "no installer ran, so the pricing provenance is unknown -- and says so");
+	assert.equal(snap.truncated, 0, "model-less calls are not truncation; no named row was folded");
+	assert.deepEqual(snap.models, [
+		{ provider: "anthropic", model: "claude-x", calls: 2, input: 11, output: 7, cacheRead: 80, cacheWrite: 4, cacheWrite1h: 2, reasoning: 3, total: 150, cost: 0.75, unpriced: 0 },
+		{ provider: "openai", model: "gpt-y", calls: 1, input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0, total: 30, cost: 0.125, unpriced: 0 },
+		{ provider: "other", model: "other", calls: 2, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0, total: 12, cost: 0, unpriced: 0 },
+	]);
+	// THE invariant the worker's reader leans on: every record lands on exactly one row, so the rows
+	// partition the billed total -- same shape of claim as the root/other/loose split above.
+	assert.equal(
+		snap.models.reduce((sum, row) => sum + row.total, 0),
+		meter.state.total,
+		"the ledger rows must sum to the flat billed total exactly",
+	);
+});
+
+test("caps the ledger at 8 named rows and folds the overflow numerically into other", async () => {
+	const meter = createUsageMeter({ maxTokens: null });
+	for (let i = 1; i <= 10; i += 1) {
+		meter.observe(streamOf(usage({ input: i, total: i * 10, cost: 0.25 })), { provider: "prov", modelId: `model-${i}` });
+	}
+	meter.observe(streamOf(usage({ total: 5 }))); // model-less: lands on other, must NOT count as truncated
+	await flush();
+
+	const snap = meter.usageSnapshot();
+	assert.equal(snap.models.length, 9, "8 named rows plus the fold row");
+	assert.equal(snap.truncated, 2, "only folded NAMED rows count; the model-less call was never a row to lose");
+	assert.deepEqual(
+		snap.models.slice(0, 8).map((row) => row.model),
+		["model-10", "model-9", "model-8", "model-7", "model-6", "model-5", "model-4", "model-3"],
+		"kept rows are the top 8 by billed total, descending",
+	);
+	const other = snap.models.at(-1);
+	assert.equal(other.provider, "other");
+	assert.equal(other.model, "other");
+	assert.equal(other.calls, 3, "two folded rows plus one model-less call");
+	assert.equal(other.total, 35, "20 + 10 folded, 5 model-less -- the fold is numeric, never lossy");
+	assert.equal(other.input, 3, "2 + 1 from the folded rows' own numerics");
+	assert.equal(other.cost, 0.5);
+	assert.equal(
+		snap.models.reduce((sum, row) => sum + row.total, 0),
+		meter.state.total,
+		"the numeric fold preserves the partition invariant",
+	);
+	// Re-emittable: the fold must work on a copy of the bucket, not compound into live state.
+	assert.deepEqual(meter.usageSnapshot(), snap);
+});
+
+test("prices each row separately and counts a costless call as unpriced on ITS row", async () => {
+	const meter = createUsageMeter({ maxTokens: null });
+	meter.observe(streamOf(usage({ total: 10, cost: 0.25 })), { provider: "anthropic", modelId: "claude-x" });
+	meter.observe(streamOf({ input: 1, output: 1, totalTokens: 2 }), { provider: "anthropic", modelId: "claude-x" }); // no cost object at all
+	meter.observe(streamOf(usage({ total: 3, cost: 0.5 })), { provider: "openai", modelId: "gpt-y" });
+	await flush();
+
+	const [anthropic, openai] = meter.usageSnapshot().models;
+	assert.equal(anthropic.calls, 2);
+	assert.equal(anthropic.cost, 0.25);
+	assert.equal(anthropic.unpriced, 1, "counted on the row, never priced at zero -- the flat counter's rule, per model");
+	assert.equal(openai.cost, 0.5);
+	assert.equal(openai.unpriced, 0);
+	assert.equal(meter.state.unpriced, 1, "the row counters mirror the flat one; they do not replace it");
+});
+
+test("usageSnapshot is null until a call is observed, and piAi is null until the installer stamps it", async () => {
+	const meter = createUsageMeter({ maxTokens: null });
+	assert.equal(meter.usageSnapshot(), null, "zero calls -> no usage key on the exit line, not an empty ledger");
+
+	meter.setPiAiVersion("0.80.7"); // a stamp must not conjure a ledger out of zero calls
+	assert.equal(meter.usageSnapshot(), null);
+
+	meter.observe(streamOf(usage({ total: 1 })), { provider: "p", modelId: "m" });
+	await flush();
+	assert.equal(meter.usageSnapshot().piAi, "0.80.7");
+
+	// Anything that is not a non-empty string is ignored, never stored: piAi is a version or null.
+	for (const bad of ["", 42, null, undefined, { version: "9.9.9" }]) meter.setPiAiVersion(bad);
+	assert.equal(meter.usageSnapshot().piAi, "0.80.7");
+});
+
+test("the worst-case exit line fits the worker's 8 KiB recovery tail with headroom", async () => {
+	// The worker rebuilds `turns`/`tokens`/`usage` from a bounded tail of container stdout
+	// (worker/src/run-history.mjs, TAIL_CAP_BYTES = 8 KiB), and a line the tail truncates loses ALL
+	// token accounting at once -- so this budget is load-bearing, and the 8-row cap is what upholds
+	// it. Maximal by construction: 9 distinct models with 64-char provider AND model ids (one folds),
+	// a model-less call to force the other row, 8-digit token counts everywhere, every session
+	// distinct. If this ever fails, shrink the cap in usage-meter.mjs; do not widen this number.
+	const meter = createUsageMeter({ maxTokens: null, rootSessionId: "root-0" });
+	const wide = (prefix, i) => `${prefix}-${i}`.padEnd(64, "x");
+	for (let i = 0; i < 9; i += 1) {
+		meter.observe(
+			streamOf(usage({
+				input: 99_999_999,
+				output: 99_999_999,
+				cacheRead: 99_999_999,
+				cacheWrite: 99_999_999,
+				cacheWrite1h: 99_999_999,
+				reasoning: 99_999_999,
+				total: 99_999_999,
+				cost: 99_999.99,
+			})),
+			{ sessionId: `session-${i}`, provider: wide("provider", i), modelId: wide("model", i) },
+		);
+	}
+	meter.observe(streamOf(usage({ total: 99_999_999 })));
+	await flush();
+	meter.setPiAiVersion("88.88.88");
+
+	const ledger = meter.usageSnapshot();
+	assert.equal(ledger.models.length, 9, "the worst case must actually be built: 8 named rows of 64-char ids plus other");
+	assert.equal(ledger.truncated, 1);
+	const line = JSON.stringify({
+		event: "exit",
+		jobId: "repeat:very-long-schedule-name:1767225600000",
+		code: 0,
+		reason: "completed",
+		turns: 4096,
+		tokens: meter.snapshot(),
+		usage: ledger,
+		session: { resumed: false, reason: "absent" },
+	});
+	assert.ok(line.length < 5000, `the worst-case exit line must leave tail headroom; got ${line.length} chars`);
+});
+
+// ---------------------------------------------------------------------------------------------
 // wrapProviderStreams
 // ---------------------------------------------------------------------------------------------
 
@@ -320,6 +474,20 @@ test("with no catalog loaded everything falls back to the registry entry", async
 	wrapProviderStreams({ inner, fallbackModels: null, meter }).streamSimple(MODEL, [], {});
 	await flush();
 	assert.equal(inner.calls.length, 1);
+});
+
+test("hands the meter the model identity compat dispatched on, so the ledger row is never a guess", async () => {
+	// The wrapper is the ONE place the full Model object and the stream co-exist, which is why the
+	// ledger's (provider, model) pair is read here and not parsed back out of the settled message.
+	const meter = createUsageMeter({ maxTokens: null });
+	const inner = fakeInner();
+	wrapProviderStreams({ inner, fallbackModels: null, meter }).streamSimple(MODEL, [], { sessionId: "s1" });
+	await flush();
+
+	const [row] = meter.usageSnapshot().models;
+	assert.equal(row.provider, MODEL.provider);
+	assert.equal(row.model, MODEL.id);
+	assert.equal(row.calls, 1);
 });
 
 test("after a breach the hard stop replaces the call entirely", async () => {
@@ -707,4 +875,53 @@ test("a wrapped api routes real calls through the meter", async () => {
 	assert.equal(meter.state.total, 2);
 	assert.equal(meter.state.otherTotal, 1, "a subagent call the session bus would have missed entirely");
 	assert.equal(meter.state.rootTotal, 1);
+});
+
+test("the installer stamps the meter with the accepted copy's package version, via the injected reader", async () => {
+	const copy = fakeCopy(["anthropic-messages"]);
+	const meter = createUsageMeter({ maxTokens: null });
+	const reads = [];
+	const handle = await installProcessUsageMeter({
+		...installArgs({ copy, meter }),
+		readText: (path) => {
+			reads.push(path);
+			return JSON.stringify({ name: "a-package", version: "0.80.7" });
+		},
+	});
+	handle.uninstall();
+
+	// ../package.json RELATIVE TO the accepted compat url: the copy the probe proved, never whichever
+	// copy a bare specifier would have resolved -- the same discipline as the providers/all.js sibling.
+	assert.deepEqual(reads, [
+		"/app/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/package.json",
+	]);
+
+	copy.registry.get("anthropic-messages").streamSimple(MODEL, [], {});
+	await flush();
+	assert.equal(meter.usageSnapshot().piAi, "0.80.7", "the version priced with, stamped before the first call");
+});
+
+test("a failed version probe is silent -- no extra log line, no path, and the meter still installs", async () => {
+	// The failure path may not log AT ALL: an error message here would carry the resolved package.json
+	// path, and the no-path rule for shipped run logs has no exception for optional extras. The exact
+	// whole-array assertions on usage_meter / usage_meter_teardown elsewhere in this file are what pin
+	// the line SHAPES; this pins the line COUNT against the probe's failure.
+	const copy = fakeCopy(["anthropic-messages"]);
+	const meter = createUsageMeter({ maxTokens: null });
+	const logged = [];
+	const handle = await installProcessUsageMeter({
+		...installArgs({ copy, meter }),
+		readText: () => {
+			throw new Error("ENOENT: /some/resolved/path/package.json");
+		},
+		log: (event, fields) => logged.push({ event, fields }),
+	});
+	handle.uninstall();
+
+	assert.equal(handle.ok, true, "a version is optional; failing to read one must not degrade the meter");
+	assert.deepEqual(logged.map((entry) => entry.event), ["usage_meter", "usage_meter_teardown"]);
+
+	copy.registry.get("anthropic-messages").streamSimple(MODEL, [], {});
+	await flush();
+	assert.equal(meter.usageSnapshot().piAi, null, "unknown stays null -- never guessed, never defaulted");
 });
