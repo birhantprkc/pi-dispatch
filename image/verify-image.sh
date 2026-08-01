@@ -49,6 +49,14 @@ docker run --rm --entrypoint pi "$IMAGE_REF" -p --help >/dev/null 2>&1 \
 	|| fail "pi is not on PATH, or -p is no longer a flag. The image must carry the pinned pi (CONST-PI-VERSION-PINNED); a stale or absent pi makes jobs no-ops that still report success."
 ok "pi is present and -p is still a flag"
 
+# bash, because `pi-dispatch sandbox` re-opens a finished run with `--entrypoint bash`
+# (REQ-RESURRECTABLE-SANDBOX). An image without it fails that at exit 127 -- long after the run it is
+# meant to let you inspect, and with an error naming a flag rather than a missing shell. It is also what
+# reads TMOUT, which is the only thing that closes a forgotten sandbox.
+docker run --rm --entrypoint bash "$IMAGE_REF" -c 'exit 0' >/dev/null 2>&1 \
+	|| fail "bash is not present. \`pi-dispatch sandbox\` re-opens a run with --entrypoint bash and would fail at exit 127, and TMOUT (the sandbox idle logout) is a bash feature."
+ok "bash is present (an operator can re-open a finished run)"
+
 # The forge CLIs the job envelopes instruct the agent to use. Each is only meaningful for jobs on its own
 # forge, but a MISSING one fails the same silent way: the agent follows an envelope naming a command that
 # is not there, reports what went wrong in prose, and exits 0.

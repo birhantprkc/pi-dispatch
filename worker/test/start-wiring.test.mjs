@@ -31,7 +31,7 @@ function fakeHost(overrides = {}) {
 // Drive startWorker with injected fakes and capture the exact object handed to createWorker
 // (deps are nested under `deps`). No real Redis: createWorkerFn is faked. The real ioredis client
 // startWorker constructs via makeRedisClient is torn down so it leaves no dangling handle.
-async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitLabHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, makeRunContainer, order } = {}) {
+async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitLabHost, makeReaper, makeLogSink, makeRecordWriter, makeLogReaper, makeSandboxReaper, makeRunContainer, order } = {}) {
 	const calls = [];
 	const registered = {};
 	const createWorkerFn = (arg) => {
@@ -76,6 +76,17 @@ async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitL
 			logReaperCalls.push(args);
 			return () => {};
 		});
+	// The sandbox reaper is faked for the SAME reason as makeReaper above, and it is the stronger case of
+	// the two: this one asks docker which sandboxes are live before it sweeps, so a real one here would
+	// shell out to `docker ps` on every wiring test -- and block for as long as an unreachable daemon takes
+	// to answer. Ordering/threading tests inject their own.
+	const sandboxReaperCalls = [];
+	const sandboxReaper =
+		makeSandboxReaper ??
+		((args) => {
+			sandboxReaperCalls.push(args);
+			return async () => {};
+		});
 
 	// The container factory is faked for the same reason as the run-history ones: the wiring tests assert
 	// what boot HANDS it (image, overlay, staged packages), never a docker launch. It records its args and
@@ -104,6 +115,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitL
 			makeLogSink: logSink,
 			makeRecordWriter: recordWriter,
 			makeLogReaper: logReaper,
+			makeSandboxReaper: sandboxReaper,
 			makeRunContainer: runContainerFactory,
 			makeImagePreflight: (args) => (imagePreflightCalls.push(args), async () => ({ ok: true })),
 			...(makeGitLabAuth ? { makeGitLabAuth } : {}),
@@ -127,7 +139,7 @@ async function runStart({ env = {}, makeAuth, makeHost, makeGitLabAuth, makeGitL
 	});
 	// Expose the registration map under both names: `handlers` for the completed/failed handler tests,
 	// `registered` for the scheduler stall-guard test. Same object, one capture path.
-	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls, runContainerCalls, imagePreflightCalls };
+	return { captured, deps: captured?.deps, logs, handlers: registered, registered, logSinkCalls, recordWriterCalls, logReaperCalls, sandboxReaperCalls, runContainerCalls, imagePreflightCalls };
 }
 
 // Capture the JSON log lines a synchronous fn emits via process.stdout.write, then restore it.
@@ -386,6 +398,44 @@ test("run-history: the log reaper sweeps aged history BEFORE the worker starts d
 	assert.deepEqual(order, ["reapLogs", "createWorker"], "the log reaper must sweep before the worker is created");
 	assert.equal(reaperArgs.logsDir, "/tmp/pi-logs", "the log reaper must receive config.logsDir");
 	assert.equal(reaperArgs.retentionDays, 7, "the log reaper must receive config.logRetentionDays");
+});
+
+test("sandbox: the retention sweep runs BEFORE the worker drains, and is handed a way to ask docker", { skip }, async () => {
+	const order = [];
+	let reaperArgs;
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const makeSandboxReaper = (args) => {
+		reaperArgs = args;
+		return async () => {
+			order.push("reapSandboxes");
+		};
+	};
+	const { deps } = await runStart({
+		env: { PI_SANDBOX_DIR: "/tmp/pi-sbx", PI_SANDBOX_RETENTION_HOURS: "6", PI_JOB_IMAGE: "pi-job:pinned" },
+		makeAuth,
+		makeHost: () => fakeHost(),
+		makeSandboxReaper,
+		order,
+	});
+	assert.deepEqual(order, ["reapSandboxes", "createWorker"], "retained directories are swept before the worker takes a job");
+	assert.equal(reaperArgs.sandboxDir, "/tmp/pi-sbx");
+	assert.equal(reaperArgs.retentionHours, 6);
+	// The one thing this reaper needs that its siblings do not: without it the sweep is blind and can
+	// delete a bind mount out from under a shell an operator is sitting in.
+	assert.equal(typeof reaperArgs.listRunning, "function", "the sweep must be able to ask which sandboxes are live");
+	assert.equal(typeof deps.cleanup, "function", "teardown is the retention-aware closure, not the bare rm");
+});
+
+test("sandbox: retention off still wires a cleanup, and it is the delete-only one", { skip }, async () => {
+	const makeAuth = async () => ({ mintToken: async () => "tok", selfId: 1, source: "gh" });
+	const { deps, logs } = await runStart({
+		env: { PI_SANDBOX_RETENTION_HOURS: "0" },
+		makeAuth,
+		makeHost: () => fakeHost(),
+	});
+	assert.equal(typeof deps.cleanup, "function");
+	// Boot says which way it is configured, so "why was nothing retained" is answerable from the log alone.
+	assert.equal(logs.find((l) => l.event === "worker_started")?.sandboxRetentionHours, 0);
 });
 
 // REQ-GLOBAL-PI-OVERLAY staged packages. The overlay dir EXISTS (config refuses a missing one at load)

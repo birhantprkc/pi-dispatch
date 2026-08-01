@@ -122,11 +122,46 @@ that always fires is one nobody reads.
   would have preserved the enumeration below untouched, and it puts the transcript inside the worktree the
   agent commits from, one `git add -A` away from a public pull request. The enumeration is amended
   instead. The residual is `OQ-014`.
+
+  **A SECOND CONTAINER SHAPE NOW EXISTS, and the existing carve-out does not cover it.** With
+  `REQ-RESURRECTABLE-SANDBOX`, `pi-dispatch sandbox <jobId>` starts a container with an interactive TTY
+  and `--entrypoint bash` on a finished run's workspace. The Statement's carve-out is about **pi running
+  on the host** — an operator's own session hosting the admin extension — and says nothing about a
+  container that is not a job container; the Acceptance below is scoped *"Given any job"* and likewise
+  does not reach it. So this is argued here rather than assumed from either.
+
+  **What is unchanged, and it is the part that matters.** The *job* container is untouched: still
+  single-use, still `--rm`, still no TTY, still no published port, still gone at exit. A sandbox is a
+  **new** container built from the same `buildDockerRunArgs`, so every isolation flag applies to it by
+  construction rather than by a promise — `--cap-drop=ALL`, `no-new-privileges`, the pids/memory/cpu
+  bounds, non-root. Its name is outside the boot reaper's `pi-job-` namespace, which is the reason a
+  worker restart cannot kill it, not an exemption granted to it. With retention off, no directory is
+  kept and teardown is the `rm -rf` it always was.
+
+  **Three of the carve-out's four tests are met; the fourth is NOT, and that is the honest part.** It is
+  not a harness invocation — no trigger, no chain request and no model tool can reach it, only an
+  operator's keypress. It is operator-present by definition: it is a shell. It holds **no harness
+  credentials** — no minted forge token, no provider key, nothing forwarded — and that is structural
+  rather than careful, since `buildContainerEnv` throws without a provider credential and so cannot
+  produce this container's env at all. But it **does** process adversarial input: a forge job's workspace
+  is whatever a run produced from an issue anyone could open. The claim is not that this is harmless. It
+  is that opening a shell next to that code, cap-dropped and resource-bounded and credential-free, is the
+  same act as checking out a stranger's pull request on your own machine — which every maintainer this
+  project is for already does, with fewer flags.
+
+  **Rejected alternatives**, all three of which would have reached this entry rather than sat beside it:
+  *keeping the job container alive to `docker exec` into* — a live container that has run adversarial
+  code, still holding the minted token, with `--rm` removed; *a stdin channel to the running agent* —
+  the operator becomes an input to a session whose prompt carries untrusted issue text; *`docker commit`
+  snapshots* — gigabytes per run to preserve what belonged in the image. `DES-SANDBOX-IS-A-FRESH-CONTAINER`
+  records them in full. What survives a run is a **directory**, not a container, and it is swept on a
+  bounded window that has no keep-forever value.
 - **Evidence (upstream)**: pi README, verbatim: *"Pi does not include a built-in permission system for
   restricting filesystem, process, network, or credential access. By default, it runs with the
   permissions of the user and process that launched it."* … *"If you need stronger boundaries,
   containerize or sandbox Pi."*
-- **Traces to**: `INT-CONTAINER-RUNTIME-CONTRACT`, `CONST-TOKEN-SCOPED-PER-JOB`, `INT-SESSION-STORE-CONTRACT`
+- **Traces to**: `INT-CONTAINER-RUNTIME-CONTRACT`, `CONST-TOKEN-SCOPED-PER-JOB`, `INT-SESSION-STORE-CONTRACT`,
+  `INT-SANDBOX-CONTRACT`, `DES-SANDBOX-IS-A-FRESH-CONTAINER`
 - **Acceptance**: Given any job, the agent has no filesystem path to the host outside the declared mounts
   in `INT-CONTAINER-RUNTIME-CONTRACT` — `/job:ro`, `/workspace:rw`, `/outbox:rw` (local only),
   `/opt/pi-global:ro` (the operator global overlay, only when configured; `REQ-GLOBAL-PI-OVERLAY`), and
@@ -140,6 +175,12 @@ that always fires is one nobody reads.
   run. Given a fork pull request, no key resolves, no `/session` mount is created, and the docker argv is
   byte-identical to a job run before this feature existed. Given a trigger that did not arm `run.resume`,
   the same, and nothing is written to disk.
+  **Given a resurrected sandbox** (`INT-SANDBOX-CONTRACT`) — which is not a job, and so is asserted
+  separately rather than folded into the enumeration above: its argv carries every member of
+  `ISOLATION_FLAGS`, its env contains no minted forge token and no provider key, its name contains no
+  `pi-job-`, and no trigger, chain request or model tool can start one. Given
+  `PI_SANDBOX_RETENTION_HOURS=0`, no directory outlives a run and every job's argv and teardown are
+  byte-identical to one from before that feature existed.
 
 ## CONST-NO-CONTEXT-FILES-MANDATORY
 
@@ -581,6 +622,7 @@ that always fires is one nobody reads.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | `CONST-ISOLATION-CONTAINER-PER-JOB` **AMENDED** for `REQ-RESURRECTABLE-SANDBOX` (issue #55): a second container shape now exists — an operator-started interactive shell on a finished run's workspace. Written into this entry rather than somewhere quieter, for the reason the 2026-07-31 row gives about mounts: the Statement's carve-out covers **pi running on the host** and the Acceptance is scoped *"Given any job"*, so neither reaches a container that is not a job container and the case could not be borrowed from either. The job container is **UNCHANGED and was verified rather than asserted** — `--rm`, no TTY, no port, gone at exit; a sandbox is a NEW container built from the same `buildDockerRunArgs`, so the isolation flags apply by construction, and its name sits outside the boot reaper's namespace rather than being exempted from it. **Three of the carve-out's four tests are met and the fourth is explicitly NOT**: not harness-invoked, operator-present, no harness credentials (structural — `buildContainerEnv` throws without a provider key and so cannot produce this env), but it **does** process adversarial input, since a forge workspace is whatever a run made of an issue anyone could open. That is recorded as the accepted trade rather than argued away: the act is the one every maintainer already performs when they check out a stranger's pull request, here with cap-drop, resource bounds and no credentials. Acceptance extended with a `Given a resurrected sandbox` clause kept **separate** from the mount enumeration, because a sandbox is not a job and folding it in would have quietly widened a sentence that means something precise. `CONST-TOKEN-SCOPED-PER-JOB` **UNCHANGED, and checked** — a sandbox mints nothing and carries nothing, so the scoping rule has no new case to cover. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 (2026-07-14, local, uncommitted). That document recorded "50 claims adversarially verified: 48 confirmed, 2 refuted" — but verified **against documentation**. Source-verification at `earendil-works/pi @ 5e336cf` subsequently corrected ~7 points, two of them architecture-breaking. Hence the evidence convention above: source is authoritative, docs are a hint. |
 | 2026-07-15 | `CONST-NO-CONTEXT-FILES-MANDATORY` amended: it named only the CLI flag (`-nc`), but the runner uses the **SDK**, where the mechanism is `noContextFiles: true` on a caller-constructed `DefaultResourceLoader` — and it is **off by default**. The constraint therefore fails **open by omission**: there is no flag to forget, there is an entire object to forget to build. Statement and Evidence corrected; Acceptance unchanged (it was right; the named mechanism was wrong). This is the distinction the evidence convention exists to catch — the *requirement* was verified, the *mechanism* was assumed. |
 | 2026-07-17 | `CONST-TOKEN-SCOPED-PER-JOB` amended: Statement, Why, and Acceptance rewritten from a single-mechanism mandate (App installation token with one fixed expiry duration) to mechanism-neutral **required properties** — repo-scoped, minimally-permissioned, short-lived, host-held, env-injected, not merge-capable in practice. The App path satisfies them and stays **mandatory for multi-tenant**; a tightly-scoped short-expiry **fine-grained** PAT satisfies them for **single-owner**; a broad or long-lived classic PAT is excluded. The bound is the token's **expiry**, not a fixed duration — no acceptance clause mandates one. Provider-key exception preserved unchanged. |

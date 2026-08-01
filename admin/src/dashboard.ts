@@ -144,6 +144,10 @@ export function makeDashboard({
   let view = "LIST";
   let selected = 0;
   let detailRun: any = null;
+  // REQ-RESURRECTABLE-SANDBOX: whether the run opened in RUN_DETAIL still has a retained workspace, read
+  // ONCE on entry through the injected seam rather than on every tick -- the answer changes at worker boot,
+  // not per second, and this module does no I/O of its own.
+  let detailSandbox: any = null;
   let detailTrigger: any = null; // the trigger opened in TRIGGER_DETAIL (its display record + file index)
   // LIVE_TAIL state, held here in dedicated component fields keyed only by the id-only `activeJobId`. The
   // raw `.log` bytes in `tail` are PII-bearing and untrusted: they live here and reach the TUI overlay via
@@ -218,6 +222,8 @@ export function makeDashboard({
         tail,
         tailTop,
         tailAvailable: typeof deps?.tailLog === "function",
+        detailSandbox,
+        sandboxAvailable: typeof deps?.launchSandbox === "function",
       }, styler);
     },
     invalidate(): void {
@@ -226,11 +232,39 @@ export function makeDashboard({
     handleInput(data: string): void {
       if (view === "RUN_DETAIL") {
         // Escape backs out to the list only; it never closes the overlay or disposes the held clients.
-        // Every other key (including q/p/r) is inert in the detail view.
         if (matchesKey(data, "escape")) {
           view = "LIST";
+          detailSandbox = null;
           tui?.requestRender?.();
+          return;
         }
+        // `b` re-opens this run's sandbox as a shell (REQ-RESURRECTABLE-SANDBOX).
+        //
+        // Launched IN PLACE, unlike TRIGGER_DETAIL's `e`/`x`, which resolve the overlay so ctx.ui dialogs
+        // can run after it closes. This needs the opposite: the LIVE `tui`, because handing the terminal to
+        // an interactive container means suspending pi's own render loop and input handling for the
+        // duration and restoring them after. `stop()`/`start()` are pi's designed pair for exactly that --
+        // it uses them itself to launch $EDITOR -- and `requestRender(true)` forces the full redraw that
+        // an external program's output has invalidated.
+        //
+        // The spawn itself is the injected `launchSandbox`; this module holds the tui and nothing else.
+        if (data === "b" || data === "B") {
+          if (typeof deps?.launchSandbox !== "function" || !detailRun?.jobId) return;
+          if (detailSandbox && detailSandbox.retained === false) return; // nothing to open; the view says so
+          void (async () => {
+            tui?.stop?.();
+            try {
+              await deps.launchSandbox({ jobId: detailRun.jobId });
+            } catch {
+              // A failed launch must not leave the panel suspended -- the `finally` is the whole guarantee.
+            } finally {
+              tui?.start?.();
+              tui?.requestRender?.(true);
+            }
+          })();
+          return;
+        }
+        // Every other key (including q/p/r) is inert in the detail view.
         return;
       }
       if (view === "TRIGGER_DETAIL") {
@@ -300,6 +334,8 @@ export function makeDashboard({
           void refresh();
         } else {
           detailRun = row.record;
+          // One read on entry, through the seam whose fs access lives in index.ts.
+          detailSandbox = typeof deps?.sandboxInfo === "function" ? deps.sandboxInfo({ jobId: row.record?.jobId }) : null;
           view = "RUN_DETAIL";
           tui?.requestRender?.();
         }
@@ -380,7 +416,7 @@ function budgetMeters(budget: any, settings: any, width: number): string[] {
  * the same content with `box`, its inner column count driving every meter and clip.
  */
 function renderPanel(snapshot: any, width: number, state: any, styler: any): string[] {
-  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailAvailable } = state;
+  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailAvailable, detailSandbox, sandboxAvailable } = state;
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
@@ -400,9 +436,10 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
     const detailTitle = `run ${detailRun?.jobId ?? "-"}`;
     const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
     const allRuns = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
-    const lines = renderRunDetail(detailRun, framed ? dw - 4 : 24, styler, allRuns);
-    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", "esc back"];
-    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler) });
+    const canOpen = Boolean(sandboxAvailable && detailSandbox?.retained);
+    const lines = renderRunDetail(detailRun, framed ? dw - 4 : 24, styler, allRuns, detailSandbox);
+    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", canOpen ? "b sandbox · esc back" : "esc back"];
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler, canOpen) });
     return centerBlock(boxed, Math.trunc(width), dw);
   }
 
@@ -991,7 +1028,7 @@ function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tai
  * already in the snapshot: no read, no `.log`, no `.data` -- exactly the PII-free run-history fields
  * (INT-RUN-HISTORY-FILE-CONTRACT). Every line is `inner` cols; a missing field renders `-` rather than throw.
  */
-function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[] = []): string[] {
+function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[] = [], sandbox: any = null): string[] {
   const r = record ?? {};
   const show = (v: any): string => (v === null || v === undefined ? "-" : String(v));
   const out: string[] = [];
@@ -1041,6 +1078,16 @@ function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[]
   if (children.length > 0) chainBits.push(`spawned ${children.length} → ${children.map((c) => c.jobId).join(", ")}`);
   if (r.chainRefused) chainBits.push(`${r.chainRefused} refused`);
   out.push(kv("chain", chainBits.join(" · ")));
+
+  // REQ-RESURRECTABLE-SANDBOX. A retention state, never a path: the manifest holds a host path (which on
+  // Windows embeds the operator's account name) and this view is the one that renders beside PII-free
+  // record fields, so only the verdict crosses.
+  if (sandbox) {
+    const state = sandbox.retained
+      ? `${sandbox.running ? "running" : "retained"}${sandbox.expiresIn ? ` · ${sandbox.expiresIn} left` : ""}`
+      : (sandbox.reason ?? "swept");
+    out.push(kv("sandbox", state, sandbox.retained ? "success" : "dim"));
+  }
 
   out.push(styler.cell("", inner));
   out.push(styler.divider("post-mortem", null, inner));
@@ -1096,7 +1143,13 @@ function formatDuration(ms: number): string {
   return `${h}h ${m % 60}m`;
 }
 
-/** The RUN_DETAIL footer hint (read-only post-mortem; Esc backs out). */
-function runDetailHints(inner: number, styler: any): string {
-  return fitLine(styler.fg("accent", "esc") + " " + styler.fg("dim", "back"), inner, styler);
+/**
+ * The RUN_DETAIL footer hint. Still a read-only post-mortem, with one action: `b` re-opens this run's
+ * sandbox, offered ONLY while a retained workspace exists, so the key is never advertised where it would
+ * do nothing (`triggerDetailHints` is the shape).
+ */
+function runDetailHints(inner: number, styler: any, canOpen = false): string {
+  const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
+  const bits = canOpen ? [k("b", "sandbox"), k("esc", "back")] : [k("esc", "back")];
+  return fitLine(bits.join(styler.fg("dim", "  ·  ")), inner, styler);
 }

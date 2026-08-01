@@ -164,6 +164,16 @@ export function loadConfig(env = process.env, { fileExists = existsSync } = {}) 
 		forwardEnv: forwardEnvList(env.PI_FORWARD_ENV), // extra host var NAMES to forward (e.g. a custom provider's key); explicit allowlist, GitHub token names refused
 		authFromPi: env.PI_AUTH_FROM_PI !== "0", // ON by default: use the key in ~/.pi/agent/auth.json when the env has none (api-key only). PI_AUTH_FROM_PI=0 forces env-only.
 		jobsDir: env.PI_JOBS_DIR ?? defaultJobsDir(),
+		// REQ-RESURRECTABLE-SANDBOX. `||` (not `??`) so an empty string falls back, matching logsDir.
+		sandboxDir: env.PI_SANDBOX_DIR || defaultSandboxDir(env),
+		// Hours a finished run's directory stays re-openable. NOTE THE SENTINEL, which is the OPPOSITE of
+		// logRetentionDays' and sessionsTtlDays': 0 means the feature is OFF (nothing is retained, cleanup
+		// is the `rm` it always was), NOT keep-forever. There is deliberately no keep-forever value -- a
+		// full repository clone per run with no ceiling is a disk bomb, and `--pin` exists for the one run
+		// worth keeping longer, bounded by sandboxPinDays.
+		sandboxRetentionHours: nonNegativeInt(env, "PI_SANDBOX_RETENTION_HOURS", 24),
+		sandboxPinDays: nonNegativeInt(env, "PI_SANDBOX_PIN_DAYS", 7), // `--pin` extends to now + this, never to forever
+		sandboxIdleMinutes: nonNegativeInt(env, "PI_SANDBOX_IDLE_MINUTES", 30), // bash's own TMOUT inside a sandbox; 0 = no idle logout
 		triggersFile: env.PI_TRIGGERS_FILE ?? null, // DES-CRON-VIA-BULLMQ-SCHEDULER: unified triggers file; null = cron disabled for the worker (it selects on.type:"cron")
 		pauseWindowsFile: env.PI_PAUSE_WINDOWS_FILE ?? null, // REQ-SCOPED-PAUSE-WINDOWS: per-folder/repo timed pause; null = no scoped pauses
 		schedulerStallMax: positiveInt(env, "PI_SCHEDULER_STALL_MAX", 2), // CONST-RETRY-INFRA-ONLY: per-scheduler stall backstop; positiveInt rejects <1 so a 0 threshold fails closed
@@ -235,6 +245,15 @@ function defaultJobsDir() {
 	// Under the OS temp dir by default. Holds only the read-only /job inputs (prompt + .pi/); the
 	// workspace for a local job is the operator's own folder, not here.
 	return `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}/pi-dispatch/jobs`.replace(/\\/g, "/");
+}
+
+export function defaultSandboxDir(env = process.env) {
+	// Beside the per-job dirs, because a retained directory IS a per-job dir -- `cleanup` renames it here
+	// rather than copying, which only stays atomic while both live on one filesystem. Created mode 0700 by
+	// the retention step, since the OS temp dir is 1777 on POSIX and a retained tree holds a repository
+	// clone plus the run's prompt.md/event.json. Exported so the admin extension resolves the same default
+	// without calling loadConfig, which throws on unrelated env problems.
+	return `${env.PI_JOBS_DIR ?? defaultJobsDir()}/sandboxes`.replace(/\\/g, "/");
 }
 
 export function defaultLogsDir() {

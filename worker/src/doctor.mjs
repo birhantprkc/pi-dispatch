@@ -25,11 +25,11 @@
  * Both end the same way -- pi skips an absent local source with no error, and the flow exits 0 without the
  * tools it was written for.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn as nodeSpawn } from "node:child_process";
-import { globalExtensionsEnabled } from "./config.mjs";
+import { defaultSandboxDir, globalExtensionsEnabled } from "./config.mjs";
 import { isForgeKind } from "./forges.mjs";
 import { findLiteralSecret, ADMIN_RE } from "./import-pi.mjs";
 import { PACKAGES_SUBDIR, readStageManifest } from "./packages.mjs";
@@ -408,6 +408,26 @@ export async function runDoctor(env = process.env, deps = {}) {
 		}
 	}
 
+	// REQ-RESURRECTABLE-SANDBOX. A warning, never a failure: retention is a convenience, and the only thing
+	// worth surfacing is that finished runs' directories -- a repository clone plus the run's prompt.md and
+	// event.json, so issue text -- are sitting on disk, and how many. An operator who never opens a sandbox
+	// should still know they are being kept.
+	{
+		const retentionHours = nonNegativeEnvInt(env.PI_SANDBOX_RETENTION_HOURS, 24);
+		const sandboxDir = env.PI_SANDBOX_DIR || defaultSandboxDir(env);
+		if (retentionHours === 0) {
+			checks.push({ ok: true, label: "Workspace retention off (PI_SANDBOX_RETENTION_HOURS=0) — finished runs are deleted, none are re-openable" });
+		} else {
+			const kept = countRetained(sandboxDir, fileExists);
+			checks.push({
+				ok: true,
+				warn: kept.count > 0,
+				label: `${kept.count} retained workspace(s) in ${sandboxDir}, swept after ${retentionHours}h — re-open one with \`pi-dispatch sandbox <jobId>\``,
+				fix: "each holds the run's clone plus its prompt.md/event.json (issue text); PI_SANDBOX_RETENTION_HOURS=0 turns retention off entirely",
+			});
+		}
+	}
+
 	let failed = false;
 	for (const c of checks) {
 		out(`${c.ok ? "✓" : c.warn ? "⚠" : "✗"} ${c.label}\n`);
@@ -418,6 +438,29 @@ export async function runDoctor(env = process.env, deps = {}) {
 	}
 	out(failed ? "\ndoctor: some checks failed — fix the above, then re-run.\n" : "\ndoctor: ready. Start the worker with `pi-dispatch worker`.\n");
 	return failed ? 1 : 0;
+}
+
+/**
+ * How many retained workspaces are sitting in the retention root.
+ *
+ * Reads its OWN env rather than loadConfig, like every other doctor check (`doctor.mjs` header): a broken
+ * GitHub auth must not stop the operator finding out how much disk this is using. Never throws -- an
+ * unreadable or absent root reports zero, which is the honest answer to "how many can I open".
+ */
+function countRetained(sandboxDir, fileExists) {
+	if (!fileExists(sandboxDir)) return { count: 0 };
+	try {
+		return { count: readdirSync(sandboxDir).length };
+	} catch {
+		return { count: 0 };
+	}
+}
+
+/** PI_SANDBOX_RETENTION_HOURS, parsed the same permissive way the admin's own env reads are. */
+function nonNegativeEnvInt(raw, fallback) {
+	if (raw === undefined || raw === "") return fallback;
+	const n = Number.parseInt(raw, 10);
+	return Number.isInteger(n) && n >= 0 && String(n) === String(raw).trim() ? n : fallback;
 }
 
 function nodeCheck(version) {

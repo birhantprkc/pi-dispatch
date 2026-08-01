@@ -17,7 +17,9 @@ import { makeImagePreflight } from "./image-preflight.mjs";
 import { createWorker } from "./index.mjs";
 import { makeCollectChain } from "./outbox.mjs";
 import { containerPackagePaths, readStageManifest } from "./packages.mjs";
-import { cleanup, makeForgePreparers, makePrepareWorkspace } from "./prepare.mjs";
+import { makeCleanup, makeForgePreparers, makePrepareWorkspace } from "./prepare.mjs";
+import { listRunningSandboxes } from "./sandbox.mjs";
+import { makeSandboxReaper } from "./sandbox-store.mjs";
 import { makeSessionStore } from "./session-store.mjs";
 import { loadPauseWindows, pauseUntilMs } from "./pause-windows.mjs";
 import { makeQueue } from "./queue.mjs";
@@ -141,6 +143,7 @@ export async function startWorker(
 		makeLogSink: makeLogSinkFn = makeLogSink,
 		makeRecordWriter: makeRecordWriterFn = makeRecordWriter,
 		makeLogReaper: makeLogReaperFn = makeLogReaper,
+		makeSandboxReaper: makeSandboxReaperFn = makeSandboxReaper,
 		makeRunContainer: makeRunContainerFn = makeRunContainer,
 		makeImagePreflight: makeImagePreflightFn = makeImagePreflight,
 		makeGitLabAuth: makeGitLabAuthFn = makeGitLabAuth,
@@ -236,6 +239,22 @@ export async function startWorker(
 		await makeLogReaperFn({ logsDir: config.logsDir, retentionDays: config.logRetentionDays, log })();
 	} catch (err) {
 		log("log_reaper_skipped", { reason: err?.message });
+	}
+
+	// REQ-RESURRECTABLE-SANDBOX: sweep retained per-job directories past their window, so what `cleanup`
+	// kept for re-opening stays bounded. Third in the row and deliberately its own sweep -- a different
+	// retention policy, a different PII class, and one thing neither sibling needs: it asks docker which
+	// sandboxes are live first, because an operator's shell can outlive a worker restart by design and
+	// deleting a bind mount underneath it is a confusing failure with a boring cause. Same double-wrap.
+	try {
+		await makeSandboxReaperFn({
+			sandboxDir: config.sandboxDir,
+			retentionHours: config.sandboxRetentionHours,
+			listRunning: listRunningSandboxes,
+			log,
+		})();
+	} catch (err) {
+		log("sandbox_reaper_skipped", { reason: err?.message });
 	}
 
 	// One raw Redis client, shared by the budget (via the worker) and the scheduler stall guard, so it is
@@ -350,6 +369,9 @@ export async function startWorker(
 			prepareWorkspace: makePrepareWorkspace({
 				jobsDir: config.jobsDir,
 				forgeFor,
+				// REQ-RESURRECTABLE-SANDBOX: the deployment default, resolved per job against run.image so a
+				// retained directory records the image that actually ran and a sandbox re-opens that one.
+				jobImage: config.jobImage,
 				preparers: makeForgePreparers({ gitlabApiUrl: config.gitlab?.apiUrl ?? null, forgejoApiUrl: config.forgejo?.apiUrl ?? null, azureOrgUrl: config.azure?.orgUrl ?? null }),
 				// The cron event.json's previousRunAt (INT-CONTAINER-JOB-INPUTS): read back from the same
 				// per-job run-history sidecars recordRun writes above -- no new store, no new query surface.
@@ -359,7 +381,9 @@ export async function startWorker(
 				// PI_SESSIONS_DIR is unset -- and a null means no mount and nothing written.
 				resolveSession: sessionStore.resolveSession,
 			}),
-			cleanup,
+			// REQ-RESURRECTABLE-SANDBOX. With the window at 0 this IS the old bare `cleanup`, by the same
+			// `rm` on the same path -- a deployment that wants no retention keeps today's behaviour exactly.
+			cleanup: makeCleanup({ sandboxDir: config.sandboxDir, retentionHours: config.sandboxRetentionHours, log }),
 			comment: async (job, text) => {
 				// Best-effort: the processor awaits comment() inside its try, so a rejection here would
 				// corrupt the job outcome and could drive a wrong retry / second PR (CONST-RETRY-INFRA-ONLY).
@@ -472,6 +496,7 @@ export async function startWorker(
 		settingsFile: config.settingsFile,
 		captureJobLogs: config.captureJobLogs,
 		logRetentionDays: config.logRetentionDays,
+		sandboxRetentionHours: config.sandboxRetentionHours, // 0 = retention off; a run's directory is deleted as before
 	});
 	return worker;
 }

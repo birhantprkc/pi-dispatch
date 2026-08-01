@@ -324,6 +324,25 @@ because that raw stream can contain issue and comment text (PII). Both files sta
 mounted into the job container, and are gitignored. A boot-time sweep prunes anything older than
 `PI_LOG_RETENTION_DAYS` (default 30; `0` keeps them forever).
 
+## Re-open a finished run
+
+The container is gone the moment a job exits, and stays gone. But the run's workspace is kept for a
+short window, so you can start a **fresh** container on it and see what the agent actually built:
+
+```bash
+pi-dispatch sandbox --list                    # what is still re-openable, and for how long
+pi-dispatch sandbox gh-12345 --publish 3000   # a shell in that run's workspace, app on 127.0.0.1:3000
+```
+
+Same image, same workspace, same isolation flags — and **no credentials**: no minted forge token, no
+provider key. The agent is not running; you are. Bring your own auth if you need to push. From the admin
+panel, press `b` on a run's detail screen.
+
+Retention is on by default for 24 hours (`PI_SANDBOX_RETENTION_HOURS`; `0` turns it off) and swept at
+worker boot. `--pin` keeps one run for `PI_SANDBOX_PIN_DAYS` (default 7) — bounded, never forever.
+A retained directory holds the run's clone **plus its issue text**, so read `docs/sandbox.md` before
+leaving it on.
+
 ## Flows: the custom prompt a trigger runs
 
 A **flow** is the recipe the agent follows — a pi **skill** committed to the target repo/folder at

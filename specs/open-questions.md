@@ -533,10 +533,41 @@ adversarial passes did.
 
 ---
 
+## OQ-016 — The admin panel suspends pi's TUI to hand the terminal to a sandbox, and that pair is verified by reading, not by running
+
+- **Status**: `WATCH`
+- **Position**: `b` on the RUN_DETAIL screen opens a run's sandbox **in place**: `tui.stop()`, spawn
+  `docker run -it` with `stdio: "inherit"`, then `tui.start()` and a forced full re-render
+  (`REQ-RESURRECTABLE-SANDBOX`). Nothing in pi's *extension* API offers this — `ExtensionUIContext` has
+  `select`/`confirm`/`input`/`notify`/`onRawInput`/`custom` and nothing else, and `execCommand` captures
+  stdout rather than inheriting it. What makes it work is that the `custom` factory hands the component
+  the real `TUI`, whose `start`/`stop` are a symmetric suspend/resume pair: `stop()` clears the render
+  timer, moves the cursor past the rendered content, restores the cursor, and calls `terminal.stop()`,
+  which disables bracketed paste and the Kitty protocol, removes listeners, pauses stdin and restores the
+  prior raw-mode state.
+- **Why it is a WATCH row and not a claim**: this is verified **against the pinned artifact by reading
+  it**, plus the strongest circumstantial evidence available — pi uses the same pair itself, for the same
+  purpose, to launch `$EDITOR` (`modes/interactive/components/extension-editor.js`), and
+  `ProcessTerminal.start`'s own comment says the dimensions refresh exists because *"SIGWINCH is lost
+  while the process is stopped"*, which is a sentence about being suspended across an external program.
+  It has **not** been run end-to-end here. `constitution.md`'s evidence rule is to verify against the
+  pinned artifact rather than HEAD; it does not claim reading is the same as running, and neither does
+  this row.
+- **What bounds it meanwhile**: the failure mode is cosmetic and recoverable, not a security or
+  correctness one — a panel that does not redraw cleanly is fixed by reopening `/dispatch`. `tui.start()`
+  sits in a `finally`, so a launch that throws still resumes the panel, and a test pins that ordering.
+  The CLI path (`pi-dispatch sandbox`) shares none of this: it owns its terminal outright.
+- **What would reopen it**: any pi upgrade that changes `TUI.start`/`TUI.stop`, `ProcessTerminal`, or
+  drops `tui` from the `custom` factory's arguments — the last of which would be a compile-time break
+  rather than a silent one. Also: the first report of a panel that does not come back cleanly on a
+  terminal we have not tried.
+- **Related risks**: `OQ-012` (a conformance list this repo cannot enforce), `OQ-004`.
+
 ## Revision History
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Added **`OQ-016`** (`WATCH`) — the admin panel's `tui.stop()` → spawn → `tui.start()` handoff for `REQ-RESURRECTABLE-SANDBOX` is verified by reading the pinned pi and by pi's own `$EDITOR` use of the same pair, **not** by having been run. Recorded rather than left implicit because the mechanism reaches past the extension API (which has no terminal handoff) into the `TUI` object the `custom` factory happens to hand over, so it is exactly the class of assumption `REQ-UPSTREAM-CONTRACT-TESTS` exists to catch — with the difference, stated in the row, that this one fails cosmetically and recoverably rather than silently. |
 | 2026-07-15 | Initial. Replaces `DESIGN.md` v0.1 §10. Collapsed from ~10 checklist items to 5 rows: source-verification at `earendil-works/pi @ 5e336cf` answered most of them. The register's value inverted in the process — from "holds ten unknowns" to "holds one known-incoming breaking change" (`OQ-005`). |
 | 2026-07-16 | `OQ-005` **retracted and re-corrected** to `WATCH — NOT IN THE PIN`. The 2026-07-15 "correction" below was itself wrong: it read `sdk.ts` at `5e336cf` (**HEAD**) to describe npm `0.80.7` (**the pin**), concluded `modelRuntime` had already landed, and declared the changelog unreliable. `ModelRuntime` does not exist in `0.80.7` — no `model-runtime` in its `dist/`, not exported from `dist/index.js`. The changelog said `[Unreleased]` and was exactly right. The runner was written against the phantom API, the image built cleanly, and every job would have died on a missing export; CI caught it on the first real container run. `constitution.md`'s evidence convention now requires verification against the **published artifact**, and `pinned-api.test.mjs` asserts `ModelRuntime` is absent so the real migration fails a test instead of a job. |
 | 2026-07-15 | ~~`OQ-005` corrected to **WATCH — PARTIALLY LANDED**~~ — **this entry was wrong; see above.** It claimed `modelRuntime` was already in `CreateAgentSessionOptions` at the pinned sha and that the changelog was not a reliable signal. Both false: the sha was HEAD, not the pin. Kept rather than deleted, because a spec that hides having been wrong teaches the next reader to trust it more than it deserves. |

@@ -755,6 +755,57 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   non-completed exit, the canonical transcript is unchanged. Given an armed trigger with `PI_SESSIONS_DIR`
   unset, the job is refused before a budget slot is reserved.
 
+## REQ-RESURRECTABLE-SANDBOX
+
+- **Statement**: A finished run's per-job directory shall be retained for a bounded window, and
+  `pi-dispatch sandbox <jobId>` shall start a **new** container from that run's image with that run's
+  mounts as an interactive operator shell holding **no credentials**. The job container is unchanged:
+  still `--rm`, still no TTY, still no published port. With the window at `0` nothing is retained and
+  teardown is the `rm -rf` it always was.
+- **Scope**: Every job kind. A forge job's clone travels with its directory; a local job's workspace is
+  the operator's own folder and is never moved, so only its `/job` inputs and `/outbox` are retained.
+  Available from the CLI and from the admin panel's RUN_DETAIL screen; never from a trigger, an
+  `/outbox` chain request, or a model tool.
+- **Why**: Perhaps 5% of runs end on a question the run record cannot answer — *does the thing it built
+  actually work?* Three separate facts make that unanswerable today: `--rm` disposes the container at
+  exit, stdin is `ignore` with no TTY so nothing can be typed into a live run either, and for a forge
+  job `cleanup` deletes the directory the clone lives in. The first two are load-bearing and must not
+  move; only the third is incidental. So the container is not kept alive — it is made reproducible, and
+  the *only* thing that had to change is how long its inputs survive it.
+- **What is NOT preserved, and the contract says so.** Process state and every filesystem change outside
+  `/workspace`. Same image plus same workspace, fresh processes. That covers "start the app and click
+  through it"; anything a run installed outside the workspace belongs in the image. A `docker commit`
+  snapshot would preserve more and is rejected in `DES-SANDBOX-IS-A-FRESH-CONTAINER` — gigabytes per run
+  to serve a case image+workspace already serves.
+- **No credential, and it is not a knob.** No minted forge token, no provider key, no forwarded host
+  variable; the container env is `TERM` and `TMOUT`. `buildContainerEnv` is deliberately not reused —
+  it writes the mint into that forge's variable names and throws when no provider credential resolves,
+  so a credential-free container cannot be produced from it. An operator who needs to push authenticates
+  themselves inside the shell.
+- **Bounded, and swept like every other artifact.** `PI_SANDBOX_RETENTION_HOURS` (default 24) with a
+  boot sweep, `--pin` extending ONE run to `now + PI_SANDBOX_PIN_DAYS`. A pin is a timestamp, never a
+  boolean: there is no keep-forever value, because a repository clone per run with no ceiling is
+  unbounded growth wearing a feature's clothing. `0` means the feature is OFF — the OPPOSITE of
+  `PI_LOG_RETENTION_DAYS` and `PI_SESSIONS_TTL_DAYS`, where `0` means keep forever — and it sweeps what
+  an earlier setting retained, so turning it off turns it off.
+- **The transcript is excluded by construction.** A retained directory may contain a job's `/session`
+  copy, which is the most PII-bearing artifact this system holds and belongs to `PI_SESSIONS_DIR`'s own
+  TTL (`INT-SESSION-STORE-CONTRACT`). It is deleted BEFORE the directory is retained. Carrying it along
+  would not weaken the session policy so much as end-run it, since `--pin` can extend this window and
+  cannot extend that one.
+- **Traces to**: `CONST-ISOLATION-CONTAINER-PER-JOB`, `CONST-TOKEN-SCOPED-PER-JOB`,
+  `INT-SANDBOX-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`, `INT-SESSION-STORE-CONTRACT`,
+  `DES-SANDBOX-IS-A-FRESH-CONTAINER`, `OQ-016`
+- **Acceptance**: Given `PI_SANDBOX_RETENTION_HOURS=0`, a job's `docker run` argv is byte-identical to
+  one built before this feature existed and its per-job directory is deleted at teardown. Given the
+  default window, a finished run is listed by `pi-dispatch sandbox --list` and `pi-dispatch sandbox
+  <jobId>` opens a shell in its workspace; inside it, no forge token and no provider key are set, and
+  `capsh --print` shows no capabilities. Given `--publish 3000`, the port is reachable at `127.0.0.1`
+  and an explicit non-loopback bind is refused. Given a worker restart while a sandbox runs, the
+  container survives (`docker ps --filter name=pi-job-` never matches it) and its directory is not
+  swept. Given a run whose window has closed, the refusal names the window. Given a job that persisted a
+  session, no transcript exists anywhere under the retention root.
+
 ## Notes (not requirements)
 
 **Capacity and cost.** ~1.5–2.5 GB RAM per job (pi + dev server + headless Chromium) and roughly
@@ -773,6 +824,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Added **`REQ-RESURRECTABLE-SANDBOX`** (issue #55): a finished run's per-job directory is retained for a bounded window and `pi-dispatch sandbox <jobId>` re-opens it as a credential-free operator shell. The job container is **UNCHANGED and was checked rather than assumed** — `--rm`, no TTY, no published port, and with `PI_SANDBOX_RETENTION_HOURS=0` the argv and the teardown are byte-identical to pre-feature. Three things went on the record because they are the ones a later reader would get wrong: retention covers **every job kind**, not just forge jobs, which is why the unit is the per-job *directory* rather than a workspace; `0` means **off** here, the inverse of `PI_LOG_RETENTION_DAYS`/`PI_SESSIONS_TTL_DAYS`, and there is deliberately no keep-forever value; and the per-job `/session` copy is **deleted before** retention, because `--pin` can extend this window and cannot extend `PI_SESSIONS_TTL_DAYS`, so carrying a transcript across would end-run that policy rather than merely weaken it. `REQ-RESUMABLE-SESSION` **UNCHANGED, and checked** — the retained directory holds no transcript, so nothing about what resumes moved. |
 | 2026-07-28 | **The pi-normal discovery posture, and operator-staged code on by default** (`CONST-NO-CONTEXT-FILES-MANDATORY` amended in the same change). `REQ-UPSTREAM-CONTRACT-TESTS`: the `AGENTS.md` bullet is **inverted** — it asserted the sentinel appears **nowhere** in the assembled prompt (`-nc` holds) and now asserts it appears in `getAgentsFiles()` and **nowhere in the append block**, because the shipped loader sets `noContextFiles: false`. Two bullets added, both pinned on **outcome** rather than on a flag: a repo `.pi/extensions` factory ran while an admin-named or `dispatch_*`-registering one is absent (project-resource discovery hangs on pi's `isProjectTrusted()` default, which would take the path down silently if it flipped), and a repo skill resolves **once** from `/job/pi/skills`. The silent failure this REQ exists for did not vanish, it **moved**, and the entry says so. `REQ-GLOBAL-PI-OVERLAY`: overlay extensions are **staged and loaded by default** — `import-pi` copies `extensions/` unless `--no-extensions` and **prints every extension it staged by name** (the vetting step is a list, not a flag), the admin extension is still hard-blocked, and `PI_GLOBAL_ALLOW_EXTENSIONS` survives only as an **opt-OUT** where unset/`""`/legacy `"1"` load, exactly `"0"` disables, and **any other value is a loud `configError` at all three enforcement points** — the strict parse is unchanged but the damaging misreading flipped, since `=false` used to degrade safely to "dormant" and would now silently mean "on". A new `Why` paragraph records the reasoning: the operator vetted the code twice (running it in `~/.pi/agent`, staging it with a printed list), so a third gate is friction, and a present-but-dormant overlay is a deployment silently missing the setup its flows were written against. `run.packages` inverted to an **opt-OUT** on all four trigger kinds (absent or `true` load; only `false` withholds), with `parseTriggers`' load-time boolean validation now the only place that strictness lives; the four-gate framing restated honestly as three gates that refuse by default plus one withdrawal, and `Scope`'s "inert until a trigger arms them" corrected. Acceptance updated throughout for both inversions. |
 | 2026-07-15 | Initial. Extracted from `DESIGN.md` v0.1 §1, §5.1–5.2, §5.6, §7, §8. `REQ-RUNNER-TURN-BUDGET` and `REQ-UPSTREAM-CONTRACT-TESTS` are **new** — both exist because source-verification refuted design assumptions the doc had marked "verify". §8's failure-mode table was the richest source; one of its rows ("verify: pi max-turns option") was wrong. |
 | 2026-07-17 | Added REQ-BRANCH-PROTECTION-PRECONDITION, formalizing the branch-protection refusal already enforced in `processor.mjs`/`github-host.mjs` (was a dangling code citation). |
