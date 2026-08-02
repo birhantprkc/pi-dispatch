@@ -15,7 +15,7 @@ const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-a
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url);
 const dashboardPath = fileURLToPath(new URL("../src/dashboard.ts", import.meta.url));
-const { makeDashboard } = await jiti.import(dashboardPath);
+const { makeDashboard, targetUrl } = await jiti.import(dashboardPath);
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1464,6 +1464,289 @@ test("a throwing or unreachable fetchCosts degrades to an in-frame message, neve
   const out2 = stripAnsi(unreachable.render(80).join("\n"));
   await unreachable.dispose();
   assert.match(out2, /costs unreachable \(logs dir unreadable \(EACCES\)\)/);
+});
+
+// --- OSC-8 links, OSC-52 copy, live-tail search, height-aware collapsing (the terminal round) ---
+
+/** A theme whose fg/bold emit real SGR (the shape the width tests above use), shared by this section. */
+const SGR_THEME = { fg: (_c, t) => `\x1b[38;5;42m${t}\x1b[39m`, bold: (t) => `\x1b[1m${t}\x1b[22m`, bg: (_c, t) => t };
+
+/** The canned run re-declared as a github one: `kind` is what targetUrl keys off. */
+const githubRunSnap = () => ({ ...SNAPSHOT, runs: [{ ...SNAPSHOT.runs[0], kind: "github" }] });
+
+test("targetUrl: a github repo#N target yields the one derivable URL; everything else is null", () => {
+  // issues/N redirects to pull/N when N is a PR, so the one shape covers both kinds.
+  assert.equal(targetUrl({ kind: "github", target: "o/r#5" }), "https://github.com/o/r/issues/5");
+  assert.equal(targetUrl({ kind: "github", target: "acme/web#123" }), "https://github.com/acme/web/issues/123");
+  // A gitlab/azure/forgejo instance host is unknowable from the record: null, never a guessed URL.
+  assert.equal(targetUrl({ kind: "gitlab", target: "grp/proj#5" }), null);
+  assert.equal(targetUrl({ kind: "local", target: "local:folder" }), null);
+  assert.equal(targetUrl({ kind: "github", target: "o/r#" }), null, "malformed: no number");
+  assert.equal(targetUrl({ kind: "github", target: "o r#5" }), null, "malformed: whitespace in the repo");
+  assert.equal(targetUrl({ kind: "github", target: null }), null);
+  assert.equal(targetUrl(null), null);
+});
+
+test("a github run's target is an OSC-8 link under a theme, still width-true; the plain path has no escape bytes", async () => {
+  const themed = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, theme: SGR_THEME, deps: cannedDeps({ fetchSnapshot: async () => githubRunSnap() }) });
+  await flush();
+  const lines = themed.render(80);
+  assert.ok(lines.join("\n").includes("\x1b]8;;https://github.com/o/r/issues/5\x07"), "the LIST run row links its target");
+  // stripAnsi covers OSC-8: asserted once explicitly on a linked row -- the link adds zero visible columns.
+  const linked = lines.find((l) => l.includes("\x1b]8;;"));
+  assert.equal(visibleLen(linked), 80, "the linked row still measures exactly the frame width");
+
+  themed.handleInput("\r"); // the run is row 0 (no triggers, no active row in this snapshot)
+  await flush();
+  const detail = themed.render(80).join("\n");
+  await themed.dispose();
+  assert.ok(detail.includes("\x1b]8;;https://github.com/o/r/issues/5\x07"), "RUN_DETAIL's target line links too");
+
+  const plain = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => githubRunSnap() }) });
+  await flush();
+  const out = plain.render(80).join("\n");
+  plain.handleInput("\r");
+  await flush();
+  const plainDetail = plain.render(80).join("\n");
+  await plain.dispose();
+  assert.ok(!out.includes("\x1b]8;;"), "PLAIN_THEME's link is a byte-identical passthrough on the list");
+  assert.ok(!plainDetail.includes("\x1b]8;;"), "and on the drill-in");
+});
+
+test("`y`/`Y` copy the job id and target URL through the seam, with a one-input transient note", async () => {
+  const copied = [];
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({ fetchSnapshot: async () => githubRunSnap(), copyText: (text) => copied.push(text) }),
+  });
+  await flush();
+  comp.handleInput("\r"); // open RUN_DETAIL on j1
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /y copy/, "the footer advertises the key while the seam is wired");
+
+  comp.handleInput("y");
+  assert.deepEqual(copied, ["j1"], "y hands the terminal the job id");
+  assert.match(stripAnsi(comp.render(80).join("\n")), /copied job id/, "the acknowledgment rides the footer");
+  comp.handleInput("z"); // any next input outdates the note (z is otherwise inert in RUN_DETAIL)
+  assert.doesNotMatch(stripAnsi(comp.render(80).join("\n")), /copied/, "the note is transient by construction");
+
+  comp.handleInput("Y");
+  assert.deepEqual(copied, ["j1", "https://github.com/o/r/issues/5"], "Y hands over the browsable URL");
+  assert.match(stripAnsi(comp.render(80).join("\n")), /copied target url/);
+  await comp.dispose();
+});
+
+test("without the copy seam y/Y are inert and unadvertised; Y with no derivable URL copies nothing", async () => {
+  const bare = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps() });
+  await flush();
+  bare.handleInput("\x1b[B");
+  bare.handleInput("\r");
+  await flush();
+  assert.doesNotMatch(stripAnsi(bare.render(80).join("\n")), /y copy/, "no seam, no hint");
+  bare.handleInput("y");
+  bare.handleInput("Y");
+  assert.doesNotMatch(stripAnsi(bare.render(80).join("\n")), /copied/, "no seam, no note");
+  await bare.dispose();
+
+  // SNAPSHOT's run carries no `kind`, so targetUrl is null: Y must stay inert rather than guess a URL.
+  const copied = [];
+  const comp = makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ copyText: (t) => copied.push(t) }) });
+  await flush();
+  comp.handleInput("\r");
+  await flush();
+  comp.handleInput("Y");
+  assert.deepEqual(copied, [], "no URL, no copy");
+  assert.doesNotMatch(stripAnsi(comp.render(80).join("\n")), /copied/, "and no note claiming otherwise");
+  await comp.dispose();
+});
+
+// --- LIVE_TAIL search: the `/` layer, n/N navigation, the post-clip highlight ---
+
+const TAIL_CANNED = ["alpha", "beta ERR one", "gamma", "delta err two", "epsilon"];
+
+/** A dashboard with LIVE_TAIL open (`l` from LIST) over canned tail lines. */
+async function openTail(lines, { theme } = {}) {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    theme,
+    intervalMs: 100000,
+    deps: cannedDeps({ fetchSnapshot: async () => ({ ...SNAPSHOT, activeJobId: "jA" }), tailLog: () => ({ lines }) }),
+  });
+  await flush();
+  comp.handleInput("l");
+  await flush();
+  await flush();
+  return comp;
+}
+
+test("'/' opens the tail search; printable keys land in the query first; Enter arms; n/N navigate and wrap", async () => {
+  const comp = await openTail(TAIL_CANNED);
+  comp.handleInput("/");
+  await flush();
+  comp.handleInput("t"); // a printable must join the query, never act as a view key
+  await flush();
+  let out = stripAnsi(comp.render(80).join("\n"));
+  assert.match(out, /\/ t/, "the bar renders the typed query");
+
+  comp.handleInput("\x7f"); // backspace routes to the input too
+  for (const ch of "err") comp.handleInput(ch);
+  comp.handleInput("\r"); // Enter closes the input, keeping the query armed
+  await flush();
+  out = stripAnsi(comp.render(80).join("\n"));
+  assert.doesNotMatch(out, /\/ err/, "the bar is closed");
+  assert.match(out, /\/err · 0\/2/, "the footer names the armed query and the match count before any jump");
+  assert.match(out, /follow/, "arming alone does not disturb follow mode");
+
+  comp.handleInput("n");
+  await flush();
+  out = stripAnsi(comp.render(80).join("\n"));
+  assert.match(out, /paused/, "a matched jump suspends follow exactly as manual scrolling does");
+  assert.match(out, /\/err · 1\/2/, "the footer shows the match position");
+
+  comp.handleInput("n");
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /\/err · 2\/2/);
+
+  comp.handleInput("n"); // past the last match: wraps to the first
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /\/err · 1\/2/, "n wraps");
+
+  comp.handleInput("N"); // before the first match: wraps back to the last
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /\/err · 2\/2/, "N wraps");
+  await comp.dispose();
+});
+
+test("Esc pops the search layer first, the view second; an unmatched query says so", async () => {
+  const comp = await openTail(TAIL_CANNED);
+  comp.handleInput("/");
+  for (const ch of "zzz") comp.handleInput(ch);
+  comp.handleInput("\r");
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /\/zzz · no match/, "an armed query with no hit is stated in the footer");
+  comp.handleInput("n"); // nothing to jump to: stays put
+  await flush();
+  const still = stripAnsi(comp.render(80).join("\n"));
+  assert.match(still, /no match/);
+  assert.match(still, /follow/, "a jump that cannot happen does not suspend follow");
+
+  comp.handleInput("\x1b"); // pops the search alone
+  await flush();
+  const popped = stripAnsi(comp.render(80).join("\n"));
+  assert.doesNotMatch(popped, /\/zzz/, "the query is cleared");
+  assert.match(popped, /live jA/, "still in the tail view");
+
+  comp.handleInput("\x1b"); // now the view pops
+  await flush();
+  assert.match(stripAnsi(comp.render(80).join("\n")), /pi-dispatch/, "back on the LIST");
+  await comp.dispose();
+});
+
+test("the current match line is highlighted post-clip under a theme, and every line stays width-true", async () => {
+  const comp = await openTail(TAIL_CANNED, { theme: SGR_THEME });
+  comp.handleInput("/");
+  for (const ch of "err") comp.handleInput(ch);
+  comp.handleInput("\r");
+  comp.handleInput("n");
+  await flush();
+  const lines = comp.render(80);
+  await comp.dispose();
+  // The warning wrap sits AROUND the clipped text: clip ran first (the untrusted-byte gate), color second.
+  assert.ok(lines.some((l) => l.includes("\x1b[38;5;42mbeta ERR one")), "the match line is color-wrapped after clip");
+  assert.ok(!lines.some((l) => l.includes("\x1b[38;5;42mgamma")), "non-match tail lines stay plain clip output");
+  for (const l of lines) {
+    assert.equal(visibleLen(l), 80, `every framed line is exactly 80 visible cols: ${JSON.stringify(stripAnsi(l))}`);
+  }
+});
+
+// --- height-aware collapsing: the injected terminalRows seam and the section collapse budget ---
+
+/** A tall LIST snapshot: 4 triggers, 6 pause windows, 3 runs -- enough to overflow a short terminal. */
+const tallSnap = () => ({
+  ...manyRuns(3),
+  triggers: { triggers: Array.from({ length: 4 }, (_, i) => ({ type: "label", any: [`t${i}`], all: [], none: [], flow: "fix" })) },
+  pauseWindows: { windows: Array.from({ length: 6 }, (_, i) => ({ scope: `acme/p${i}`, from: "01:00", to: "02:00", tz: "UTC", fromMin: 60, toMin: 120 })) },
+});
+
+test("with terminalRows the LIST collapses by priority, never the cursor's section, and fits the budget", async () => {
+  const comp = makeDashboard({
+    paths: {},
+    done() {},
+    tui: fakeTui(),
+    intervalMs: 100000,
+    deps: cannedDeps({ fetchSnapshot: async () => tallSnap(), terminalRows: () => 18 }),
+  });
+  await flush();
+
+  // Cursor opens on the triggers: they stay expanded while everything foldable around them gives way.
+  let text = stripAnsi(comp.render(80).join("\n"));
+  assert.match(text, /t0/, "the cursor's section (triggers) is never collapsed");
+  assert.match(text, /6 hidden — w to view/, "pause windows fold first, to their divider alone");
+  assert.match(text, /2 hidden — s to view/, "settings fold too, naming their key");
+  assert.doesNotMatch(text, /hidden — tab to view/, "triggers hold while the cursor is in them");
+
+  comp.handleInput("\t"); // jump the cursor to the runs head: triggers become foldable
+  await flush();
+  const lines = comp.render(80);
+  text = stripAnsi(lines.join("\n"));
+  await comp.dispose();
+  assert.ok(lines.length <= 18, `the composed frame fits the 18-row budget (got ${lines.length})`);
+  assert.match(text, /4 hidden — tab to view/, "triggers fold once the cursor leaves them");
+  assert.match(text, /› .*r0/, "the runs viewport (which bounds itself) still shows the cursor row");
+});
+
+test("rows 999 or an absent seam render byte-identically to the panel without the feature", async () => {
+  const mk = (over) => makeDashboard({ paths: {}, done() {}, tui: fakeTui(), intervalMs: 100000, deps: cannedDeps({ fetchSnapshot: async () => tallSnap(), ...over }) });
+  const base = mk({});
+  const big = mk({ terminalRows: () => 999 });
+  const blind = mk({ terminalRows: () => null });
+  await flush();
+  // The status clock is the one legitimately time-varying byte; scrub it so the compare is about layout.
+  const scrub = (lines) => lines.map((l) => l.replace(/\d\d:\d\d:\d\d/, "HH:MM:SS"));
+  const a = scrub(base.render(80));
+  const b = scrub(big.render(80));
+  const c = scrub(blind.render(80));
+  await base.dispose();
+  await big.dispose();
+  await blind.dispose();
+  assert.deepEqual(b, a, "a tall terminal collapses nothing");
+  assert.deepEqual(c, a, "an unknown height (not a TTY) collapses nothing");
+  assert.doesNotMatch(a.join("\n"), /hidden/, "and the full panel carries no collapse markers");
+});
+
+test("COSTS collapses the table first, then plans, then the daily row; the verdict never folds", async () => {
+  const open = async (rows) => {
+    const comp = await openCosts(costsDeps({ terminalRows: () => rows }));
+    const lines = comp.render(100);
+    await comp.dispose();
+    return { lines, text: stripAnsi(lines.join("\n")) };
+  };
+
+  const full = await open(999);
+  assert.doesNotMatch(full.text, /hidden/, "a tall terminal folds nothing");
+
+  const noTable = await open(17);
+  assert.match(noTable.text, /\(table · 3 hidden\)/, "the rollup table folds first");
+  assert.match(noTable.text, /peak 5h rolling/, "the plans block survives");
+  assert.match(noTable.text, /daily {2}/, "the daily row survives");
+  assert.match(noTable.text, /VERDICT/, "the verdict never folds");
+  assert.ok(noTable.lines.length <= 17, `fits 17 rows (got ${noTable.lines.length})`);
+
+  const noPlans = await open(13);
+  assert.match(noPlans.text, /\(table · 3 hidden\)/);
+  assert.match(noPlans.text, /\(plans · 4 hidden\)/, "the plans block folds second");
+  assert.match(noPlans.text, /daily {2}/, "the daily row is still the last to go");
+  assert.ok(noPlans.lines.length <= 13, `fits 13 rows (got ${noPlans.lines.length})`);
+
+  const tiny = await open(12);
+  assert.doesNotMatch(tiny.text, /daily {2}/, "the daily row folds last");
+  assert.match(tiny.text, /VERDICT/, "the verdict still never folds");
+  assert.ok(tiny.lines.length <= 12, `fits 12 rows (got ${tiny.lines.length})`);
 });
 
 test("the viewport, markers and badges keep every colored line at exactly the frame width", async () => {

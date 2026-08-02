@@ -201,6 +201,17 @@ export function makeDashboard({
   // and stays pinned as the log grows. Scrolling up pauses following; scrolling back to the bottom
   // re-arms it. The footer names the state, so a paused tail cannot masquerade as a live one.
   let tailFollow = true;
+  // LIVE_TAIL search: `tailSearchInput` is the open `/` line input (null when closed), `tailQuery` the
+  // armed case-insensitive substring (null when none), `tailMatchLine` the absolute index of the current
+  // match in the tail. They live beside the other tail fields and reset with them on Esc-to-LIST; the
+  // query only ever matches over the same held `tail` bytes the view already renders, so search adds no
+  // new surface for the untrusted log to reach.
+  let tailSearchInput: any = null;
+  let tailQuery: any = null;
+  let tailMatchLine: any = null;
+  // RUN_DETAIL's transient clipboard acknowledgment: set by y/Y, cleared by the NEXT handleInput or
+  // refresh, so it renders for exactly the frames between two inputs -- simple and test-observable.
+  let copiedNote: any = null;
   // The active runs-list ordering (`o` cycles RUN_SORTS); named in the runs divider so the list is never
   // silently re-ordered.
   let runSort = "time";
@@ -220,6 +231,8 @@ export function makeDashboard({
   const refresh = async () => {
     if (fetching || disposed) return;
     fetching = true;
+    copiedNote = null; // the copy note is one-frame-transient: any refresh outdates it
+
     try {
       snapshot = await deps.fetchSnapshot();
       // Only while the tail view is open, and only through the injected capability, re-read the tail keyed
@@ -335,6 +348,9 @@ export function makeDashboard({
         tailTop,
         tailFollow,
         tailAvailable: typeof deps?.tailLog === "function",
+        tailSearchInput,
+        tailQuery,
+        tailMatchLine,
         detailSandbox,
         sandboxAvailable: typeof deps?.launchSandbox === "function",
         pendingDelete,
@@ -342,12 +358,20 @@ export function makeDashboard({
         costs,
         costsSel,
         costsAvailable: typeof deps?.fetchCosts === "function",
+        copiedNote,
+        copyAvailable: typeof deps?.copyText === "function",
+        // Height through the injected seam, read per frame (a resize changes it): null (seam absent, or
+        // stdout not a TTY) means the collapse budget stays off and the panel composes exactly as before.
+        terminalRows: typeof deps?.terminalRows === "function" ? deps.terminalRows() : null,
       }, styler);
     },
     invalidate(): void {
       // No cached render state to clear; the TUI redraws from render().
     },
     handleInput(data: string): void {
+      // Whatever key arrives next outdates the copy acknowledgment; y/Y below set a fresh one AFTER this
+      // line, so the note lives for exactly the renders between two inputs.
+      copiedNote = null;
       if (view === "RUN_DETAIL") {
         // Escape backs out to the list only; it never closes the overlay or disposes the held clients.
         if (matchesKey(data, "escape")) {
@@ -398,6 +422,18 @@ export function makeDashboard({
           })();
           return;
         }
+        // OSC 52 copy, bound only while the seam is wired (the terminal write lives in index.ts beside
+        // tailLog). `y` takes the job id -- the handle every other command keys off -- and `Y` the
+        // browsable target URL when the record's forge yields one (github only; see targetUrl). Both are
+        // operator-initiated, id-only strings; the acknowledgment rides the footer until the next input.
+        if ((data === "y" || data === "Y") && typeof deps?.copyText === "function") {
+          const text = data === "y" ? detailRun?.jobId : targetUrl(detailRun);
+          if (!text) return; // nothing to copy: inert, no note
+          deps.copyText(String(text));
+          copiedNote = `copied ${data === "y" ? "job id" : "target url"}`;
+          tui?.requestRender?.();
+          return;
+        }
         // Every other key (including q/p/r) is inert in the detail view.
         return;
       }
@@ -436,20 +472,84 @@ export function makeDashboard({
         return;
       }
       if (view === "LIVE_TAIL") {
-        // Escape backs out to the list and drops the held tail bytes; scroll keys move the window. Every
-        // other key is inert. This view never closes the overlay or disposes the held clients.
+        // The `/` search input is the innermost layer, routed BEFORE every view key (the COSTS filter is
+        // the template): a printable byte must land in the query, never fire a scroll or view key.
+        if (tailSearchInput) {
+          if (matchesKey(data, "escape")) {
+            // Esc closes the SEARCH -- input and armed query together -- one layer above the view's own
+            // Esc-to-LIST below, matching the pop-one-layer discipline everywhere else in the overlay.
+            tailSearchInput = null;
+            tailQuery = null;
+            tailMatchLine = null;
+            tui?.requestRender?.();
+            return;
+          }
+          if (data === "\r" || data === "\n") {
+            // Enter closes the input keeping the query armed; an empty query arms nothing.
+            const q = tailSearchInput.value();
+            tailQuery = q.length > 0 ? q : null;
+            if (tailQuery === null) tailMatchLine = null;
+            tailSearchInput = null;
+            tui?.requestRender?.();
+            return;
+          }
+          if (matchesKey(data, "backspace")) tailSearchInput.backspace();
+          else if (matchesKey(data, "left")) tailSearchInput.left();
+          else if (matchesKey(data, "right")) tailSearchInput.right();
+          else if (matchesKey(data, "home")) tailSearchInput.home();
+          else if (matchesKey(data, "end")) tailSearchInput.end();
+          else if (!data.startsWith("\x1b") && data >= " ") tailSearchInput.insert(data);
+          else return; // any other control sequence is inert while the search is up
+          tui?.requestRender?.();
+          return;
+        }
+        // Escape pops ONE layer: an armed query first, the view second. Backing out to the list drops the
+        // held tail bytes AND the search state; scroll keys move the window. Every other key is inert.
+        // This view never closes the overlay or disposes the held clients.
         if (matchesKey(data, "escape")) {
+          if (tailQuery !== null) {
+            tailQuery = null;
+            tailMatchLine = null;
+            tui?.requestRender?.();
+            return;
+          }
           view = "LIST";
           tailJobId = null;
           tail = null;
           tailTop = 0;
           tailFollow = true;
+          tailSearchInput = null;
+          tailMatchLine = null;
+          tui?.requestRender?.();
+          return;
+        }
+        if (data === "/") {
+          // Seeded with the armed query (empty when none), so reopening the bar refines rather than
+          // restarts; Enter re-arms whatever it says.
+          tailSearchInput = makeLineInput(tailQuery ?? "");
           tui?.requestRender?.();
           return;
         }
         // Scrolling up pauses follow mode at the current window; reaching the bottom again re-arms it.
         const len = Array.isArray(tail?.lines) ? tail.lines.length : 0;
         const maxTop = Math.max(0, len - TAIL_VIEWPORT);
+        // With a query armed, n/N jump to the next/previous matching line (wrapping). A matched jump is
+        // manual scrolling in every way that matters, so it suspends follow exactly as the arrows do; with
+        // no match there is nothing to jump to and the footer already says `no match`.
+        if ((data === "n" || data === "N") && tailQuery !== null) {
+          const all = Array.isArray(tail?.lines) ? tail.lines : [];
+          const matches = tailMatches(all, tailQuery);
+          if (matches.length === 0) return;
+          const from = tailMatchLine === null ? tailTop : tailMatchLine;
+          tailMatchLine =
+            data === "n"
+              ? matches.find((i) => i > from) ?? matches[0]
+              : [...matches].reverse().find((i) => i < from) ?? matches[matches.length - 1];
+          tailFollow = false;
+          tailTop = Math.min(tailMatchLine, maxTop);
+          tui?.requestRender?.();
+          return;
+        }
         if (matchesKey(data, "up")) {
           tailFollow = false;
           tailTop = Math.max(0, tailTop - 1);
@@ -702,7 +802,7 @@ function budgetMeters(budget: any, settings: any, width: number): string[] {
  * the same content with `box`, its inner column count driving every meter and clip.
  */
 function renderPanel(snapshot: any, width: number, state: any, styler: any): string[] {
-  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailFollow, tailAvailable, detailSandbox, sandboxAvailable, pendingDelete, runSort, costs, costsSel, costsAvailable } = state;
+  const { view, selected, detailRun, detailTrigger, tailJobId, tail, tailTop, tailFollow, tailAvailable, tailSearchInput, tailQuery, tailMatchLine, detailSandbox, sandboxAvailable, pendingDelete, runSort, costs, costsSel, costsAvailable, copiedNote, copyAvailable, terminalRows } = state;
   const framed = Number.isFinite(width) && Math.trunc(width) >= MIN_WIDTH;
   const inner = Math.trunc(width) - 4;
   const title = "pi-dispatch";
@@ -723,18 +823,25 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
     const dw = framed ? Math.min(Math.trunc(width), DRILL_WIDTH) : Math.trunc(width);
     const allRuns = Array.isArray(snapshot?.runs) ? snapshot.runs : [];
     const canOpen = Boolean(sandboxAvailable && detailSandbox?.retained);
+    const canCopy = Boolean(copyAvailable);
     const lines = renderRunDetail(detailRun, framed ? dw - 4 : 24, styler, allRuns, detailSandbox);
-    if (!framed) return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", canOpen ? "←→ prev/next · b sandbox · esc back" : "←→ prev/next · esc back"];
-    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler, canOpen) });
+    if (!framed) {
+      const bits = ["←→ prev/next"];
+      if (canOpen) bits.push("b sandbox");
+      if (canCopy) bits.push("y copy");
+      bits.push("esc back");
+      return [detailTitle, "", ...lines.map((l: string) => styler.stripAnsi(l)), "", (copiedNote ? `${copiedNote} · ` : "") + bits.join(" · ")];
+    }
+    const boxed = frame(styler, { title: detailTitle, width: dw, lines, footer: runDetailHints(dw - 4, styler, canOpen, canCopy, copiedNote) });
     return centerBlock(boxed, Math.trunc(width), dw);
   }
 
   if (view === "LIVE_TAIL") {
-    return renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable });
+    return renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable, tailSearchInput, tailQuery, tailMatchLine, styler });
   }
 
   if (view === "COSTS") {
-    return renderCosts({ costs, costsSel, costsAvailable, framed, width: Math.trunc(width), styler });
+    return renderCosts({ costs, costsSel, costsAvailable, framed, width: Math.trunc(width), styler, availableRows: terminalRows });
   }
 
   if (snapshot === null) {
@@ -748,9 +855,11 @@ function renderPanel(snapshot: any, width: number, state: any, styler: any): str
   }
 
   // LIST — the colored dashboard. Content is composed on PLAIN text (widths via styler.cell/visibleLen)
-  // and colored last, so pi's ANSI-aware visibleWidth frames it correctly.
+  // and colored last, so pi's ANSI-aware visibleWidth frames it correctly. `terminalRows` (the injected
+  // height, when known) drives the section collapse budget in buildListLines; the degraded path below
+  // stays uncollapsed -- it is already the everything-else-failed rendering.
   if (framed) {
-    const lines = buildListLines(snapshot, selected, inner, styler, runSort);
+    const lines = buildListLines(snapshot, selected, inner, styler, runSort, terminalRows);
     return frame(styler, { title, width, lines, footer: keyHints(inner, styler) });
   }
 
@@ -787,36 +896,81 @@ function fitLine(line: string, inner: number, styler: any): string {
   return styler.cell(styler.stripAnsi(line), inner);
 }
 
-/** Compose the colored LIST body lines (RULE marks a `├──┤` separator). */
-function buildListLines(snapshot: any, selected: number, inner: number, styler: any, runSort = "time"): any[] {
-  const lines: any[] = [];
-  lines.push(statusHeader(snapshot.queue, inner, styler));
-  lines.push(RULE);
+// The frame rows around a composed body -- top border, footer rule, footer, bottom border -- charged to
+// the collapse budget before any section is measured. Shared by the LIST and COSTS budgets because both
+// frame with the same chrome.
+const FRAME_CHROME_ROWS = 4;
 
-  lines.push(styler.divider("spend & limits", "jobs & tokens/day · s set", inner));
-  for (const l of spendLines(snapshot.budget, snapshot.settings, inner, styler)) lines.push(l);
-  lines.push(RULE);
+/**
+ * The pure collapse decision, shared by LIST and COSTS: which sections give way when the composed panel
+ * outgrows the terminal. `sections` carry `{ key, rows, keptRows, priority }`; `baseRows` is everything
+ * that never collapses (frame chrome, RULE separators, the fixed blocks); collapsing a section keeps
+ * `keptRows` of it -- LIST keeps the divider line, COSTS keeps a one-line marker or nothing. Sections
+ * fold in ascending `priority`, never the `focus`ed one and never one without a priority, until the total
+ * fits. A null/non-finite `availableRows` (seam absent, stdout not a TTY) collapses NOTHING, so an
+ * unknown height renders byte-identically to the panel before this existed. Best-effort on purpose: when
+ * everything foldable is folded the panel may still overflow, and the residue is the runs/tail viewport's
+ * own already-bounded height.
+ */
+function collapseKeys(sections: any[], availableRows: any, focus: string | null, baseRows: number): Set<string> {
+  const out = new Set<string>();
+  if (!Number.isFinite(availableRows)) return out;
+  let total = baseRows;
+  for (const s of sections) total += s.rows;
+  const order = sections
+    .filter((s) => Number.isFinite(s.priority) && s.key !== focus)
+    .sort((a, b) => a.priority - b.priority);
+  for (const s of order) {
+    if (total <= availableRows) break;
+    out.add(s.key);
+    total -= s.rows - s.keptRows;
+  }
+  return out;
+}
 
+/** Compose the colored LIST body lines (RULE marks a `├──┤` separator). With a known terminal height
+ * (`availableRows` through the injected seam) sections collapse by priority until the frame fits; an
+ * unknown height composes exactly the full panel it always did -- byte-identical by construction. */
+function buildListLines(snapshot: any, selected: number, inner: number, styler: any, runSort = "time", availableRows: any = null): any[] {
   // Triggers are selectable and come FIRST in buildRows, so a trigger's file index == its selection index.
   const trg = triggerLines(snapshot, selected, inner, styler);
-  lines.push(styler.divider("triggers", `${trg.count} standing · a add · ↵ open`, inner));
-  for (const l of trg.lines) lines.push(l);
-  lines.push(RULE);
-
   const pw = pauseLines(snapshot.pauseWindows, inner, styler);
-  lines.push(styler.divider("pause windows", `${pw.count} · w manage`, inner));
-  for (const l of pw.lines) lines.push(l);
-  lines.push(RULE);
-
   // Active + run rows follow the triggers in buildRows, so offset the selection index by the trigger count.
   const runRows = buildRows(snapshot, runSort).slice(trg.count);
   const runCount = Array.isArray(snapshot.runs) ? snapshot.runs.length : 0;
-  lines.push(styler.divider("runs", `last ${runCount} · o ${runSort}`, inner));
-  for (const l of runLines(runRows, selected - trg.count, inner, styler)) lines.push(l);
-  lines.push(RULE);
-
-  lines.push(styler.divider("settings", "s edit", inner));
-  for (const l of settingsLines(snapshot.settings, inner, styler)) lines.push(l);
+  // The panel as an ordered section model. `head` is the divider label+meta (null for the status header),
+  // `priority` the collapse order -- pause windows give way first, then settings, then triggers, then
+  // spend, roughly inverse to how often an operator acts on them from this panel -- and `viewKey` the key
+  // the collapsed divider names. Status and runs carry no priority: the header is the panel's one
+  // constant and the runs viewport already bounds itself.
+  const sections: any[] = [
+    { key: "status", head: null, body: [statusHeader(snapshot.queue, inner, styler)] },
+    { key: "spend", head: ["spend & limits", "jobs & tokens/day · s set"], body: spendLines(snapshot.budget, snapshot.settings, inner, styler), priority: 4, viewKey: "s" },
+    { key: "triggers", head: ["triggers", `${trg.count} standing · a add · ↵ open`], body: trg.lines, priority: 3, viewKey: "tab" },
+    { key: "pauses", head: ["pause windows", `${pw.count} · w manage`], body: pw.lines, priority: 1, viewKey: "w" },
+    { key: "runs", head: ["runs", `last ${runCount} · o ${runSort}`], body: runLines(runRows, selected - trg.count, inner, styler) },
+    { key: "settings", head: ["settings", "s edit"], body: settingsLines(snapshot.settings, inner, styler), priority: 2, viewKey: "s" },
+  ];
+  // The cursor's section is never collapsed out from under it. Runs cannot collapse anyway; the rule is
+  // stated for both so Tab-into-triggers always re-expands them on the very next frame.
+  const focus = selected < trg.count ? "triggers" : "runs";
+  const collapsed = collapseKeys(
+    sections.map((s) => ({ key: s.key, rows: (s.head ? 1 : 0) + s.body.length, keptRows: 1, priority: s.priority })),
+    availableRows,
+    focus,
+    FRAME_CHROME_ROWS + sections.length - 1, // chrome + one RULE between each pair of sections
+  );
+  const lines: any[] = [];
+  sections.forEach((s, i) => {
+    if (i > 0) lines.push(RULE);
+    if (collapsed.has(s.key)) {
+      // The divider line alone, its meta now saying what folded away and which key gets it back.
+      lines.push(styler.divider(s.head[0], `(${s.body.length} hidden — ${s.viewKey} to view)`, inner));
+      return;
+    }
+    if (s.head) lines.push(styler.divider(s.head[0], s.head[1], inner));
+    for (const l of s.body) lines.push(l);
+  });
   return lines;
 }
 
@@ -1036,6 +1190,21 @@ function runsWindow(len: number, selected: number): { top: number; count: number
   return { top, count };
 }
 
+/**
+ * The browsable URL for a run record's target, or null. Only github is derivable: the record's target is
+ * `repo#number`, and `https://github.com/<repo>/issues/<n>` resolves for BOTH kinds -- GitHub redirects
+ * issues/N to pull/N when N is a PR, so one shape covers issues and pull requests without the record
+ * having to say which. Everything else is null ON PURPOSE: gitlab/azure/forgejo run against
+ * operator-hosted instances whose hosts are unknowable from the record, and a guessed URL an operator
+ * would click is worse than no link at all.
+ */
+export function targetUrl(record: any): string | null {
+  if (record?.kind !== "github" || typeof record?.target !== "string") return null;
+  const m = record.target.match(/^([^#\s]+)#(\d+)$/);
+  if (!m) return null;
+  return `https://github.com/${m[1]}/issues/${m[2]}`;
+}
+
 function runRow(row: any, sel: boolean, inner: number, styler: any): string {
   const cursor = sel ? styler.fg("accent", "›") : " ";
   if (row.kind === "active") {
@@ -1048,9 +1217,15 @@ function runRow(row: any, sel: boolean, inner: number, styler: any): string {
   // one misreading this list can produce. Absent on an unreplicated run, so today's rows are unchanged.
   const rep = r.replica > 0 ? styler.fg("warning", `r${r.replica}/${r.replicas ?? "?"} `) : "";
   const sep = styler.fg("dim", " · ");
+  // The target cell is an OSC-8 hyperlink when the record yields a URL. PLAIN_THEME's `link` is a
+  // byte-identical passthrough, so the monochrome path and every width test are untouched by
+  // construction; under a real theme, stripAnsi/visibleLen already strip OSC-8, so the linked cell still
+  // measures exactly its text width and fitLine stays honest.
+  const url = targetUrl(r);
+  const targetCell = styler.fg("muted", r.target ?? "-");
   const cells = [
     styler.fg("text", r.jobId ?? "-"),
-    styler.fg("muted", r.target ?? "-"),
+    url === null ? targetCell : styler.link(targetCell, url),
     styler.fg("accent", r.flow ?? "-"),
     outcomeColored(r.outcome, r.reason, styler),
     styler.fg("dim", `${r.turns ?? "-"}t`),
@@ -1350,10 +1525,12 @@ function dominantProvider(records: any, flow: any): string | null {
  * fetchCosts snapshot; every money surface funnels through styler.fmtCost, so a plan-covered row can
  * never read as $0.00 and an estimate can never pass as a metered figure.
  */
-function renderCosts({ costs, costsSel, costsAvailable, framed, width, styler }: any): string[] {
+function renderCosts({ costs, costsSel, costsAvailable, framed, width, styler, availableRows }: any): string[] {
   const inner = framed ? width - 4 : Math.max(24, width);
   const title = `COSTS · ${costsWindowLabel(costs.windowKey)}`;
-  const lines = buildCostsLines(costs, costsSel, inner, styler, costsAvailable);
+  // The collapse budget applies to the framed path only, like LIST's: the unframed degrade is already
+  // the everything-else-failed rendering and stays whole.
+  const lines = buildCostsLines(costs, costsSel, inner, styler, costsAvailable, framed ? availableRows : null);
   const footer = costsHints(inner, styler);
   if (!framed) {
     const plain = lines.filter((l: any) => l !== RULE).map((l: any) => styler.stripAnsi(l));
@@ -1363,8 +1540,10 @@ function renderCosts({ costs, costsSel, costsAvailable, framed, width, styler }:
 }
 
 /** The COSTS body: verdicts, the daily sparkline, the selectable rollup table, the optional what-if
- * block, the plans facts and the provenance footer -- or the loading/unreachable degrades. */
-function buildCostsLines(costs: any, costsSel: number, inner: number, styler: any, available: boolean): any[] {
+ * block, the plans facts and the provenance footer -- or the loading/unreachable degrades. With a known
+ * terminal height the blocks collapse by priority (see below); an unknown height composes exactly the
+ * full body it always did -- byte-identical by construction. */
+function buildCostsLines(costs: any, costsSel: number, inner: number, styler: any, available: boolean, availableRows: any = null): any[] {
   if (costs.data === null) {
     return [fitLine(styler.fg("dim", available ? "loading costs…" : "costs unavailable in this build"), inner, styler)];
   }
@@ -1372,18 +1551,40 @@ function buildCostsLines(costs: any, costsSel: number, inner: number, styler: an
     return [fitLine(styler.fg("error", `costs unreachable (${costs.data.unreachable})`), inner, styler)];
   }
   const fold = costs.data.fold ?? {};
-  const out: any[] = [];
-  for (const l of verdictLines(fold, costs.windowKey, inner, styler)) out.push(l);
-  out.push(dailyLine(fold, inner, styler));
+  const verdict = verdictLines(fold, costs.windowKey, inner, styler);
+  const daily = dailyLine(fold, inner, styler);
+  const table = costsTableLines(fold, costs.table, costsSel, inner, styler);
+  const what = costs.whatIf ? whatIfLines(costs.whatIf, costs.data, inner, styler) : null;
+  const plans = planLines(fold, inner, styler);
+  const prov = provenanceLine(fold, inner, styler);
+  // COSTS collapse order: the rollup table first (the bulk of the body, and ↑↓/f/w still act on the full
+  // model underneath), then the plans block, then the daily row. The verdict block NEVER collapses -- it
+  // is the sentence this view exists to say -- and neither does an open what-if: the operator just asked
+  // for it, so it sits in the fixed budget beside the verdicts and the provenance ledger. `keptRows` is 1
+  // for the blocks that leave a marker and 0 for the one-line daily row, where a marker would save nothing.
+  const collapsed = collapseKeys(
+    [
+      { key: "table", rows: table.length, keptRows: 1, priority: 1 },
+      { key: "plans", rows: plans.length, keptRows: plans.length > 0 ? 1 : 0, priority: 2 },
+      { key: "daily", rows: 1, keptRows: 0, priority: 3 },
+    ],
+    availableRows,
+    null,
+    FRAME_CHROME_ROWS + 2 + (what ? 1 : 0) + verdict.length + 1 + (what ? what.length : 0), // chrome + RULEs + verdicts + provenance + open what-if
+  );
+  const out: any[] = [...verdict];
+  if (!collapsed.has("daily")) out.push(daily);
   out.push(RULE);
-  for (const l of costsTableLines(fold, costs.table, costsSel, inner, styler)) out.push(l);
-  if (costs.whatIf) {
+  if (collapsed.has("table")) out.push(fitLine(styler.fg("dim", `(table · ${table.length} hidden)`), inner, styler));
+  else for (const l of table) out.push(l);
+  if (what) {
     out.push(RULE);
-    for (const l of whatIfLines(costs.whatIf, costs.data, inner, styler)) out.push(l);
+    for (const l of what) out.push(l);
   }
   out.push(RULE);
-  for (const l of planLines(fold, inner, styler)) out.push(l);
-  out.push(provenanceLine(fold, inner, styler));
+  if (collapsed.has("plans") && plans.length > 0) out.push(fitLine(styler.fg("dim", `(plans · ${plans.length} hidden)`), inner, styler));
+  else for (const l of plans) out.push(l);
+  out.push(prov);
   return out;
 }
 
@@ -1661,36 +1862,76 @@ function renderRunList(rows: any[], selected: number, w: number): string[] {
   return out;
 }
 
+/** The indices of tail lines containing `query` (case-insensitive substring) -- the LIVE_TAIL search
+ * model, computed over the held tail bytes alone, so search reads nothing the view does not already. */
+function tailMatches(lines: any[], query: string): number[] {
+  const q = String(query).toLowerCase();
+  const out: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (String(lines[i]).toLowerCase().includes(q)) out.push(i);
+  }
+  return out;
+}
+
 /**
  * The LIVE_TAIL view: a bounded, scrollable window of a running job's captured `.log`, framed in the
  * overlay. The tail bytes arrive here only through render() -> this pure function and are returned as
  * overlay lines; they never enter `snapshot`, a shared renderer, or `sendMessage` (INT-RUN-HISTORY-FILE-CONTRACT).
  * Four states: capability absent, no captured log, the windowed tail, and the tail after the job left the
  * active slot. `tailTop` is clamped to `[0, maxTop]` so a shrunk log cannot scroll past the end.
+ *
+ * The tail state frames through `frame` (not panel's box) because the search bar's cursor and the match
+ * highlight are escapes box's own clip would strip; under PLAIN_THEME the two framers are byte-identical
+ * for this content, so the plain path is unchanged. The ORDER inside is the security seam: every
+ * untrusted tail byte passes through `clip` FIRST -- control-strip plus width -- and the warning color
+ * wraps the ALREADY-clipped text, so a stray escape in the log still dies in clip and the highlight can
+ * never carry raw bytes past it.
  */
-function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable }: any): string[] {
+function renderLiveTail({ snapshot, framed, width, tailJobId, tail, tailTop, tailFollow, tailAvailable, tailSearchInput, tailQuery, tailMatchLine, styler }: any): string[] {
   const boxTitle = `live ${tailJobId}`;
-  let lines: string[];
-  let footer: string;
   if (tail === null && !tailAvailable) {
-    lines = ["live tail unavailable in this build"];
-    footer = "Esc back";
-  } else if (tail?.missing) {
-    lines = [`live ${tailJobId} -- no captured log (PI_CAPTURE_JOB_LOGS off or not found)`];
-    footer = "Esc back";
-  } else {
-    const all = Array.isArray(tail?.lines) ? tail.lines : [];
-    const len = all.length;
-    const maxTop = Math.max(0, len - TAIL_VIEWPORT);
-    const top = Math.min(Math.max(0, tailTop), maxTop);
-    lines = [`live ${tailJobId} -- ${len} line(s)`, ...all.slice(top, top + TAIL_VIEWPORT)];
-    // The job left the active slot (ended, or a different job now runs): keep showing the last tail.
-    if (snapshot?.activeJobId !== tailJobId) lines.push("(run ended -- Esc to go back)");
-    // The state is named, not implied: a paused tail reads "paused", so stale lines cannot pass as live.
-    footer = `[${Math.min(top + TAIL_VIEWPORT, len)}/${len}] ${tailFollow ? "follow" : "paused"} · Up/Down PgUp/PgDn scroll, Esc back`;
+    const lines = ["live tail unavailable in this build"];
+    if (!framed) return [boxTitle, "", ...lines, "", "Esc back"];
+    return box({ title: boxTitle, footer: "Esc back", width, sections: [{ lines }] });
   }
-  if (!framed) return [boxTitle, "", ...lines, "", footer];
-  return box({ title: boxTitle, footer, width, sections: [{ lines }] });
+  if (tail?.missing) {
+    const lines = [`live ${tailJobId} -- no captured log (PI_CAPTURE_JOB_LOGS off or not found)`];
+    if (!framed) return [boxTitle, "", ...lines, "", "Esc back"];
+    return box({ title: boxTitle, footer: "Esc back", width, sections: [{ lines }] });
+  }
+  const all = Array.isArray(tail?.lines) ? tail.lines : [];
+  const len = all.length;
+  const maxTop = Math.max(0, len - TAIL_VIEWPORT);
+  const top = Math.min(Math.max(0, tailTop), maxTop);
+  const ended = snapshot?.activeJobId !== tailJobId;
+  // The state is named, not implied: a paused tail reads "paused", so stale lines cannot pass as live.
+  let footer = `[${Math.min(top + TAIL_VIEWPORT, len)}/${len}] ${tailFollow ? "follow" : "paused"} · Up/Down PgUp/PgDn scroll, Esc back`;
+  // An armed query joins the footer with its match position (`/err · 3/7`; 0/N before the first jump),
+  // or the honest `no match` -- the search state must be readable without guessing.
+  if (tailQuery !== null) {
+    const matches = tailMatches(all, tailQuery);
+    const pos = tailMatchLine !== null ? matches.indexOf(tailMatchLine) + 1 : 0;
+    footer += matches.length === 0 ? ` · /${tailQuery} · no match` : ` · /${tailQuery} · ${pos}/${matches.length}`;
+  }
+  if (!framed) {
+    const plain = [`live ${tailJobId} -- ${len} line(s)`, ...all.slice(top, top + TAIL_VIEWPORT)];
+    if (ended) plain.push("(run ended -- Esc to go back)");
+    if (tailSearchInput) plain.push("/ " + tailSearchInput.value());
+    return [boxTitle, "", ...plain, "", footer];
+  }
+  const inner = Math.trunc(width) - 4;
+  const lines: any[] = [clip(`live ${tailJobId} -- ${len} line(s)`, inner)];
+  for (let i = top; i < Math.min(top + TAIL_VIEWPORT, len); i++) {
+    // clip FIRST (the untrusted-byte gate), color the clipped text second -- see the doc comment above.
+    const safe = clip(all[i], inner);
+    lines.push(tailQuery !== null && i === tailMatchLine ? styler.fg("warning", safe) : safe);
+  }
+  // The job left the active slot (ended, or a different job now runs): keep showing the last tail.
+  if (ended) lines.push(clip("(run ended -- Esc to go back)", inner));
+  // The search bar is the view's last body line, COSTS-filter style: a 2-col `/ ` sigil plus the focused
+  // line input (inverse-video cursor via styler.lineInput) filling the rest.
+  if (tailSearchInput) lines.push(styler.fg("accent", "/ ") + styler.lineInput(tailSearchInput, Math.max(1, inner - 2)));
+  return frame(styler, { title: boxTitle, width: Math.trunc(width), lines, footer: clip(footer, inner) });
 }
 
 /**
@@ -1716,7 +1957,12 @@ function renderRunDetail(record: any, inner: number, styler: any, allRuns: any[]
   out.push(fitLine(head, inner, styler));
   out.push(styler.cell("", inner));
 
-  out.push(kv("target", `${show(r.target)} · flow ${show(r.flow)}`, "accent"));
+  // The target is an OSC-8 hyperlink when the record's forge yields one (targetUrl; github only). Only
+  // the target itself is linked, not the flow riding the same line -- and under PLAIN_THEME `link` is a
+  // byte-identical passthrough, so the plain drill-in and its width math are untouched by construction.
+  const url = targetUrl(r);
+  const targetPart = url === null ? styler.fg("accent", show(r.target)) : styler.link(styler.fg("accent", show(r.target)), url);
+  out.push(fitLine(styler.cell("target", 12, { color: "muted" }) + " " + targetPart + styler.fg("accent", ` · flow ${show(r.flow)}`), inner, styler));
 
   // timing: start -> end (+ duration when both timestamps resolve; they may be ms or ISO strings).
   const startMs = toMs(r.startedAt);
@@ -1830,13 +2076,19 @@ function formatDuration(ms: number): string {
 }
 
 /**
- * The RUN_DETAIL footer hint. Still a read-only post-mortem, with one action: `b` re-opens this run's
- * sandbox, offered ONLY while a retained workspace exists, so the key is never advertised where it would
- * do nothing (`triggerDetailHints` is the shape).
+ * The RUN_DETAIL footer hint. Still a read-only post-mortem, with two actions: `b` re-opens this run's
+ * sandbox, offered ONLY while a retained workspace exists, and `y` copies -- offered only when the OSC 52
+ * seam is wired, the same capability pattern, so neither key is ever advertised where it would do nothing
+ * (`triggerDetailHints` is the shape). A fresh copy's acknowledgment leads the line and is gone by the
+ * next input.
  */
-function runDetailHints(inner: number, styler: any, canOpen = false): string {
+function runDetailHints(inner: number, styler: any, canOpen = false, canCopy = false, copiedNote: any = null): string {
   const k = (key: string, label: string) => styler.fg("accent", key) + " " + styler.fg("dim", label);
-  const nav = k("←→", "prev/next");
-  const bits = canOpen ? [nav, k("b", "sandbox"), k("esc", "back")] : [nav, k("esc", "back")];
-  return fitLine(bits.join(styler.fg("dim", "  ·  ")), inner, styler);
+  const bits = [k("←→", "prev/next")];
+  if (canOpen) bits.push(k("b", "sandbox"));
+  if (canCopy) bits.push(k("y", "copy"));
+  bits.push(k("esc", "back"));
+  const line = bits.join(styler.fg("dim", "  ·  "));
+  if (copiedNote) return fitLine(styler.fg("success", copiedNote) + styler.fg("dim", "  ·  ") + line, inner, styler);
+  return fitLine(line, inner, styler);
 }
