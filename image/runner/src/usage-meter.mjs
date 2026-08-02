@@ -64,6 +64,40 @@ function finite(value) {
 }
 
 /**
+ * Named-row cap for the exit line's `usage` ledger (INT-RUN-HISTORY-FILE-CONTRACT). Sized against the
+ * worker's recovery path, not against taste: the run record is rebuilt from a bounded 8 KiB tail of
+ * container stdout (worker/src/run-history.mjs, TAIL_CAP_BYTES), and an exit line the tail truncates
+ * loses ALL token accounting at once -- tokens, turns and ledger together, not merely the rows that
+ * pushed it over. Eight worst-case named rows keep the whole line under ~5 KB with headroom, which
+ * usage-meter.test.mjs asserts against a maximal fixture; if the line ever grows, shrink THIS cap --
+ * never the test's budget.
+ */
+const MAX_NAMED_ROWS = 8;
+
+/** The ten numerics a ledger row accumulates, zeroed. One shape for named rows and the fold bucket. */
+function emptyRow() {
+	return { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0, total: 0, cost: 0, unpriced: 0 };
+}
+
+/**
+ * Add every counter of one row into another. This ONE routine is both how a call lands on its row and
+ * how usageSnapshot() folds overflow rows into "other", so the ledger's invariant -- the rows partition
+ * state.total exactly -- holds by construction rather than by two pieces of arithmetic agreeing.
+ */
+function foldRow(into, row) {
+	into.calls += row.calls;
+	into.input += row.input;
+	into.output += row.output;
+	into.cacheRead += row.cacheRead;
+	into.cacheWrite += row.cacheWrite;
+	into.cacheWrite1h += row.cacheWrite1h;
+	into.reasoning += row.reasoning;
+	into.total += row.total;
+	into.cost += row.cost;
+	into.unpriced += row.unpriced;
+}
+
+/**
  * The accumulator. Pure: no pi contact, no I/O, no timers -- everything pi-shaped is injected by
  * installProcessUsageMeter, so this is the part that is fully testable and always exercised.
  *
@@ -110,11 +144,28 @@ export function createUsageMeter({ maxTokens, rootSessionId, onBreach } = {}) {
 	// makes the double count impossible instead of merely unlikely.
 	const observed = new WeakSet();
 
+	// The per-(provider,model) ledger (issue #53; REQ-TOKEN-ACCOUNTING-AND-CAPS,
+	// INT-RUN-HISTORY-FILE-CONTRACT). The flat totals above deliberately collapse the cache split --
+	// `total` is the billed sum -- but WHICH model spent what is exactly the question the flat numbers
+	// cannot answer, so every record also lands on a row keyed by the (provider, model) pair. NUL as
+	// the separator because it is a byte neither id can carry; the ids themselves live on the row, so
+	// the key never has to be parsed back apart.
+	const byModel = new Map();
+	// Where a call lands when its ctx names no model: kept OFF the map, so a provider literally named
+	// "other" can never merge into it. Same honesty rule as `unpriced` above -- a model-less call is
+	// COUNTED here, never guessed onto whichever model a heuristic liked.
+	const other = emptyRow();
+	// The version of the pi-ai copy the meter priced with, stamped by installProcessUsageMeter once
+	// the probe accepts a candidate. Pricing PROVENANCE for the run record: history is priced once,
+	// and a later pin bump must show as a different stamp on new records, not a silent repricing of
+	// old ones. null = unknown, and the exit line says so rather than inventing one.
+	let piAiVersion = null;
+
 	/**
 	 * SYNCHRONOUS by design, like attachTokenBudget's listener: the breach flag must be set before the
 	 * caller's next line runs, or the next provider call slips through under the cap.
 	 */
-	function record(usage, { sessionId } = {}) {
+	function record(usage, ctx = {}) {
 		const u = usage ?? {};
 		state.input += finite(u.input);
 		state.output += finite(u.output);
@@ -122,14 +173,45 @@ export function createUsageMeter({ maxTokens, rootSessionId, onBreach } = {}) {
 		state.total += billed;
 
 		const price = u.cost?.total;
-		if (typeof price === "number" && Number.isFinite(price)) state.cost += price;
+		const priced = typeof price === "number" && Number.isFinite(price);
+		if (priced) state.cost += price;
 		else state.unpriced += 1;
 
-		const id = typeof sessionId === "string" ? sessionId : "";
+		const id = typeof ctx.sessionId === "string" ? ctx.sessionId : "";
 		if (id.length > 0) state.sessionIds.add(id);
 		if (root !== null && id === root) state.rootTotal += billed;
 		else if (id.length > 0) state.otherTotal += billed;
 		else state.looseTotal += billed;
+
+		// The ledger landing. BOTH ids or neither: a provider without a model id (or the reverse) is
+		// not a pair, and a half-attributed row would be a guess wearing a label, so it goes to the
+		// bucket with the other model-less calls. `billed` and `priced` are the very values already
+		// accumulated above, which is what makes the rows a PARTITION of the flat totals rather than a
+		// second opinion on them. The cache split (cacheRead/cacheWrite/cacheWrite1h/reasoning) is kept
+		// only here -- it is precisely what `total` collapses.
+		const provider = typeof ctx.provider === "string" && ctx.provider.length > 0 ? ctx.provider : null;
+		const modelId = typeof ctx.modelId === "string" && ctx.modelId.length > 0 ? ctx.modelId : null;
+		let row = other;
+		if (provider !== null && modelId !== null) {
+			const key = `${provider}\u0000${modelId}`;
+			row = byModel.get(key);
+			if (!row) {
+				row = { provider, model: modelId, ...emptyRow() };
+				byModel.set(key, row);
+			}
+		}
+		foldRow(row, {
+			calls: 1,
+			input: finite(u.input),
+			output: finite(u.output),
+			cacheRead: finite(u.cacheRead),
+			cacheWrite: finite(u.cacheWrite),
+			cacheWrite1h: finite(u.cacheWrite1h),
+			reasoning: finite(u.reasoning),
+			total: billed,
+			cost: priced ? price : 0,
+			unpriced: priced ? 0 : 1,
+		});
 
 		if (cap !== null && state.total > cap && !state.breached) {
 			state.breached = true;
@@ -186,7 +268,40 @@ export function createUsageMeter({ maxTokens, rootSessionId, onBreach } = {}) {
 		};
 	}
 
-	return { state, cap, record, observe, snapshot };
+	/**
+	 * The exit line's `usage` block (INT-RUN-HISTORY-FILE-CONTRACT), or null when the meter observed no
+	 * provider call at all. run-job.mjs OMITS the key on null rather than emitting `usage: null`, so a
+	 * zero-call run keeps the exit line a pre-ledger reader already knows -- absence IS the signal, the
+	 * same way `metered: false` is for the fallback meter.
+	 *
+	 * Emission is bounded to MAX_NAMED_ROWS named rows -- top by billed total; sort() is stable, so
+	 * ties keep first-seen order and re-emission is deterministic -- plus at most one "other" row that
+	 * absorbs BOTH the folded overflow and the model-less calls. `truncated` counts only the folded
+	 * NAMED rows: a model-less call was never a row to lose, merely a call that refused to be guessed
+	 * about. The fold targets a COPY of the bucket, so calling this twice cannot compound overflow into
+	 * live state, and because the fold is numeric the emitted rows still sum to state.total exactly.
+	 */
+	function usageSnapshot() {
+		if (state.calls === 0) return null;
+		const named = [...byModel.values()].sort((a, b) => b.total - a.total);
+		const folded = named.slice(MAX_NAMED_ROWS);
+		const overflow = { ...other };
+		for (const row of folded) foldRow(overflow, row);
+		const models = named.slice(0, MAX_NAMED_ROWS).map((row) => ({ ...row }));
+		if (overflow.calls > 0) models.push({ provider: "other", model: "other", ...overflow });
+		return { v: 1, piAi: piAiVersion, truncated: folded.length, models };
+	}
+
+	/**
+	 * Stamp the pricing provenance. Only a non-empty string is stored: the installer's version probe is
+	 * best-effort, and `piAi` on the exit line must be a real version or null -- never "", never some
+	 * object that would serialise into the run record as a shape its readers have to defend against.
+	 */
+	function setPiAiVersion(version) {
+		if (typeof version === "string" && version.length > 0) piAiVersion = version;
+	}
+
+	return { state, cap, record, observe, snapshot, usageSnapshot, setPiAiVersion };
 }
 
 /**
@@ -210,7 +325,10 @@ export function wrapProviderStreams({ inner, fallbackModels, meter, hardStop }) 
 			const stream = builtin?.api === model.api
 				? fallbackModels.streamSimple(model, context, options)
 				: inner.streamSimple(model, context, options);
-			meter.observe(stream, { sessionId: options?.sessionId });
+			// The full pi-ai Model is in scope right HERE, so the ledger's (provider, model) pair is read
+			// off the object compat actually dispatched on -- never parsed back out of a settled message,
+			// whose provider/model fields a provider is free to normalise, alias, or omit.
+			meter.observe(stream, { sessionId: options?.sessionId, provider: model.provider, modelId: model.id });
 			return stream;
 		},
 	};
@@ -382,6 +500,7 @@ export async function installProcessUsageMeter({
 	resolve,
 	load = (url) => import(url),
 	exists,
+	readText = (path) => readFileSync(path, "utf8"),
 	platform = process.platform,
 }) {
 	const candidates = resolvePiAiCompat({ resolve, exists });
@@ -419,6 +538,19 @@ export async function installProcessUsageMeter({
 	}
 
 	const module = accepted.mod;
+
+	// Stamp the ledger's pricing provenance: the `version` of the COPY the probe just accepted, read
+	// from the package.json above its dist/. Same reasoning as the sibling load below -- resolving the
+	// package by specifier would reopen trap #1, but a path built RELATIVE TO the accepted compat url
+	// can only ever name the accepted copy. Best-effort and SILENT on any failure: a version is
+	// optional (the exit line's `piAi` is null when unknown), and an error logged here would carry the
+	// resolved path, which the no-path rule above already forbids shipping. `readText` is injected so
+	// the pure tests need no disk.
+	try {
+		meter.setPiAiVersion(JSON.parse(readText(fileURLToPath(new URL("../package.json", accepted.candidate.url)))).version);
+	} catch {
+		// piAi stays null on the exit line; the ledger itself is unaffected.
+	}
 
 	// The catalog path compat would have taken for builtin models, loaded as a SIBLING of the accepted
 	// compat url so it comes from the same copy. Resolving it by specifier would reopen trap #1.

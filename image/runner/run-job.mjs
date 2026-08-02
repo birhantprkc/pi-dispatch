@@ -256,11 +256,19 @@ async function main() {
 	// `metered: true` on the process-wide snapshot is what tells the daily token counter that this
 	// total includes every in-process session, not just the root's turns.
 	const tokens = usageMeter.ok ? meter.snapshot() : { ...pickTotals(tokenBudget.state), metered: false };
+	// The per-(provider,model) ledger (issue #53, INT-RUN-HISTORY-FILE-CONTRACT) -- a SIBLING of
+	// `tokens`, never a widening of it: `tokens` rides through the worker verbatim because it holds
+	// nothing but numbers, while the ledger carries id STRINGS the host re-validates through its own
+	// parser. Only the process-wide meter keeps a ledger (the per-session fallback cannot attribute a
+	// call to a model), and a metered run with zero provider calls has no rows to report -- both come
+	// back null, and the key is then OMITTED rather than emitted as null, so those exit lines stay
+	// byte-identical to what every pre-ledger consumer already parses.
+	const usage = usageMeter.ok ? meter.usageSnapshot() : null;
 	// `session` reports what pi ACTUALLY did, not what the host intended. The host records its own
 	// intent separately, and the pair is what makes a degrade visible: a host that resolved a key while
 	// the container reports resumed:false is a real event, and without both numbers it is indist-
 	// inguishable from an ordinary cold start. A feature that fails open must still say that it did.
-	log("exit", { ...outcome, turns: budget.state.turns, tokens, session: { resumed: sessionResumed, reason: sessionReason } });
+	log("exit", { ...outcome, turns: budget.state.turns, tokens, ...(usage ? { usage } : {}), session: { resumed: sessionResumed, reason: sessionReason } });
 	return outcome.code;
 }
 

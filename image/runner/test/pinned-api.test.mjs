@@ -94,8 +94,14 @@ test("the pinned pi-ai still exposes the Usage shape the runner's token meter re
 
   const usage = src.match(/export interface Usage \{([\s\S]*?)\n\}/);
   assert.ok(usage, "the Usage interface must exist in the pinned pi-ai");
-  for (const field of ["input", "output", "totalTokens", "cost"]) {
-    assert.match(usage[1], new RegExp(`\\b${field}\\b`), `Usage.${field} must remain declared -- the token meter sums it`);
+  // The cache-split fields are pinned alongside the four originals because the per-model ledger
+  // (issue #53) accumulates them per row -- they are exactly what the flat totals collapse. A pin bump
+  // that drops the split would not error anywhere: finite() coerces the absent fields to 0 and every
+  // ledger row silently reports a cache-free run, so the loss must fail HERE instead. cacheWrite1h and
+  // reasoning are optional at the pin (Anthropic-only split / provider-dependent breakdown) and the
+  // meter already defaults them to 0; declared-but-optional is the shape this pin holds them to.
+  for (const field of ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning", "totalTokens", "cost"]) {
+    assert.match(usage[1], new RegExp(`\\b${field}\\b`), `Usage.${field} must remain declared -- the meter's flat totals or its ledger rows sum it`);
   }
   // The meter dereferences usage.cost.total, so `cost` must stay an OBJECT declaring `total`. A bare-name
   // check on `cost` would keep passing if a pin bump flattened it to `cost: number`, while the meter

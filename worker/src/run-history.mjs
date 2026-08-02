@@ -7,7 +7,8 @@ import { isForgeKind, targetSeparator } from "./forges.mjs";
  *
  * The PURE HELPERS are total functions over their arguments -- no filesystem, no clock, no
  * `process.env`, no randomness -- so the record shape and the filename/telemetry parsing are testable
- * without a container, a queue, or a disk: `sanitizeJobId`, `parseExitTurns`, `buildRecord`.
+ * without a container, a queue, or a disk: `sanitizeJobId`, `parseExitTurns`, `parseExitTokens`,
+ * `parseExitSession`, `parseExitUsage`, `buildRecord`.
  *
  * The I/O factories -- `makeLogSink`, `makeRecordWriter`, `makeFindPreviousRun`, `makeLogReaper` --
  * each inject their own `fs` (and, for the reaper, their own clock via `now`), so they too are testable
@@ -37,8 +38,8 @@ export function sanitizeJobId(id) {
  * Recover the agent's turn count from buffered container stdout, or `null` if it is not reported.
  *
  * The stream interleaves docker/agent noise and other JSON events (`pi_auto_retry`) with the runner's
- * own lines. Only the success exit line carries `turns` (`image/runner/run-job.mjs:108`); the
- * catch-path exit line (`:122`) omits it. Scan from the end and return the turns of the last `exit`
+ * own lines. Only the success exit line carries `turns` (`image/runner/run-job.mjs:263`); the
+ * catch-path exit line (`:277`) omits it. Scan from the end and return the turns of the last `exit`
  * event that reports an integer count.
  *
  * This is read-only telemetry: it MUST NEVER throw and MUST NOT feed exit-code or retry
@@ -129,6 +130,112 @@ export function parseExitTokens(text) {
 	return null;
 }
 
+/** The id allowlist for a ledger row's provider/model, applied AFTER lowercasing. The first-char class
+ *  has no dot, colon or slash, so `.hidden`, `../etc` and `:` shapes fail at character one. */
+const USAGE_ID_PATTERN = /^[a-z0-9][a-z0-9._:/-]{0,63}$/;
+
+/** The ten per-row counters, in the row's serialisation order. Absent is an honest zero; anything
+ *  present must be a finite non-negative number or the whole block is refused. */
+const USAGE_ROW_NUMERIC_KEYS = ["calls", "input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "reasoning", "total", "cost", "unpriced"];
+
+/**
+ * The runner's per-(provider,model) usage ledger off the exit line -- `{ v, piAi, truncated, models }`
+ * -- REBUILT and validated, or `null` (INT-RUN-HISTORY-FILE-CONTRACT).
+ *
+ * A sibling of `parseExitSession` rather than a widening of `parseExitTokens`, for the same reason that
+ * one was: `tokens` may ride through verbatim only because it holds nothing but numbers, while this
+ * block's `provider`/`model` strings are container-emitted and therefore attacker-adjacent. So nothing
+ * here is stored as received. Every field is validated and re-written into an explicit literal: ids are
+ * lowercased and held to a strict allowlist, the ten per-row counters to finite non-negatives, and ANY
+ * violation nulls the WHOLE block, never a partial -- the same malformed->null rule `parseExitTokens`
+ * applies to the daily counter, because a half-validated ledger is how sums stop meaning anything.
+ *
+ * An absent `usage` is the NORMAL case, not an error: the metered:false fallback, the catch-path exit
+ * line and a pre-ledger runner image all omit it, and a container may die before any exit line at all.
+ *
+ * Cross-field sums (the rows against `tokens.total`) are deliberately NOT checked here. The sum is the
+ * EMITTER's invariant, asserted where the emitter lives -- in the runner's own meter tests. The host
+ * validates fields, not bookkeeping; re-deriving the arithmetic on this side would only manufacture a
+ * second source of truth for the first one to drift from.
+ *
+ * Read-only telemetry, exactly like its siblings: NEVER throws and MUST NOT feed exit-code or retry
+ * classification (INT-RUNNER-EXIT-CODE-PROTOCOL).
+ */
+export function parseExitUsage(text) {
+	if (typeof text !== "string") return null;
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i].trim();
+		if (line === "") continue;
+		let parsed;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue; // docker/agent noise or a truncated final line
+		}
+		if (parsed?.event !== "exit") continue;
+		return rebuildUsage(parsed?.usage);
+	}
+	return null;
+}
+
+/** The validating rebuild behind `parseExitUsage`: explicit literals only, null on ANY violation. */
+function rebuildUsage(u) {
+	if (!u || typeof u !== "object" || Array.isArray(u)) return null;
+	// v is kept as-is once it passes: readers treat an unknown version as opaque-but-present.
+	if (!Number.isInteger(u.v) || u.v < 1) return null;
+	let piAi = null;
+	if (u.piAi !== undefined && u.piAi !== null) {
+		// A rates-provenance stamp is three dot-joined integers or nothing -- any other string is a
+		// malformed block, not a value to store.
+		if (typeof u.piAi !== "string" || !/^\d+\.\d+\.\d+$/.test(u.piAi)) return null;
+		piAi = u.piAi;
+	}
+	let truncated = 0;
+	if (u.truncated !== undefined) {
+		if (!Number.isInteger(u.truncated) || u.truncated < 0) return null;
+		truncated = u.truncated;
+	}
+	// 1..9: up to 8 named rows plus at most one {other, other} fold row. Ten rows is not a bigger
+	// ledger, it is an emitter that broke its own envelope -- refuse the block whole.
+	if (!Array.isArray(u.models) || u.models.length < 1 || u.models.length > 9) return null;
+	const models = [];
+	for (const row of u.models) {
+		if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+		if (typeof row.provider !== "string" || typeof row.model !== "string") return null;
+		// Lowercase BEFORE the allowlist, so "Anthropic" and "anthropic" are one id and the pattern
+		// itself never has to admit uppercase.
+		const provider = row.provider.toLowerCase();
+		const model = row.model.toLowerCase();
+		if (!USAGE_ID_PATTERN.test(provider) || !USAGE_ID_PATTERN.test(model)) return null;
+		const nums = {};
+		for (const key of USAGE_ROW_NUMERIC_KEYS) {
+			const value = row[key] === undefined ? 0 : row[key];
+			// null is present-and-wrong, not absent; JSON.parse cannot produce NaN but CAN produce
+			// Infinity (1e999), which is why the finite check is load-bearing, not decorative.
+			if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+			nums[key] = value;
+		}
+		// The explicit 12-key literal: an unknown key on the emitted row is dropped HERE, by never
+		// being read -- the buildRecord no-spread posture, applied one level down.
+		models.push({
+			provider,
+			model,
+			calls: nums.calls,
+			input: nums.input,
+			output: nums.output,
+			cacheRead: nums.cacheRead,
+			cacheWrite: nums.cacheWrite,
+			cacheWrite1h: nums.cacheWrite1h,
+			reasoning: nums.reasoning,
+			total: nums.total,
+			cost: nums.cost,
+			unpriced: nums.unpriced,
+		});
+	}
+	return { v: u.v, piAi, truncated, models };
+}
+
 /**
  * Build the durable run record from the full BullMQ job wrapper and the run's outcome.
  *
@@ -162,6 +269,16 @@ export function buildRecord({ job, result, error, startedAt, endedAt }) {
 		// spread. The runner's per-job usage totals `{ input, output, total, cost }`, or null when the
 		// container died before the exit line. PII-free -- integer token counts and numeric cost only.
 		tokens: source.tokens ?? null,
+		// Usage ledger (INT-RUN-HISTORY-FILE-CONTRACT): all three additive and nullable on the
+		// tokens/session precedent, explicit literals, no spread. `usage` is the charset-validated
+		// per-model ledger recovered from the exit line exactly as `tokens` is -- but through
+		// parseExitUsage's REBUILD, so every provider/model id in it has already passed the lowercased
+		// allowlist before it can reach this literal. `provider`/`model` beside it are HOST-effective
+		// dispatch facts -- overlay-resolved by the processor, never container strings -- which is what
+		// lets a catch-path or pre-exit-line death still attribute the spend it incurred.
+		usage: source.usage ?? null,
+		provider: source.provider ?? null,
+		model: source.model ?? null,
 		budgetReserved: source.budgetReserved ?? null,
 		attempt: job.attemptsMade ?? 0,
 		// Chain telemetry (INT-RUN-HISTORY-FILE-CONTRACT): additive and nullable, explicit literals, no spread.
@@ -259,10 +376,11 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 		}
 
 		async function close({ timeoutMs = 2000 } = {}) {
-			// Capture turns and tokens from the tail first, so they survive even if the flush errors or times out.
+			// Capture turns/tokens/session/usage from the tail first, so they survive even if the flush errors or times out.
 			const turns = parseExitTurns(tail);
 			const tokens = parseExitTokens(tail);
 			const session = parseExitSession(tail);
+			const usage = parseExitUsage(tail);
 			try {
 				if (stream !== null) {
 					const s = stream;
@@ -286,7 +404,7 @@ export function makeLogSink({ logsDir, enabled, fs = nodeFs, log = () => {} }) {
 			} catch (err) {
 				log("log_sink_error", { jobId, reason: err?.message });
 			}
-			return { turns, tokens, session };
+			return { turns, tokens, session, usage };
 		}
 
 		return { write, close };
