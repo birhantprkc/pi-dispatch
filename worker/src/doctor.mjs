@@ -13,6 +13,17 @@
  * carries; and gh is preflighted inside the job image, since a token that works host-side but not
  * in-container fails jobs mid-run, not at submit. Token values travel via the spawn env only, never argv.
  *
+ * Issue #80 adds the RECEIVER's half of the preflight. Doctor runs on the worker host, but the triggers
+ * file names forges whose deliveries only ever arrive if the receiver can boot -- and the receiver is
+ * deliberately fail-loud (receiver/src/config.mjs), so a missing WEBHOOK_SECRET or a half-set forge env
+ * block is a refusal the operator otherwise meets at deploy time with no forewarning. Doctor mirrors
+ * exactly the variables each forge loader hard-requires and WARNS about what boot will refuse -- never
+ * fails, because the worker host may legitimately not be the receiver host, and a deployment can be
+ * mid-setup. Secrets are checked for presence only and never printed, same rule as the provider key. The
+ * github repos the triggers file names also get a READ-ONLY branch-protection preflight, so
+ * REQ-BRANCH-PROTECTION-PRECONDITION surfaces at setup time instead of as a refusal comment on the first
+ * paid trigger.
+ *
  * The overlay checks (REQ-GLOBAL-PI-OVERLAY, INT-TRIGGERS-FILE-CONTRACT) exist because nothing about the
  * overlay is visible from the worker host once jobs are running. BOTH halves of it -- `extensions/` and the
  * staged `packages/` -- now load by default, so the state worth surfacing is no longer "armed": an armed
@@ -84,7 +95,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 	// image checks just below, and `optingOut`/`requiring` colour the staged-packages lines further down.
 	// `optingOut` counts the only value that withholds the staged set; `requiring` counts an explicit
 	// run.packages: true, which arms nothing any more but is still an operator statement of intent.
-	const { requiring, optingOut, resuming, replicating, images, forges } = readTriggerFacts(env, fileExists);
+	const { requiring, optingOut, resuming, replicating, images, forges, repositories } = readTriggerFacts(env, fileExists, cwd);
 
 	// Only meaningful if docker itself responds; otherwise the image check is noise on top of a down daemon.
 	const imageCode = dockerCode === 0 ? await runCmd(spawn, "docker", ["image", "inspect", jobImage]) : null;
@@ -122,6 +133,43 @@ export async function runDoctor(env = process.env, deps = {}) {
 		}
 	}
 
+	// The receiver itself, when the triggers file names ANY forge (issue #80). Only forge deliveries need
+	// the receiver at all, so a cron/local-only deployment gets no receiver noise here. WARNS rather than
+	// fails, same doctrine as the gitlab block below: a deployment can legitimately be mid-setup (or run
+	// the receiver on another host with its own env), and doctor's job is to say what will not work, not
+	// to refuse.
+	if (forges.length > 0) {
+		// Presence only, value never read out (secrets-and-pii) -- without it the receiver refuses to boot,
+		// because a webhook it cannot verify is a forgeable paid-agent trigger (CONST-HMAC-OVER-RAW-BODY).
+		const webhookSecret = env.WEBHOOK_SECRET;
+		if (typeof webhookSecret !== "string" || webhookSecret.trim() === "") {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `triggers.json has ${forges.join("/")} triggers but WEBHOOK_SECRET is unset -- the receiver will refuse to start`,
+				fix: "generate one (`openssl rand -hex 32`) and set WEBHOOK_SECRET in .env -- `pi-dispatch-receiver` verifies every delivery's signature against it and refuses to boot without it",
+			});
+		} else {
+			checks.push({ ok: true, label: "WEBHOOK_SECRET set -- the receiver (`pi-dispatch-receiver`) can verify deliveries" });
+		}
+		// Validated only WHEN SET: unset (or empty) means the loader's own default of 3000, which needs no
+		// line. The malformed value IS echoed -- a port is not a secret, and naming the shape it actually
+		// has is what makes the warn actionable. Mirrors `positiveInt` (worker config.mjs) exactly, because
+		// that is the parse the receiver refuses to boot on.
+		const port = env.RECEIVER_PORT;
+		if (port !== undefined && port !== "") {
+			const n = Number.parseInt(port, 10);
+			if (!Number.isInteger(n) || n < 1 || String(n) !== String(port).trim()) {
+				checks.push({
+					ok: false,
+					warn: true,
+					label: `RECEIVER_PORT is ${JSON.stringify(port)}, which is not a positive integer -- the receiver will refuse to start`,
+					fix: "set RECEIVER_PORT to a TCP port number, or drop it for the default (3000)",
+				});
+			}
+		}
+	}
+
 	// GitLab, when the triggers file names it. WARNS rather than fails, matching the github auth checks
 	// below and for the same reason: a deployment can legitimately be mid-setup, and doctor's job is to say
 	// what will not work, not to refuse.
@@ -145,6 +193,97 @@ export async function runDoctor(env = process.env, deps = {}) {
 				label: "a GitLab project access token needs the `api` scope to post notes, which grants full project API read/write",
 				fix: "scope the token to ONE project and rotate it on a schedule -- GitLab offers no contents-vs-issues split, and no short-expiry equivalent of a GitHub App token",
 			});
+		}
+		// The receiver-boot half (issue #80), mirrored from receiver/src/config.mjs loadGitLabConfig: once
+		// ANY GITLAB_* variable is set, boot refuses without a chosen mode and a secret -- and with NONE
+		// set there is no /gitlab route at all, so these triggers can never fire either way. The mode value
+		// is echoed (it is a choice, not a secret); the secret is presence-only.
+		const glMode = env.GITLAB_WEBHOOK_MODE;
+		if (glMode !== "signature" && glMode !== "token") {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `triggers.json has gitlab triggers but GITLAB_WEBHOOK_MODE is ${glMode === undefined ? "unset" : JSON.stringify(glMode)} -- the receiver will refuse to start`,
+				fix: 'set it to "signature" (HMAC, GitLab 19.0+) or "token" (X-Gitlab-Token, any version) -- deliberately undefaulted, which verification a deployment runs must be a thing somebody chose (.env.example, docs/gitlab.md)',
+			});
+		}
+		if (typeof env.GITLAB_WEBHOOK_SECRET !== "string" || env.GITLAB_WEBHOOK_SECRET.trim() === "") {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: "triggers.json has gitlab triggers but GITLAB_WEBHOOK_SECRET is unset -- the receiver cannot verify deliveries and will refuse to start",
+				fix: "set GITLAB_WEBHOOK_SECRET in .env to the secret configured on the project webhook (.env.example, docs/gitlab.md)",
+			});
+		}
+	}
+
+	// Forgejo, when the triggers file names it (issue #80) -- the gitlab block's twin, and previously the
+	// gap: a forgejo misconfiguration hard-failed at receiver boot with no preflight warning. The variable
+	// set mirrors receiver/src/config.mjs loadForgejoConfig exactly (those three are what boot
+	// hard-requires), so this warns about precisely what the receiver will refuse. Presence-only for all
+	// three: FORGEJO_URL is no secret, but one rule for the set is one rule to audit.
+	if (forges.includes("forgejo")) {
+		const missing = ["FORGEJO_URL", "FORGEJO_WEBHOOK_SECRET", "FORGEJO_TOKEN"].filter((k) => typeof env[k] !== "string" || env[k].trim() === "");
+		if (missing.length > 0) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `triggers.json has forgejo triggers but ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} unset -- the receiver will refuse to start (or serve no /forgejo endpoint at all)`,
+				fix: "set them in .env (.env.example documents each; docs/forgejo.md walks the webhook setup); FORGEJO_BOT_ID is also needed when FORGEJO_TOKEN is repository-scoped -- a scoped token cannot call GET /user to identify itself",
+			});
+		} else {
+			checks.push({ ok: true, label: `forgejo triggers configured (${env.FORGEJO_URL})` });
+		}
+	}
+
+	// Azure DevOps, when the triggers file names it (issue #80) -- same shape, mirrored from
+	// receiver/src/config.mjs loadAzureConfig. AZURE_WEBHOOK_MODE gets its own line because it is
+	// required-UNDEFAULTED: Azure offers no HMAC at all, so both modes are shared-secret compares, and
+	// which header carries the secret must be a thing somebody decided. AZURE_WEBHOOK_HEADER joins the
+	// required set only under mode=header, exactly as boot requires it.
+	if (forges.includes("azure")) {
+		const azMode = env.AZURE_WEBHOOK_MODE;
+		const azModeOk = azMode === "basic" || azMode === "header";
+		if (!azModeOk) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `triggers.json has azure triggers but AZURE_WEBHOOK_MODE is ${azMode === undefined ? "unset" : JSON.stringify(azMode)} -- the receiver will refuse to start`,
+				fix: 'set it to "basic" (HTTP Basic on the service hook) or "header" (a custom header) -- deliberately undefaulted, Azure offers no HMAC, so which shared-secret compare gates the endpoint must be a chosen thing (.env.example, docs/azure-devops.md)',
+			});
+		}
+		const azRequired = ["AZURE_WEBHOOK_SECRET", "AZURE_TOKEN", "AZURE_ORG_URL", ...(azMode === "header" ? ["AZURE_WEBHOOK_HEADER"] : [])];
+		const azMissing = azRequired.filter((k) => typeof env[k] !== "string" || env[k].trim() === "");
+		if (azMissing.length > 0) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `triggers.json has azure triggers but ${azMissing.join(", ")} ${azMissing.length === 1 ? "is" : "are"} unset -- the receiver will refuse to start (or serve no /azure endpoint at all)`,
+				fix: "set them in .env (.env.example documents each; docs/azure-devops.md walks the service-hook setup)",
+			});
+		} else if (azModeOk) {
+			checks.push({ ok: true, label: `azure triggers configured (${env.AZURE_ORG_URL})` });
+		}
+	}
+
+	// REQ-BRANCH-PROTECTION-PRECONDITION, preflighted (issue #80). The worker refuses a forge-backed job
+	// on an unprotected default branch BEFORE any spend -- correct, but that answer arrives at the first
+	// paid trigger, as a refusal comment a requester is already waiting on. Doctor asks the same question
+	// READ-ONLY at setup time, for each github repo the triggers file NAMES. Warn, never fail: the
+	// worker's own gate stays the enforcement, this is the early copy of its answer.
+	if (forges.includes("github")) {
+		if (repositories.length === 0) {
+			// A github label/comment trigger takes its repository from each delivery's payload, and the
+			// shared schema admits `run.repository` only on azure triggers today (triggers.mjs,
+			// validateRepository) -- so there is nothing here to ask GitHub about. Said in ONE line so a
+			// green doctor cannot read as "this REQ was preflighted": it is enforced per job, just not
+			// checkable from here.
+			checks.push({
+				ok: true,
+				label: "github triggers take their repository from each delivery -- branch protection cannot be preflighted per repo here, and is enforced per job before any spend (REQ-BRANCH-PROTECTION-PRECONDITION)",
+			});
+		} else {
+			checks.push(...(await githubProtectionPreflight(spawn, repositories)));
 		}
 	}
 
@@ -502,6 +641,12 @@ function nodeCheck(version) {
  * `requiring` counts explicit `run.packages: true`, which arms nothing any more but is still an operator
  * asserting "this flow needs those packages"; that assertion is what makes an empty stage a hard failure.
  *
+ * `repositories` is the sorted set of distinct `run.repository` values on github-kind triggers, feeding the
+ * branch-protection preflight (issue #80). Note the shared schema currently ADMITS `run.repository` only on
+ * azure label/comment triggers (triggers.mjs, validateRepository), so this set is empty today for every
+ * valid file -- collected here anyway, rather than hard-coded empty, so the preflight lights up the day the
+ * schema grows the field for github instead of silently never running.
+ *
  * Parsed with the SHARED `parseTriggers`, so doctor counts exactly the entries the worker and receiver will
  * act on -- a truthy `"true"` string is rejected there and therefore never counted here.
  *
@@ -509,11 +654,14 @@ function nodeCheck(version) {
  * worker boot (config.mjs, schedules.mjs), so re-reporting the parse failure here would only bury doctor's
  * own findings under a second copy of a diagnosis the operator already gets.
  */
-function readTriggerFacts(env, fileExists) {
-	const none = { requiring: 0, optingOut: 0, resuming: 0, replicating: 0, images: [], forges: [] };
+function readTriggerFacts(env, fileExists, cwd) {
+	const none = { requiring: 0, optingOut: 0, resuming: 0, replicating: 0, images: [], forges: [], repositories: [] };
 	try {
-		const path = env.PI_TRIGGERS_FILE; // config.mjs's own default is null -- unset means no triggers at all
-		if (!path || !fileExists(path)) return none;
+		// Unset falls back to ./triggers.json in cwd, MIRRORING the receiver's own default
+		// (receiver/src/config.mjs) -- the two must read the same file, or doctor preflights a deployment
+		// the receiver will not boot. An absent file still means "no triggers at all", exactly as before.
+		const path = env.PI_TRIGGERS_FILE ?? join(cwd, "triggers.json");
+		if (!fileExists(path)) return none;
 		const triggers = parseTriggers(readFileSync(path, "utf8"), path);
 		return {
 			requiring: triggers.filter((t) => t.run.packages === true).length,
@@ -531,10 +679,78 @@ function readTriggerFacts(env, fileExists) {
 			// none }`, so a forge missing from a hand-written filter would not merely be unchecked -- doctor
 			// would report all-green and never mention that the credential it needs was never looked for.
 			forges: [...new Set(triggers.map((t) => t.run.kind).filter(isForgeKind))].sort(),
+			repositories: [...new Set(triggers.filter((t) => t.run.kind === "github" && typeof t.run.repository === "string").map((t) => t.run.repository))].sort(),
 		};
 	} catch {
 		return none;
 	}
+}
+
+/**
+ * READ-ONLY branch-protection preflight for the github repos the triggers file names (issue #80,
+ * REQ-BRANCH-PROTECTION-PRECONDITION). Two `gh api` GETs per repo -- resolve the default branch, then ask
+ * the protection endpoint -- and never anything else: doctor reports repo settings, it does not change
+ * them, so the fix line SHOWS the settings page rather than running a PUT.
+ *
+ * A non-zero exit on the protection endpoint deliberately conflates GitHub's determinate 404 ("no
+ * protection") with transient errors. The worker's own gate does the 404-vs-retryable split, because there
+ * a false "unprotected" would disarm the never-merge backstop (github-host.mjs, issue #61) -- here every
+ * answer is an advisory warn, and a warn that occasionally fires on a flaky API is acceptable where a
+ * false ✓ would not be.
+ *
+ * Exported rather than folded into runDoctor: the shared schema admits `run.repository` only on azure
+ * triggers today (see readTriggerFacts), so no valid triggers file can reach this loop through runDoctor
+ * yet -- tests exercise it directly, and the runDoctor wiring is already live for the day the schema
+ * grows the field for github. Returns check objects in runDoctor's `{ok, warn, label, fix}` shape.
+ */
+export async function githubProtectionPreflight(spawn, repositories) {
+	const checks = [];
+	// gh availability first, mirroring the GITHUB_AUTH_SOURCE=gh handling in runDoctor: one warn covers
+	// every repo, and the loop is skipped rather than producing one confusing failure line per repo.
+	const status = await runCmdCapture(spawn, "gh", ["auth", "status"]);
+	if (status.code !== 0) {
+		checks.push({
+			ok: false,
+			warn: true,
+			label: `branch-protection preflight skipped: gh is unavailable or not logged in (${repositories.length} github repo(s) named in triggers.json)`,
+			fix: "install gh and run `gh auth login` -- the preflight is a read-only `gh api` per repo; the worker still enforces REQ-BRANCH-PROTECTION-PRECONDITION at job time either way",
+		});
+		return checks;
+	}
+	// Bounded so a large trigger file cannot turn doctor into a network crawl: two API round-trips per
+	// repo, five repos. The rest are not silently dropped -- the cap line says so, and job time enforces.
+	const capped = repositories.slice(0, 5);
+	if (repositories.length > capped.length) {
+		checks.push({
+			ok: true,
+			label: `branch-protection preflight capped at ${capped.length} of ${repositories.length} repos -- the rest are still enforced per job before any spend`,
+		});
+	}
+	for (const repo of capped) {
+		const branch = await runCmdCapture(spawn, "gh", ["api", `repos/${repo}`, "--jq", ".default_branch"]);
+		const name = branch.code === 0 ? branch.output.trim() : "";
+		if (!name) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `could not resolve the default branch of ${repo} -- branch protection not preflighted`,
+				fix: "check the run.repository value and this gh login's access to it; the worker still refuses an unprotected repo at job time",
+			});
+			continue;
+		}
+		const code = await runCmd(spawn, "gh", ["api", `repos/${repo}/branches/${name}/protection`]);
+		checks.push(
+			code === 0
+				? { ok: true, label: `default branch of ${repo} is protected (${name})` }
+				: {
+						ok: false,
+						warn: true,
+						label: `default branch of ${repo} is not protected -- the worker refuses forge jobs on unprotected repos before any spend (REQ-BRANCH-PROTECTION-PRECONDITION)`,
+						fix: `protect ${name} at https://github.com/${repo}/settings/branches (see SECURITY.md) -- a read-only preflight, doctor never changes repo settings`,
+					},
+		);
+	}
+	return checks;
 }
 
 /** Resolve a spawned command's exit code; null means it could not be launched (e.g. not on PATH). */

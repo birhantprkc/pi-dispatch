@@ -133,7 +133,7 @@ majority pay for the minority, so it lives in a variant:
 
 ```bash
 docker build -f image/Dockerfile.azure -t pi-job:azure \
-  --build-arg BASE=ghcr.io/edgehero/pi-dispatch-job:latest .
+  --build-arg BASE=ghcr.io/edgehero/pi-job:latest .
 ```
 
 Name it on the trigger with `run.image`. If you forget, the job is **refused before it costs anything**:

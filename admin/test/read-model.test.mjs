@@ -153,7 +153,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
     schedulerStallMax: 2,
-    pauseWindowsPath: "deploy/pause-windows.json",
+    pauseWindowsPath: "./pause-windows.json",
     subscriptionsPath: "/subs.json",
   });
 });
@@ -161,7 +161,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
 test("resolvePaths falls back to defaults on empty env (no worker config required)", () => {
   const p = resolvePaths({});
   assert.equal(p.valkeyUrl, "redis://127.0.0.1:6379");
-  assert.equal(p.triggersPath, "deploy/triggers.json");
+  assert.equal(p.triggersPath, "./triggers.json", "cwd default matching what `pi-dispatch init` scaffolds (issue #80)");
   assert.equal(p.captureJobLogs, false);
   assert.equal(p.globalPiDir, null, "no overlay dir configured -> no staged packages to arm");
   assert.equal(resolvePaths({ PI_GLOBAL_PI_DIR: "" }).globalPiDir, null, "an empty overlay dir reads as unset");
@@ -169,7 +169,7 @@ test("resolvePaths falls back to defaults on empty env (no worker config require
   assert.ok(typeof p.settingsFile === "string" && p.settingsFile.length > 0);
   assert.deepEqual(p.dispatchRunRoots, [], "default roots [] fails closed");
   assert.equal(p.dispatchRunPerHour, 3, "default per-hour cap");
-  assert.equal(p.subscriptionsPath, "deploy/subscriptions.json", "the deployed default, like triggers/pause-windows");
+  assert.equal(p.subscriptionsPath, "./subscriptions.json", "the cwd default, like triggers/pause-windows");
 });
 
 test("resolvePaths reads PI_DISPATCH_ASCII as the glyph opt-in, defaulting to box-drawing", () => {

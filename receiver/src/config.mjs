@@ -13,7 +13,8 @@
  * - `triggers` is the receiver's webhook allowlist, grouped by type: label rules (the label IS the
  *   collaborator approval), the single comment trigger (phrase + default flow), and pull_request rules.
  *   Only collaborators can apply labels, so the label/PR-label allowlist is the human approval gate
- *   (CONST-TRIGGER-AUTHOR-GATE).
+ *   (CONST-TRIGGER-AUTHOR-GATE). It is read from `./triggers.json` in the working directory by
+ *   default -- the file `pi-dispatch init` scaffolds -- with PI_TRIGGERS_FILE as the override.
  * - `bind` defaults to `0.0.0.0` (public): the receiver is the trigger surface that lives outside pi
  *   (DES-TRIGGER-OUTSIDE-PI). It carries no admin/dashboard config -- the admin surface is a pi extension
  *   in the operator's session and binds no port (DES-ADMIN-VIA-PI-EXTENSION), so there is none here.
@@ -26,7 +27,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { configError, loadGitHubAuth, positiveInt } from "@pi-dispatch/worker/config";
 import { FORGE_KINDS, parseTriggers } from "@pi-dispatch/worker/triggers";
 
-const DEFAULT_TRIGGERS_PATH = "deploy/triggers.json";
+// Cwd-relative, matching what `pi-dispatch init` scaffolds (and the admin's default): the receiver's
+// default must be the file init just told the operator it created, not a demo buried in the repo.
+const DEFAULT_TRIGGERS_PATH = "./triggers.json";
 
 /**
  * Parse the receiver's config from `env` (default process.env). Filesystem access is injected
@@ -196,7 +199,7 @@ function loadTriggers(env, readFile, fileExists) {
 	const path = env.PI_TRIGGERS_FILE ?? DEFAULT_TRIGGERS_PATH;
 
 	if (!fileExists(path)) {
-		throw configError(`triggers file not found: ${path}`);
+		throw configError(`triggers file not found: ${path} -- run \`pi-dispatch init\` in this folder to scaffold one, or set PI_TRIGGERS_FILE to yours`);
 	}
 
 	const parsed = parseTriggers(readFile(path, "utf8"), path); // fail-loud
@@ -232,7 +235,7 @@ function emptyGroup() {
 	return { label: [], comment: null, pullRequest: [] };
 }
 
-/** The triggers file path the receiver reads (env override or the committed deploy default). */
+/** The triggers file path the receiver reads (env override or the cwd default matching what `pi-dispatch init` scaffolds). */
 export function triggersFilePath(env = process.env) {
 	return env.PI_TRIGGERS_FILE ?? DEFAULT_TRIGGERS_PATH;
 }

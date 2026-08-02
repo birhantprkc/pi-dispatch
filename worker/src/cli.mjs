@@ -8,7 +8,7 @@ import { gitDirty } from "./git-dirty.mjs";
 
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
-  pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json here
+  pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json + subscriptions.json here
   pi-dispatch doctor       preflight Docker, Valkey, the job image, and your provider key
   pi-dispatch import-pi    stage your host pi setup (models/skills/persona) into a global overlay
                            [--no-extensions] [--with-packages] [--packages-file <path>]
@@ -23,6 +23,7 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
                            what is still re-openable, for how long, and what is running now
 
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
+  pi-dispatch-receiver     webhook receiver for forge triggers — its own bin (see the GitHub section of the README)
   pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
   pi-dispatch resume       resume taking jobs
   pi-dispatch status       show paused state + job counts
