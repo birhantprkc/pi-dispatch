@@ -1,7 +1,7 @@
 @echo off
 REM UNTESTED EXAMPLE -- a starting point for a Windows service, not a shipped, verified unit. Adapt it.
 REM
-REM pi-dispatch worker launcher for Windows service managers (nssm; see deploy/nssm-install.cmd). Windows
+REM pi-dispatch launcher for Windows service managers (nssm; see deploy/nssm-install.cmd). Windows
 REM services have no `.env` mechanism, so this wrapper loads `.env` from the repo root itself, then
 REM launches node. It reads ONLY the declared `.env` (see `.env.example`), never the host user profile:
 REM the container-boundary rules require an explicit, auditable variable set. Nothing here contains a
@@ -30,5 +30,21 @@ if not exist ".env" (
 
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do set "%%A=%%B"
 
-node worker\src\cli.mjs worker
-exit /b %ERRORLEVEL%
+REM One wrapper serves both daemons (see the .sh twin): no argument runs the worker; `receiver`
+REM (passed by `pi-dispatch service --receiver`) runs the webhook receiver.
+if "%~1"=="receiver" (
+  node receiver\src\start.mjs
+) else (
+  node worker\src\cli.mjs worker
+)
+set "RC=%ERRORLEVEL%"
+
+REM Exit 2 is EXIT_POLICY (worker\src\exit-code.mjs): a determinate config/budget refusal. nssm's
+REM `AppExit 2 Exit` already refuses to restart it, but converting to a clean 0 here keeps ANY service
+REM manager pointed at this wrapper from relaunch-looping a refusal into a provider bill (mirrors the
+REM .sh twin, which exists for launchd's KeepAlive that cannot exclude a single exit code).
+if "%RC%"=="2" (
+  echo worker-env-wrapper: policy refusal, exit 2: not restarting; fix the config and start the service again 1>&2
+  exit /b 0
+)
+exit /b %RC%

@@ -25,6 +25,10 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
   pi-dispatch-receiver     webhook receiver for forge triggers — its own bin (see the GitHub section of the README)
+  pi-dispatch service <render|install|uninstall|status|start|stop|restart> [--receiver] [--user|--system] [--force]
+                           run the worker (or --receiver) as an OS service — the deploy/ templates
+                           rendered with this host's real paths, installed user-level;
+                           \`service restart --drain\` lets the in-flight job finish first
   pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
   pi-dispatch resume       resume taking jobs
   pi-dispatch status       show paused state + job counts
@@ -64,6 +68,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		const { startWorker } = await import("./start.mjs");
 		await startWorker(env);
 		return 0; // the worker keeps the process alive until SIGTERM
+	}
+
+	if (cmd === "service") {
+		const { runService } = await import("./service.mjs");
+		return runService(argv.slice(1), { env });
 	}
 
 	if (cmd === "run") {

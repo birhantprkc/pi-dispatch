@@ -10,12 +10,16 @@
   `.env` at runtime instead (note the ANTHROPIC_OAUTH_TOKEN over ANTHROPIC_API_KEY precedence trap
   documented in the wrapper).
 
-  Graceful shutdown needs NO macOS-specific code: `launchctl bootout` sends SIGTERM, which reaches node
-  through the wrapper's `exec`, and the worker drains in-flight work on SIGTERM. ExitTimeOut 30 gives it
-  room (at least the 5s docker-stop grace) before launchd escalates to SIGKILL.
+  Graceful shutdown needs NO macOS-specific code: `launchctl bootout` sends SIGTERM, which the wrapper
+  forwards to node (a trap + kill; its former `exec` is gone, see the wrapper's own comments), and the
+  worker drains in-flight work on SIGTERM. ExitTimeOut 30 gives it room (at least the 5s docker-stop
+  grace) before launchd escalates to SIGKILL.
 
   KeepAlive restarts on a crash (SuccessfulExit false) but NOT on a clean exit, so a deliberate stop
-  stays stopped.
+  stays stopped. KeepAlive cannot exclude a single exit code the way systemd's
+  RestartPreventExitStatus=2 and nssm's `AppExit 2 Exit` do, so the wrapper converts EXIT_POLICY
+  (exit 2, a determinate config/budget refusal) into a clean exit 0: a policy refusal stays stopped
+  instead of relaunch-looping against a paid provider.
 
   Per-host PLACEHOLDERS: replace /opt/pi-dispatch (the repo root, used in ProgramArguments and
   WorkingDirectory) and /opt/pi-dispatch/logs (StandardOutPath, StandardErrorPath) with your paths.

@@ -159,12 +159,32 @@ container, and a subscription isn't the credential for an unattended service; us
 ## Run as a service
 
 `pi-dispatch worker` is a long-running process — run it in a terminal, or hand it to your OS's service
-manager so it starts on boot and restarts on a crash. The units in [`deploy/`](deploy/) are **per-host
-templates, not turnkey**: each carries `<PLACEHOLDER>` paths you fill in for your machine. The systemd
-unit's *structure* is checked by `systemd-analyze`; the launchd and nssm units are worked examples. All
-three run the worker on the **host** — it drives the `docker` CLI and is not itself containerised — so
-they need the AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running
-alongside, which is what makes the queue **and the pause state** survive a reboot.
+manager so it starts on boot and restarts on a crash. Since issue #80 the hand-editing is optional:
+
+```bash
+pi-dispatch service render     # show the unit it would install — real node path, real repo root
+pi-dispatch service install    # user-level: LaunchAgent (macOS) / systemctl --user (Linux) / nssm (Windows)
+pi-dispatch service status     # which unit exists, in which scope, and whether it is running
+```
+
+`install` renders the [`deploy/`](deploy/) templates with **computed absolutes** — the node that is
+actually running (`process.execPath`, so an nvm install works where the template's `/usr/bin/node`
+would not) and the real repo root — and installs **user-level, without sudo**. `--system` on Linux
+prints the exact `sudo` commands instead of running them; `--receiver` installs the receiver unit;
+`--force` replaces an existing same-scope unit. It **refuses** to install a second worker unit in the
+other scope: one worker per docker daemon is a boot-reaper invariant — a second worker would treat the
+first's in-flight container as a stray to kill. Two honesty notes: on macOS and Windows the service is
+**login-scoped**, because Docker Desktop itself only runs while you're logged in (Linux with a system
+`dockerd` gets true boot persistence — add `sudo loginctl enable-linger $(whoami)` for user units on a
+headless box); and a **policy refusal never relaunches** — exit 2 (a determinate budget/config refusal)
+is excluded from restart on systemd and nssm, and the launchd wrapper converts it to a clean exit, so no
+supervisor loops against a paid provider.
+
+The templates in `deploy/` remain hand-editable **per-host examples** for anyone who wants to adapt them
+directly; `service render` is those templates with the placeholders filled in. All three OSes run the
+worker on the **host** — it drives the `docker` CLI and is not itself containerised — so they need the
+AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running alongside,
+which is what makes the queue **and the pause state** survive a reboot.
 
 **Steer the running worker** without stopping it — these commands talk to Valkey, so they work whether the
 worker runs in a terminal or under a service manager:
@@ -218,18 +238,17 @@ gracefully.
 
 ### Drain before a planned restart
 
-A planned restart should abort no in-flight job. Pause, wait for the queue to go idle, restart, then
-resume:
+A planned restart should abort no in-flight job:
 
 ```bash
-pi-dispatch pause                     # stop taking new jobs (durable)
-pi-dispatch status                    # repeat until "active": 0 — nothing in flight
-sudo systemctl restart worker         # (or the launchctl / nssm equivalent)
-pi-dispatch resume                    # take jobs again
+pi-dispatch service restart --drain   # pause → wait until "active": 0 → restart the unit → resume
 ```
 
-Because the pause is durable, the worker comes back paused even if the restart outruns your `resume`, so
-nothing slips through in the gap.
+That composes the durable-pause ritual (`pause` / poll `status` / restart / `resume`) into one command.
+If the queue is still busy at `--drain-timeout` (default 600s) it stops **without restarting and without
+resuming** — a timed-out drain must not un-pause a queue that still has a job in flight. The manual
+sequence still works, and because the pause is durable, the worker comes back paused even if a restart
+outruns your `resume`, so nothing slips through in the gap.
 
 **Windows caveat**: stop the service with nssm's **console-stop** (`nssm stop`), which delivers a signal
 the worker handles and drains gracefully. Task Scheduler is a weaker fallback — it stops a task with a
