@@ -23,7 +23,7 @@
  * The username is required (Forgejo's endpoint takes no numeric id) and is never logged or returned.
  */
 
-import { fetchFailureReason } from "@pi-dispatch/worker/gitlab-identity";
+import { fetchFailureReason } from "@edgehero/pi-dispatch/gitlab-identity";
 
 /** Forgejo/Gitea's API path prefix. `apiUrl` is the instance root, e.g. `https://codeberg.org`. */
 const API_PREFIX = "/api/v1";

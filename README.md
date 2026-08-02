@@ -38,30 +38,39 @@ system. **pi-dispatch is exactly that missing operational layer, and nothing els
 
 ## Quickstart (local folders)
 
-You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic).
+You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic). No clone needed:
 
 ```bash
-# 1. Get the job image — pull the prebuilt one (fast)...
+# 1. A folder for your deployment's config, then one consented pass over the whole setup
+mkdir my-dispatch && cd my-dispatch
+npx @edgehero/pi-dispatch up   # checks Docker → offers to pull+tag the job image → offers to start
+                               #    Valkey (AOF, localhost) → scaffolds five config files (never
+                               #    clobbers) → generates WEBHOOK_SECRET → runs the doctor preflight.
+                               #    Every docker action shows its exact command and asks first.
+#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
+#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
+
+# 2. Run the worker in one terminal
+npx @edgehero/pi-dispatch worker
+
+# 3. Queue a job from another
+npx @edgehero/pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
+```
+
+Prefer the steps typed out, or working from a clone (required for a **custom job image** — the
+Dockerfile needs this repo as build context)? Same commands, unbundled:
+
+```bash
+git clone https://github.com/edgehero/pi-dispatch && cd pi-dispatch && npm ci
+# 1. The job image — pull the prebuilt one (fast)...
 docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest
 #    ...or bake your own toolchain in (slower, fully yours) — same tag, or a new one you point triggers at:
 #    docker build -f image/Dockerfile -t pi-job:latest .
-
-# 2. Start Valkey (the durable job queue)
+# 2. Valkey (the durable job queue)
 docker compose -f deploy/docker-compose.yml up -d
-
-# 3. Install, scaffold, and check your setup
-npm ci
-npx pi-dispatch init         # writes five files (never clobbers): .env, triggers.json,
-                             #    pause-windows.json, pi-packages.json, subscriptions.json
-#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
-#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
-npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the images your triggers name, and your provider key
-
-# 4. Run the worker in one terminal
-npx pi-dispatch worker       # (or: npm --workspace worker start)
-
-# 5. Queue a job from another
-npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
+# 3. Scaffold + preflight (same five files; doctor checks Docker, Valkey, images, provider key)
+npx pi-dispatch init && npx pi-dispatch doctor
+# 4-5. worker in one terminal, run from another — as above (the local bin is `npx pi-dispatch`)
 ```
 
 > **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
@@ -73,11 +82,12 @@ npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 > fetches an image at job time. A name it cannot find is refused *before* the job costs anything, rather than
 > becoming a silent pull of whatever answers to that name in a registry. `pi-dispatch doctor` checks presence.
 
-> **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
-> which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It
-> is **not** the unrelated npm package `pi-dispatch` (see [License](#license)); this project isn't published
-> to npm. If a shell can't find the local bin, use the explicit form:
-> `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
+> **Heads-up on the CLI name.** The published package is **scoped**: `@edgehero/pi-dispatch` (its bin is
+> `pi-dispatch`). The **bare** npm name `pi-dispatch` belongs to an unrelated package (see
+> [License](#license)) — so outside a checkout, always `npx @edgehero/pi-dispatch <cmd>`; bare
+> `npx pi-dispatch` would ask the registry for the wrong project. Inside a clone after `npm ci`, bare
+> `npx pi-dispatch` resolves to the local workspace bin and is fine; if a shell can't find it, use the
+> explicit form: `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
 
 The worker picks up the job, mounts your folder into a container, and pi edits it **in place**. It
 refuses a dirty git working tree unless you pass `--force`, because there is no undo — point it at
@@ -712,4 +722,8 @@ MIT. See [LICENSE](LICENSE). Built on [pi](https://github.com/earendil-works/pi)
 does the actual hard part.
 
 > **Not affiliated with** the unrelated npm package `pi-dispatch`, a pi extension for rotating ChatGPT
-> Codex OAuth accounts. Same name, different thing — this project is not distributed via npm.
+> Codex OAuth accounts. Same name, different thing — this project publishes **scoped** packages only:
+> [`@edgehero/pi-dispatch`](https://www.npmjs.com/package/@edgehero/pi-dispatch) (worker + CLI),
+> [`@edgehero/pi-dispatch-receiver`](https://www.npmjs.com/package/@edgehero/pi-dispatch-receiver), and
+> [`@edgehero/pi-dispatch-admin`](https://www.npmjs.com/package/@edgehero/pi-dispatch-admin) (the
+> console). The bare name is theirs.

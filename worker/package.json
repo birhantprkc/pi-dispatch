@@ -1,10 +1,40 @@
 {
-  "name": "@pi-dispatch/worker",
+  "name": "@edgehero/pi-dispatch",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "BullMQ worker: drains the queue, mints scoped tokens, runs one container per job.",
+  "description": "Self-hosted job harness for the pi coding agent: a BullMQ worker that drains the queue, mints scoped forge tokens, and runs one container per job — plus the pi-dispatch CLI (init, up, doctor, service).",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "coding-agent",
+    "ai-agent",
+    "autonomous-agents",
+    "self-hosted",
+    "github",
+    "gitlab",
+    "forgejo",
+    "gitea",
+    "azure-devops",
+    "job-queue",
+    "bullmq",
+    "cron",
+    "docker",
+    "cli"
+  ],
   "license": "MIT",
+  "author": "Rob Boerman",
+  "homepage": "https://github.com/edgehero/pi-dispatch/tree/main/worker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edgehero/pi-dispatch.git",
+    "directory": "worker"
+  },
+  "bugs": "https://github.com/edgehero/pi-dispatch/issues",
+  "files": [
+    "src",
+    ".env.example",
+    "deploy"
+  ],
   "main": "src/index.mjs",
   "bin": {
     "pi-dispatch": "src/cli.mjs"

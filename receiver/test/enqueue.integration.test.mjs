@@ -90,7 +90,7 @@ async function drive(handler, req, res, raw) {
 
 test("verify->filter->enqueue lands a github job in a real Valkey under the GUID jobId", { skip }, async () => {
 	const { Queue } = await import("bullmq");
-	const { parseConnection } = await import("@pi-dispatch/worker/connection");
+	const { parseConnection } = await import("@edgehero/pi-dispatch/connection");
 
 	// A uniquely-named queue per run so parallel/repeated Valkey tests cannot see each other's jobs.
 	// `parseConnection` returns connection OPTIONS (not a shared ioredis instance), so this Queue owns

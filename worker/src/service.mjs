@@ -32,8 +32,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-// deploy/ resolved relative to this module (the init.mjs pattern), so `service` works no matter where
-// the CLI is invoked from — the templates are package contents, not cwd contents.
+// Deploy templates resolved relative to this module (the init.mjs pattern): worker/deploy is SHIPPED
+// in the npm tarball and kept byte-identical to the repo-root deploy/ (the documented source) by
+// worker/test/publish.test.mjs — so `service` renders the same templates from a checkout and from an
+// npm install, no matter where the CLI is invoked from.
+const DEPLOY_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "deploy");
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /**
@@ -237,7 +240,7 @@ function unitPaths(ctx) {
 }
 
 function readTemplate(ctx, name) {
-	return ctx.fs.readFileSync(join(ctx.repoRoot, "deploy", name), "utf8");
+	return ctx.fs.readFileSync(join(DEPLOY_DIR, name), "utf8");
 }
 
 /**

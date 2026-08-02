@@ -24,8 +24,10 @@ export function runInit(cwd = process.cwd(), deps = {}) {
 	const { fs = { existsSync, copyFileSync, writeFileSync }, out = (s) => process.stdout.write(s) } = deps;
 	const results = [];
 
-	// .env from the example. Prefer the copy in cwd (the clone's repo root); fall back to the one
-	// packaged next to the worker so init still works when run from elsewhere in the checkout.
+	// .env from the example. Prefer the copy in cwd (the clone's repo root); fall back to the copy
+	// SHIPPED with the worker package (worker/.env.example, kept byte-identical to the root example by
+	// worker/test/publish.test.mjs) so init works both from elsewhere in a checkout and from an npm
+	// install, where the repo root does not exist.
 	const envPath = join(cwd, ".env");
 	if (fs.existsSync(envPath)) {
 		results.push(["kept", ".env", "already exists — left untouched"]);
@@ -33,7 +35,7 @@ export function runInit(cwd = process.cwd(), deps = {}) {
 		const cwdExample = join(cwd, ".env.example");
 		const source = fs.existsSync(cwdExample)
 			? cwdExample
-			: fileURLToPath(new URL("../../.env.example", import.meta.url));
+			: fileURLToPath(new URL("../.env.example", import.meta.url));
 		fs.copyFileSync(source, envPath);
 		results.push(["created", ".env", "from .env.example — set your provider key next"]);
 	}

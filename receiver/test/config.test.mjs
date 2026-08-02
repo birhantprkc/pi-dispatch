@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadReceiverConfig, reloadTriggers, triggersFilePath } from "../src/config.mjs";
-import { FORGE_KINDS } from "@pi-dispatch/worker/triggers";
+import { FORGE_KINDS } from "@edgehero/pi-dispatch/triggers";
 
 // A valid unified triggers file, injected: exists and parses to one of each webhook type. The exhaustive
 // schema validation lives in the shared validator's own suite (worker/test/triggers.test.mjs); here we

@@ -25,15 +25,15 @@ import { watch } from "node:fs";
 import { dirname, basename } from "node:path";
 import { loadReceiverConfig, triggersFilePath, reloadTriggers } from "./config.mjs";
 import { makeReceiver } from "./receiver.mjs";
-import { makeGitHubAuth } from "@pi-dispatch/worker/get-token";
-import { resolveGitLabSelfId } from "@pi-dispatch/worker/gitlab-identity";
-import { resolveForgejoSelfId } from "@pi-dispatch/worker/forgejo-identity";
-import { resolveAzureSelfId } from "@pi-dispatch/worker/azure-identity";
+import { makeGitHubAuth } from "@edgehero/pi-dispatch/get-token";
+import { resolveGitLabSelfId } from "@edgehero/pi-dispatch/gitlab-identity";
+import { resolveForgejoSelfId } from "@edgehero/pi-dispatch/forgejo-identity";
+import { resolveAzureSelfId } from "@edgehero/pi-dispatch/azure-identity";
 import { makeResolveAuthority } from "./gitlab-members.mjs";
 import { makeResolveForgejoAuthority } from "./forgejo-members.mjs";
 import { makeResolveAzureAuthority } from "./azure-members.mjs";
-import { makeQueue } from "@pi-dispatch/worker/queue";
-import { parseConnection } from "@pi-dispatch/worker/connection";
+import { makeQueue } from "@edgehero/pi-dispatch/queue";
+import { parseConnection } from "@edgehero/pi-dispatch/connection";
 
 /**
  * Boot the receiver. Collaborators are injected (defaulting to the real ones) so the whole wiring is

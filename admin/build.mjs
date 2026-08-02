@@ -1,8 +1,10 @@
 /**
  * Bundle the operator extension into a single self-contained `dist/index.mjs` for publishing as a pi-package.
  *
- * The admin extension imports ~10 `@pi-dispatch/worker` subpaths (a private workspace); esbuild INLINES those
- * local `.mjs` files so the published package has no `@pi-dispatch/*` dependency. The pi runtime is
+ * The admin extension imports ~10 `@edgehero/pi-dispatch` subpaths (the worker workspace); esbuild INLINES those
+ * local `.mjs` files so the published package has no worker dependency — the admin tarball stands alone even
+ * though the worker is now published too (a devDependency, resolved through the workspace symlink at build
+ * time and never declared at runtime). The pi runtime is
  * host-provided (a peerDependency) and `bullmq`/`ioredis` are heavy real deps kept EXTERNAL and declared in
  * package.json; everything else — the admin's own files, the inlined worker internals, and `typebox` — is
  * bundled in. `import.meta.url` is preserved (esm), so the extension's `../skills` resolution still points at

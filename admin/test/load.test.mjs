@@ -40,7 +40,7 @@ test("(b) the .pi/extensions shim re-exports the same factory", async () => {
   assert.deepEqual(shim.USED_API, mod.USED_API);
 });
 
-test("(c) jiti resolves the @pi-dispatch/worker workspace export", async () => {
+test("(c) jiti resolves the @edgehero/pi-dispatch workspace export", async () => {
   const probe = await jiti.import(probePath);
   assert.equal(probe.ok, true, "settingsFilePath imported through the workspace exports map");
 });

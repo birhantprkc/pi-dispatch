@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  UNTESTED EXAMPLE: a starting point for the macOS (launchd) worker daemon, not a shipped, verified
+  unit. Adapt it. The Linux/systemd equivalent is deploy/worker.service.
+
+  ProgramArguments points at deploy/worker-env-wrapper.sh; that wrapper is what loads `.env`, because
+  launchd has no EnvironmentFile mechanism. NO secrets are inlined here: there is deliberately no
+  EnvironmentVariables dict, since that would commit credentials into this file. The wrapper reads
+  `.env` at runtime instead (note the ANTHROPIC_OAUTH_TOKEN over ANTHROPIC_API_KEY precedence trap
+  documented in the wrapper).
+
+  Graceful shutdown needs NO macOS-specific code: `launchctl bootout` sends SIGTERM, which the wrapper
+  forwards to node (a trap + kill; its former `exec` is gone, see the wrapper's own comments), and the
+  worker drains in-flight work on SIGTERM. ExitTimeOut 30 gives it room (at least the 5s docker-stop
+  grace) before launchd escalates to SIGKILL.
+
+  KeepAlive restarts on a crash (SuccessfulExit false) but NOT on a clean exit, so a deliberate stop
+  stays stopped. KeepAlive cannot exclude a single exit code the way systemd's
+  RestartPreventExitStatus=2 and nssm's `AppExit 2 Exit` do, so the wrapper converts EXIT_POLICY
+  (exit 2, a determinate config/budget refusal) into a clean exit 0: a policy refusal stays stopped
+  instead of relaunch-looping against a paid provider.
+
+  Per-host PLACEHOLDERS: replace /opt/pi-dispatch (the repo root, used in ProgramArguments and
+  WorkingDirectory) and /opt/pi-dispatch/logs (StandardOutPath, StandardErrorPath) with your paths.
+
+  One worker per host (DES-CONCURRENCY-3): parallelism is PI_CONCURRENCY inside the one process.
+  Requires the AOF-enabled Valkey from deploy/docker-compose.yml.
+
+  PI_LOGS_DIR (run-history records; default OS-temp /pi-dispatch/logs) is created and written by the
+  worker at boot, so it must be writable by the account the daemon runs as. Set via `.env` (the wrapper),
+  not a plist change; its default is distinct from the StandardOutPath worker.out.log below.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.pi-dispatch.worker</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/opt/pi-dispatch</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+
+	<key>StandardOutPath</key>
+	<string>/opt/pi-dispatch/logs/worker.out.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/opt/pi-dispatch/logs/worker.err.log</string>
+</dict>
+</plist>

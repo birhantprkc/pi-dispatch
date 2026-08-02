@@ -20,7 +20,7 @@
 
 import { makeVerifiedHandler } from "./verify.mjs";
 import { filter } from "./filter.mjs";
-import { enqueueForgeJob, enqueueGitHubJob, enqueueGitLabJob } from "@pi-dispatch/worker/queue";
+import { enqueueForgeJob, enqueueGitHubJob, enqueueGitLabJob } from "@edgehero/pi-dispatch/queue";
 import { filterGitLab } from "./filter-gitlab.mjs";
 import { parseGitLabSubset } from "./gitlab-subset.mjs";
 import { makeGitLabVerifiedHandler } from "./verify-gitlab.mjs";

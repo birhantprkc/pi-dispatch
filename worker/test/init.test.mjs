@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runInit } from "../src/init.mjs";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pi-init-"));
@@ -46,4 +47,19 @@ test("init is idempotent and never overwrites operator edits", () => {
 	assert.deepEqual(JSON.parse(readFileSync(join(dir, "pause-windows.json"), "utf8")), { windows: [] }, "the missing ones are still created");
 	assert.deepEqual(JSON.parse(readFileSync(join(dir, "subscriptions.json"), "utf8")), { version: 1, subscriptions: [] });
 	assert.match(text(), /kept.*\.env/, "an existing file is reported as kept");
+});
+
+test("init without a cwd .env.example falls back to the copy shipped with the package (the npm-install path)", () => {
+	// No seeded .env.example: this is `pi-dispatch init` in an empty deployment folder, where the bin
+	// came from an npm install and the repo root does not exist. The fallback must reach the REAL
+	// worker/.env.example next to src/, so the real fs is used, not a fake.
+	const dir = tmp();
+	const { out, text } = capture();
+
+	const code = runInit(dir, { out });
+
+	assert.equal(code, 0);
+	const packaged = readFileSync(fileURLToPath(new URL("../.env.example", import.meta.url)), "utf8");
+	assert.equal(readFileSync(join(dir, ".env"), "utf8"), packaged, ".env is the packaged worker/.env.example, byte for byte");
+	assert.match(text(), /created\s+\.env/, "the fallback still reports .env as created");
 });

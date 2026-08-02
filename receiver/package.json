@@ -1,8 +1,35 @@
 {
-  "name": "@pi-dispatch/receiver",
+  "name": "@edgehero/pi-dispatch-receiver",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "description": "Webhook receiver for pi-dispatch: the always-on edge that verifies GitHub, GitLab, Forgejo and Azure DevOps deliveries and enqueues (at most) one job per event for the worker.",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "coding-agent",
+    "ai-agent",
+    "self-hosted",
+    "webhook",
+    "github",
+    "gitlab",
+    "forgejo",
+    "gitea",
+    "azure-devops",
+    "job-queue",
+    "bullmq"
+  ],
+  "license": "MIT",
+  "author": "Rob Boerman",
+  "homepage": "https://github.com/edgehero/pi-dispatch/tree/main/receiver",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edgehero/pi-dispatch.git",
+    "directory": "receiver"
+  },
+  "bugs": "https://github.com/edgehero/pi-dispatch/issues",
+  "files": [
+    "src"
+  ],
   "main": "src/start.mjs",
   "bin": {
     "pi-dispatch-receiver": "src/cli.mjs"
@@ -18,7 +45,7 @@
   },
   "dependencies": {
     "@octokit/webhooks": "14.2.0",
-    "@pi-dispatch/worker": "*",
+    "@edgehero/pi-dispatch": "^0.1.0",
     "bullmq": "5.80.4",
     "ioredis": "5.11.1"
   }

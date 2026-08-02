@@ -19,15 +19,15 @@
  * touches the filesystem -- the bytes reach the overlay alone, never `snapshot`, never a shared renderer,
  * never a message.
  */
-import { dayKey, weekKey, monthKey, tokenDayKey, windowState } from "@pi-dispatch/worker/budget";
-import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
-import { makeQueue } from "@pi-dispatch/worker/queue";
-import { STALL_KEY } from "@pi-dispatch/worker/scheduler-stall-guard";
-import { windowEndAt } from "@pi-dispatch/worker/pause-windows";
+import { dayKey, weekKey, monthKey, tokenDayKey, windowState } from "@edgehero/pi-dispatch/budget";
+import { parseConnection, makeRedisClient } from "@edgehero/pi-dispatch/connection";
+import { makeQueue } from "@edgehero/pi-dispatch/queue";
+import { STALL_KEY } from "@edgehero/pi-dispatch/scheduler-stall-guard";
+import { windowEndAt } from "@edgehero/pi-dispatch/pause-windows";
 // The pricing façade is imported HERE and wired into the deps factory alone: dashboard views call
 // injected seams (`fetchCosts`/`listPricedModels`/`whatIf`), never the façade, so tests stay fully
 // canned and the one worker/pricing coupling sits beside the queue and redis this module already owns.
-import * as pricing from "@pi-dispatch/worker/pricing";
+import * as pricing from "@edgehero/pi-dispatch/pricing";
 import { listRuns, readSettingsView, mapSchedulers, readTriggers, readPauseWindows, readStagedPackages, readSubscriptions, scanRunRecords } from "./read-model.mjs";
 import { renderStatus, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
 import { matchesKey } from "./keys.mjs";

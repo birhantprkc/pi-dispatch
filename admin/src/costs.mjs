@@ -21,7 +21,7 @@
  * only renderer.
  */
 
-import { dayKey } from "@pi-dispatch/worker/budget";
+import { dayKey } from "@edgehero/pi-dispatch/budget";
 
 /** Every class a typed dollar can carry. Note what is NOT here: "free". A $0 is always "zero-rated"
  * (a rate table said zero) or "plan" (prepaid) -- the fold has no way to assert that anything is free. */

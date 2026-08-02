@@ -8,16 +8,19 @@ import { fileURLToPath } from "node:url";
 import { runService, TEMPLATE_PINS } from "../src/service.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+// The deploy/ copy the render actually reads: worker/deploy, shipped in the npm tarball and kept
+// byte-identical to the repo-root deploy/ by the sync test in publish.test.mjs.
+const DEPLOY_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "deploy");
 
 // ---------------------------------------------------------------------------------------------------
 // The pin test: render is a targeted substitution of the templates' KNOWN literals, so a template
 // edit that renames one must fail HERE (build time), not at render time on an operator's host. Reads
-// the REAL deploy/ files on purpose — a fake would pin nothing.
+// the REAL worker/deploy files — the ones readTemplate resolves — on purpose; a fake would pin nothing.
 // ---------------------------------------------------------------------------------------------------
 
 test("pin: every literal the render substitutes or preserves is present in its real deploy/ template", () => {
 	for (const [name, literals] of Object.entries(TEMPLATE_PINS)) {
-		const text = readFileSync(join(REPO_ROOT, "deploy", name), "utf8");
+		const text = readFileSync(join(DEPLOY_DIR, name), "utf8");
 		for (const literal of literals) {
 			assert.ok(
 				text.includes(literal),

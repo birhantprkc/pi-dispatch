@@ -18,20 +18,20 @@
 import * as nodeFs from "node:fs";
 import { join, delimiter, sep } from "node:path";
 import { execFileSync } from "node:child_process";
-import { defaultLogsDir, defaultSandboxDir } from "@pi-dispatch/worker/config";
-import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@pi-dispatch/worker/runtime-settings";
-import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
-import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
-import { parseTriggers } from "@pi-dispatch/worker/triggers";
-import { parsePauseWindows } from "@pi-dispatch/worker/pause-windows";
+import { defaultLogsDir, defaultSandboxDir } from "@edgehero/pi-dispatch/config";
+import { settingsFilePath, readOverlay, writeOverlay, KNOWN_KEYS } from "@edgehero/pi-dispatch/runtime-settings";
+import { sanitizeJobId } from "@edgehero/pi-dispatch/run-history";
+import { dayKey, weekKey, monthKey } from "@edgehero/pi-dispatch/budget";
+import { parseTriggers } from "@edgehero/pi-dispatch/triggers";
+import { parsePauseWindows } from "@edgehero/pi-dispatch/pause-windows";
 // The subscriptions validator is shared for the same anti-drift reason: the admin prices finished runs
 // against the exact schema the file declares, and re-deriving it here is how the two would disagree.
-import { parseSubscriptions, SUBSCRIPTIONS_VERSION } from "@pi-dispatch/worker/subscriptions";
-import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
-import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
-import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
-import { gitDirty } from "@pi-dispatch/worker/git-dirty";
-import { readStageManifest } from "@pi-dispatch/worker/packages";
+import { parseSubscriptions, SUBSCRIPTIONS_VERSION } from "@edgehero/pi-dispatch/subscriptions";
+import { parseConnection, makeRedisClient } from "@edgehero/pi-dispatch/connection";
+import { makeQueue, enqueueLocalJob } from "@edgehero/pi-dispatch/queue";
+import { readFlowGate } from "@edgehero/pi-dispatch/flow-gate";
+import { gitDirty } from "@edgehero/pi-dispatch/git-dirty";
+import { readStageManifest } from "@edgehero/pi-dispatch/packages";
 
 // Re-exported so the command layer reaches the key contract through the admin's single worker-coupling
 // funnel, never re-deriving the five known keys.

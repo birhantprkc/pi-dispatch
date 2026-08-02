@@ -10,7 +10,7 @@
  * from here to a `.log` file (asserted by render.test.mjs).
  */
 
-import { windowState } from "@pi-dispatch/worker/budget";
+import { windowState } from "@edgehero/pi-dispatch/budget";
 // Pure-to-pure, the same standing as the windowState import above: panel.mjs is the admin's other no-I/O
 // text module (asserted so by panel.test.mjs), so borrowing its sparkline/fmtUsd/fmtCost adds no I/O
 // surface here -- and fmtCost is THE single renderer of typed cost values, so the costs view below must

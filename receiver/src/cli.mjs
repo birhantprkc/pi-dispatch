@@ -4,7 +4,7 @@
  * deploy/receiver.service -- an operator without systemd had nothing documented to type.
  *
  * It is a separate bin rather than a `receiver` case in the worker CLI because the dependency points
- * the other way: the receiver depends on `@pi-dispatch/worker` (queue, config, the shared triggers
+ * the other way: the receiver depends on `@edgehero/pi-dispatch` (queue, config, the shared triggers
  * schema), so teaching the worker CLI to start the receiver would invert that into a circular
  * workspace dependency. And the receiver is the always-on public trigger surface that lives OUTSIDE
  * pi (DES-TRIGGER-OUTSIDE-PI) -- the edge deserves its own entry point, not a mode of the thing it
@@ -13,7 +13,7 @@
  * Thin by design, mirroring worker/src/cli.mjs: recognise the command, lazy-import the real work.
  */
 
-import { EXIT_POLICY } from "@pi-dispatch/worker/exit-code";
+import { EXIT_POLICY } from "@edgehero/pi-dispatch/exit-code";
 
 const USAGE = `pi-dispatch-receiver — the always-on webhook edge: verifies deliveries, enqueues jobs
 

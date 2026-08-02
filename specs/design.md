@@ -65,17 +65,31 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-NAME-KEEP-PI-DISPATCH
 
-- **Decision**: Keep the name `pi-dispatch`. Do not publish to npm.
+- **Decision**: Keep the name `pi-dispatch`. Do not publish under the **bare npm name** — it is
+  taken. Scoped `@edgehero/*` publishing is the sanctioned channel (amended 2026-08-02, issue #80;
+  the original Decision line read "Do not publish to npm" unqualified, and practice had already
+  diverged: `@edgehero/pi-dispatch-admin` shipped 2026-07 without this entry recording it).
+  Published artifacts: `@edgehero/pi-dispatch-admin` (the console), `@edgehero/pi-dispatch` (the
+  worker + CLI — the "management CLI" this entry's change trigger named), and
+  `@edgehero/pi-dispatch-receiver`. The bin name stays `pi-dispatch`, which shadows nothing locally;
+  the README warns that **bare** `npx pi-dispatch` outside a checkout resolves to the unrelated
+  squatted package, so docs always use the scoped form.
 - **Why**: `pi-dispatch` **is** taken on npm — `pi-dispatch@1.0.3`, a pi *extension* that rotates
   ChatGPT Codex OAuth accounts to maximise quota. It does not bind us: it is functionally unrelated
   (it runs *inside* a pi session; this project runs pi inside *itself*), it was published once on
   2026-04-06 with no release since, and its GitHub repository returns 404. **We do not need the npm
-  name** — distribution is docker-compose and container images, not `pi install npm:`, because this is
-  not a pi package. GitHub namespaces by owner, so there is no conflict there either.
+  name** — the *bare* name, that is: scoped `@edgehero/*` names have no collision at all, which is
+  what made the 2026-08-02 amendment a scoping of this entry rather than a reversal. GitHub
+  namespaces by owner, so there is no conflict there either.
   Recorded because the collision is real and the question will otherwise return every time someone
   searches npm.
 - **What would change this**: wanting to publish *any* npm artifact under this name — a management CLI,
   a client library. At that point rename; `pi-foreman` and `pi-onduty` were verified available.
+  **The trigger fired** (issue #80: the worker CLI is exactly "a management CLI") and the resolution
+  chosen was **scoped publishing, not the rename**: the collision only ever bound the bare name, the
+  `@edgehero` scope was already shipping the admin console, and renaming a documented project to route
+  around a squatter's dead package is cost without benefit. A *bare-name* artifact would still require
+  the rename this entry prescribes.
 - **Evidence (upstream)**: `registry.npmjs.org/pi-dispatch` — versions 1.0.2 and 1.0.3 both published
   2026-04-06; `time.modified` 2026-07-06 is a metadata touch, not a release; `repository.url` →
   `github.com/vincenthopf/pi-dispatch` → HTTP 404
@@ -385,7 +399,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 - **Decision**: One `triggers.json` of `{ on, run }` entries is the single source of standing triggers for
   **both** services. A shared validator (`worker/src/triggers.mjs`, exported as
-  `@pi-dispatch/worker/triggers`) parses and validates the whole file; the worker selects `on.type:"cron"`
+  `@edgehero/pi-dispatch/triggers` — `@pi-dispatch/worker/triggers` before the issue-#80 rename) parses and validates the whole file; the worker selects `on.type:"cron"`
   and the receiver selects `on.type ∈ {label, comment, pull_request}` for whichever forge each entry's `run.kind` names. Both validate everything; each
   evaluates only its own subset. This replaces the two prior files (`PI_SCHEDULES_FILE` and
   `receiver.flows.json`) with **no compatibility shim** — a clean cutover.
@@ -395,8 +409,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   The `on × run` matrix pairs `cron ↔ local` and webhook ↔ a **forge** (`github`|`gitlab`), and that
   pairing **is** the trust boundary, encoded as a fail-loud validation rule (`INT-TRIGGERS-FILE-CONTRACT`). One validator, run
   by both, means a malformed file fails both services identically — the two cannot drift. The shared module
-  lives in the worker package because `receiver` and `admin` already depend on `@pi-dispatch/worker`; the
-  dependency is one-way, so no cycle.
+  lives in the worker package because `receiver` and `admin` already depend on it (today
+  `@edgehero/pi-dispatch`); the dependency is one-way, so no cycle.
 - **Rejected**: a compat union accepting both old shapes (the repo bans backwards-compat shims,
   `.claude/rules/legacy-removal.md`) · two independent validators (they drift) · a third shared package
   (unnecessary — the one-way worker dependency already exists).
@@ -1528,6 +1542,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-02 | The clone stops being the only distribution (issue #80). **DES-NAME-KEEP-PI-DISPATCH amended, on its own terms**: its change trigger ("wanting to publish *any* npm artifact under this name — a management CLI") fired, and the resolution is scoped publishing (`@edgehero/pi-dispatch` = worker + CLI, `@edgehero/pi-dispatch-receiver`), not the rename — the collision only ever bound the bare name. The amendment also retro-records `@edgehero/pi-dispatch-admin`, which shipped 2026-07 without a row here: practice had diverged from the entry's unqualified "Do not publish to npm" line, and a constitution that quietly diverges from what ships is worse than none. The two checkout-relative runtime escapes are closed package-relative (worker/.env.example, worker/deploy/ mirrors with byte-equality sync tests against the root copies — the root files stay the documented, edited source). Bare `npx pi-dispatch` outside a checkout resolves to the squatter's package; docs use scoped forms everywhere. **DES-WORKER-ON-HOST UNCHANGED, checked**: npm-on-host is the architecturally correct distribution for a worker that must drive the host docker CLI. **CONST-PI-VERSION-PINNED UNCHANGED, checked**: the pins travel into the published packages byte-identical. |
 | 2026-08-02 | Durable running becomes a subcommand (issue #80). **DES-CONCURRENCY-3 amended**: the one-worker-per-docker-daemon boot-reaper invariant is now *enforced* at unit-mint time — `pi-dispatch service install` refuses a worker unit when one exists in the other scope; previously the invariant was one unenforced paragraph. `service` renders the shipped deploy/ templates by substituting their documented literals (`/usr/bin/node` → `process.execPath`, `/opt/pi-dispatch` → the real repo root) rather than introducing marker syntax, so the templates stay byte-usable examples and deploy-lint keeps checking exactly what ships; a pin test asserts every substitution literal is still present, making template drift a build failure instead of a broken render. The launchd gap is closed in the wrapper, not the plist: `KeepAlive/SuccessfulExit=false` cannot express exit-code-conditional restart, so `worker-env-wrapper.sh`/`.cmd` convert EXIT_POLICY (2) to a clean exit with a loud refusal note — launchd never relaunches a determinate policy refusal, mirroring systemd's `RestartPreventExitStatus=2` and nssm's `AppExit 2 Exit` (**CONST-RETRY-INFRA-ONLY UNCHANGED, checked**: the conversion is where the *supervisor* learns what the exit space already meant; the exit protocol itself is untouched). The wrapper's `exec` gave way to a trap/double-wait form because exit-2 interception needs a live parent — SIGTERM still reaches node via the trap. **DES-WORKER-ON-HOST UNCHANGED, checked**: `service` supervises the host process the entry mandates; nothing moves into a container. |
 | 2026-08-02 | The CLI surface gets a recorded gate ladder (issue #80). Added **DES-CLI-SURFACE**: read-only (`doctor`, `status`) / operator-typed-ungated (`run`, `pause`, `resume`, `sandbox`, `import-pi`) / create-only (`init`) / consented host mutations (`up`, `doctor --fix` — each action shown verbatim, y/N default No incl. non-TTY), plus the load-bearing never-tier (no malformed-config rewrites, no triggers/pause-windows content, no trigger-named `run.image` pulls — only the deployment default, where the consent keypress is SECURITY.md's "pulled it yourself" act). `init`/`doctor` had no recorded surface at all, and the ladder makes "may this be automated?" a lookup. **DES-WORKER-ON-HOST amended** (Accepted cost): `up` sequences the surrounding chores behind consent; the price — the worker is a host process the operator runs — is unchanged, only the typing shrank. **DES-CLI-TRIGGER-FOR-LOCAL UNCHANGED, checked**: `up` is not a producer; it enqueues nothing. **INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: its repair-write precedent is cited by the fix-tier reasoning, not extended — `--fix` never rewrites an invalid overlay; that stays the admin write path's documented repair. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (dashboard polish): run targets render as OSC-8 hyperlinks **only when the URL is derivable from id-only fields** (github `repo#N`; other forges' instance hosts are unknowable from the record, so no URL is ever guessed) — display-only escapes, byte-identical passthrough under the plain theme, and `visibleLen` already strips OSC-8. `y`/`Y` in RUN_DETAIL copy the job id / target URL via a new injected `copyText` seam whose OSC-52 emission lives in index.ts (the dashboard stays I/O-free); operator-initiated, id-only strings, nothing read back — recorded in SECURITY.md. LIVE_TAIL gains `/` search over the captured tail (a line-input layer above the view, popping on the established one-Esc-per-layer discipline; matches jump and suspend follow exactly as manual scrolling does; **untrusted bytes still pass only through `clip`** — the match highlight colors post-clip). The LIST and COSTS frames become height-aware through an injected `terminalRows` seam: sections collapse to their divider-plus-count by fixed priority (pause windows → settings → triggers → spend; COSTS: by-model → plans → daily), the cursor's section and the verdict block never collapse, and an absent seam renders byte-identically to before. The fs ban and every width invariant **UNCHANGED, checked**. |

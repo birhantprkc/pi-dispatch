@@ -1,0 +1,151 @@
+/**
+ * The publish contract for the two npm-published services (issue #80): the worker ships as
+ * `@edgehero/pi-dispatch` (bin `pi-dispatch`), the receiver as `@edgehero/pi-dispatch-receiver`
+ * (bin `pi-dispatch-receiver`).
+ *
+ * Three families of assertion:
+ *   - sync: the package-local copies that make the tarball self-sufficient (worker/.env.example,
+ *     worker/deploy/*) are byte-identical to their repo-root originals — the ROOT copies stay the
+ *     documented, edited ones; the mirrors only ship.
+ *   - manifest: package.json says what publishing needs (name, no private, files, bin, and a caret
+ *     range on the receiver's worker dep — `*` cannot resolve from the registry).
+ *   - tarball: `npm pack --dry-run --json` (offline — no registry hit) agrees file by file.
+ */
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const WORKER_DIR = join(REPO_ROOT, "worker");
+const RECEIVER_DIR = join(REPO_ROOT, "receiver");
+
+// The deploy templates `pi-dispatch service` renders (see TEMPLATE_PINS in src/service.mjs) plus the
+// wrapper scripts the rendered units invoke — the full set worker/deploy must mirror and ship.
+const MIRRORED_DEPLOY = [
+	"com.pi-dispatch.worker.plist",
+	"nssm-install.cmd",
+	"receiver.service",
+	"worker-env-wrapper.cmd",
+	"worker-env-wrapper.sh",
+	"worker.service",
+];
+
+// npm pack forks a whole npm; generous headroom so a cold cache on CI never flakes the suite.
+const PACK_TIMEOUT = { timeout: 120_000 };
+
+// ---------------------------------------------------------------------------------------------------
+// sync: the shipped mirrors track their repo-root originals byte for byte
+// ---------------------------------------------------------------------------------------------------
+
+test("sync: worker/.env.example is byte-identical to the root .env.example", () => {
+	assert.equal(
+		readFileSync(join(WORKER_DIR, ".env.example"), "utf8"),
+		readFileSync(join(REPO_ROOT, ".env.example"), "utf8"),
+		"the ROOT .env.example is the documented, edited copy — after changing it, re-copy it to worker/.env.example (the one npm ships and init falls back to)",
+	);
+});
+
+test("sync: every worker/deploy template is byte-identical to its root deploy/ twin", () => {
+	assert.deepEqual(
+		readdirSync(join(WORKER_DIR, "deploy")).sort(),
+		MIRRORED_DEPLOY,
+		"worker/deploy must hold exactly the templates the service renderer reads — nothing missing, no strays",
+	);
+	for (const name of MIRRORED_DEPLOY) {
+		assert.equal(
+			readFileSync(join(WORKER_DIR, "deploy", name), "utf8"),
+			readFileSync(join(REPO_ROOT, "deploy", name), "utf8"),
+			`worker/deploy/${name} drifted from deploy/${name} — the ROOT deploy/ is the documented source; edit both (copy root over the mirror)`,
+		);
+	}
+});
+
+// ---------------------------------------------------------------------------------------------------
+// manifest: what package.json promises the registry
+// ---------------------------------------------------------------------------------------------------
+
+test("worker package.json: scoped name, publishable (no private), files list, unchanged bin", () => {
+	const pkg = JSON.parse(readFileSync(join(WORKER_DIR, "package.json"), "utf8"));
+	assert.equal(pkg.name, "@edgehero/pi-dispatch");
+	assert.ok(!("private" in pkg), "private:true would make npm publish refuse");
+	assert.deepEqual(pkg.files, ["src", ".env.example", "deploy"], "the three things the CLI needs at runtime");
+	assert.deepEqual(pkg.bin, { "pi-dispatch": "src/cli.mjs" }, "the bin NAME survives the scope rename");
+	assert.ok(pkg.repository?.directory === "worker" && pkg.license === "MIT" && pkg.description && pkg.keywords?.length, "registry metadata present");
+});
+
+test("receiver package.json: scoped name, publishable (no private), files list, caret worker range", () => {
+	const pkg = JSON.parse(readFileSync(join(RECEIVER_DIR, "package.json"), "utf8"));
+	assert.equal(pkg.name, "@edgehero/pi-dispatch-receiver");
+	assert.ok(!("private" in pkg), "private:true would make npm publish refuse");
+	assert.deepEqual(pkg.files, ["src"]);
+	assert.deepEqual(pkg.bin, { "pi-dispatch-receiver": "src/cli.mjs" }, "the bin NAME survives the scope rename");
+	assert.ok(!("@pi-dispatch/worker" in (pkg.dependencies ?? {})), "the old workspace dep name must be gone");
+	assert.match(
+		pkg.dependencies["@edgehero/pi-dispatch"],
+		/^\^\d+\.\d+\.\d+$/,
+		"the worker dep must be a real caret range: `*` cannot resolve from the registry, while the workspace still links locally because the workspace version satisfies the caret",
+	);
+	assert.ok(pkg.repository?.directory === "receiver" && pkg.license === "MIT" && pkg.description && pkg.keywords?.length, "registry metadata present");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// tarball: npm pack --dry-run --json, the file list npm would actually publish
+// ---------------------------------------------------------------------------------------------------
+
+/** The pack report for the package at cwd. --dry-run --json is offline: no tarball, no registry. */
+function npmPack(cwd) {
+	return new Promise((resolvePromise, reject) => {
+		const child = spawn("npm", ["pack", "--dry-run", "--json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		let out = "";
+		let errOut = "";
+		child.stdout.on("data", (d) => (out += d));
+		child.stderr.on("data", (d) => (errOut += d));
+		child.on("error", reject);
+		child.on("close", (code) => {
+			if (code !== 0) reject(new Error(`npm pack --dry-run exited ${code}:\n${errOut}`));
+			else resolvePromise(JSON.parse(out)[0]);
+		});
+	});
+}
+
+test("npm pack (worker): ships src, .env.example and every deploy template — and never test/", PACK_TIMEOUT, async () => {
+	const report = await npmPack(WORKER_DIR);
+	assert.equal(report.name, "@edgehero/pi-dispatch");
+	const paths = report.files.map((f) => f.path);
+	assert.ok(paths.includes("src/cli.mjs"), "the bin target ships");
+	assert.ok(paths.includes("src/service.mjs"), "the service renderer ships");
+	assert.ok(paths.includes(".env.example"), "init's packaged fallback ships");
+	for (const name of MIRRORED_DEPLOY) {
+		assert.ok(paths.includes(`deploy/${name}`), `deploy/${name} must ship — the service renderer reads it from the package`);
+	}
+	assert.ok(paths.includes("package.json"));
+	assert.deepEqual(paths.filter((p) => p.startsWith("test/")), [], "test/ stays out of the tarball");
+});
+
+test("npm pack (receiver): ships src (cli.mjs included) — and never test/", PACK_TIMEOUT, async () => {
+	const report = await npmPack(RECEIVER_DIR);
+	assert.equal(report.name, "@edgehero/pi-dispatch-receiver");
+	const paths = report.files.map((f) => f.path);
+	assert.ok(paths.includes("src/cli.mjs"), "the bin target ships");
+	assert.ok(paths.includes("src/start.mjs"), "the exports target ships");
+	assert.ok(paths.includes("package.json"));
+	assert.deepEqual(paths.filter((p) => p.startsWith("test/")), [], "test/ stays out of the tarball");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// drift: the pre-rename specifier must never come back
+// ---------------------------------------------------------------------------------------------------
+
+test("drift: the old @pi-dispatch/worker specifier appears nowhere in receiver/src or admin/src", () => {
+	const offenders = [];
+	for (const dir of [join(RECEIVER_DIR, "src"), join(REPO_ROOT, "admin", "src")]) {
+		for (const rel of readdirSync(dir, { recursive: true })) {
+			if (!/\.(mjs|ts)$/.test(rel)) continue;
+			if (readFileSync(join(dir, rel), "utf8").includes("@pi-dispatch/worker")) offenders.push(join(dir, rel));
+		}
+	}
+	assert.deepEqual(offenders, [], "imports (and comments) must use @edgehero/pi-dispatch — the old name resolves to nothing once installed from the registry");
+});
