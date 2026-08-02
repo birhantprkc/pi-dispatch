@@ -11,6 +11,11 @@
  */
 
 import { windowState } from "@pi-dispatch/worker/budget";
+// Pure-to-pure, the same standing as the windowState import above: panel.mjs is the admin's other no-I/O
+// text module (asserted so by panel.test.mjs), so borrowing its sparkline/fmtUsd/fmtCost adds no I/O
+// surface here -- and fmtCost is THE single renderer of typed cost values, so the costs view below must
+// route every dollar through it rather than grow a second money formatter in this file.
+import { fmtCost, fmtUsd, sparkline } from "./panel.mjs";
 
 const SETTINGS_KEYS = ["model", "provider", "maxTurns", "dailyCap", "weeklyCap", "monthlyCap", "maxTokens", "dailyTokenCap", "concurrency", "softHoldPct"];
 
@@ -207,6 +212,148 @@ function schedulerLine(s) {
   const drift =
     typeof s?.overdueMs === "number" && s.overdueMs > 0 ? `  overdue by ${Math.round(s.overdueMs / 1000)}s` : "";
   return `${id}  next ${next}${drift}`;
+}
+
+// ---- the costs view (issue #53) ----
+
+// Human labels for the three windows `/dispatch costs` offers. An unknown key falls through verbatim so a
+// future window renders as itself rather than as a wrong claim about its span.
+const COSTS_WINDOW_LABELS = { "7d": "last 7 days", "30d": "last 30 days", mtd: "month to date" };
+
+/**
+ * Render the costs fold (costs.mjs `foldCosts`) as the plain-text `/dispatch costs` view, mirroring the
+ * dashboard's section order: header with the window total, per-plan verdict lines, the daily sparkline,
+ * the by-flow and by-model tables, the plans block, and the provenance footer. Every dollar goes through
+ * the panel's `fmtCost` -- the single renderer of typed cost values -- so a bare money number cannot
+ * appear here: a plan-covered row reads `plan:<id>` and never `$0.00`, a zero-rated one reads
+ * `$0 (unrated)`, and the word "free" appears nowhere because the fold has no class that could claim it.
+ *
+ * The plans block reports per-window peak FACTS only -- what was observed, never remaining/burn-down --
+ * and a `null` window limit reads `limit undisclosed by vendor`, first-class per the subscriptions schema.
+ */
+export function renderCosts(fold, { window } = {}) {
+  const label = COSTS_WINDOW_LABELS[window] ?? window ?? `${fold?.window?.days ?? 0}d`;
+  const prov = fold?.provenance ?? {};
+  const plans = Array.isArray(fold?.plans) ? fold.plans : [];
+  const runsTotal = prov.runsTotal ?? 0;
+
+  const out = [runsTotal > 0 ? `Costs (${label}): ${fmtCost(prov.total)} · ${runsTotal} runs` : `Costs (${label}):`];
+  // Verdicts up top: the one line per plan an operator opened this view for. A run-less window still
+  // shows them (every verdict is then NO_BASELINE -- nothing was attributed).
+  for (const p of plans) out.push(`  ${planVerdictLine(p)}`);
+  if (runsTotal === 0) {
+    out.push("No runs in window.");
+    return out.join("\n");
+  }
+
+  const daily = Array.isArray(fold.daily) ? fold.daily : [];
+  if (daily.length > 0) {
+    out.push("", `Daily: ${sparkline(daily.map((d) => d?.cost?.usd), 30)}  (${daily[0].day} → ${daily[daily.length - 1].day})`);
+  }
+
+  const byFlow = Array.isArray(fold.byFlow) ? fold.byFlow : [];
+  if (byFlow.length > 0) {
+    out.push("", "By flow:");
+    const rows = byFlow.map((f) => [cell(f.flow), cell(f.runs), cell(f.tokens), fmtCost(f.cost), fmtCost(f.apiEquiv)]);
+    for (const line of tableLines(["FLOW", "RUNS", "TOKENS", "COST", "API-EQUIV"], rows)) out.push(`  ${line}`);
+  }
+
+  // The model grain is where the class system pays off: a uniform plan/zero-rated bucket KEEPS its class
+  // (costs.mjs combineRowCosts), so this is the one table where `plan:<id>` and `$0 (unrated)` render.
+  const byModel = Array.isArray(fold.byModel) ? fold.byModel : [];
+  if (byModel.length > 0) {
+    out.push("", "By model:");
+    const rows = byModel.map((m) => [`${m.provider}/${m.model}`, cell(m.runs), cell(m.tokens), fmtCost(m.cost)]);
+    for (const line of tableLines(["MODEL", "RUNS", "TOKENS", "COST"], rows)) out.push(`  ${line}`);
+  }
+
+  if (plans.length > 0) {
+    out.push("", "Plans:");
+    for (const p of plans) {
+      const name = p.hypothetical ? `${p.id} (hypothetical)` : p.id;
+      out.push(`  ${name} — ${p.vendor}, ${fmtUsd(p.price?.amount)}/${p.price?.per ?? "month"}`);
+      const amortized = p.amortizedPerRun ? `${fmtCost(p.amortizedPerRun)}/run amortized` : "amortized —";
+      out.push(`    runs ${p.attributedRuns} · tokens ${p.attributedTokens} · ${amortized} · API-equiv ${fmtCost(p.apiEquiv)}`);
+      for (const w of p.windows ?? []) out.push(`    peak ${windowFacts(w)}`);
+    }
+  }
+
+  out.push(
+    "",
+    `~ marks estimates · metered = pi-ai computed prices, not invoices · pi-ai ${prov.piAiPin ?? "unknown"}`,
+    provenanceCounts(prov),
+  );
+  return out.join("\n");
+}
+
+/** One plan's verdict line. NO_BASELINE spells out the fix rather than showing an invented number. */
+function planVerdictLine(p) {
+  const name = p?.hypothetical ? `${p?.id} (hypothetical)` : p?.id;
+  const v = p?.verdict ?? {};
+  switch (v.kind) {
+    case "SAVING":
+      return `${name}: SAVING ${fmtCost(v.usd)} vs API rates`;
+    case "LOSING":
+      return `${name}: LOSING ${fmtCost(v.usd)} vs API rates`;
+    case "WOULD_SAVE":
+      return `${name}: WOULD_SAVE ${fmtCost(v.usd)} if bought`;
+    case "WOULD_LOSE":
+      return `${name}: WOULD_LOSE ${fmtCost(v.usd)} if bought`;
+    default:
+      // NO_BASELINE (and, fail-soft, anything malformed): no counterfactual, so no number to show.
+      return `${name}: no API-rate baseline declared — set counterfactualModel to compare`;
+  }
+}
+
+/** One declared window's observed peak, FACTS only: runs/tokens seen, and the limit verbatim. */
+function windowFacts(w) {
+  const shape = `${w.per}${w.rolling ? " rolling" : ""}`;
+  const unit = w.unit ? ` ${w.unit}` : "";
+  const limit =
+    w.limit === null || w.limit === undefined
+      ? "limit undisclosed by vendor"
+      : Array.isArray(w.limit)
+        ? `limit ${w.limit[0]}–${w.limit[1]}${unit}`
+        : `limit ${w.limit}${unit}`;
+  return `${shape}: ${w.peakRuns} runs · ${w.peakTokens} tokens · ${limit}`;
+}
+
+/** The honesty counts beside the numbers: how much of the window was measured and re-priceable. */
+function provenanceCounts(prov) {
+  const parts = [`unmetered ${prov.runsUnmetered ?? 0}`, `no ledger (not re-priceable) ${prov.runsUnledgered ?? 0}`];
+  if ((prov.ratesDrifted ?? 0) > 0) parts.push(`rates drifted ${prov.ratesDrifted}`);
+  return parts.join(" · ");
+}
+
+/**
+ * Render one `whatIfFlow` estimate (costs.mjs) as a compact block. The measured path shows the estimate
+ * through `fmtCost` with its coverage/excluded honesty and the rates version; the zero-knowledge path
+ * shows the seeded band verbatim -- both bounds through `fmtCost`'s seeded shape, plus the fold's own
+ * note -- so an unmeasured flow can never read like a measurement.
+ */
+export function renderWhatIf(result, { flow, target } = {}) {
+  const head = `What-if ${flow} @ ${target}:`;
+  if (!result || typeof result !== "object") return `${head}\n  no estimate`;
+  if (result.class === "seeded") {
+    return [
+      head,
+      `  no ledgered run to measure from — seeded band ${fmtCost({ usd: result.low, class: "seeded" })} to ${fmtCost({ usd: result.high, class: "seeded" })} · ${result.note}`,
+    ].join("\n");
+  }
+  const pct = Math.round((result.coverage ?? 0) * 100);
+  return [
+    head,
+    `  estimate ${fmtCost({ usd: result.usd, class: "estimated" })} total · ${fmtCost({ usd: result.perRun, class: "estimated" })} per run`,
+    `  coverage ${pct}% of observed runs ledgered · excluded ${result.excluded} (no ledger)`,
+    `  rates pi-ai ${result.ratesVersion ?? "unknown"}`,
+  ].join("\n");
+}
+
+/** Aligned columns with two-space gaps (the renderRuns convention), trailing space trimmed per row. */
+function tableLines(headers, rows) {
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i].length)));
+  const fmt = (cells) => cells.map((v, i) => v.padEnd(widths[i])).join("  ").trimEnd();
+  return [fmt(headers), ...rows.map(fmt)];
 }
 
 /** Render the settings overlay view: every overlay key, unset ones marked, or the fail-closed invalid reason. */

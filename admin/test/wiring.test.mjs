@@ -115,7 +115,7 @@ test("an unknown subcommand notifies and never touches the model channel", async
 
 /**
  * The model-facing control surface (DES-ADMIN-VIA-PI-EXTENSION, amended): reads
- * (`dispatch_status`/`_runs`/`_triggers`), the on/off controls (`_pause`/`_resume`), the gated PAID enqueue
+ * (`dispatch_status`/`_runs`/`_costs`/`_triggers`), the on/off controls (`_pause`/`_resume`), the gated PAID enqueue
  * (`_run`), and the confirm-gated writes (`_set`, `_trigger_add`/`_edit`/`_delete`). Two invariants are locked
  * here: there is still NO raw-log tool (no name contains "log"), and every WRITE tool is `sequential` so two
  * writes cannot interleave. This test is the deliberate record that model-callable writes were added on
@@ -125,8 +125,9 @@ const WRITE_TOOLS = ["dispatch_set", "dispatch_trigger_add", "dispatch_trigger_e
 test("registers exactly the read/control/enqueue/write tools, and never a raw-log tool", async () => {
   const { calls } = await loadRegistered();
   const names = calls.registerTool.map((t) => t.name).sort();
-  assert.equal(calls.registerTool.length, 14, "exactly fourteen tools");
+  assert.equal(calls.registerTool.length, 15, "exactly fifteen tools");
   assert.deepEqual(names, [
+    "dispatch_costs",
     "dispatch_pause",
     "dispatch_pause_add",
     "dispatch_pause_delete",
@@ -255,6 +256,84 @@ test("runs renders into the pi-dispatch-admin channel with triggerTurn unset", a
   assert.ok(!options || !options.triggerTurn, "must never trigger a paid turn to observe state");
 });
 
+test("costs renders into the pi-dispatch-admin channel with triggerTurn unset", async () => {
+  const { calls, def } = await loadRegistered();
+  await def.handler("costs", fakeCtx().ctx);
+  assert.equal(calls.sendMessage.length, 1);
+  const [message, options] = calls.sendMessage[0];
+  assert.equal(message.customType, "pi-dispatch-admin");
+  assert.equal(message.display, true);
+  assert.match(message.content, /Costs \(/, "the costs view text is the message");
+  assert.ok(!options || !options.triggerTurn, "must never trigger a paid turn to observe state");
+});
+
+/**
+ * dispatch_costs.execute folds the on-disk history against the declared subscriptions with the REAL
+ * pricing façade and returns TYPED dollars: every money value carries its `class`, so a model reading the
+ * JSON cannot launder an estimate into a fact by dropping the label. Driven fully offline: a temp logs dir
+ * holding one canned ledgered record, and a canned subscriptions file via PI_SUBSCRIPTIONS_FILE.
+ */
+test("dispatch_costs.execute returns the typed fold as JSON, class on every dollar, flow-filterable", async () => {
+  const prevLogsDir = process.env.PI_LOGS_DIR;
+  const prevSubs = process.env.PI_SUBSCRIPTIONS_FILE;
+  const dir = mkdtempSync(join(tmpdir(), "admin-coststool-"));
+  // One metered, ledgered run an hour ago -- inside any window, and no UTC-month-boundary hazard because
+  // the test asks for the 7d window.
+  const endedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  writeFileSync(
+    join(dir, "cost-1.json"),
+    JSON.stringify({
+      jobId: "cost-1",
+      target: "local:repo",
+      flow: "fix",
+      outcome: "completed",
+      endedAt,
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      tokens: { input: 1000, output: 500, total: 1500, cost: 0.5, metered: true, calls: 2, unpriced: 0, unresolved: 0 },
+      usage: {
+        v: 1,
+        piAi: "1.2.3",
+        truncated: 0,
+        models: [{ provider: "anthropic", model: "claude-sonnet-4", calls: 2, input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, total: 1500, cost: 0.5 }],
+      },
+    }),
+  );
+  const subsFile = join(dir, "subscriptions.json");
+  writeFileSync(
+    subsFile,
+    JSON.stringify({
+      version: 1,
+      subscriptions: [{ id: "kimi", vendor: "Moonshot AI", provider: "kimi-coding", models: ["*"], price: { amount: 90, currency: "USD", per: "month" } }],
+    }),
+  );
+  process.env.PI_LOGS_DIR = dir;
+  process.env.PI_SUBSCRIPTIONS_FILE = subsFile;
+
+  try {
+    const { calls } = await loadRegistered();
+    const costs = toolByName(calls, "dispatch_costs");
+    assert.equal(costs.executionMode, undefined, "a read tool, never sequential");
+
+    const res = await costs.execute("call-1", { window: "7d" });
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.window, "7d");
+    assert.equal(parsed.fold.provenance.runsTotal, 1);
+    assert.equal(parsed.fold.provenance.total.class, "metered", "the window total carries its class");
+    assert.equal(parsed.fold.provenance.total.usd, 0.5);
+    assert.equal(parsed.fold.byFlow[0].cost.class, "metered", "per-flow money is typed too");
+    assert.equal(parsed.fold.byModel[0].cost.class, "metered", "per-model money is typed too");
+    assert.equal(parsed.fold.plans[0].id, "kimi", "the declared subscription was read and scored");
+
+    const filtered = await costs.execute("call-2", { window: "7d", flow: "other" });
+    assert.equal(JSON.parse(filtered.content[0].text).fold.provenance.runsTotal, 0, "flow filters the fold's input records");
+  } finally {
+    process.env.PI_LOGS_DIR = prevLogsDir;
+    if (prevSubs === undefined) delete process.env.PI_SUBSCRIPTIONS_FILE;
+    else process.env.PI_SUBSCRIPTIONS_FILE = prevSubs;
+  }
+});
+
 test("logs renders in the overlay viewer and NEVER via sendMessage", async () => {
   const { calls, def } = await loadRegistered();
   const view = fakeCtx({ withCustom: true });
@@ -292,6 +371,15 @@ test("argument completion offers subcommands then run ids", async () => {
   assert.equal(await def.getArgumentCompletions("logs "), null);
   // No subcommand matches -> null.
   assert.equal(await def.getArgumentCompletions("zzz"), null);
+});
+
+test("argument completion offers the costs windows and whatif", async () => {
+  const { def } = await loadRegistered();
+  const all = await def.getArgumentCompletions("costs ");
+  assert.deepEqual(all.map((i) => i.value), ["costs 7d", "costs 30d", "costs mtd", "costs whatif"]);
+  const m = await def.getArgumentCompletions("costs m");
+  assert.deepEqual(m, [{ value: "costs mtd", label: "mtd" }]);
+  assert.equal(await def.getArgumentCompletions("costs zzz"), null);
 });
 
 test("argument completion offers the known settings keys for `set`/`unset`", async () => {

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "../src/render.mjs";
+import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView, renderCosts, renderWhatIf } from "../src/render.mjs";
 
 test("render.mjs has no path to raw .log content", () => {
   const src = readFileSync(fileURLToPath(new URL("../src/render.mjs", import.meta.url)), "utf8");
@@ -284,6 +284,109 @@ test("renderRuns adds a REPLICA column, and an unreplicated run reads '-' rather
   assert.match(out, /\br2\/2\b/);
   // The third row is the unreplicated one; a "0/..." anywhere would mean the derive leaked a falsy index.
   assert.doesNotMatch(out, /\br0\b/);
+});
+
+// ---- the costs view (issue #53): golden-ish assertions on a canned fold literal ----
+
+/** A typed dollar exactly as costs.mjs emits one, overridable for coverage/planId. */
+function typedCost(usd, cls, over = {}) {
+  return { usd, class: cls, floor: false, ...over };
+}
+
+const CANNED_FOLD = {
+  window: { fromMs: Date.parse("2026-07-01T00:00:00.000Z"), toMs: Date.parse("2026-07-03T00:00:00.000Z"), days: 2 },
+  daily: [
+    { day: "2026-07-01", cost: typedCost(0.5, "metered"), runs: 2 },
+    { day: "2026-07-02", cost: typedCost(1.0, "metered"), runs: 1 },
+  ],
+  byFlow: [
+    { flow: "fix", runs: 2, tokens: 3000, cost: typedCost(1.5, "metered"), apiEquiv: null },
+    { flow: "(no flow)", runs: 1, tokens: 6000000, cost: typedCost(0, "estimated", { coverage: 0 }), apiEquiv: typedCost(102, "estimated") },
+  ],
+  byModel: [
+    { provider: "anthropic", model: "claude-sonnet-4", runs: 2, tokens: 3000, cost: typedCost(1.5, "metered") },
+    { provider: "kimi-coding", model: "kimi-k2", runs: 1, tokens: 6000000, cost: typedCost(0, "plan", { planId: "kimi" }) },
+    { provider: "zai", model: "glm-4.7", runs: 1, tokens: 1500, cost: typedCost(0, "zero-rated") },
+  ],
+  plans: [
+    {
+      id: "kimi", vendor: "Moonshot AI", hypothetical: false, price: { amount: 90, currency: "USD", per: "month" },
+      attributedRuns: 1, attributedTokens: 6000000,
+      amortizedPerRun: typedCost(6, "estimated"), apiEquiv: typedCost(102, "estimated"),
+      verdict: { kind: "SAVING", usd: typedCost(96, "estimated") },
+      windows: [{ per: "5h", rolling: true, unit: "tokens", limit: null, peakRuns: 1, peakTokens: 6000000 }],
+    },
+    {
+      id: "glm", vendor: "Zhipu", hypothetical: true, price: { amount: 30, currency: "USD", per: "month" },
+      attributedRuns: 1, attributedTokens: 1500, amortizedPerRun: typedCost(2, "estimated"), apiEquiv: null,
+      verdict: { kind: "WOULD_LOSE", usd: typedCost(2, "estimated") }, windows: [],
+    },
+    {
+      id: "bare", vendor: "Vendor", hypothetical: false, price: { amount: 10, currency: "USD", per: "month" },
+      attributedRuns: 1, attributedTokens: 100, amortizedPerRun: typedCost(0.7, "estimated"), apiEquiv: null,
+      verdict: { kind: "NO_BASELINE", usd: null }, windows: [],
+    },
+  ],
+  provenance: { total: typedCost(1.5, "estimated", { coverage: 2 / 3 }), runsTotal: 3, runsUnmetered: 1, runsUnledgered: 1, ratesDrifted: 0, piAiPin: "1.2.3" },
+};
+
+test("renderCosts: header, verdicts, sparkline, tables, peak facts, provenance — money only via fmtCost", () => {
+  const out = renderCosts(CANNED_FOLD, { window: "mtd" });
+  assert.match(out, /^Costs \(month to date\): ~\$1\.50 est\. · 3 runs/);
+  // Verdict wording per kind, the ~/est. estimate markers riding on the typed dollars.
+  assert.match(out, /kimi: SAVING ~\$96\.00 est\. vs API rates/);
+  assert.match(out, /glm \(hypothetical\): WOULD_LOSE ~\$2\.00 est\./);
+  assert.match(out, /bare: no API-rate baseline declared — set counterfactualModel to compare/);
+  assert.match(out, /Daily: [▁▂▃▄▅▆▇█·]+ {2}\(2026-07-01 → 2026-07-02\)/, "the daily sparkline row is present");
+  assert.match(out, /FLOW {2}.*RUNS {2}.*TOKENS {2}.*COST {2}.*API-EQUIV/s);
+  assert.match(out, /plan:kimi/, "a plan-covered model row reads plan:<id>, never a dollar");
+  assert.match(out, /\$0 \(unrated\)/, "a zero-rated row says a table rated it zero");
+  assert.match(out, /limit undisclosed by vendor/, "a null window limit is a first-class fact, not a zero");
+  assert.match(out, /peak 5h rolling: 1 runs · 6000000 tokens/, "the peak is FACTS observed, never burn-down");
+  assert.match(out, /~ marks estimates · metered = pi-ai computed prices, not invoices · pi-ai 1\.2\.3/);
+  assert.match(out, /unmetered 1 · no ledger \(not re-priceable\) 1/);
+  assert.ok(!out.includes("$0.00"), "$0.00 must never appear -- a plan row rendering it would misread as free");
+  assert.ok(!/free/i.test(out), "'free' is a claim no renderer may make");
+});
+
+test("renderCosts verdict wording covers LOSING and WOULD_SAVE too", () => {
+  const fold = structuredClone(CANNED_FOLD);
+  fold.plans[0].verdict = { kind: "LOSING", usd: typedCost(40, "estimated") };
+  fold.plans[1].verdict = { kind: "WOULD_SAVE", usd: typedCost(3, "estimated") };
+  const out = renderCosts(fold, { window: "7d" });
+  assert.match(out, /Costs \(last 7 days\)/);
+  assert.match(out, /kimi: LOSING ~\$40\.00 est\. vs API rates/);
+  assert.match(out, /glm \(hypothetical\): WOULD_SAVE ~\$3\.00 est\./);
+});
+
+test("renderCosts renders a sane empty view", () => {
+  const empty = {
+    window: { fromMs: 0, toMs: 0, days: 0 },
+    daily: [],
+    byFlow: [],
+    byModel: [],
+    plans: [],
+    provenance: { total: typedCost(0, "metered"), runsTotal: 0, runsUnmetered: 0, runsUnledgered: 0, ratesDrifted: 0, piAiPin: null },
+  };
+  assert.equal(renderCosts(empty, { window: "mtd" }), "Costs (month to date):\nNo runs in window.");
+});
+
+test("renderWhatIf shows the estimate through fmtCost, and the seeded band verbatim", () => {
+  const est = renderWhatIf(
+    { class: "estimated", usd: 12.5, perRun: 1.25, coverage: 0.8, excluded: 2, ratesVersion: "1.2.3" },
+    { flow: "fix", target: "anthropic/claude-sonnet-4" },
+  );
+  assert.match(est, /What-if fix @ anthropic\/claude-sonnet-4:/);
+  assert.match(est, /~\$12\.50 est\. total · ~\$1\.25 est\. per run/);
+  assert.match(est, /coverage 80% of observed runs ledgered · excluded 2 \(no ledger\)/);
+  assert.match(est, /rates pi-ai 1\.2\.3/);
+
+  const seeded = renderWhatIf(
+    { class: "seeded", low: 0.5, high: 5, note: "unmeasured (OQ-002)" },
+    { flow: "new-flow", target: "anthropic/claude-sonnet-4" },
+  );
+  assert.match(seeded, /~~\$0\.50 seeded to ~~\$5\.00 seeded/, "both band edges keep their seeded class marker");
+  assert.match(seeded, /unmeasured \(OQ-002\)/, "the fold's own note rides through verbatim");
 });
 
 test("renderTriggers marks a replicating trigger, and an unflagged line is byte-identical", () => {

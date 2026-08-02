@@ -149,6 +149,7 @@ test("resolvePaths reads env with safe defaults and never calls loadConfig", () 
     sandboxIdleMinutes: 30,
     globalPiDir: "/srv/pi-global",
     captureJobLogs: true,
+    asciiGlyphs: false,
     dispatchRunRoots: ["/root-a"],
     dispatchRunPerHour: 5,
     schedulerStallMax: 2,
@@ -169,6 +170,12 @@ test("resolvePaths falls back to defaults on empty env (no worker config require
   assert.deepEqual(p.dispatchRunRoots, [], "default roots [] fails closed");
   assert.equal(p.dispatchRunPerHour, 3, "default per-hour cap");
   assert.equal(p.subscriptionsPath, "deploy/subscriptions.json", "the deployed default, like triggers/pause-windows");
+});
+
+test("resolvePaths reads PI_DISPATCH_ASCII as the glyph opt-in, defaulting to box-drawing", () => {
+  assert.equal(resolvePaths({ PI_DISPATCH_ASCII: "1" }).asciiGlyphs, true, "1 opts the panel into ASCII glyphs");
+  assert.equal(resolvePaths({}).asciiGlyphs, false, "unset keeps the box-drawing default");
+  assert.equal(resolvePaths({ PI_DISPATCH_ASCII: "0" }).asciiGlyphs, false, "only exactly '1' opts in");
 });
 
 test("resolvePaths reimplements the non-negative-int parse: invalid PI_DISPATCH_RUN_PER_HOUR falls back", () => {

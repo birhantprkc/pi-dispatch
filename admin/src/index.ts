@@ -24,7 +24,7 @@
  * bytes go ONLY to the overlay viewer, never to a message.
  *
  * It also registers LLM-callable tools: reads (`dispatch_status`, `dispatch_runs`,
- * `dispatch_triggers`), the durable-but-reversible on/off controls (`dispatch_pause`/
+ * `dispatch_costs`, `dispatch_triggers`), the durable-but-reversible on/off controls (`dispatch_pause`/
  * `dispatch_resume`), the gated PAID enqueue (`dispatch_run`), and the confirm-gated
  * writes (`dispatch_set`, `dispatch_trigger_add`/`_edit`/`_delete`) -- each of which
  * refuses unless a human operator approves a confirmation dialog showing the concrete
@@ -57,11 +57,19 @@ import {
   writeTriggers,
   writePauseWindows,
   enqueueDispatchRun,
+  scanRunRecords,
+  readSubscriptions,
   KNOWN_KEYS,
 } from "./read-model.mjs";
+import { foldCosts, whatIfFlow } from "./costs.mjs";
+// The REAL pricing façade. costs.mjs may not hold a module-scope worker/pricing import by contract (the
+// fold is pure; tests inject a canned fake) -- index.ts is where the fs-adjacent assembly lives, so the
+// injection happens here.
+import { getPricedModel, isZeroRated, listPricedModels, piAiVersion, reprice } from "@pi-dispatch/worker/pricing";
+import { setGlyphs } from "./panel.mjs";
 import { buildSandboxRunArgs, launchSandbox as spawnSandbox, resolveSandbox, sandboxContainerName } from "@pi-dispatch/worker/sandbox";
 import { readManifest } from "@pi-dispatch/worker/sandbox-store";
-import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView } from "./render.mjs";
+import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView, renderCosts, renderWhatIf } from "./render.mjs";
 import { makeDashboard, createDashboardDeps } from "./dashboard.ts";
 import { matchesKey } from "./keys.mjs";
 
@@ -77,7 +85,7 @@ const REBUILT_NOTICE = (reason: string) =>
   `replaced invalid settings file (${reason}) — other keys were lost`;
 
 const USAGE =
-  "usage: /dispatch <status|pause|resume|run|runs|logs|budget|triggers|settings|set|unset>";
+  "usage: /dispatch <status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset>";
 
 const KNOWN_SUBCOMMANDS = [
   "status",
@@ -87,6 +95,7 @@ const KNOWN_SUBCOMMANDS = [
   "runs",
   "logs",
   "budget",
+  "costs",
   "triggers",
   "settings",
   "set",
@@ -106,7 +115,7 @@ export default function admin(pi: ExtensionAPI): void {
 
   pi.registerCommand("dispatch", {
     description:
-      "pi-dispatch admin: status|pause|resume|run|runs|logs|budget|triggers|settings|set|unset",
+      "pi-dispatch admin: status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset",
     getArgumentCompletions: (prefix) => completeArguments(prefix),
     handler: async (args, ctx) => dispatch(pi, args, ctx),
   });
@@ -132,7 +141,8 @@ function toolText(text: string): { content: { type: "text"; text: string }[]; de
 }
 
 /**
- * Register the LLM-callable tools. Reads: `dispatch_status`, `dispatch_runs`, `dispatch_triggers`. On/off:
+ * Register the LLM-callable tools. Reads: `dispatch_status`, `dispatch_runs`, `dispatch_costs`,
+ * `dispatch_triggers`. On/off:
  * `dispatch_pause`/`dispatch_resume` (durable, reversible, money-safe -- no confirm). The gated PAID enqueue:
  * `dispatch_run`. Confirm-gated writes: `dispatch_set` (a limit/setting) and `dispatch_trigger_add`/`_edit`/
  * `_delete`. There is still NO log tool -- raw `.log` bytes never enter model context (DES-ADMIN-VIA-PI-EXTENSION
@@ -186,6 +196,29 @@ function registerTools(pi: ExtensionAPI): void {
         ? readRun({ logsDir: paths.logsDir, jobId: params.jobId })
         : listRuns({ logsDir: paths.logsDir, limit: params.limit ?? 10 });
       return toolText(JSON.stringify(data));
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_costs",
+    label: "pi-dispatch costs",
+    description:
+      "Read-only. Folds the PII-free run history against the operator's declared subscriptions and pi-ai's " +
+      "rate tables into the costs read-model: window totals, daily buckets, per-flow and per-model rollups, " +
+      "per-plan verdicts, and provenance. window = 7d | 30d | mtd (default mtd); flow filters to one flow's runs.",
+    parameters: Type.Object({ window: Type.Optional(Type.String()), flow: Type.Optional(Type.String()) }),
+    async execute(_toolCallId, params) {
+      const window = params.window ?? "mtd";
+      if (!COSTS_WINDOWS.includes(window)) {
+        throw new Error(`unknown window '${window}' (7d|30d|mtd)`);
+      }
+      const paths = resolvePaths(process.env);
+      const res = assembleCosts(paths, window, params.flow);
+      if (res.unreachable) throw new Error(`could not read the run history: ${res.unreachable}`);
+      // The fold's dollars are TYPED `{ usd, class, floor, ... }` on purpose: the class rides beside every
+      // number in this JSON, so a model consuming it cannot launder an estimate into a fact by dropping
+      // the label -- the same discipline fmtCost enforces on the text views.
+      return toolText(JSON.stringify({ window, fold: res.fold }));
     },
   });
 
@@ -679,6 +712,10 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const sub = tokens[0] ?? "";
   const paths = resolvePaths(process.env);
+  // Glyph posture BEFORE any rendering: every /dispatch surface (the overlay, the costs view's sparkline)
+  // draws through panel.mjs' active table, and this is the one funnel all subcommands pass through. The
+  // dashboard's own styler keeps its default for now -- its `ascii` opt-in lands when the view PR settles.
+  setGlyphs(paths.asciiGlyphs);
 
   if (sub === "") {
     await openDashboard(paths, ctx, notify);
@@ -714,6 +751,10 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
     }
     case "settings": {
       send(pi, renderSettingsView(readSettingsView({ settingsFile: paths.settingsFile })));
+      return;
+    }
+    case "costs": {
+      costsCommand(pi, paths, tokens, notify);
       return;
     }
     case "run": {
@@ -769,6 +810,110 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
       notify?.(`dispatch: unknown subcommand '${sub}'. ${USAGE}`, "warning");
       return;
   }
+}
+
+// ---- the costs command surface (issue #53) ----
+
+const COSTS_WINDOWS = ["7d", "30d", "mtd"];
+
+const COSTS_USAGE = "usage: /dispatch costs [7d|30d|mtd] | /dispatch costs whatif <provider/model> --flow <flow>";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// The pricing façade in the injectable shape the pure fold expects (costs.mjs takes `pricing` as an
+// argument by contract; the tests hand it a canned fake, this object is the real one).
+const PRICING = { listPricedModels, getPricedModel, isZeroRated, reprice, piAiVersion };
+
+/** A window's inclusive start: 7d/30d count back from now; mtd is the start of the current UTC month. */
+function costsSinceMs(window: string, nowMs: number): number {
+  if (window === "7d") return nowMs - 7 * DAY_MS;
+  if (window === "30d") return nowMs - 30 * DAY_MS;
+  const now = new Date(nowMs);
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+}
+
+/**
+ * Assemble the costs fold exactly as the dashboard view does: scan the run records for the window, read
+ * the declared subscriptions (a missing/invalid file degrades to none -- the fold then simply has no plans
+ * to score), and fold both with the real pricing façade. An optional `flow` filters the fold's INPUT
+ * records, so every aggregate -- daily, plans, provenance -- is scoped, not just one table. Returns
+ * `{ fold }`, or scanRunRecords' `{ unreachable }` passed through for the caller to surface.
+ */
+function assembleCosts(paths: any, window: string, flow?: string): any {
+  const nowMs = Date.now();
+  const records = scanRunRecords({ logsDir: paths.logsDir, sinceMs: costsSinceMs(window, nowMs), nowMs });
+  if (!Array.isArray(records)) return records; // { unreachable }
+  const subs: any = readSubscriptions({ subscriptionsPath: paths.subscriptionsPath });
+  const scoped = typeof flow === "string" && flow !== "" ? records.filter((r: any) => (r?.flow ?? null) === flow) : records;
+  const fold = foldCosts({
+    records: scoped,
+    subscriptions: Array.isArray(subs?.subscriptions) ? subs.subscriptions : [],
+    pricing: PRICING,
+    nowMs,
+    piAiPin: piAiVersion(),
+  });
+  return { fold };
+}
+
+/**
+ * `/dispatch costs [7d|30d|mtd]` renders the fold; `costs whatif …` estimates one flow at another model's
+ * rates. Both send PII-free text into the admin channel -- the same records `runs` already sends,
+ * aggregated -- while usage mistakes go to notify, never into model context.
+ */
+function costsCommand(pi: ExtensionAPI, paths: any, tokens: string[], notify: Notify): void {
+  if (tokens[1] === "whatif") {
+    costsWhatIf(pi, paths, tokens, notify);
+    return;
+  }
+  const window = tokens[1] ?? "mtd";
+  if (!COSTS_WINDOWS.includes(window)) {
+    notify?.(COSTS_USAGE, "warning");
+    return;
+  }
+  const res = assembleCosts(paths, window);
+  if (res.unreachable) {
+    notify?.(`costs: ${res.unreachable}`, "error");
+    return;
+  }
+  send(pi, renderCosts(res.fold, { window }));
+}
+
+/**
+ * `costs whatif <provider/model> --flow <flow>`. The target splits on the FIRST "/" -- model ids carry
+ * dots and colons, never the provider separator -- and `--flow` is required because whatIfFlow scores one
+ * flow's median run, not a portfolio. An unknown model answers with the closest priced ids by a cheap
+ * contains-filter over the façade's catalog: that reply IS the long-tail model picker the TUI deliberately
+ * does not grow a widget for.
+ */
+function costsWhatIf(pi: ExtensionAPI, paths: any, tokens: string[], notify: Notify): void {
+  const target = tokens[2] ?? "";
+  const slash = target.indexOf("/");
+  const flowAt = tokens.indexOf("--flow");
+  const flow = flowAt >= 0 ? tokens[flowAt + 1] : undefined;
+  if (slash <= 0 || slash === target.length - 1 || !flow) {
+    notify?.(COSTS_USAGE, "warning");
+    return;
+  }
+  const provider = target.slice(0, slash);
+  const id = target.slice(slash + 1);
+  if (getPricedModel(provider, id) === null) {
+    const needle = id.toLowerCase();
+    const near = listPricedModels()
+      .filter((m: any) => m.id.toLowerCase().includes(needle) || needle.includes(m.id.toLowerCase()))
+      .slice(0, 3)
+      .map((m: any) => `  ${m.provider}/${m.id}`);
+    send(pi, [`unknown model: ${provider}/${id}`, ...(near.length > 0 ? ["closest priced ids:", ...near] : [])].join("\n"));
+    return;
+  }
+  // No window argument here: the estimate wants every ledgered run of the flow it can see, so the scan
+  // runs at its own 92-day ceiling rather than a display window.
+  const records = scanRunRecords({ logsDir: paths.logsDir, nowMs: Date.now() });
+  if (!Array.isArray(records)) {
+    notify?.(`costs: ${(records as any).unreachable}`, "error");
+    return;
+  }
+  const result = whatIfFlow({ records, flow, target: { provider, id }, pricing: PRICING });
+  send(pi, renderWhatIf(result, { flow, target: `${provider}/${id}` }));
 }
 
 /**
@@ -1264,7 +1409,8 @@ function makeLogViewer(jobId: string, tail: { lines?: string[]; missing?: boolea
 
 /**
  * Argument completion: the first token completes against the subcommand names; `logs <partial>` completes
- * against the run ids present on disk. Returns null (not []) when there is nothing to offer.
+ * against the run ids present on disk; `costs <partial>` against the three windows plus `whatif`. Returns
+ * null (not []) when there is nothing to offer.
  */
 function completeArguments(prefix: string) {
   const parts = prefix.trimStart().split(/\s+/);
@@ -1279,6 +1425,13 @@ function completeArguments(prefix: string) {
     const items = ids
       .filter((id) => id.startsWith(partial))
       .map((id) => ({ value: `logs ${id}`, label: id }));
+    return items.length > 0 ? items : null;
+  }
+  if (parts[0] === "costs" && parts.length === 2) {
+    const partial = parts[1];
+    const items = ["7d", "30d", "mtd", "whatif"]
+      .filter((w) => w.startsWith(partial))
+      .map((w) => ({ value: `costs ${w}`, label: w }));
     return items.length > 0 ? items : null;
   }
   if ((parts[0] === "set" || parts[0] === "unset") && parts.length === 2) {

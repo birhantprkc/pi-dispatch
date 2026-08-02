@@ -56,6 +56,10 @@ export function resolvePaths(env = process.env) {
     // normal deployment, in which no trigger can arm any package.
     globalPiDir: env.PI_GLOBAL_PI_DIR || null,
     captureJobLogs: env.PI_CAPTURE_JOB_LOGS === "1",
+    // Swap the panel's box-drawing/sparkline glyphs for plain ASCII (glyph-width-hostile terminals).
+    // Resolved here like every other env read; panel.mjs itself stays env-free -- the extension entry
+    // point flips its `setGlyphs` switch from this value before anything renders.
+    asciiGlyphs: env.PI_DISPATCH_ASCII === "1",
     // REQ-RESURRECTABLE-SANDBOX: where finished runs' directories are retained, and for how long. Read
     // from env for the same reason as everything above -- never loadConfig. The `0` here means retention
     // OFF (the panel then says so rather than offering a key that always refuses), which is the opposite

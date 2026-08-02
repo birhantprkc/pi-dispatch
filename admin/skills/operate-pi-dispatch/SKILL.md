@@ -14,6 +14,13 @@ configuration and are gated behind a human confirmation.
 Observe (no approval needed):
 - `dispatch_status` — queue/worker state, today's budget, settings overlay, schedulers.
 - `dispatch_runs` — recent run records (PII-free). Raw job logs are never available to tools.
+- `dispatch_costs` — cost analytics folded from the run history: window totals (`window` = `7d`/`30d`/`mtd`),
+  daily buckets, per-flow and per-model rollups, subscription plan verdicts, provenance (`flow` filters to
+  one flow). Every dollar in the result is typed `{ usd, class, ... }` — quote the class with the number
+  (`metered` is measured, `estimated`/`seeded` are not), and never present an estimate as an exact spend.
+  The operator sees the same fold in the terminal via `/dispatch costs [7d|30d|mtd]`, and
+  `/dispatch costs whatif <provider/model> --flow <flow>` estimates what a flow would cost per run on
+  another model's rates.
 - `dispatch_triggers` — the configured triggers with their array `index` (needed to edit/delete one).
 
 Control (no approval needed — reversible and money-safe):
