@@ -30,6 +30,7 @@
     "./run-history": "./src/run-history.mjs",
     "./sandbox": "./src/sandbox.mjs",
     "./sandbox-store": "./src/sandbox-store.mjs",
+    "./subscriptions": "./src/subscriptions.mjs",
     "./budget": "./src/budget.mjs",
     "./scheduler-stall-guard": "./src/scheduler-stall-guard.mjs"
   },

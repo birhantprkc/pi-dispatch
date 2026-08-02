@@ -24,6 +24,9 @@ import { sanitizeJobId } from "@pi-dispatch/worker/run-history";
 import { dayKey, weekKey, monthKey } from "@pi-dispatch/worker/budget";
 import { parseTriggers } from "@pi-dispatch/worker/triggers";
 import { parsePauseWindows } from "@pi-dispatch/worker/pause-windows";
+// The subscriptions validator is shared for the same anti-drift reason: the admin prices finished runs
+// against the exact schema the file declares, and re-deriving it here is how the two would disagree.
+import { parseSubscriptions, SUBSCRIPTIONS_VERSION } from "@pi-dispatch/worker/subscriptions";
 import { parseConnection, makeRedisClient } from "@pi-dispatch/worker/connection";
 import { makeQueue, enqueueLocalJob } from "@pi-dispatch/worker/queue";
 import { readFlowGate } from "@pi-dispatch/worker/flow-gate";
@@ -47,6 +50,7 @@ export function resolvePaths(env = process.env) {
     settingsFile: settingsFilePath(env),
     triggersPath: env.PI_TRIGGERS_FILE ?? "deploy/triggers.json",
     pauseWindowsPath: env.PI_PAUSE_WINDOWS_FILE ?? "deploy/pause-windows.json",
+    subscriptionsPath: env.PI_SUBSCRIPTIONS_FILE ?? "deploy/subscriptions.json",
     // The operator's global pi overlay dir (REQ-GLOBAL-PI-OVERLAY), where the staged third-party pi
     // packages live under `packages/`. `|| null` so unset AND empty both read as "no overlay" -- the
     // normal deployment, in which no trigger can arm any package.
@@ -366,6 +370,57 @@ export function writePauseWindows({ pauseWindowsPath, mutate, fs = nodeFs }) {
   const tmp = `${pauseWindowsPath}.tmp`;
   fs.writeFileSync(tmp, text, { mode: 0o644 });
   fs.renameSync(tmp, pauseWindowsPath);
+  return { ok: true };
+}
+
+/**
+ * Read + validate the operator-declared subscriptions file (DES-SUBSCRIPTIONS-ARE-COUNTERFACTUAL-ONLY).
+ * Returns `{ version, subscriptions }` of normalized entries, or `{ missing }` / `{ invalid }` so the
+ * viewer degrades rather than throwing — the `{ invalid }` case includes a file written by a newer
+ * pi-dispatch, whose fail-loud message names both versions. Uses the SHARED `parseSubscriptions`, so the
+ * admin and the worker's exported validator cannot drift on the schema. The admin is the ONLY reader:
+ * the worker never opens this file at job time, because the prices here change no runtime behavior —
+ * they price what already happened.
+ */
+export function readSubscriptions({ subscriptionsPath, fs = nodeFs }) {
+  if (subscriptionsPath === null || subscriptionsPath === undefined) return { missing: true };
+  let text;
+  try {
+    text = fs.readFileSync(subscriptionsPath, "utf8");
+  } catch {
+    return { missing: true };
+  }
+  try {
+    return parseSubscriptions(text, subscriptionsPath);
+  } catch (e) {
+    return { invalid: e?.message ?? String(e) };
+  }
+}
+
+/**
+ * Read-modify-write the subscriptions file (mirrors `writePauseWindows`): `mutate(subscriptions)` receives
+ * a copy of the current normalized entry array and returns the new array; the result is re-serialized to
+ * the versioned file shape, VALIDATED through the SHARED `parseSubscriptions` (fail-closed — a rejected
+ * result is NEVER written), and written ATOMICALLY (tmp + rename). A missing or unparseable existing file
+ * starts from the empty v1 shape, so a validated write REPAIRS it. Returns `{ ok }` or `{ invalid }`.
+ */
+export function writeSubscriptions({ subscriptionsPath, mutate, fs = nodeFs }) {
+  let current = [];
+  try {
+    current = parseSubscriptions(fs.readFileSync(subscriptionsPath, "utf8"), subscriptionsPath).subscriptions;
+  } catch {
+    // Missing/invalid file: start from the empty v1 shape; the validated atomic write below repairs it.
+  }
+  const next = mutate(current.map((s) => ({ ...s })));
+  const text = `${JSON.stringify({ version: SUBSCRIPTIONS_VERSION, subscriptions: next }, null, 2)}\n`;
+  try {
+    parseSubscriptions(text, subscriptionsPath); // the loaders' own validator -- never write a file they would reject
+  } catch (e) {
+    return { invalid: e?.message ?? String(e) };
+  }
+  const tmp = `${subscriptionsPath}.tmp`;
+  fs.writeFileSync(tmp, text, { mode: 0o644 });
+  fs.renameSync(tmp, subscriptionsPath);
   return { ok: true };
 }
 

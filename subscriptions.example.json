@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "subscriptions": [
+    {
+      "id": "kimi-for-coding",
+      "vendor": "Moonshot AI",
+      "provider": "kimi-coding",
+      "models": ["*"],
+      "price": { "amount": 99, "currency": "USD", "per": "month" },
+      "sharedWithOtherProducts": true,
+      "counterfactualModel": { "provider": "anthropic", "id": "claude-sonnet-4-5" },
+      "windows": [
+        { "per": "5h", "rolling": true, "unit": null, "limit": null },
+        { "per": "7d", "rolling": true, "unit": null, "limit": null }
+      ]
+    },
+    {
+      "id": "anthropic-plan-considered",
+      "vendor": "Anthropic",
+      "provider": "anthropic",
+      "models": ["claude-*"],
+      "price": { "amount": 100, "currency": "USD", "per": "month" },
+      "hypothetical": true,
+      "windows": [
+        { "per": "5h", "rolling": true, "unit": null, "limit": null },
+        { "per": "7d", "unit": null, "limit": null, "scope": ["claude-opus-*"] }
+      ]
+    }
+  ]
+}
