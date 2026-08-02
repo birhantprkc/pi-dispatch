@@ -36,6 +36,16 @@ function localMatchesKey(data, keyId) {
       return data === "\x1b[5~";
     case "pageDown":
       return data === "\x1b[6~";
+    case "left":
+      return data === "\x1b[D" || data === "\x1bOD";
+    case "right":
+      return data === "\x1b[C" || data === "\x1bOC";
+    case "home":
+      return data === "\x1b[H" || data === "\x1b[1~" || data === "\x1bOH";
+    case "end":
+      return data === "\x1b[F" || data === "\x1b[4~" || data === "\x1bOF";
+    case "backspace":
+      return data === "\x7f" || data === "\b";
     default:
       return false;
   }

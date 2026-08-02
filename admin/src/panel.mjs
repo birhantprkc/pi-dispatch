@@ -11,7 +11,7 @@
 // Custom: no box-drawing/meter primitive exists in deps -- ink/blessed/boxen are full TUI frameworks and
 // this dashboard is a handful of monochrome frames, so a thin pure module is the right size (library-first).
 
-/** Box-drawing + block glyphs. Swap to ASCII by aliasing this to `ASCII` for glyph-width-hostile terminals. */
+/** Box-drawing + block glyphs. Swap to ASCII via `setGlyphs(true)` for glyph-width-hostile terminals. */
 export const GLYPHS = {
   tl: "┌", // top-left corner
   tr: "┐", // top-right corner
@@ -24,6 +24,8 @@ export const GLYPHS = {
   full: "█", // filled meter cell
   empty: "░", // empty meter cell
   ellipsis: "…", // truncation marker
+  ramp: "▁▂▃▄▅▆▇█", // sparkline quantization ramp, lowest to full; all width-1 BMP so length == columns
+  gap: "·", // sparkline cell for an absent (null) value
 };
 
 /** Parallel ASCII fallback: same keys, no glyph-width risk. Single point of substitution for `GLYPHS`. */
@@ -39,9 +41,30 @@ export const ASCII = {
   full: "#",
   empty: ".",
   ellipsis: "...",
+  ramp: "_.:-=+*#", // same length as GLYPHS.ramp so the quantization math never shifts between tables
+  gap: ".",
 };
 
+// Custom: a runtime switch, not an environment read -- this module stays pure (asserted by the purity
+// test), and whether a terminal is glyph-width-hostile is the caller's knowledge, not this module's.
+// The extension entry point reads its own config once at startup and flips the switch; every renderer
+// below reads the active table so the whole panel swaps together.
+let active = GLYPHS;
+
+/** Select the ASCII glyph table (`setGlyphs(true)`) or restore the box-drawing default (`setGlyphs(false)`). */
+export function setGlyphs(ascii) {
+  active = ascii ? ASCII : GLYPHS;
+}
+
 const MIN_WIDTH = 8;
+
+// eslint-disable-next-line no-control-regex -- defensive strip of C0/C1 control chars from untrusted input
+const CONTROL_CHARS = /[\x00-\x1f\x7f-\x9f]/g;
+
+/** Remove C0/C1 control characters (shared by `clip` and `makeLineInput`). */
+function stripControls(s) {
+  return String(s ?? "").replace(CONTROL_CHARS, "");
+}
 
 /**
  * Truncate `line` to `w` display columns, appending an ellipsis glyph when content is cut. Control
@@ -50,11 +73,11 @@ const MIN_WIDTH = 8;
  */
 export function clip(line, w) {
   const width = Math.max(0, Math.trunc(w) || 0);
-  // eslint-disable-next-line no-control-regex -- defensive strip of C0/C1 control chars from untrusted input
-  const clean = String(line ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+  const clean = stripControls(line);
   if (clean.length <= width) return clean;
-  if (width <= 1) return GLYPHS.ellipsis.slice(0, width);
-  return clean.slice(0, width - 1) + GLYPHS.ellipsis;
+  const ell = active.ellipsis;
+  if (width <= ell.length) return ell.slice(0, width);
+  return clean.slice(0, width - ell.length) + ell;
 }
 
 /** `clip` to `w`, then right-pad with spaces to exactly `w` columns. */
@@ -77,10 +100,10 @@ export function box({ title = "", sections = [], footer, width = 40 } = {}) {
   // Top border: `+- title -...-+`, title clipped so the border never overflows `w`.
   const titleText = title ? ` ${clip(title, Math.max(0, inner - 2))} ` : "";
   const topFill = Math.max(0, w - 2 - 1 - titleText.length); // corners + one leading `h`
-  lines.push(GLYPHS.tl + GLYPHS.h + titleText + GLYPHS.h.repeat(topFill) + GLYPHS.tr);
+  lines.push(active.tl + active.h + titleText + active.h.repeat(topFill) + active.tr);
 
-  const framed = (text) => `${GLYPHS.v} ${pad(text, inner)} ${GLYPHS.v}`;
-  const rule = () => GLYPHS.ml + GLYPHS.h.repeat(w - 2) + GLYPHS.mr;
+  const framed = (text) => `${active.v} ${pad(text, inner)} ${active.v}`;
+  const rule = () => active.ml + active.h.repeat(w - 2) + active.mr;
 
   sections.forEach((section, i) => {
     if (i > 0) lines.push(rule());
@@ -93,7 +116,7 @@ export function box({ title = "", sections = [], footer, width = 40 } = {}) {
     lines.push(framed(footer));
   }
 
-  lines.push(GLYPHS.bl + GLYPHS.h.repeat(w - 2) + GLYPHS.br);
+  lines.push(active.bl + active.h.repeat(w - 2) + active.br);
   return lines;
 }
 
@@ -115,6 +138,177 @@ export function meter(reserved, cap, width = 24, state = "ok") {
   const label = ` ${r}/${cap}${tag}`;
   const barCells = Math.max(0, Math.trunc(width) - label.length - 2); // "[" + cells + "]" + label
   const filled = Math.min(barCells, Math.round((Math.min(r, cap) / cap) * barCells));
-  const bar = `[${GLYPHS.full.repeat(filled)}${GLYPHS.empty.repeat(barCells - filled)}]`;
+  const bar = `[${active.full.repeat(filled)}${active.empty.repeat(barCells - filled)}]`;
   return clip(bar + label, width);
+}
+
+/**
+ * A one-line cost history: `values` (oldest -> newest, number|null) quantized onto the ramp glyphs and
+ * fitted to `width` columns. Negatives clamp to 0 (a cost cannot be negative); null/non-finite entries
+ * render the gap glyph. Returns a plain string of at most `width` columns: cells repeat
+ * `max(1, floor(width / values.length))` times and the total never exceeds `width`.
+ *
+ * Custom: quantization is ZERO-BASED, never min-max -- min-max scaling exaggerates cheap-day noise into
+ * full-height bars, and money proportions must stay truthful: half the ceiling reads as half a bar. The
+ * ceiling is `opts.max` when finite and positive (a shared scale so sparklines are comparable across
+ * rows), else the max of the finite values; with no positive ceiling there is nothing truthful to draw,
+ * so the cell reads "no data".
+ *
+ * Custom: 0 renders `ramp[0]` and null renders the gap glyph -- a zero-cost day is a fact, an absent day
+ * is unknown, and the two must never look alike. `ramp[0]` is reserved for exact zero: any positive value
+ * starts at `ramp[1]`, so a tiny-but-nonzero day never collapses into the zero baseline either.
+ *
+ * `opts.paint(cellText, value)` (optional; value is null for gaps) wraps each cell run after
+ * quantization. It exists so style.mjs can color cells without duplicating this geometry -- color stays
+ * post-layout, and an identity paint returns byte-identical output.
+ */
+export function sparkline(values, width = 24, opts = {}) {
+  const w = Math.max(0, Math.trunc(width) || 0);
+  if (w === 0) return "";
+  const norm = (Array.isArray(values) ? values : []).map((v) => (Number.isFinite(v) ? Math.max(0, v) : null));
+  const finite = norm.filter((v) => v !== null);
+  const ceiling = Number.isFinite(opts?.max) && opts.max > 0 ? opts.max : Math.max(0, ...finite);
+  if (finite.length === 0 || ceiling <= 0) return clip("no data", w);
+
+  // Custom: when there are more values than columns, each column takes its bucket's MAX, never an
+  // average -- peaks matter for cost, and an averaged-away spike is exactly the day an operator
+  // needs to see. A bucket with no finite value at all stays a gap.
+  let cells = norm;
+  if (norm.length > w) {
+    cells = [];
+    for (let i = 0; i < w; i++) {
+      const bucket = norm.slice(Math.floor((i * norm.length) / w), Math.floor(((i + 1) * norm.length) / w));
+      const present = bucket.filter((v) => v !== null);
+      cells.push(present.length > 0 ? Math.max(...present) : null);
+    }
+  }
+
+  const rep = Math.max(1, Math.floor(w / cells.length));
+  const top = active.ramp.length - 1;
+  const paint = typeof opts?.paint === "function" ? opts.paint : (text) => text;
+  let out = "";
+  let cols = 0;
+  for (const v of cells) {
+    const run = Math.min(rep, w - cols);
+    if (run <= 0) break;
+    const glyph = v === null ? active.gap : v === 0 ? active.ramp[0] : active.ramp[Math.min(top, Math.ceil((v / ceiling) * top))];
+    out += paint(glyph.repeat(run), v);
+    cols += run;
+  }
+  return out;
+}
+
+/**
+ * Compact USD for tight cells, at most 7 characters at any magnitude: `$0.0042`, `$0.42`, `$4.12`,
+ * `$41.20`, `$412`, `$4.1k`, `$412k`, `$4.1M`. Sub-cent costs are real money and render at four
+ * decimals; below what four decimals can show meaningfully the honest fallback is `<1¢` -- never
+ * `$0.00`, which would misread as free. Non-finite and negative input (this ladder renders costs;
+ * a negative cost is malformed) degrade to `-`.
+ */
+export function fmtUsd(n) {
+  if (!Number.isFinite(n) || n < 0) return "-";
+  if (n === 0) return "$0";
+  if (n < 0.0005) return "<1¢";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  if (n < 100) return `$${n.toFixed(2)}`;
+  if (n < 1000) return `$${Math.round(n)}`;
+  if (n < 100000) return `$${(n / 1000).toFixed(1)}k`;
+  if (n < 1e6) return `$${Math.round(n / 1000)}k`;
+  if (n < 1e8) return `$${(n / 1e6).toFixed(1)}M`;
+  return `$${Math.round(n / 1e6)}M`;
+}
+
+/**
+ * THE single renderer of the typed cost value `{ usd, class, floor, coverage, planId }` -- every money
+ * surface funnels here.
+ *
+ * Custom: the class system exists so an estimate CANNOT be mislabeled as truth by a rendering path.
+ * Each class has a distinct, non-overlapping shape: metered is a bare dollar figure (`≥`-prefixed when
+ * only a floor is known), plan is `plan:<planId>` and never a dollar amount (a covered run must never
+ * read as $0.00), zero-rated is `$0 (unrated)` and never the word "free", estimated is `~` + figure +
+ * ` est.`, seeded is `~~` + figure + ` seeded`, unknown is an em dash. Nullish or malformed input also
+ * degrades to the em dash rather than guessing a class.
+ */
+export function fmtCost(cost) {
+  if (!cost || typeof cost !== "object") return "—";
+  const floor = cost.floor ? "≥" : "";
+  switch (cost.class) {
+    case "metered":
+      return floor + fmtUsd(cost.usd);
+    case "plan":
+      return `plan:${cost.planId ?? "?"}`;
+    case "zero-rated":
+      return "$0 (unrated)";
+    case "estimated":
+      return `~${floor}${fmtUsd(cost.usd)} est.`;
+    case "seeded":
+      return `~~${fmtUsd(cost.usd)} seeded`;
+    default:
+      return "—";
+  }
+}
+
+/**
+ * Sentinel pair `render` wraps around the cursor cell when focused. Both are C0 control characters on
+ * purpose: the monochrome path funnels every line through `clip`, whose control strip drops them to
+ * nothing (a plain box simply shows no cursor), while style.mjs replaces the pair with an inverse-video
+ * cell. Either path yields exactly the render width in visible columns.
+ */
+export const LINE_INPUT_CURSOR = ["\x01", "\x02"];
+
+/**
+ * A pure single-line text-input state machine. No key decoding lives here -- the caller decodes raw
+ * input (keys.mjs) and calls the edit methods, which keeps this module free of the pi-tui resolver and
+ * keeps every transition a plain value-in/value-out step a test can drive directly.
+ *
+ * `render(width, { focused })` windows the value around the cursor when it outgrows `width - 1` (the
+ * cursor needs one cell past the last character) and always returns exactly `width` visible columns;
+ * when focused, the cursor cell is wrapped in `LINE_INPUT_CURSOR` (see above).
+ */
+export function makeLineInput(initial = "") {
+  let value = stripControls(initial);
+  let cursor = value.length;
+  return {
+    value: () => value,
+    cursor: () => cursor,
+    /** Insert a printable char -- or a whole pasted string -- at the cursor; control chars are stripped first. */
+    insert(ch) {
+      const clean = stripControls(ch);
+      if (clean.length === 0) return;
+      value = value.slice(0, cursor) + clean + value.slice(cursor);
+      cursor += clean.length;
+    },
+    backspace() {
+      if (cursor === 0) return;
+      value = value.slice(0, cursor - 1) + value.slice(cursor);
+      cursor -= 1;
+    },
+    del() {
+      if (cursor < value.length) value = value.slice(0, cursor) + value.slice(cursor + 1);
+    },
+    left() {
+      if (cursor > 0) cursor -= 1;
+    },
+    right() {
+      if (cursor < value.length) cursor += 1;
+    },
+    home() {
+      cursor = 0;
+    },
+    end() {
+      cursor = value.length;
+    },
+    setValue(s) {
+      value = stripControls(s);
+      cursor = value.length;
+    },
+    render(width, { focused = true } = {}) {
+      const w = Math.max(1, Math.trunc(width) || 1);
+      const start = value.length > w - 1 ? Math.max(0, cursor - (w - 1)) : 0;
+      const text = value.slice(start, start + w).padEnd(w);
+      if (!focused) return text;
+      const rel = cursor - start; // 0..w-1 by construction: the window never scrolls past the cursor
+      return text.slice(0, rel) + LINE_INPUT_CURSOR[0] + text[rel] + LINE_INPUT_CURSOR[1] + text.slice(rel + 1);
+    },
+  };
 }
