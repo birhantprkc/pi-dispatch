@@ -10,6 +10,7 @@ import {
   readSchedulers,
   readBudget,
   listRuns,
+  scanRunRecords,
   readRun,
   readLogTail,
   readSettingsView,
@@ -1063,6 +1064,68 @@ test("normalizeTriggerForDisplay carries run.resume, and only an explicit true a
     assert.equal(t.resume, false, `resume ${JSON.stringify(value)} must not arm the badge`);
     assert.equal(t.packages, true, "packages is an opt-OUT and stays true here -- the polarities are deliberately opposite");
   }
+});
+
+// ---- scanRunRecords (the cost fold's bounded scan) ----
+
+test("scanRunRecords returns every in-window record -- the scan is bounded by time, not the 50-record display clamp", () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const files = {};
+  for (let i = 0; i < 60; i++) {
+    files[`j${i}.json`] = JSON.stringify({ jobId: `j${i}`, endedAt: "2026-07-09T00:00:00.000Z" });
+  }
+  const res = scanRunRecords({ logsDir: "/logs", sinceMs: nowMs - 5 * 86400000, nowMs, fs: fakeFs(files) });
+  assert.equal(res.length, 60, "all 60 records return -- listRuns' 1..50 clamp is a display concern, not a scan bound");
+});
+
+test("scanRunRecords filters on endedAt with startedAt fallback, and drops a record with no usable timestamp", () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const sinceMs = Date.parse("2026-07-05T00:00:00.000Z");
+  const files = {
+    "in.json": JSON.stringify({ jobId: "in", endedAt: "2026-07-07T00:00:00.000Z" }),
+    "out.json": JSON.stringify({ jobId: "out", endedAt: "2026-07-01T00:00:00.000Z" }),
+    "started.json": JSON.stringify({ jobId: "started", endedAt: null, startedAt: "2026-07-08T00:00:00.000Z" }),
+    "started-out.json": JSON.stringify({ jobId: "started-out", endedAt: null, startedAt: "2026-07-02T00:00:00.000Z" }),
+    "no-ts.json": JSON.stringify({ jobId: "no-ts", endedAt: null, startedAt: null }),
+  };
+  const ids = scanRunRecords({ logsDir: "/logs", sinceMs, nowMs, fs: fakeFs(files) })
+    .map((r) => r.jobId)
+    .sort();
+  assert.deepEqual(ids, ["in", "started"], "endedAt governs; startedAt only stands in when endedAt is null; timestampless records cannot be windowed");
+});
+
+test("scanRunRecords hard-caps the window at 92 days even when sinceMs asks for more", () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const files = {
+    "recent.json": JSON.stringify({ jobId: "recent", endedAt: "2026-07-01T00:00:00.000Z" }),
+    "ancient.json": JSON.stringify({ jobId: "ancient", endedAt: "2026-04-01T00:00:00.000Z" }), // 100 days back
+  };
+  const res = scanRunRecords({ logsDir: "/logs", sinceMs: nowMs - 120 * 86400000, nowMs, fs: fakeFs(files) });
+  assert.deepEqual(
+    res.map((r) => r.jobId),
+    ["recent"],
+    "a keep-forever deployment (PI_LOG_RETENTION_DAYS=0) still folds at most a quarter",
+  );
+});
+
+test("scanRunRecords: a missing dir is a normal empty history; any other readdir error is { unreachable }", () => {
+  assert.deepEqual(scanRunRecords({ logsDir: "/nope", sinceMs: 0, fs: fakeFs({}, { readdirError: { code: "ENOENT" } }) }), []);
+  const res = scanRunRecords({ logsDir: "/logs", sinceMs: 0, fs: fakeFs({}, { readdirError: { code: "EACCES" } }) });
+  assert.match(res.unreachable, /EACCES/);
+});
+
+test("scanRunRecords skips a record deleted between scan and read (reaper race), non-JSON text, and non-json files", () => {
+  const nowMs = Date.parse("2026-07-10T00:00:00.000Z");
+  const files = {
+    "a.json": JSON.stringify({ jobId: "a", endedAt: "2026-07-09T00:00:00.000Z" }),
+    "b.json": { __throw: true, code: "ENOENT", message: "gone" },
+    "c.json": "{ not valid json",
+    "d.log": "raw container output",
+  };
+  assert.deepEqual(
+    scanRunRecords({ logsDir: "/logs", sinceMs: nowMs - 86400000, nowMs, fs: fakeFs(files) }).map((r) => r.jobId),
+    ["a"],
+  );
 });
 
 test("normalizeTriggerForDisplay surfaces replicas on the webhook kinds, and null is the one-run default", () => {

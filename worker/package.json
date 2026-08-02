@@ -32,6 +32,7 @@
     "./sandbox-store": "./src/sandbox-store.mjs",
     "./subscriptions": "./src/subscriptions.mjs",
     "./budget": "./src/budget.mjs",
+    "./pricing": "./src/pricing.mjs",
     "./scheduler-stall-guard": "./src/scheduler-stall-guard.mjs"
   },
   "engines": {
