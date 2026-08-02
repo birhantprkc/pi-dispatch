@@ -85,6 +85,11 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   The receiver may run **containerised** (`docker compose --profile receiver up`, issue #82) — that
   changes none of the above: HMAC-before-parse is the same code, the container mounts `triggers.json`
   read-only and **no docker socket**, and the worker stays a host process either way.
+  **Polling mode has no webhook surface at all** (`pi-dispatch-receiver poll`, issue #81): GitHub
+  events are *fetched* over TLS with your own credential rather than delivered to a public port, so
+  there is no signature to verify and nothing to forge against — the HMAC gate defends the webhook
+  path; polling removes the path. Every author/label/bot-loop/dedup gate still runs, on the same
+  fields, through the same pure filter. The cost is ~60s of trigger latency.
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.

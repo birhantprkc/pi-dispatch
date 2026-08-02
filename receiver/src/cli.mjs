@@ -15,27 +15,41 @@
 
 import { EXIT_POLICY } from "@edgehero/pi-dispatch/exit-code";
 
-const USAGE = `pi-dispatch-receiver — the always-on webhook edge: verifies deliveries, enqueues jobs
+const USAGE = `pi-dispatch-receiver — the always-on trigger edge: turns GitHub activity into queued jobs
 
-  pi-dispatch-receiver serve   start the receiver (the default when no command is given)
+  pi-dispatch-receiver serve   start the webhook receiver (the default when no command is given)
+  pi-dispatch-receiver poll    start the polling producer — no public URL, no DNS, no tunnel: it
+                               reads api.github.com with the operator's own credential instead
 
-Config comes from the environment (see .env.example): WEBHOOK_SECRET is required,
-PI_TRIGGERS_FILE overrides the ./triggers.json default, VALKEY_URL names the queue,
-RECEIVER_PORT/RECEIVER_BIND choose where to listen. Serve is the only command today;
-the command form exists so future modes have somewhere to land.`;
+Config comes from the environment (see .env.example): WEBHOOK_SECRET is required for serve
+(poll needs none — there is no inbound delivery to verify), PI_TRIGGERS_FILE overrides the
+./triggers.json default, VALKEY_URL names the queue, RECEIVER_PORT/RECEIVER_BIND choose where
+serve listens, and POLL_REPOS / POLL_INTERVAL_SECONDS shape what poll watches and how often.`;
 
 /**
- * `start` is an injection seam defaulting to the lazy import of ./start.mjs, so tests can run the
- * command dispatch without resolving identity, opening a socket, or touching Valkey -- and the
- * help/unknown paths stay runnable even where the queue deps are not installed.
+ * `start`/`startPoll` are injection seams defaulting to the lazy imports of ./start.mjs and
+ * ./poller.mjs, so tests can run the command dispatch without resolving identity, opening a socket,
+ * or touching Valkey -- and the help/unknown paths stay runnable even where the queue deps are not
+ * installed.
  */
-export async function main(argv = process.argv.slice(2), env = process.env, { start } = {}) {
+export async function main(argv = process.argv.slice(2), env = process.env, { start, startPoll } = {}) {
 	const cmd = argv[0];
 
 	if (cmd === undefined || cmd === "serve") {
 		const startReceiver = start ?? (await import("./start.mjs")).startReceiver;
 		await startReceiver(env);
 		return 0; // the server keeps the process alive until SIGTERM
+	}
+
+	if (cmd === "poll") {
+		// The polling producer (issue #81): the same gate and the same queue as serve, fed by reading
+		// api.github.com instead of by being reachable from it. Awaiting `done` is what keeps the
+		// process alive -- unlike serve there is no listening socket holding the loop open, only the
+		// loop itself, and returning early would let the bin exit under a healthy poller.
+		const startPoller = startPoll ?? (await import("./poller.mjs")).startPoller;
+		const poller = await startPoller(env);
+		await poller?.done;
+		return 0;
 	}
 
 	process.stdout.write(`${USAGE}\n`);

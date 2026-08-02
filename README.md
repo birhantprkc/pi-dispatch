@@ -573,6 +573,20 @@ read-only, published on `127.0.0.1:3000` (your reverse proxy or tunnel does the 
 as with the host receiver). No service in the compose file mounts the docker socket; the trust model is
 unchanged — the receiver still never executes agent-authored content.
 
+**No public URL at all?** Run the **polling** producer instead of the webhook edge:
+
+```bash
+pi-dispatch-receiver poll     # fetches issue events / comments / PRs over TLS with your own credential
+```
+
+Same triggers, same author/label/bot-loop gates, same queue — GitHub events are *fetched* (~60s cadence,
+conditional requests, nearly free against the rate limit) rather than delivered, so there is no port, no
+tunnel, no DNS, and no webhook secret to manage. Pair it with `pi-dispatch setup github --no-webhook`,
+which mints the App hook-inactive. The webhook receiver stays the low-latency default; polling trades
+~60s of trigger latency for zero public surface. Repos come from `POLL_REPOS` or, under App auth, the
+App installation's repo list. A fresh poller starts from *now* — it never replays a repo's history of
+old labels.
+
 ```mermaid
 flowchart LR
   GH["GitHub repo<br/>issue labeled, @pi comment, or PR"] -->|"webhook, HMAC-signed"| R
