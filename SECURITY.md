@@ -82,6 +82,9 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   is accepted, so a sender cannot choose the weaker gate. **Token mode is genuinely weaker**: it proves
   the sender knew a secret, and nothing at all about whether the body arrived as it was sent. Prefer
   `signature` where your instance supports it.
+  The receiver may run **containerised** (`docker compose --profile receiver up`, issue #82) — that
+  changes none of the above: HMAC-before-parse is the same code, the container mounts `triggers.json`
+  read-only and **no docker socket**, and the worker stays a host process either way.
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.

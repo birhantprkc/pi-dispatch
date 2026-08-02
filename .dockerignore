@@ -1,0 +1,58 @@
+# Every image here builds with the REPO ROOT as context (image/Dockerfile, image/Dockerfile.azure,
+# receiver/Dockerfile), so without this file each build ships the whole working tree to the daemon --
+# node_modules alone is ~350 MB of upload before the first layer runs.
+#
+# Patterns are ANCHORED to the context root (dockerignore is filepath.Match, not gitignore): `docs`
+# matches only ./docs, and matching node_modules at any depth needs the explicit `**/`.
+#
+# What must STAY in the context is defined by the Dockerfiles' COPY lines:
+#   image/Dockerfile:    package.json, package-lock.json, image/runner, image/entrypoint.sh, guardrails/
+#   receiver/Dockerfile: package.json, package-lock.json, .npmrc, worker/{package.json,src},
+#                        receiver/{package.json,src}
+# image/ is therefore NOT excluded wholesale -- the pi-job build copies image/runner verbatim (its test/
+# included; excluding it would silently change that image's contents), and guardrails/ is the baked
+# safety floor. Anything below is copied by no Dockerfile and never may be.
+
+# Installed deps -- each image runs its own `npm ci` from the lockfile; a host node_modules in the
+# context is pure upload weight and a platform mismatch waiting to be COPY'd by accident.
+**/node_modules
+
+# History and CI config: builds consume the working tree, never the repo.
+.git
+.github
+
+# Docs, specs, planning, editor/agent tooling -- prose and provenance, not runtime.
+docs
+specs
+examples
+.plan-artifacts
+.pi
+.claude
+README.md
+SECURITY.md
+LICENSE
+
+# The admin workspace: a pi extension in the operator's session (DES-ADMIN-VIA-PI-EXTENSION);
+# no image runs it.
+admin
+
+# Deploy templates (systemd/launchd/nssm/compose) configure the HOST, not a container.
+deploy
+
+# Tests for the workspaces whose src is copied. image/runner/test is deliberately NOT listed:
+# image/Dockerfile copies image/runner as a whole, and the ignore file must not edit that image.
+worker/test
+receiver/test
+
+# Secrets and operator-local state. The .env never enters an image -- compose hands it to the
+# CONTAINER via env_file; a real secret in a LAYER is published with the image.
+.env
+.env.*
+triggers.json
+pause-windows.json
+pi-packages.json
+subscriptions.json
+logs
+jobs
+sessions
+**/*.log

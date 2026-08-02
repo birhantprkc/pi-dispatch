@@ -560,6 +560,19 @@ above. Start the receiver with `npx pi-dispatch-receiver` (or the explicit form,
 if a shell can't find the local bin) from the folder you ran `pi-dispatch init` in: it reads
 `./triggers.json` there, `PI_TRIGGERS_FILE` overrides, and it **refuses to start** when neither exists.
 
+Or run it as a **container** — the receiver is the one piece with zero docker dependency, so it
+containerises for free (the worker never does — it drives the host `docker` CLI):
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile receiver up -d
+```
+
+That adds the prebuilt [`ghcr.io/edgehero/pi-dispatch-receiver`](https://github.com/edgehero/pi-dispatch/pkgs/container/pi-dispatch-receiver)
+beside Valkey — `restart: unless-stopped` durability for one flag, your `triggers.json` mounted
+read-only, published on `127.0.0.1:3000` (your reverse proxy or tunnel does the public exposure, exactly
+as with the host receiver). No service in the compose file mounts the docker socket; the trust model is
+unchanged — the receiver still never executes agent-authored content.
+
 ```mermaid
 flowchart LR
   GH["GitHub repo<br/>issue labeled, @pi comment, or PR"] -->|"webhook, HMAC-signed"| R
