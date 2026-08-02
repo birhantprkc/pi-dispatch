@@ -9,7 +9,8 @@ import { gitDirty } from "./git-dirty.mjs";
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json + subscriptions.json here
-  pi-dispatch doctor       preflight Docker, Valkey, the job image, and your provider key
+  pi-dispatch doctor [--fix]  preflight Docker, Valkey, the job image, and your provider key; --fix offers to run each fix (y/N per action)
+  pi-dispatch up [--yes]   one consented pass: pull+tag the job image, start Valkey, init, doctor
   pi-dispatch import-pi    stage your host pi setup (models/skills/persona) into a global overlay
                            [--no-extensions] [--with-packages] [--packages-file <path>]
                            [--from <agentDir>] [--to <overlayDir>]
@@ -40,7 +41,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 
 	if (cmd === "doctor") {
 		const { runDoctor } = await import("./doctor.mjs");
-		return runDoctor(env);
+		// `fix` rides in the deps position (runDoctor(env, depsOrOpts)) — one options bag, no third arg.
+		return runDoctor(env, { fix: argv.slice(1).includes("--fix") });
+	}
+
+	if (cmd === "up") {
+		const { runUp } = await import("./up.mjs");
+		return runUp(argv.slice(1), { env });
 	}
 
 	if (cmd === "import-pi") {

@@ -527,6 +527,29 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`, `DES-AI-TRIGGER-FLOW-GATE`,
   `DES-JOB-OUTBOX-CHAINING`, `REQ-LOCAL-JOB-VISIBILITY`
 
+## DES-CLI-SURFACE
+
+- **Decision**: The workspace CLI (`pi-dispatch`, bin of the worker package) is the deployment's
+  operator surface, and its subcommands sit on an explicit gate ladder. **Read-only / always safe**:
+  `doctor`, `status`. **Operator-typed, ungated**: `run`, `pause`, `resume`, `sandbox`, `import-pi`
+  (each is its own gate — typing it is the approval, `REQ-ADMIN-VIA-PI-EXTENSION`'s ladder top).
+  **Create-only, contractually non-destructive**: `init` (idempotent scaffolds; an existing file is
+  never touched). **Consented host mutations**: `up` and `doctor --fix` — each concrete action (a
+  docker pull of the deployment's *own default* image, a loopback Valkey start, an overlay
+  `auth.json` delete, an `import-pi` restage) is shown verbatim and runs only on an explicit y/N
+  accept, defaulting to No, including on non-TTY stdin. The receiver's `pi-dispatch-receiver` bin is
+  a sibling on the same ladder (serve = the operator typed it).
+- **Why**: `init` and `doctor` grew organically with no recorded surface; issue #80 adds subcommands
+  that *mutate the host*, and an unrecorded gate ladder is how a later "helpful" flag erodes a trust
+  property nobody wrote down. Recording which tier each subcommand sits on makes "may this be
+  automated?" a lookup instead of a debate.
+- **The never-tier is load-bearing**: no subcommand, flag, or fix path may rewrite malformed config
+  (fail-loud/keep-last-good is doctrine), write triggers/pause-windows *content*, pull a
+  trigger-named `run.image` (each image is a separate per-flow trust posture — only the deployment's
+  default is ever offered, and the consent keypress is the "pulled it onto this host yourself" act
+  `SECURITY.md` requires), guess a semantic env value, or touch branch protection on a forge.
+- **Traces to**: `REQ-DEPLOYMENT-BOOTSTRAP`, `DES-CLI-TRIGGER-FOR-LOCAL`, `CONST-BUDGET-BEFORE-TOKENS`
+
 ## DES-WORKER-ON-HOST
 
 - **Decision**: The worker runs **on the host** (a Node process, `pi-dispatch worker` / `npm start`), not
@@ -561,6 +584,10 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   longer runs everything; the operator also runs `pi-dispatch worker`. That is the honest price of
   local-folder jobs working on Windows/macOS/Linux without fragile path math. The receiver is Node too,
   so it is one install story (`npm ci`), with Docker running Valkey and the job containers.
+  Since issue #80, `pi-dispatch up` *sequences* the surrounding chores (image pull+tag, Valkey start,
+  scaffold, preflight) behind explicit per-action consent — the price above is unchanged (the worker is
+  still a host process the operator runs); only the amount of typing shrank
+  (`REQ-DEPLOYMENT-BOOTSTRAP`).
 - **Evidence**: verified first-hand this session — `docker context` (`npipe` endpoint, `linux/x86_64`
   daemon) · `moby/for-win#14271` (VM prefix `/run/desktop/mnt/host/…`) and `docker/compose#5563`
   (older `/host_mnt/…`), i.e. the prefix moved · `docker/compose#4240`
@@ -1497,6 +1524,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-02 | The CLI surface gets a recorded gate ladder (issue #80). Added **DES-CLI-SURFACE**: read-only (`doctor`, `status`) / operator-typed-ungated (`run`, `pause`, `resume`, `sandbox`, `import-pi`) / create-only (`init`) / consented host mutations (`up`, `doctor --fix` — each action shown verbatim, y/N default No incl. non-TTY), plus the load-bearing never-tier (no malformed-config rewrites, no triggers/pause-windows content, no trigger-named `run.image` pulls — only the deployment default, where the consent keypress is SECURITY.md's "pulled it yourself" act). `init`/`doctor` had no recorded surface at all, and the ladder makes "may this be automated?" a lookup. **DES-WORKER-ON-HOST amended** (Accepted cost): `up` sequences the surrounding chores behind consent; the price — the worker is a host process the operator runs — is unchanged, only the typing shrank. **DES-CLI-TRIGGER-FOR-LOCAL UNCHANGED, checked**: `up` is not a producer; it enqueues nothing. **INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: its repair-write precedent is cited by the fix-tier reasoning, not extended — `--fix` never rewrites an invalid overlay; that stays the admin write path's documented repair. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (dashboard polish): run targets render as OSC-8 hyperlinks **only when the URL is derivable from id-only fields** (github `repo#N`; other forges' instance hosts are unknowable from the record, so no URL is ever guessed) — display-only escapes, byte-identical passthrough under the plain theme, and `visibleLen` already strips OSC-8. `y`/`Y` in RUN_DETAIL copy the job id / target URL via a new injected `copyText` seam whose OSC-52 emission lives in index.ts (the dashboard stays I/O-free); operator-initiated, id-only strings, nothing read back — recorded in SECURITY.md. LIVE_TAIL gains `/` search over the captured tail (a line-input layer above the view, popping on the established one-Esc-per-layer discipline; matches jump and suspend follow exactly as manual scrolling does; **untrusted bytes still pass only through `clip`** — the match highlight colors post-clip). The LIST and COSTS frames become height-aware through an injected `terminalRows` seam: sections collapse to their divider-plus-count by fixed priority (pause windows → settings → triggers → spend; COSTS: by-model → plans → daily), the cursor's section and the verdict block never collapse, and an absent seam renders byte-identically to before. The fs ban and every width invariant **UNCHANGED, checked**. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (issue #53, `REQ-COST-ANALYTICS`): the overlay gains its fifth view, **COSTS** (`c`) — verdict-first analytics over one `DES-COST-FOLD-BY-SCAN` fold: per-plan verdicts with the API-rate comparison line, a daily sparkline, by-flow/by-model tables whose money cells all funnel through the typed-cost formatter, plan blocks with amortized $/run and peak-window facts (never burn-down), a provenance footer naming the pi-ai pin, and the keyboard what-if (`w` shortlist cycle; `/` type-to-filter over the full priced catalog via the line-input primitive — the long tail lives in the TUI now that the primitive exists, and in `/dispatch costs whatif` for scripting). The costs data path is lazy and throttled (view entry + window change + stale-tick refresh): the fold is cheap, but a per-second full-directory scan is the quiet load a dashboard must not add. `/dispatch costs [7d\|30d\|mtd]` renders the same fold plain for the degraded path; `dispatch_costs` returns it as JSON with `class` on every monetary value, so the model-facing surface cannot launder an estimate any more than the human-facing one. `PI_DISPATCH_ASCII=1` flips every panel/overlay glyph table to the ASCII twins at extension load (the switch the primitives shipped; the env decision lives at the entry point, keeping panel.mjs pure). The dashboard's source-regex fs ban is **UNCHANGED, checked** — the costs data arrives through `createDashboardDeps` seams over the read-model, like every other byte the overlay renders. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (issue #71, dashboard usability): the LIST runs list becomes a cursor-following 10-row viewport over the read model's 50-record window with `↑/↓ N more` edge markers (raising the fetch from 10 to 50 without growing the frame); `Tab` jumps between the trigger and run section heads; `o` cycles the runs sort (time → tokens → cost → outcome — absent numbers sort last because a pre-metering record is unknown, not cheap, and Enter opens the row the sorted list shows because cursor and renderer share one rows model); the long-advertised-but-unbound `l` now opens the live tail of the active job and stays inert without one; LIVE_TAIL opens pinned to the bottom in follow mode (scroll-up pauses, bottom re-arms, footer names the state — it previously opened ~180 lines behind the head at the top of the tail window); RUN_DETAIL gains `←`/`→` in-place record walking with the LIST cursor following; a cron trigger row in LIST carries the amber `⚠ overdue`/`⚠ stalled` badge previously visible only in TRIGGER_DETAIL; and `x` delete arms an in-frame y/n whose `y` alone signals `deleteTrigger` with `confirmed: true`, letting `deleteTriggerEntry` skip the duplicate `ctx.ui.confirm` while still writing through the shared validator — the dialog path is unchanged for the model-initiated `dispatch_trigger_delete` tool, whose `confirmedWrite` gate is **UNCHANGED, checked**. The fallback `matchesKey` in `keys.mjs` learned `left`/`right`/`home`/`end`/`backspace` so the overlays' new keys cannot be silently eaten when pi-tui is unresolvable. No new read-model surface, no new fs access; the dashboard's source-regex fs ban is **UNCHANGED, checked**. |
