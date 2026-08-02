@@ -66,6 +66,7 @@ export function makeProcessor({ cancelJob, stopContainer, redis, getSettings, ap
 				// job completed and does not retry a file that can never parse (CONST-RETRY-INFRA-ONLY). Resolved
 				// before runJob, so no budget slot is reserved and no container starts (CONST-BUDGET-BEFORE-TOKENS).
 				// recordRun leaves the durable settings-overlay-invalid trace for the admin extension.
+				// No provider/model here, alone among the terminal results: the overlay is the thing that failed to parse, so no honest effective value exists -- buildRecord defaults both null.
 				const result = { outcome: "policy", reason: "settings-overlay-invalid", exitCode: null, turns: null, tokens: null, budgetReserved: false };
 				recordRun({ job, result, startedAt, endedAt: new Date().toISOString() });
 				return result;

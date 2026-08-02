@@ -388,6 +388,14 @@ test("(a) completed run: real writer serialises a PII-free record to <jobId>.jso
 	assert.equal(rec.exitCode, 0);
 	assert.equal(rec.turns, 3);
 	assert.equal(rec.budgetReserved, true);
+	// The usage-ledger trio (INT-RUN-HISTORY-FILE-CONTRACT) rides the serialized bytes end-to-end:
+	// provider/model are the HOST-effective values the overlay fill resolved (here the settings, since
+	// the job data names none), and usage is null-defaulted -- this container reported no ledger, and
+	// null-with-the-key-present is the contract's normal case, not an error.
+	assert.equal("usage" in rec && "provider" in rec && "model" in rec, true, "the record carries all three additive keys");
+	assert.equal(rec.provider, "anthropic", "provider is the overlay-resolved host fact, never a container string");
+	assert.equal(rec.model, "m");
+	assert.equal(rec.usage, null);
 	// buildRecord reads only stable non-PII fields, so the serialized bytes carry neither title nor body.
 	assert.equal(writes[0].data.includes("SECRET_T"), false, "issue title must not leak into the record bytes");
 	assert.equal(writes[0].data.includes("SECRET_B"), false, "issue body must not leak into the record bytes");

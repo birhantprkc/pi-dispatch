@@ -466,7 +466,10 @@ Evidence convention as in `constitution.md`.
   a total) and `unpriced` (calls whose usage carried no finite cost; counted rather than guessed, because a
   silent `0` would read as "this call was free"). The four original keys keep their meaning and position,
   so a reader that only knows them is unaffected. The fallback line carries `metered: false` and the four
-  originals only.
+  originals only. The sibling `usage` key (the per-model ledger, `REQ-TOKEN-ACCOUNTING-AND-CAPS`) is the
+  same class of read-only telemetry: recovered by its own validating parser (`parseExitUsage`), absent on
+  the fallback and catch-path lines, and **feeding classification exactly as much as `tokens` does —
+  not at all**.
 - **Why**: This exit code **is** the mechanism `CONST-RETRY-INFRA-ONLY` is implemented by. The worker
   has no other channel to distinguish "the agent ran and said no" from "the container died" — collapse
   them and you either burn money blind-retrying determinate outcomes, or you silently swallow real infra
@@ -1502,6 +1505,16 @@ worker reads.
                    "metered": <bool>,                                                          // true = process-wide meter; false = the subscribe() fallback (then the keys below are absent)
                    "rootTotal": <int>, "otherTotal": <int>, "looseTotal": <int>,                // attribution split; sums to `total`
                    "sessions": <int>, "calls": <int>, "unresolved": <int>, "unpriced": <int> } | null,
+    "usage":     { "v": <int>,                                                                  // ledger block version; readers treat an unknown v as opaque-but-present
+                   "piAi": "<major.minor.patch>" | null,                                        // the pi-ai the meter priced with, read from the resolved package at install; a rates PROVENANCE stamp
+                   "truncated": <int>,                                                          // named rows folded into the "other" row at the 8-row cap; 0 = none
+                   "models": [ { "provider": "<id>", "model": "<id>",                           // lowercased, host-validated ^[a-z0-9][a-z0-9._:/-]{0,63}$
+                                 "calls": <int>, "input": <int>, "output": <int>,
+                                 "cacheRead": <int>, "cacheWrite": <int>, "cacheWrite1h": <int>,
+                                 "reasoning": <int>, "total": <int>,                            // billed total, same convention as tokens.total; rows sum to it
+                                 "cost": <number>, "unpriced": <int> } ] } | null,              // null: fallback meter, pre-ledger runner, died before exit line, or malformed
+    "provider":  "<host-effective provider>" | null,                                            // what the HOST dispatched with (job.data > overlay > env), never a container string
+    "model":     "<host-effective model id>" | null,
     "budgetReserved": <bool> | null,
     "attempt":   <int>,
     "parentJobId": "<job id: same id-space as jobId>" | null,
@@ -1567,6 +1580,28 @@ worker reads.
   compaction/summarisation calls that never surfaced as a root `turn_end`, so at identical real spend the
   counter fills faster than it used to. That is the correction the meter exists for, and `metered` is what
   lets a reader tell a corrected total from a legacy one.
+  The `usage` ledger is a **SIBLING of `tokens`, not a widening of it** — and the reason is the same one
+  that made `parseExitSession` a sibling. `tokens` rides through `parseExitTokens` verbatim only because it
+  holds nothing but numbers; the ledger carries `provider`/`model` **strings emitted by the container**,
+  which makes them attacker-adjacent, so `parseExitUsage` REBUILDS a narrowed, validated object and never
+  passes one through: ids are lowercased and must match `^[a-z0-9][a-z0-9._:/-]{0,63}$`, every numeric must
+  be finite and non-negative, and **any violation nulls the whole block, never a partial** (the same
+  malformed→null rule `tokens` has). Widening `tokens` instead would have traded that validation away for
+  parser convenience — the one trade this record cannot make. The block is bounded by construction: at most
+  **8 named rows** (top by billed total) plus one `{provider:"other", model:"other"}` row that numerically
+  absorbs both the overflow (counted by `truncated`) and any call observed without model context — a call
+  is **never guessed onto a model**. The fold is numeric, so `Σ models[].total === tokens.total` still
+  holds; that sum is the **emitter's** invariant, asserted in the runner's meter tests — the host validates
+  fields, not bookkeeping. `piAi` stamps which pinned rate tables priced the run, so history is **priced
+  once and never silently repriced** — a later pin bump shows up as a visible provenance difference on new
+  records, not a rewrite of old ones. The sibling `provider`/`model` fields are **host-effective dispatch
+  facts** (`job.data > overlay > env`, resolved by `effectiveSettings`), threaded through every terminal
+  result and error object — including `InfraRetry` — precisely so a catch-path or pre-exit-line death
+  still attributes to the model the host dispatched; they are operator-side strings on the `flow`
+  precedent, never container output. A `usage: null` beside a real `tokens` object is **normal, not an
+  error**: the fallback meter, a pre-ledger runner image, and a mid-run death all produce it, and readers
+  degrade to the flat totals exactly as pre-meter readers degraded to `turns`. Like `tokens`, the ledger is
+  read-only telemetry and never feeds exit-code or retry classification (`INT-RUNNER-EXIT-CODE-PROTOCOL`).
   The `session` field is **additive and nullable** in exactly the way `tokens` and the chain fields are —
   an explicit no-spread literal, `null` for every job that had no session. It merges the host's intent
   with the container's report, because either alone lies: the host knows whether a key resolved and which
@@ -1581,7 +1616,11 @@ worker reads.
   id exists; its `outcome` matches the queue outcome (`completed` / `policy` / `failed`); no field carries
   issue or comment body text (`target` is `repo#issue` / `local:<basename>` only); `turns` is `null` when
   the container died before emitting the runner `exit` line; the `.log` exists only when
-  `PI_CAPTURE_JOB_LOGS` is set.
+  `PI_CAPTURE_JOB_LOGS` is set. Given a metered run, `usage.models` carries only lowercased,
+  charset-validated ids and its rows sum to `tokens.total`; given a usage block violating any field rule,
+  the record stores `usage: null`, never a partial; given a catch-path or pre-exit-line death,
+  `provider`/`model` still carry the host-effective dispatch values; given a fallback-metered
+  (`metered: false`) or pre-ledger run, `usage` is `null` and no reader treats that as an error.
 
 ## INT-OUTBOX-CONTRACT
 
@@ -1827,6 +1866,7 @@ worker reads.
 
 | Date | Change |
 |---|---|
+| 2026-08-01 | Per-(provider,model) usage ledger (issue #53, gap 1). **INT-RUN-HISTORY-FILE-CONTRACT** amended: the record gains `usage` (the ledger block: `v`/`piAi`/`truncated` + up to 8 named rows and one `other` row carrying the full cache split each call's `Usage` always had but the flat totals collapse) and host-effective `provider`/`model` — all three additive and nullable. The entry records the load-bearing shape decision: `usage` is a **sibling of `tokens`, not a widening**, for the same reason `parseExitSession` was — `tokens` may ride through verbatim only because it holds nothing but numbers, while the ledger carries container-emitted id STRINGS, so `parseExitUsage` rebuilds a narrowed object (lowercased, `^[a-z0-9][a-z0-9._:/-]{0,63}$`, whole-block-null on any violation) and the record's PII-free-by-construction property survives. `provider`/`model` are host-side dispatch facts threaded through every terminal result/error object including `InfraRetry` (which also gains the `session` field its constructor silently dropped — a latent loss on infra-retry records, repaired in passing), so catch-path deaths still attribute. `piAi` stamps rate-table provenance: history is priced once, never silently repriced. **INT-RUNNER-EXIT-CODE-PROTOCOL** amended with one paragraph: `usage` is read-only telemetry and feeds classification exactly as much as `tokens` does — not at all. `parseExitTokens` and the `tokens` shape are **UNCHANGED, checked** — the widening precedent explicitly does NOT extend to blocks carrying strings. **INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: the ledger reads the overlay's resolved values through `effectiveSettings`, adding no key. |
 | 2026-08-01 | Operator-declared subscriptions (issue #53). Added **INT-SUBSCRIPTIONS-FILE-CONTRACT**: the operator-authored `subscriptions.json` (`PI_SUBSCRIPTIONS_FILE`, admin default `deploy/subscriptions.json`) declaring what subscription-backed providers actually cost — their rate tables are all zeros, so runs record cost 0 and read as free when they are prepaid, and the env boundary refuses OAuth/subscription logins by design, leaving the operator declaration as the only honest price source. Counterfactual arithmetic only: the worker exports the shared `parseSubscriptions` validator and reads nothing at job time; the admin is the sole reader/writer (validate-then-tmp+rename, repairs a broken file). `version` is required and a HIGHER version is refused loudly naming both versions — fail-loud-on-newer cannot be retrofitted; `null` window `unit`/`limit` is first-class "vendor undisclosed", rendered as unknown, never an invented burn-down. **INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: subscriptions get their own operator file, not overlay keys — the overlay is runtime tuning with fail-closed job-start semantics, and prices are bookkeeping. The env-allowlist OAuth/subscription refusal **UNCHANGED, checked**: declaring a plan never admits its login. |
 | 2026-08-01 | Replica runs (issue #56). **INT-TRIGGERS-FILE-CONTRACT** amended with **`run.replicas`** (github `label`/`comment`/`pull_request` only, integer `2..3`) — the only field in this file that MULTIPLIES SPEND, so every refusal is spelled out with its own reason rather than as one range check: a `local`/cron trigger is refused because its `/workspace` IS the operator's folder, bind-mounted rw, where a forge job gets its own `mkdtemp`'d clone; a non-github forge is refused as *not yet covered* rather than impossible, since every forge mints its branch through the same `issueBranch`; `1` is refused rather than accepted-and-ignored, because a one-member replica set is a field that does nothing and *accepted-and-ignored is how an operator comes to trust one that does*; `3` is the ceiling because `PI_CONCURRENCY` defaults to 3 and a fourth replica would queue rather than race; and `run.resume: true` is refused alongside, naming both fields, because that refusal is the ONLY reason `session-key.mjs` may keep deriving from the unsuffixed branch. The delicate half is recorded explicitly: the **semantic dedup key gains `:r<i>` only when a replica is set**, so re-deliveries of each replica still coalesce while replicas never coalesce against each other — and distinct job ids alone would NOT have sufficed, since a duplicate `queue.add` under a taken id is *silently ignored* and the second replica would vanish with no error surface. Acceptance gains the byte-match clause for `data` **and the dedup id**, the four load refusals, the two-jobs-one-delivery clause, and the 503-partial-failure clause (the retry converges on exactly *n* jobs because the queued ones dedup on their own now-taken ids). **INT-RUN-HISTORY-FILE-CONTRACT** amended: `replica`/`replicas`, additive and nullable **on the chain fields' precedent**, and the entry states WHY they are admissible at all — they are host-assigned INTEGERS, so the record's PII-free-by-construction property is untouched, and the branch name they imply is deliberately absent for the same reason `session` omits its key. The `reason` enum gains one token, `job-image-replicas-unsupported`. **INT-CONTAINER-RUNTIME-CONTRACT** amended: `dev.pi-dispatch.capabilities` joins the conformance checklist, and its **polarity is the OPPOSITE of `dev.pi-dispatch.forges`** — stated on the record because that asymmetry reads as a bug later. `forges` is an EXCLUSION list, so no claim excludes nothing; `capabilities` is an INCLUSION list, so no claim includes nothing and an unlabelled image is refused every replica job. The failure it prevents is the quiet one this list exists for: a pre-feature image bakes a `HARD_RULES.md` naming `pi/issue-<n>` as a SYSTEM rule, which overrides the user prompt naming `-r2`, so both replicas converge on one branch, nothing errors, and the operator pays twice for one pull request. `verify-image.sh` greps the baked guardrails when the label claims `replicas`, so it cannot lie any more than `forges` can. **INT-CONTAINER-JOB-INPUTS** and **INT-WEBHOOK-PAYLOAD-SUBSET UNCHANGED, checked, and the check is the point**: `event.json` is a deliberate literal of the webhook's own body plus one decision record, and an execution knob is not a fact about the delivery — the agent learns its index from the prompt and `PI_JOB_ID` already ends `-r2`, so nothing there needed to move. Recorded as a rejected alternative in `DES-REPLICA-INDEX-REACHES-THE-BRANCH`, not as an oversight. **INT-OUTBOX-CONTRACT UNCHANGED, checked**: its `local`-only guard already closes chain fanout, and a replica is always a github job. **INT-SESSION-STORE-CONTRACT UNCHANGED, checked**: a replica job can never carry `run.resume`, so no replica reads or writes a transcript. |
 | 2026-08-01 | Added **`INT-SANDBOX-CONTRACT`** (issue #55, `REQ-RESURRECTABLE-SANDBOX`) — the operator-session container shape, plus the retained-directory layout and its manifest. **A SIBLING of `INT-CONTAINER-RUNTIME-CONTRACT`, not an amendment to it**, and the reasoning is the same one `INT-GITLAB-PAYLOAD-SUBSET` recorded: IDs are permanent addresses, and a container an operator opens with no agent in it is a different object, not more of the job one. That entry is **UNCHANGED, and was checked rather than forgotten** — its `No TTY (-it absent)` line still describes every container the harness launches, which is precisely why the new shape needed its own address instead of a qualifier on that one. Three decisions written down because a later reader would otherwise re-litigate them: the sandbox argv comes from `buildDockerRunArgs` through the previously-unused `extraFlags` seam, so the isolation flags are inherited **by construction** rather than re-listed; the retained-directory manifest is a **separate file from the run-history sidecar**, because `INT-RUN-HISTORY-FILE-CONTRACT`'s PII-free-by-construction property is what lets the admin extension feed those records to a model and this one holds a host path (that entry likewise **UNCHANGED and checked**); and expiry reads the manifest's `createdAt` rather than mtime, inverting `makeLogReaper`'s documented "mtime is the authority" for the one case where it fails — an operator working inside a sandbox moves mtime, so the window would never close. `INT-SESSION-STORE-CONTRACT` **UNCHANGED, and checked**: the per-job `/session` copy is deleted **before** retention, so no transcript ever enters a directory whose lifetime `--pin` can extend. |

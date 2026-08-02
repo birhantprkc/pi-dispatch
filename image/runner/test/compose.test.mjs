@@ -74,3 +74,27 @@ test("run-job.mjs staples `turns` onto the success-path exit line -- worker pars
 	// exists when the agent loop never started. The regex above matches the success call and does not
 	// require every exit line to carry turns, so that omission is allowed by design.
 });
+
+test("run-job.mjs staples `usage` onto the success-path exit line -- worker parseExitUsage depends on it", () => {
+	// Same tactic and same reason as the `turns` guard above: main() self-runs on import and `log` is
+	// unexported, so the worker<->runner contract is guarded against the source. The ledger key is
+	// CONDITIONAL by design -- a fallback-metered run and a metered run with zero provider calls both
+	// OMIT it rather than emit null -- so the regex targets the guard expression inside the exit
+	// object literal. \busage\b is what keeps `usageMeter` (the install handle, also in scope there)
+	// from satisfying the match with the ledger long gone.
+	const src = readFileSync(new URL("../run-job.mjs", import.meta.url), "utf8");
+	assert.match(
+		src,
+		/log\("exit",\s*\{[^}]*\busage\b/,
+		"run-job.mjs success exit line must carry the usage ledger -- worker parseExitUsage depends on it",
+	);
+	// ...and the value must come from the meter's ledger emitter, the only producer of the bounded,
+	// sum-preserving shape the worker's validating parser accepts.
+	assert.match(
+		src,
+		/usageSnapshot\(\)/,
+		"the exit line's usage must be meter.usageSnapshot()'s ledger, not a hand-rolled object",
+	);
+	// The catch-path exit line legitimately omits `usage` for the same reason it omits turns: no meter
+	// exists when a preflight throw kills the run before any session started.
+});

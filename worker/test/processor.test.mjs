@@ -250,6 +250,10 @@ test("InfraRetry back-compat: message-only ctor keeps piDispatchRetry and defaul
 	assert.equal(e.exitCode, null, "telemetry fields default null on the message-only ctor");
 	assert.equal(e.turns, null);
 	assert.equal(e.budgetReserved, null);
+	assert.equal(e.session, null, "the repaired session and the ledger trio default null the same way");
+	assert.equal(e.usage, null);
+	assert.equal(e.provider, null);
+	assert.equal(e.model, null);
 });
 
 test("a completed return carries exitCode/turns from the container and budgetReserved true", async () => {
@@ -579,6 +583,60 @@ test("a job with no session records session:null and never calls the store", asy
 	const r = await runJob(ghJob, { ...d, runContainer: async () => ({ code: 0, aborted: false, turns: 1, tokens: null, session: null }) });
 	assert.equal(r.session, null, "an unarmed job's record must look exactly as it did before this feature");
 	assert.equal(promoted, 0);
+});
+
+// ---- per-(provider,model) usage ledger (INT-RUN-HISTORY-FILE-CONTRACT): the exit line's rebuilt
+// ---- `usage` block and the host-effective provider/model thread through results AND throws.
+
+/** A minimal valid rebuilt ledger, as the sink would hand it back after parseExitUsage. */
+const LEDGER = { v: 1, piAi: "0.80.7", truncated: 0, models: [{ provider: "anthropic", model: "claude-x", calls: 1, input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0, total: 15, cost: 0.01, unpriced: 0 }] };
+
+test("a completed run's result carries the host-effective provider/model and the container's usage block", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 0, aborted: false, turns: 2, tokens: { total: 15 }, usage: LEDGER }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.outcome, "completed");
+	// runJob's `job` IS the effectiveJob, so these are the overlay-resolved dispatch facts -- what the
+	// HOST ran with -- never anything the container printed.
+	assert.equal(r.provider, "anthropic");
+	assert.equal(r.model, "m");
+	assert.deepEqual(r.usage, LEDGER);
+});
+
+test("a runner-policy exit carries the ledger too -- a policy container still spent real money", async () => {
+	const { deps: d } = deps({ runContainer: async () => ({ code: 2, aborted: false, turns: 1, tokens: { total: 15 }, usage: LEDGER }) });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.reason, "runner-policy");
+	assert.deepEqual(r.usage, LEDGER);
+	assert.equal(r.provider, "anthropic");
+	assert.equal(r.model, "m");
+});
+
+test("a pre-container policy refusal carries provider/model but NO usage key", async () => {
+	const { deps: d } = deps({ isDefaultBranchProtected: async () => false });
+	const r = await runJob(ghJob, d);
+	assert.equal(r.reason, "unprotected-branch");
+	assert.equal(r.provider, "anthropic", "even a refusal attributes which (provider, model) it was dispatched for");
+	assert.equal(r.model, "m");
+	assert.equal("usage" in r, false, "no container ran, so no ledger key exists -- buildRecord defaults the field null");
+});
+
+test("an exit-1 infra throw preserves usage, provider, model AND session on the InfraRetry", async () => {
+	// The session half pins the latent-drop repair: the EXIT_INFRA throw always PASSED session, but the
+	// InfraRetry constructor never read it, so every infra-retry record stored session:null and a degrade
+	// seen only on a retried attempt vanished. The ledger fields joining the constructor is what surfaced it.
+	const { deps: d } = deps({
+		runContainer: async () => ({ code: 1, aborted: false, turns: 4, tokens: { total: 15 }, session: { resumed: true, reason: "resumed" }, usage: LEDGER }),
+	});
+	await assert.rejects(
+		() => runJob(ghJob, d),
+		(e) =>
+			e instanceof InfraRetry &&
+			e.provider === "anthropic" &&
+			e.model === "m" &&
+			JSON.stringify(e.usage) === JSON.stringify(LEDGER) &&
+			e.session?.resumed === true &&
+			e.session?.reason === "resumed",
+	);
 });
 
 test("a replica job on an image that does not declare replica support refuses pre-spend, pre-reserve", async () => {

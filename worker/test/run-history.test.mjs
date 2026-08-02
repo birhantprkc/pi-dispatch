@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import { test } from "node:test";
-import { buildRecord, makeFindPreviousRun, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, sanitizeJobId } from "../src/run-history.mjs";
+import { buildRecord, makeFindPreviousRun, makeLogReaper, makeLogSink, makeRecordWriter, parseExitTokens, parseExitTurns, parseExitUsage, sanitizeJobId } from "../src/run-history.mjs";
 import { FORGE_KINDS } from "../src/forges.mjs";
 
 /**
@@ -155,21 +155,27 @@ test("parseExitTurns returns null for empty input", () => {
 	assert.equal(parseExitTurns(""), null);
 });
 
+/** The hostile corpus every parseExit* helper must survive: noise, truncation, non-strings, scalar
+ *  JSON. Shared so a new parser inherits the whole sweep rather than a hand-picked subset; the
+ *  usage-bearing lines (one valid, one mangled) joined it when the ledger parser landed. */
+const HOSTILE_CORPUS = [
+	'{"event":"exit","code":0,"turns":7}\n',
+	'{"event":"exit","code":2,"reason":"config"}',
+	'garbage not json\n{"event":"exit","turns":3}',
+	'{"event":"exi',
+	'{"event":"exit","turns":2}\n{"event":"exit","turns":9}',
+	"",
+	undefined,
+	null,
+	42,
+	"null",
+	"123",
+	'{"event":"exit","usage":{"v":1,"piAi":"0.80.7","truncated":0,"models":[{"provider":"anthropic","model":"m","total":9}]}}',
+	'{"event":"exit","usage":{"v":"1","models":"nope"}}',
+];
+
 test("parseExitTurns never throws across the full corpus", () => {
-	const inputs = [
-		'{"event":"exit","code":0,"turns":7}\n',
-		'{"event":"exit","code":2,"reason":"config"}',
-		'garbage not json\n{"event":"exit","turns":3}',
-		'{"event":"exi',
-		'{"event":"exit","turns":2}\n{"event":"exit","turns":9}',
-		"",
-		undefined,
-		null,
-		42,
-		"null",
-		"123",
-	];
-	for (const input of inputs) {
+	for (const input of HOSTILE_CORPUS) {
 		assert.doesNotThrow(() => parseExitTurns(input), `input=${JSON.stringify(input)}`);
 	}
 });
@@ -203,6 +209,78 @@ test("parseExitTokens never throws across the same corpus that stresses parseExi
 	}
 });
 
+// ---- parseExitUsage (usage ledger): mirrors parseExitTokens, but REBUILDS the per-model ledger off the exit line ----
+
+/** A fully-populated valid row, in the rebuilt 12-key shape. Tests spread over it to inject one bad field. */
+const GOOD_ROW = { provider: "anthropic", model: "claude-sonnet-4", calls: 2, input: 100, output: 50, cacheRead: 10, cacheWrite: 5, cacheWrite1h: 0, reasoning: 3, total: 168, cost: 0.02, unpriced: 0 };
+const usageLine = (usage) => `{"event":"exit","code":0,"usage":${JSON.stringify(usage)}}`;
+
+test("parseExitUsage reads the usage block off the success exit line and REBUILDS it", () => {
+	// The rebuild is the whole point, not a nicety: provider/model are container-emitted strings, so
+	// nothing rides through verbatim. Uppercase arrives lowercased, and an unknown row key is dropped
+	// on the floor by never being read into the explicit 12-key literal.
+	const emitted = { v: 1, piAi: "0.80.7", truncated: 0, models: [{ ...GOOD_ROW, provider: "Anthropic", smuggled: "SECRET_EXTRA" }] };
+	const usage = parseExitUsage(usageLine(emitted));
+	assert.deepEqual(usage, { v: 1, piAi: "0.80.7", truncated: 0, models: [GOOD_ROW] });
+	assert.equal(JSON.stringify(usage).includes("SECRET_EXTRA"), false, "an unknown row key never survives the rebuild");
+});
+
+test("parseExitUsage returns null for the catch-path exit line that omits usage", () => {
+	assert.equal(parseExitUsage('{"event":"exit","code":2,"reason":"config"}'), null);
+	// The metered:false fallback line carries tokens but no ledger -- absent is NORMAL, not an error.
+	assert.equal(parseExitUsage('{"event":"exit","code":0,"turns":3,"tokens":{"total":9}}'), null);
+});
+
+test("parseExitUsage returns the LAST exit line's usage when two are present", () => {
+	const text = `${usageLine({ v: 1, models: [{ provider: "first", model: "m" }] })}\n${usageLine({ v: 1, models: [{ provider: "last", model: "m" }] })}`;
+	assert.equal(parseExitUsage(text)?.models[0].provider, "last");
+});
+
+test("parseExitUsage rejects a malformed block rather than storing a partial -- one bad row nulls the WHOLE block", () => {
+	// The malformed->null rule from parseExitTokens, block-wide: a valid sibling row must not survive a
+	// bad one, because a partial ledger is how the rows stop summing to anything an operator can trust.
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: [GOOD_ROW, { ...GOOD_ROW, provider: "bad provider!" }] })), null);
+	assert.equal(parseExitUsage(usageLine({ v: 0, models: [GOOD_ROW] })), null, "v must be an integer >= 1");
+	assert.equal(parseExitUsage(usageLine({ v: 1.5, models: [GOOD_ROW] })), null);
+	assert.equal(parseExitUsage(usageLine({ v: 1, piAi: "evil-string", models: [GOOD_ROW] })), null, "piAi is a plain semver or null, nothing else");
+	assert.equal(parseExitUsage(usageLine({ v: 1, truncated: -1, models: [GOOD_ROW] })), null);
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: [] })), null, "an empty models array is not a ledger");
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: [42] })), null, "a non-object row nulls the block");
+	assert.equal(parseExitUsage('{"event":"exit","usage":[1,2]}'), null, "an array is not a usage block");
+	assert.equal(parseExitUsage('{"event":"exit","usage":42}'), null);
+});
+
+test("parseExitUsage charset: the id allowlist rejects length, symbols and a leading dot", () => {
+	const withProvider = (provider) => usageLine({ v: 1, models: [{ ...GOOD_ROW, provider }] });
+	assert.equal(parseExitUsage(withProvider("a".repeat(65))), null, "a 65-char id is over the cap");
+	assert.notEqual(parseExitUsage(withProvider("a".repeat(64))), null, "64 IS the cap: 1 first-class char + 63 tail");
+	assert.equal(parseExitUsage(withProvider("bad provider!")), null, "space and ! are outside the class");
+	assert.equal(parseExitUsage(withProvider("../etc")), null, "a leading dot fails the first-char class -- no path shapes");
+});
+
+test("parseExitUsage numerics: absent rebuilds as 0, but a negative, a null, or an Infinity nulls the block", () => {
+	// Absent is an honest zero and the 12-key row shape stays stable regardless of what was emitted.
+	const bare = parseExitUsage(usageLine({ v: 1, models: [{ provider: "a", model: "m" }] }));
+	assert.deepEqual(bare, { v: 1, piAi: null, truncated: 0, models: [{ provider: "a", model: "m", calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, reasoning: 0, total: 0, cost: 0, unpriced: 0 }] });
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: [{ ...GOOD_ROW, input: -1 }] })), null, "a negative count nulls the block");
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: [{ ...GOOD_ROW, cost: null }] })), null, "null is present-and-wrong, not absent");
+	// JSON.parse cannot produce NaN, but it CAN produce Infinity -- 1e999 overflows to it -- so the
+	// finite check is the guard that actually fires on hostile input, not a decorative one.
+	assert.equal(parseExitUsage('{"event":"exit","usage":{"v":1,"models":[{"provider":"a","model":"m","total":1e999}]}}'), null);
+});
+
+test("parseExitUsage never throws across the shared hostile corpus", () => {
+	for (const input of HOSTILE_CORPUS) {
+		assert.doesNotThrow(() => parseExitUsage(input), `input=${JSON.stringify(input)}`);
+	}
+});
+
+test("parseExitUsage rejects a ten-row models array -- 8 named rows plus one 'other' is the whole envelope", () => {
+	const rows = (n) => Array.from({ length: n }, (_, i) => ({ provider: "p", model: `m${i}` }));
+	assert.equal(parseExitUsage(usageLine({ v: 1, models: rows(10) })), null, "a tenth row is a broken emitter, not a bigger ledger");
+	assert.notEqual(parseExitUsage(usageLine({ v: 1, models: rows(9) })), null, "nine rows is the documented cap");
+});
+
 test("buildRecord stores a completed run's tokens object as an explicit field", () => {
 	const tokens = { input: 1000, output: 200, total: 1200, cost: 0.05 };
 	const record = buildRecord({
@@ -213,6 +291,49 @@ test("buildRecord stores a completed run's tokens object as an explicit field", 
 	});
 	assert.deepEqual(record.tokens, tokens);
 	assert.equal(record.turns, 4);
+});
+
+test("buildRecord stores usage/provider/model explicitly from a completed source", () => {
+	// The trio lands like tokens does: explicit literals off the RESULT, no spread. provider/model are
+	// what the host dispatched with; usage is the rebuilt ledger the sink recovered from the exit line.
+	const usage = { v: 1, piAi: "0.80.7", truncated: 0, models: [GOOD_ROW] };
+	const record = buildRecord({
+		job: { id: "gh-u", attemptsMade: 0, name: "github", data: { kind: "github", repo: "o/r", target: { type: "issue", number: 1 } } },
+		result: { outcome: "completed", provider: "anthropic", model: "claude-sonnet-4", usage },
+		startedAt: "2026-08-01T00:00:00.000Z",
+		endedAt: "2026-08-01T00:01:00.000Z",
+	});
+	assert.deepEqual(record.usage, usage);
+	assert.equal(record.provider, "anthropic");
+	assert.equal(record.model, "claude-sonnet-4");
+});
+
+test("the usage trio keeps the record PII-free: host-fact provider/model, charset-validated ledger ids", () => {
+	// The record's provider/model come from the RESULT -- the effectiveJob's overlay-resolved values --
+	// never from anything the container printed. Container strings enter only through parseExitUsage's
+	// rebuild, so by the time a ledger id can reach this literal it has already passed the lowercased
+	// allowlist. This test drives the real parser, not a hand-built block, to pin that composition.
+	const usage = parseExitUsage('{"event":"exit","usage":{"v":1,"models":[{"provider":"Anthropic","model":"Claude-X","total":9}]}}');
+	const record = buildRecord({
+		job: {
+			id: "gh-u2",
+			attemptsMade: 0,
+			name: "github",
+			data: { kind: "github", repo: "o/r", flow: "fix", target: { type: "issue", number: 3, title: "SECRET_T", body: "SECRET_B" } },
+		},
+		result: { outcome: "completed", provider: "anthropic", model: "claude-x", usage },
+		startedAt: "2026-08-01T00:00:00.000Z",
+		endedAt: "2026-08-01T00:01:00.000Z",
+	});
+	assert.equal(record.provider, "anthropic", "the host fact, not a container string");
+	assert.equal(record.model, "claude-x");
+	for (const row of record.usage.models) {
+		assert.match(row.provider, /^[a-z0-9][a-z0-9._:/-]{0,63}$/, "every stored ledger id passed the allowlist");
+		assert.match(row.model, /^[a-z0-9][a-z0-9._:/-]{0,63}$/);
+	}
+	const json = JSON.stringify(record);
+	assert.ok(!json.includes("SECRET_T"), "title must not leak past the trio either");
+	assert.ok(!json.includes("SECRET_B"), "body must not leak past the trio either");
 });
 
 test("a gitlab run records project!iid for an MR and project#iid for an issue, never null", () => {
@@ -280,6 +401,9 @@ test("buildRecord for a github job keeps id-only fields and admits no PII", () =
 	assert.equal(record.flow, "fix");
 	assert.equal(record.turns, null);
 	assert.equal(record.tokens, null, "a result without tokens defaults the field to null");
+	assert.equal(record.usage, null, "a result without a ledger defaults the field to null");
+	assert.equal(record.provider, null, "the dispatch facts default null when the source omits them");
+	assert.equal(record.model, null);
 	assert.equal(record.exitCode, null);
 	assert.equal(record.budgetReserved, null);
 	assert.equal(record.reason, null);
@@ -436,6 +560,32 @@ test("makeLogSink disabled never opens a stream but still returns turns", async 
 
 	assert.equal(turns, 8);
 	assert.equal(fs.calls.createWriteStream, 0); // the raw .log is opt-in; nothing opened
+});
+
+test("makeLogSink close returns the parsed usage beside turns/tokens/session", async () => {
+	// Captured from the same bounded tail, before the flush, for the same reason the other three are:
+	// telemetry must survive a flush that errors or times out.
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: false, fs });
+	const jobLog = openJobLog("gh-usage");
+
+	jobLog.write(Buffer.from('{"event":"exit","turns":3,"tokens":{"total":9},"usage":{"v":1,"models":[{"provider":"Anthropic","model":"m","total":9}]}}\n'));
+	const { turns, tokens, usage } = await jobLog.close();
+
+	assert.equal(turns, 3);
+	assert.deepEqual(tokens, { total: 9 });
+	assert.equal(usage.models[0].provider, "anthropic", "the sink hands back the REBUILT block, ids already lowercased");
+});
+
+test("makeLogSink close returns usage null for a tail without a ledger", async () => {
+	const fs = makeFakeFs({ stream: makeFakeStream() });
+	const openJobLog = makeLogSink({ logsDir: "/logs", enabled: false, fs });
+	const jobLog = openJobLog("gh-no-usage");
+
+	jobLog.write(Buffer.from('{"event":"exit","turns":8,"tokens":{"total":5}}\n'));
+	const { usage } = await jobLog.close();
+
+	assert.equal(usage, null, "a pre-ledger exit line yields null, and null is normal, not an error");
 });
 
 test("makeLogSink swallows a stream that throws on write and emits error, still returning turns", async () => {

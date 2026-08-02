@@ -122,6 +122,18 @@ test("deleteTrigger: removes on confirm, no-ops on decline", async () => {
   assert.deepEqual(read(path).triggers.map((t) => t.on.type), ["comment"]);
 });
 
+test("deleteTrigger: an overlay-confirmed delete skips the dialog and still writes through the validator", async () => {
+  const two = { triggers: [{ on: { type: "label", any: ["a"] }, run: { kind: "github", flow: "f1" } }, { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "f2" } }] };
+  const path = tmpTriggers(two);
+  // The overlay's own footer asked y/n (TRIGGER_DETAIL arms `x`), so asking again via ui.confirm would be
+  // the same question twice. A confirm that WOULD decline proves the dialog was never consulted.
+  await handleDashboardAction({ action: "deleteTrigger", index: 0, confirmed: true }, { triggersPath: path }, { ui: mockUi({ confirm: [false] }) });
+  assert.deepEqual(read(path).triggers.map((t) => t.on.type), ["comment"], "the pre-confirmed delete wrote without a second dialog");
+  // Anything short of the overlay's literal `confirmed: true` still goes through the dialog.
+  await handleDashboardAction({ action: "deleteTrigger", index: 0, confirmed: "yes" }, { triggersPath: path }, { ui: mockUi({ confirm: [false] }) });
+  assert.equal(read(path).triggers.length, 1, "a non-boolean marker does not bypass the confirm");
+});
+
 test("editSettings: pick a key + value writes the overlay; blank unsets", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-crud-"));
   const settingsFile = join(dir, "settings.json");
