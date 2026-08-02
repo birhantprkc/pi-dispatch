@@ -11,6 +11,9 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
   pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json + subscriptions.json here
   pi-dispatch doctor [--fix]  preflight Docker, Valkey, the job image, and your provider key; --fix offers to run each fix (y/N per action)
   pi-dispatch up [--yes]   one consented pass: pull+tag the job image, start Valkey, init, doctor
+  pi-dispatch setup github mint GitHub App credentials in one browser click (App Manifest flow);
+                           every write shown first and individually consented — no --yes here
+                           (--webhook-url <URL> | --no-webhook) [--org <org>] [--name <appName>]
   pi-dispatch import-pi    stage your host pi setup (models/skills/persona) into a global overlay
                            [--no-extensions] [--with-packages] [--packages-file <path>]
                            [--from <agentDir>] [--to <overlayDir>]
@@ -52,6 +55,17 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 	if (cmd === "up") {
 		const { runUp } = await import("./up.mjs");
 		return runUp(argv.slice(1), { env });
+	}
+
+	if (cmd === "setup") {
+		// Subcommand shape (`setup <forge>`) so future forges can land beside github without a new
+		// top-level verb; an unknown or missing target prints guidance rather than guessing.
+		if (argv[1] === "github") {
+			const { runGithubAppSetup } = await import("./github-app-setup.mjs");
+			return runGithubAppSetup(argv.slice(2), { env });
+		}
+		process.stdout.write(`pi-dispatch setup <target> — guided credential setup\n\n  targets: github\n\n  pi-dispatch setup github (--webhook-url <URL> | --no-webhook) [--org <org>] [--name <appName>]\n      mint GitHub App credentials via the App Manifest flow — one browser click returns the app id,\n      private key, and webhook secret; every write is shown first and individually consented\n`);
+		return argv[1] ? 1 : 0;
 	}
 
 	if (cmd === "import-pi") {

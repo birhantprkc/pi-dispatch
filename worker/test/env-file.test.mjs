@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { setEnvKeyIfEmpty, updateEnvFile } from "../src/env-file.mjs";
+import { setEnvKey, setEnvKeyIfEmpty, updateEnvFile } from "../src/env-file.mjs";
 
 // -- setEnvKeyIfEmpty: pure transform, table-driven over the text shapes it must handle ---------------
 //
@@ -96,6 +96,114 @@ test("setEnvKeyIfEmpty: the unchanged case returns the same string object (ident
 	assert.ok(setEnvKeyIfEmpty(text, "WEBHOOK_SECRET", "x") === text);
 });
 
+// -- setEnvKey: the consented-overwrite sibling — same line mechanics, opposite value discipline ------
+//
+// Same table convention: `expected: null` means "byte-identical input back", asserted by identity,
+// because the wrapper skips the write on identity exactly as it does for the sibling.
+
+const overwriteCases = [
+	{
+		name: "an existing set value IS replaced (the whole point of the sibling)",
+		text: "A=1\nGITHUB_AUTH_SOURCE=gh\nB=2\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\nGITHUB_AUTH_SOURCE=app\nB=2\n",
+	},
+	{
+		name: "an empty set line is filled in place",
+		text: "A=1\nGITHUB_AUTH_SOURCE=\nB=2\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\nGITHUB_AUTH_SOURCE=app\nB=2\n",
+	},
+	{
+		name: "whitespace around = is normalised to the canonical line",
+		text: "GITHUB_AUTH_SOURCE = gh\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "GITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "a commented line is uncommented in place when no set line exists",
+		text: "A=1\n# GITHUB_AUTH_SOURCE=gh\nB=2\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\nGITHUB_AUTH_SOURCE=app\nB=2\n",
+	},
+	{
+		name: "no trace of the key appends at the end",
+		text: "A=1\nB=2\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\nB=2\nGITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "appending to text without a trailing newline first completes the last line",
+		text: "A=1",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\nGITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "appending to empty text yields just the one line",
+		text: "",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "GITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "the FIRST set line wins; a later duplicate is left as it was",
+		text: "GITHUB_AUTH_SOURCE=gh\nGITHUB_AUTH_SOURCE=pat\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "GITHUB_AUTH_SOURCE=app\nGITHUB_AUTH_SOURCE=pat\n",
+	},
+	{
+		name: "a set line wins over a commented duplicate wherever the comment sits (the comment stays a comment)",
+		text: "# GITHUB_AUTH_SOURCE=doc note\nGITHUB_AUTH_SOURCE=gh\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "# GITHUB_AUTH_SOURCE=doc note\nGITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "already exactly KEY=value is a no-op (identity)",
+		text: "A=1\nGITHUB_AUTH_SOURCE=app\nB=2\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: null,
+	},
+	{
+		name: "a key that merely prefixes another name does not match it",
+		text: "GITHUB_AUTH_SOURCE_OLD=x\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "GITHUB_AUTH_SOURCE_OLD=x\nGITHUB_AUTH_SOURCE=app\n",
+	},
+	{
+		name: "CRLF endings survive on the replaced line and everywhere else",
+		text: "A=1\r\nGITHUB_AUTH_SOURCE=gh\r\nB=2\r\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "A=1\r\nGITHUB_AUTH_SOURCE=app\r\nB=2\r\n",
+	},
+	{
+		name: "an already-exact line in a CRLF file is still a no-op (the \\r tail is not a difference)",
+		text: "GITHUB_AUTH_SOURCE=app\r\nB=2\r\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: null,
+	},
+	{
+		name: "surrounding comments and blank lines are preserved byte-for-byte",
+		text: "# header\n\nA=1   \n# note\nGITHUB_AUTH_SOURCE=gh\n\n# footer\n",
+		key: "GITHUB_AUTH_SOURCE",
+		expected: "# header\n\nA=1   \n# note\nGITHUB_AUTH_SOURCE=app\n\n# footer\n",
+	},
+];
+
+for (const { name, text, key, expected } of overwriteCases) {
+	test(`setEnvKey: ${name}`, () => {
+		const result = setEnvKey(text, key, "app");
+		if (expected === null) {
+			assert.equal(result, text, "unchanged means the INPUT text back, identically");
+		} else {
+			assert.equal(result, expected);
+		}
+	});
+}
+
+test("setEnvKey: the already-exact case returns the same string object (identity, not just equality)", () => {
+	const text = "GITHUB_AUTH_SOURCE=app\n";
+	assert.ok(setEnvKey(text, "GITHUB_AUTH_SOURCE", "app") === text);
+});
+
 // -- updateEnvFile: the thin fs wrapper — atomicity (tmp + rename) and mode preservation ---------------
 
 // A recording fake fs over one in-memory file. `ops` captures every call in order so tests can assert
@@ -166,4 +274,30 @@ test("updateEnvFile: any other mode is left alone (no chmod call at all)", () =>
 	const { fs, ops } = fakeFs("/deploy/.env", "WEBHOOK_SECRET=\n", 0o644);
 	updateEnvFile("/deploy/.env", "WEBHOOK_SECRET", "abc123", { fs });
 	assert.equal(ops.filter(([op]) => op === "chmod").length, 0);
+});
+
+// -- updateEnvFile { overwrite }: which transform runs is the ONLY difference — atomicity is shared ----
+
+test("updateEnvFile: overwrite:true replaces a set value, still via tmp + rename", () => {
+	const { fs, files, ops } = fakeFs("/deploy/.env", "GITHUB_AUTH_SOURCE=gh\n");
+	const result = updateEnvFile("/deploy/.env", "GITHUB_AUTH_SOURCE", "app", { fs, overwrite: true });
+	assert.deepEqual(result, { changed: true });
+	assert.equal(files.get("/deploy/.env"), "GITHUB_AUTH_SOURCE=app\n");
+	assert.deepEqual(ops.filter(([op]) => op === "write"), [["write", "/deploy/.env.tmp", "GITHUB_AUTH_SOURCE=app\n"]], "content lands on the tmp path only");
+	assert.deepEqual(ops.at(-1), ["rename", "/deploy/.env.tmp", "/deploy/.env"]);
+});
+
+test("updateEnvFile: the default (overwrite absent) keeps the never-clobber discipline", () => {
+	const { fs, files } = fakeFs("/deploy/.env", "GITHUB_AUTH_SOURCE=gh\n");
+	const result = updateEnvFile("/deploy/.env", "GITHUB_AUTH_SOURCE", "app", { fs });
+	assert.deepEqual(result, { changed: false }, "without the explicit overwrite opt-in, a set value stays sacrosanct");
+	assert.equal(files.get("/deploy/.env"), "GITHUB_AUTH_SOURCE=gh\n");
+});
+
+test("updateEnvFile: overwrite:true onto an already-exact line writes NOTHING (identity short-circuit)", () => {
+	const { fs, files, ops } = fakeFs("/deploy/.env", "GITHUB_AUTH_SOURCE=app\n");
+	const result = updateEnvFile("/deploy/.env", "GITHUB_AUTH_SOURCE", "app", { fs, overwrite: true });
+	assert.deepEqual(result, { changed: false });
+	assert.equal(files.get("/deploy/.env"), "GITHUB_AUTH_SOURCE=app\n");
+	assert.deepEqual(ops, [["read", "/deploy/.env"]], "the file is read once and never touched");
 });

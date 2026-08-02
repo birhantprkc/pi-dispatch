@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -499,6 +499,86 @@ test("doctor: GITHUB_AUTH_SOURCE=app skips the in-image probe (mints per-job)", 
 	assert.match(text(), /✓ in-image gh auth: skipped \(GITHUB_AUTH_SOURCE=app mints per-job\)/);
 	assert.ok(!calls.some((c) => c.cmd === "docker" && c.args[0] === "run"), "app mints per-job — nothing to preflight");
 	assert.doesNotMatch(text(), /forwards your full gh login/, "no scope warning for source app");
+});
+
+// -- GITHUB_AUTH_SOURCE=app completeness (issue #81): the credential triple, preflighted -----------------
+//
+// Real temp files for the key, like the overlay tests above: the mode check stats a real mode and the
+// PEM sniff reads real leading bytes. cwd points at tmpdir and fileExists stays the default, so only
+// the app-auth env drives these outcomes; everything else warns at most (and warns never fail).
+
+const KEY_BODY = "sk-app-key-body-distinctive"; // planted so no-contents-in-output is a grep, not a hope
+function appKeyFile({ content = `-----BEGIN PRIVATE KEY-----\n${KEY_BODY}\n-----END PRIVATE KEY-----\n`, mode = 0o600 } = {}) {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-app-key-")), "github-app-test.pem");
+	writeFileSync(path, content);
+	chmodSync(path, mode);
+	return path;
+}
+const appEnv = (extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", GITHUB_AUTH_SOURCE: "app", ...extra });
+const appDeps = (out) => ({ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" });
+
+test("doctor: a complete app-auth triple with a locked-down PEM is all green, contents never in output", async () => {
+	const keyPath = appKeyFile();
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ GITHUB_APP_ID set \(4242\)/);
+	assert.match(text(), /✓ GITHUB_APP_INSTALLATION_ID set \(987654\)/);
+	assert.match(text(), new RegExp(`✓ GitHub App private key present \\(${keyPath.replace(/[.\\/]/g, "\\$&")}\\)`));
+	assert.doesNotMatch(text(), /group\/world-readable/);
+	assert.doesNotMatch(text(), /does not look like a PEM/);
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY), "the key's contents must never reach output");
+});
+
+test("doctor: app source with the whole triple unset warns per variable, points at setup github, exits 0", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv(), appDeps(out));
+	assert.equal(code, 0, "app-auth completeness warns, never fails — a deployment can be mid-setup");
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_ID is unset/);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_INSTALLATION_ID is unset/);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_PRIVATE_KEY_PATH is unset/);
+	assert.match(text(), /run `pi-dispatch setup github`/, "the fix is the wizard that mints all three");
+});
+
+test("doctor: a non-numeric GITHUB_APP_ID is named as such (an id is not a secret, so it IS echoed)", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "Iv1.oops", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: appKeyFile() }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_ID is not numeric \("Iv1\.oops"\)/);
+	assert.match(text(), /✓ GITHUB_APP_INSTALLATION_ID set \(987654\)/, "the other two are judged independently");
+});
+
+test("doctor: a key path that points at nothing warns with the path", async () => {
+	const { out, text } = capture();
+	const missing = join(tmpdir(), "no-such-github-app.pem");
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: missing }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), new RegExp(`⚠ GITHUB_APP_PRIVATE_KEY_PATH does not exist \\(${missing.replace(/[.\\/]/g, "\\$&")}\\)`));
+});
+
+test("doctor: a group/world-readable PEM warns with the chmod fix", { skip: process.platform === "win32" ? "POSIX modes are synthetic on win32 (the check skips itself there)" : false }, async () => {
+	const keyPath = appKeyFile({ mode: 0o644 });
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0, "a loose mode is a warning, not a failure");
+	assert.match(text(), /⚠ the App private key at .* is group\/world-readable/);
+	assert.match(text(), new RegExp(`chmod 600 ${keyPath.replace(/[.\\/]/g, "\\$&")}`));
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY));
+});
+
+test("doctor: a file that does not start with -----BEGIN warns, and its contents are never echoed", async () => {
+	const keyPath = appKeyFile({ content: `definitely not a pem ${KEY_BODY}\n` });
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /⚠ the file at GITHUB_APP_PRIVATE_KEY_PATH does not look like a PEM \(first line is not "-----BEGIN \.\.\."\)/);
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY), "not even a malformed key's contents may reach output");
+});
+
+test("doctor: the app-auth block only fires for source app", async () => {
+	const { out, text } = capture();
+	await runDoctor(ghEnv({ GITHUB_AUTH_SOURCE: "pat" }), ghDeps(out, green));
+	assert.doesNotMatch(text(), /GITHUB_APP_ID/, "pat deployments hear nothing about App credentials");
 });
 
 // -- replica runs (REQ-REPLICA-RUNS): the multiplier is worth stating, not worth failing on ------------

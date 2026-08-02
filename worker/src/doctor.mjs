@@ -44,7 +44,7 @@
  * about severity: a --fix run still exits by the same failed/ok logic, warns stay warns, and the fix pass
  * happens at most once (check, fix, re-check -- never a loop).
  */
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -483,6 +483,74 @@ export async function collectChecks(env, seams) {
 				label: "GITHUB_AUTH_SOURCE is gh but `gh auth status` failed",
 				fix: "run `gh auth login` (or switch GITHUB_AUTH_SOURCE) -- github jobs and run.github cron triggers will refuse to run",
 			});
+		}
+	}
+
+	// GITHUB_AUTH_SOURCE=app: completeness of the credential triple loadGitHubAuth hard-requires
+	// (config.mjs), preflighted here so a half-finished App setup surfaces as doctor lines instead of a
+	// boot refusal. WARN, never fail, same doctrine as the rest of the github block: a deployment can
+	// legitimately be mid-setup. The private key gets a hygiene pass on top — presence, POSIX mode, and
+	// a first-bytes PEM sniff — but its CONTENTS never reach output: only the leading bytes are read
+	// (never the whole key into memory), and nothing from the file is ever echoed. Every fix line points
+	// at `pi-dispatch setup github`, which mints all three values and writes the PEM 0600 in one pass.
+	if (ghSource === "app") {
+		const setupFix = "run `pi-dispatch setup github` -- it mints the App, writes these .env lines, and lands the key mode 0600";
+		const numeric = (v) => typeof v === "string" && /^\d+$/.test(v.trim());
+		for (const name of ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID"]) {
+			checks.push({
+				ok: numeric(env[name]),
+				warn: true,
+				label: numeric(env[name])
+					? `${name} set (${env[name].trim()})`
+					: `GITHUB_AUTH_SOURCE=app but ${name} is ${env[name] ? `not numeric (${JSON.stringify(env[name])})` : "unset"} -- github jobs cannot mint tokens`,
+				fix: setupFix,
+			});
+		}
+		const keyPath = env.GITHUB_APP_PRIVATE_KEY_PATH;
+		if (!keyPath) {
+			checks.push({ ok: false, warn: true, label: "GITHUB_AUTH_SOURCE=app but GITHUB_APP_PRIVATE_KEY_PATH is unset -- the worker will refuse to boot", fix: setupFix });
+		} else if (!fileExists(keyPath)) {
+			checks.push({ ok: false, warn: true, label: `GITHUB_APP_PRIVATE_KEY_PATH does not exist (${keyPath})`, fix: setupFix });
+		} else {
+			checks.push({ ok: true, label: `GitHub App private key present (${keyPath})` });
+			// POSIX mode only -- on win32 stat modes are synthetic (0666-ish for everything), so a warn
+			// there would fire on every healthy deployment and teach operators to ignore it.
+			if (process.platform !== "win32") {
+				try {
+					const loose = statSync(keyPath).mode & 0o077;
+					if (loose !== 0) {
+						checks.push({
+							ok: false,
+							warn: true,
+							label: `the App private key at ${keyPath} is group/world-readable`,
+							fix: `chmod 600 ${keyPath} -- any local user can read the App's signing key right now (\`pi-dispatch setup github\` writes it 0600)`,
+						});
+					}
+				} catch {
+					// stat raced a deletion or an exotic fs: the presence line above already covered existence.
+				}
+			}
+			// First bytes only: enough to see "-----BEGIN", never the key material, and never echoed.
+			try {
+				const fd = openSync(keyPath, "r");
+				const head = Buffer.alloc(16);
+				let read = 0;
+				try {
+					read = readSync(fd, head, 0, head.length, 0);
+				} finally {
+					closeSync(fd);
+				}
+				if (!head.toString("utf8", 0, read).startsWith("-----BEGIN")) {
+					checks.push({
+						ok: false,
+						warn: true,
+						label: `the file at GITHUB_APP_PRIVATE_KEY_PATH does not look like a PEM (first line is not "-----BEGIN ...") -- contents not shown`,
+						fix: setupFix,
+					});
+				}
+			} catch {
+				checks.push({ ok: false, warn: true, label: `the App private key at ${keyPath} exists but is not readable by this user`, fix: setupFix });
+			}
 		}
 	}
 

@@ -297,6 +297,13 @@ Stated openly rather than discovered later:
   scopes it carries (calling out broad ones like `admin:org`, `delete_repo`, `workflow`). Prefer a
   fine-grained PAT — or an App — for real per-job scoping. Your `~/.config/gh` is never mounted into a
   container; the credential reaches jobs only as env values.
+  **`pi-dispatch setup github` makes the App path the easy one** (issue #81): the GitHub App Manifest
+  flow mints the app id, private key, and webhook secret in one browser click, against a throwaway
+  listener on **your own loopback** — nothing crosses a maintainer-controlled service, the conversion
+  code is single-use and expires in an hour, and the wizard shows every `.env` line before writing it,
+  never prints a secret, writes the PEM `0600`, and refuses to overwrite an existing key file or an
+  already-set `WEBHOOK_SECRET`. The credential minted is the narrowest this system supports
+  (`contents`/`pull_requests`/`issues` write + `metadata` read, per-repo 1h installation tokens).
 - **On GitLab there is no stronger option to prefer.** GitLab has no App equivalent and no short-expiry
   per-job token, so your project access token is what every GitLab job gets, for as long as you leave it
   valid. Use a **project** token rather than a group token (a group token reaches every project in the
