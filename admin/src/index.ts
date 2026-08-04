@@ -38,11 +38,19 @@
  * nudge names it on a fresh host. The wizard sequences the worker CLI's own consented
  * commands and writes the deployment pointer this factory applies above.
  *
- * Supported pi version: 0.80.7. The factory registers nothing unless every API
- * member it consumes is present; on a miss it names the member and the
- * supported version on stderr and returns.
+ * Tested pi version: 0.80.7 (SUPPORTED_PI_VERSION). The gate is the capability
+ * probe, not the version: the factory registers nothing unless every API member
+ * it consumes is present; on a miss it names the member and the tested version
+ * on stderr and returns. A pi that DIFFERS from the pin but passes the probe
+ * loads normally -- the mismatch becomes a one-line info advisory drained by the
+ * next /dispatch, never a refusal (issue #96: a merely newer pi must not scare
+ * or block anyone).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// A VALUE import, deliberately its own line: the type-only line above is regex-anchored by
+// pinned-extension-api.test.mjs and must keep its exact shape. VERSION is the HOST's pi version --
+// build.mjs keeps pi external, so this resolves against whatever pi actually loaded the extension.
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import {
@@ -93,6 +101,34 @@ export const USED_API = ["registerCommand", "registerTool", "sendMessage", "on"]
 
 export const SUPPORTED_PI_VERSION = "0.80.7";
 
+/**
+ * The advisory for running on a pi that is not the tested pin (issue #96). Pure over its two inputs
+ * so the comparison is unit-testable without faking a pi install. Equal versions mean nothing to
+ * say; pi's own "0.0.0" fallback (config.js: `VERSION = pkg.version || "0.0.0"` when its
+ * package.json is unreadable) means UNKNOWN, not different -- comparing it would report a bogus
+ * mismatch on an install the capability probe already vets for real.
+ */
+export function computePiVersionAdvisory(version: string, supported: string): string | undefined {
+  if (version === supported || version === "0.0.0") return undefined;
+  return (
+    `pi-dispatch admin: running on pi ${version}, tested with pi ${supported} — things should ` +
+    `work; report anything odd, and check for a newer @edgehero/pi-dispatch-admin`
+  );
+}
+
+// The retained advisory, drained once by the next /dispatch (the takePointerNotice idiom). Computed
+// at factory time but NEVER printed there: a successful load is silent, and load.test.mjs pins the
+// refusal path to exactly one stderr line. Memoized like deployment-pointer's appliedOnce -- pi may
+// in principle evaluate the factory more than once, and a re-evaluation must not re-arm an advisory
+// the operator already saw.
+let piVersionAdvisory: string | undefined;
+let piVersionCheckDone = false;
+
+/** TEST-ONLY: arm the advisory directly (under the pinned devDep pi the natural computation is a no-op). */
+export function _setPiVersionAdvisoryForTests(message: string | undefined): void {
+  piVersionAdvisory = message;
+}
+
 const CHANNEL = "pi-dispatch-admin";
 
 const REBUILT_NOTICE = (reason: string) =>
@@ -126,6 +162,15 @@ export default function admin(pi: ExtensionAPI): void {
       );
       return;
     }
+  }
+
+  // The probe above is the gate; the version is only an advisory (issue #96). A pi that differs
+  // from the tested pin yet still carries every consumed member must not scare or block anyone, so
+  // the mismatch is computed here -- after the probe PASSES, so a refused load stays a one-line
+  // no-op -- and surfaced by the next /dispatch, never printed at load.
+  if (!piVersionCheckDone) {
+    piVersionCheckDone = true;
+    piVersionAdvisory = computePiVersionAdvisory(VERSION, SUPPORTED_PI_VERSION);
   }
 
   // Layer the setup wizard's deployment pointer into process.env exactly once, before anything can call
@@ -753,6 +798,14 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   // never into model context.
   const pnote = takePointerNotice();
   if (pnote) notify?.(pnote, "warning");
+
+  // Drain the factory's version advisory the same way, once per process -- and at "info", not
+  // "warning": a different-but-capable pi is a heads-up, not a defect (issue #96). Sits before the
+  // sub dispatch below, so every subcommand (and the bare command) passes it.
+  if (piVersionAdvisory) {
+    notify?.(piVersionAdvisory, "info");
+    piVersionAdvisory = undefined;
+  }
 
   if (sub === "") {
     // Detection decides what a bare /dispatch means (issue #92). Lazy import: the wizard module loads

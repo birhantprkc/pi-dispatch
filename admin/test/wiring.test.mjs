@@ -509,3 +509,80 @@ test("unset removes a key, leaving a valid empty overlay", async () => {
   assert.match(ctx.notes[0][0], /unset model/);
   assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), {}, "empty overlay is a valid written state");
 });
+
+/**
+ * The runtime version advisory (issue #96): a pi that differs from the tested pin loads normally
+ * and says so ONCE, at "info" -- a heads-up, not a warning, and never a refusal. The comparison is
+ * the exported pure computePiVersionAdvisory (unit-testable without faking a pi install); the drain
+ * lives in dispatch() before the sub switch, so any subcommand passes it. Under the pinned devDep
+ * pi VERSION === SUPPORTED_PI_VERSION and the natural advisory is unset, so the drain is armed via
+ * the obviously-test-only setter (deployment-pointer's resetForTests precedent).
+ */
+test("the version advisory: pure comparison, and the drain fires once per process at info", async () => {
+  const { mod, def } = await loadRegistered();
+
+  assert.equal(mod.computePiVersionAdvisory("0.80.7", "0.80.7"), undefined, "equal versions: nothing to say");
+  assert.equal(
+    mod.computePiVersionAdvisory("0.0.0", "0.80.7"),
+    undefined,
+    "pi's own unreadable-package fallback means UNKNOWN, not different -- no bogus mismatch",
+  );
+  const msg = mod.computePiVersionAdvisory("0.99.0", "0.80.7");
+  assert.match(msg, /running on pi 0\.99\.0/, "names the runtime version");
+  assert.match(msg, /tested with pi 0\.80\.7/, "names the tested version");
+  assert.match(msg, /things should work/, "reassures rather than scares");
+  assert.match(msg, /@edgehero\/pi-dispatch-admin/, "points at the upgrade that resolves it");
+
+  mod._setPiVersionAdvisoryForTests("canned version advisory");
+  const first = fakeCtx();
+  await def.handler("runs", first.ctx);
+  const drained = first.notes.filter(([m]) => m === "canned version advisory");
+  assert.equal(drained.length, 1, "surfaced exactly once");
+  assert.equal(drained[0][1], "info", "an advisory, not a warning");
+  const second = fakeCtx();
+  await def.handler("runs", second.ctx);
+  assert.equal(
+    second.notes.filter(([m]) => m === "canned version advisory").length,
+    0,
+    "once per process: the second /dispatch stays quiet",
+  );
+});
+
+/**
+ * The CI canary (.github/scripts/admin-pi-canary.mjs) keeps its OWN copies of the pinned-api needle
+ * list and the USED_API member list -- pinned-extension-api.test.mjs asserts the PIN and cannot be
+ * imported by a CI script without becoming one. This test is the anti-drift bolt both directions:
+ * the canary's members must deepEqual the real USED_API export, and its needles must deepEqual the
+ * literals in pinned-extension-api.test.mjs (parsed from the test's own source -- reading it is
+ * fine, editing it is not) AND still appear in the pinned types.d.ts. A stale canary list fails the
+ * suite here instead of silently probing the wrong surface in CI.
+ */
+test("the canary's needle/member lists cannot drift from the pinned test or USED_API", async () => {
+  const { mod } = await loadRegistered();
+  const canary = await import(new URL("../../.github/scripts/admin-pi-canary.mjs", import.meta.url));
+
+  assert.deepEqual(
+    [...canary.USED_API_MEMBERS].sort(),
+    [...mod.USED_API].sort(),
+    "the canary's USED_API_MEMBERS drifted from the real USED_API export",
+  );
+
+  const pinnedTestSrc = readFileSync(fileURLToPath(new URL("./pinned-extension-api.test.mjs", import.meta.url)), "utf8");
+  const needleBlock = pinnedTestSrc.match(/const needles = \[([\s\S]*?)\];/);
+  assert.ok(needleBlock, "could not find the needles literal in pinned-extension-api.test.mjs");
+  const pinnedNeedles = [...needleBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(pinnedNeedles.length > 0, "expected at least one pinned needle");
+  assert.deepEqual(
+    [...canary.NEEDLES].sort(),
+    [...pinnedNeedles].sort(),
+    "the canary's NEEDLES drifted from pinned-extension-api.test.mjs's list",
+  );
+
+  const typesSrc = readFileSync(
+    fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts", import.meta.url)),
+    "utf8",
+  );
+  for (const needle of canary.NEEDLES) {
+    assert.ok(typesSrc.includes(needle), `canary needle "${needle}" is not in the PINNED types.d.ts`);
+  }
+});
