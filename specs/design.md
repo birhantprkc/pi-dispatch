@@ -105,10 +105,19 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   session**, which contradicts the always-on goal outright and reproduces the exact structural flaw that
   made the closest existing tool unusable ("always-on / laptop closed: no"). This decision is why the
   repository exists at all; without it there is nothing to build.
+- **Every forge arm is conditional, including GitHub** (amended, issue #99). The receiver mounts a
+  forge's route, resolves that forge's own identity for the bot-loop guard, and requires that forge's
+  credentials **only when the deployment serves it**. GitHub was the exception: its identity resolution
+  and `WEBHOOK_SECRET` were unconditional while the other three arms were already gated, so a
+  GitLab-only, Forgejo-only or Azure-only deployment could not boot without `gh` logged in and a webhook
+  secret it would never use. The gate is now uniform, and **the coupling is the safety property**:
+  skipping identity resolution is sound only because the route is absent too. An unconfigured forge
+  answers **404, not 401** — an endpoint that answers is an endpoint an operator can believe is armed —
+  and if `/` is ever mounted unconditionally again, the guard must return with it.
 - **Evidence (upstream)**: `earendil-works/pi @ 5e336cf → packages/coding-agent/docs/extensions.md`
   (event type union; no external-trigger types)
 - **Rejected**: webhook listener inside a pi extension — session-bound lifetime.
-- **Traces to**: `REQ-QUEUE-BURST-NO-DROP`
+- **Traces to**: `REQ-QUEUE-BURST-NO-DROP`, `CONST-HMAC-OVER-RAW-BODY`
 
 ## DES-QUEUE-BULLMQ-OVER-CUSTOM
 

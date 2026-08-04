@@ -13,8 +13,15 @@
 # forgotten would be the one nobody was looking at.
 #
 # Build:
-#   docker build -f image/Dockerfile.azure -t pi-job:azure --build-arg BASE=pi-dispatch-job:latest .
-ARG BASE=ghcr.io/edgehero/pi-dispatch-job:latest
+#   docker build -f image/Dockerfile.azure -t pi-job:azure --build-arg BASE=ghcr.io/edgehero/pi-job:latest .
+#
+# The default names the image CI actually publishes (`.github/workflows/image.yml`), which is the same name
+# `up`, `init` and `doctor` pull and tag. It has to be a REAL repository and not a plausible one: the
+# previous default pointed at a name that was never published anywhere, so every build that did not pass
+# `--build-arg BASE=` failed pulling its own base -- a default that cannot work is worse than no default,
+# because it reads as one somebody tested. Override it to build on a locally-tagged default image
+# (`--build-arg BASE=pi-job:latest`).
+ARG BASE=ghcr.io/edgehero/pi-job:latest
 FROM ${BASE}
 
 USER root

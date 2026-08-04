@@ -62,11 +62,11 @@ The receiver verifies **exactly** the mode you declared. A delivery carrying the
 refused even if it is correct — otherwise a sender could pick which gate it faced, and it would always
 pick the weaker one.
 
-**4. Give the receiver what it needs regardless of forge.** `WEBHOOK_SECRET` is required and has no
-default, and a GitHub identity has to resolve at boot: unlike the GitLab, Forgejo and Azure arms, the
-receiver's GitHub identity resolution is not conditional on your triggers naming GitHub. With
-`GITHUB_AUTH_SOURCE` unset (the default is `gh`) that means a logged-in `gh` CLI on the host. A GitLab-only
-deployment still needs both, which is a wart rather than intended design (issue #99).
+**4. A GitLab-only deployment needs nothing from GitHub.** Every forge arm is conditional: the receiver
+mounts a forge's route, resolves its identity for the bot-loop guard, and requires its credentials only
+when your triggers name that forge. So no `WEBHOOK_SECRET` and no `gh` login are needed here, and `/`
+(the GitHub endpoint) answers 404 rather than 401, because an endpoint that answers is one you could
+believe is armed. Add a `github` trigger later and both become required again, as they should.
 
 **5. Check it.** `pi-dispatch doctor` reports whether the token, the verification mode and the webhook
 secret are set when your triggers name GitLab, plus `WEBHOOK_SECRET` for any forge at all.
