@@ -438,10 +438,15 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   the raw `.log` renders, then it renders in the overlay viewer and is never returned as a tool result or
   sent as a message into model context; given an operator pi whose API surface lacks any required member,
   when the extension loads, then it registers nothing and reports the unsupported version loudly;
-  given bare `/dispatch` with no deployment anywhere and the setup offer **declined**, then nothing
-  was spawned and nothing was written; given a configured deployment whose queue is down, then the
-  panel opens with the unreachable banner and no setup offer; given a second pi startup after the
-  nudge fired once, then no nudge renders.
+  given an operator pi whose API surface is complete but whose version differs from the tested pin,
+  then the extension loads normally and the first `/dispatch` surfaces one info-level advisory naming
+  both versions — an untested pi is a notice, never a refusal (issue #96);
+  given bare `/dispatch` with no deployment anywhere, then it lands directly in the wizard's opening
+  select, and answering **Cancel** spawns nothing and writes nothing (the select is the consent —
+  issue #96 made this the default route); given a configured deployment whose queue is down, then the
+  panel opens with the unreachable banner and never the wizard; given a second pi startup after the
+  nudge fired once, then no nudge renders; given a deployment whose installed runtime is older than
+  the console's pin, then bare `/dispatch` surfaces one skew notice pointing at `/dispatch setup`.
 
 ## REQ-AI-TRIGGERED-RUNS
 
@@ -1007,6 +1012,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | The wizard becomes the default route (issue #96). **REQ-ADMIN-VIA-PI-EXTENSION Acceptance amended**: bare `/dispatch` with nothing configured lands directly in the wizard's opening select (Cancel spawns nothing, writes nothing — the select is the consent); an untested-but-complete pi version is one info advisory on first `/dispatch`, never a refusal; a runtime older than the console's pin is one skew notice pointing at `/dispatch setup`. The outage and nudge-latch clauses are unchanged in substance and restated. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: the new steps (Docker pre-check, trigger-edge choice) spawn only consented infrastructure commands; nothing reserves budget or enqueues. **REQ-DEPLOYMENT-BOOTSTRAP UNCHANGED, checked**: the wizard still drives the CLI's own gates; the service-unit re-anchoring fix (recorded in design.md) changes where units point, not what may be automated. |
 | 2026-08-04 | First-run setup joins the admin surface (issue #92). **REQ-ADMIN-VIA-PI-EXTENSION amended**: `/dispatch setup` (operator-typed only — deliberately no model-callable tool), the bare-`/dispatch` detection tree (the offer appears ONLY when pointer, env, and cwd scaffold are all absent AND the queue is unreachable — a configured deployment with a down queue keeps the banner, never an offer), and a once-ever notify-only `session_start` nudge; Acceptance gains declined-offer-⇒-nothing-spawned-nothing-written, no-offer-over-an-outage, and the nudge latch. **REQ-DEPLOYMENT-BOOTSTRAP Scope amended**: "not the admin extension" becomes the carve-in — the wizard is a *driver, not a power*: it reaches the same CLI actions through their own consent gates and adds only the deployment pointer. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no wizard path reserves budget, enqueues, or spends — setup ends at the panel, not at a job. |
 | 2026-08-02 | Process supervision joins the bootstrap requirement (issue #80). **REQ-DEPLOYMENT-BOOTSTRAP Scope widened**: `pi-dispatch service` (render/install/uninstall/status/start/stop/restart `--drain`) — user-level by default, sudo commands printed never executed, per-OS honesty (macOS login-scoped because Docker Desktop is; Windows via operator-installed nssm, never Task Scheduler — its `TerminateProcess` hard-kill is the recorded rejection), `restart --drain` composing the durable pause → wait-idle → restart → resume ritual the README previously spelled out by hand, and a timed-out drain leaves the queue paused rather than un-pausing over a live job. **REQ-SPEND-CAPS-MULTI-WINDOW / CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: supervision changes when the worker runs, never what a run may spend. |
 | 2026-08-02 | Consented bootstrap (issue #80). Added **REQ-DEPLOYMENT-BOOTSTRAP**: `pi-dispatch up [--yes]` and `doctor --fix` take a fresh machine to a preflighted deployment through create-only scaffolds and per-action consented host mutations — every mutating command printed verbatim, y/N default No (No on non-TTY), closed fix tiers with an explicit never-set (malformed-config rewrites, triggers/pause-windows content, trigger-named `run.image`, semantic env guesses), `WEBHOOK_SECRET` set only when empty and never printed. Automation removes typing, never decisions: the consent keypress preserves SECURITY.md's "pulled onto that host yourself" property that a silent bootstrap would erase. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no bootstrap path reserves budget, enqueues, or spends — `up` ends at doctor, not at a job. **REQ-GLOBAL-PI-OVERLAY UNCHANGED, checked**: doctor's overlay obligations are cited by the new REQ, not moved; `--fix`'s overlay actions (auth.json delete, import-pi restage) re-execute existing gates. |

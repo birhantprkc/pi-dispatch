@@ -58,7 +58,7 @@ One command puts a live TUI over the whole deployment:
 pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
 ```
 
-**No deployment yet? The console builds one.** When `/dispatch` finds nothing, it offers `/dispatch setup`: pick a folder, consent to an npm install of the pinned runtime, watch `pi-dispatch up` run its own prompts, optionally install the worker as a service, and land in the panel. Every step asks first and can be declined; nothing is written into your repo and no credential passes through a dialog.
+**This is the default way to set up pi-dispatch.** With nothing configured, `/dispatch` takes you straight into guided setup: an opening choice, a deployment folder, a consented npm install of the pinned runtime, a Docker check with per-OS pointers if it is missing, `pi-dispatch up` running its own prompts in your terminal, an optional worker service, an optional trigger edge (receiver service, docker compose profile, or the polling command), and an optional first trigger for the repo you are sitting in. Every step shows what it will do, asks first, and can be declined; nothing is written into your repo and no credential passes through a dialog. A deployment whose queue is merely down keeps the unreachable banner instead: setup appears when there is nothing, never over an outage.
 
 Already have a deployment? The panel finds it through the deployment pointer setup writes, or through the same env vars your worker uses (`VALKEY_URL`, `PI_LOGS_DIR`, `PI_SETTINGS_FILE`, `PI_TRIGGERS_FILE`, `PI_PAUSE_WINDOWS_FILE`, `PI_SUBSCRIPTIONS_FILE`). Your env always wins.
 

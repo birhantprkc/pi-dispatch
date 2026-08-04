@@ -35,7 +35,26 @@ system. pi-dispatch is exactly that missing operational layer, and nothing else:
 ## Quickstart
 
 You need **Docker**, **Node 22.19 or newer**, and a provider API key (Anthropic, OpenAI, and about 30
-others). No clone needed:
+others).
+
+### From pi (the default route)
+
+You already run pi, so let the console do everything:
+
+```bash
+pi install npm:@edgehero/pi-dispatch-admin   # then, inside pi:  /dispatch
+```
+
+With nothing configured, `/dispatch` takes you straight into guided setup: it creates a deployment
+folder, installs the pinned runtime, runs the same consented `up` pass described below in your
+terminal, optionally installs the worker as a service and the receiver as your trigger edge, and lands
+you in the admin panel, with an optional first trigger for the repo you are sitting in. Every step
+shows what it will do, asks first, and can be declined; nothing is written into your repo and no
+credential passes through a dialog.
+
+### Servers and headless
+
+The same setup as plain commands. No clone needed:
 
 ```bash
 mkdir my-dispatch && cd my-dispatch
@@ -110,9 +129,11 @@ pi-dispatch service status    # which unit exists, in which scope, and whether i
 pi-dispatch service restart --drain   # pause, wait until nothing is in flight, restart, resume
 ```
 
-`install` renders the [`deploy/`](deploy/) templates with computed paths and installs without sudo
-(`--system` on Linux prints the sudo commands instead of running them; `--receiver` installs the
-receiver unit). It refuses a second worker unit in another scope: one worker per docker daemon, because
+`install` renders the [`deploy/`](deploy/) templates and installs without sudo (`--system` on Linux
+prints the sudo commands instead of running them; `--receiver` installs the receiver unit when the
+receiver package is installed alongside). Units anchor on your deployment folder: `WorkingDirectory`
+and `.env` point at the folder you run the command from, and the exec paths point at the installed
+package, so the same command is correct from a checkout and from an npm install. It refuses a second worker unit in another scope: one worker per docker daemon, because
 the boot reaper would treat the other's containers as strays. Honesty notes: on macOS and Windows the
 service is login-scoped, because Docker Desktop is; and a policy refusal (exit 2) never relaunches, on
 any OS, so no supervisor loops against a paid provider. The templates remain hand-editable examples if
@@ -134,13 +155,16 @@ pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
 ```
 
 **No deployment yet? The console builds one.** When `/dispatch` finds nothing (no config, no env, queue
-unreachable) it offers **`/dispatch setup`**: pick a deployment folder, consent to an npm install of the
-pinned runtime, watch `pi-dispatch up` run its own prompts in your terminal, optionally install the
-worker as a service, and land in the panel, with an optional first trigger for the repo you are sitting
-in. Every step shows what it will do and asks first; every step can be declined; nothing is ever written
-into your repo, and no credential passes through a dialog. Setup writes a small **deployment pointer**
-(`~/.pi/agent/pi-dispatch-deployment.json`, paths only, never credentials) so the panel finds the
-deployment from any directory afterwards. Your own env vars always win over it, key by key.
+unreachable) it takes you straight into **`/dispatch setup`**, described in the Quickstart above: an
+opening choice, a deployment folder, the pinned runtime, a Docker check, `pi-dispatch up` in your
+terminal, an optional worker service, an optional trigger edge (receiver service, compose profile, or
+the polling command), and an optional first trigger for this repo. Every step asks first and can be
+declined; nothing is written into your repo, and no credential passes through a dialog. Setup writes a
+small **deployment pointer** (`~/.pi/agent/pi-dispatch-deployment.json`, paths only, never credentials)
+so the panel finds the deployment from any directory afterwards. Your own env vars always win over it,
+key by key, and when the deployed runtime falls behind the console's pin, one notice points you back at
+`/dispatch setup` to upgrade. A configured deployment whose queue is merely down keeps the unreachable
+banner: setup is offered when there is nothing, never over an outage.
 
 Inside the panel: `p`/`r` pause and resume the queue, arrows and `Enter` drill into triggers and runs,
 `a`/`e`/`x` add, edit and delete triggers (validated, atomic, reloaded live by both services), `s` edits
@@ -269,10 +293,12 @@ before one consent, the key lands with mode 0600, and no secret is ever printed.
 strongest auth source (per-repo one-hour tokens); `gh` and fine-grained PATs also work
 (`GITHUB_AUTH_SOURCE`).
 
-**Three ways to run the trigger edge**, pick one:
+**Three ways to run the trigger edge**, pick one (or let `/dispatch setup` walk you through the choice,
+which is what it offers right after the credentials step):
 
 1. **Webhook receiver on the host** (lowest latency): `npx pi-dispatch-receiver` from your deployment
-   folder. Your reverse proxy or tunnel does the public exposure.
+   folder, or `pi-dispatch service install --receiver` to run it as a user-level service. Your reverse
+   proxy or tunnel does the public exposure.
 2. **Webhook receiver in a container**: `docker compose -f deploy/docker-compose.yml --profile receiver
    up -d` runs the prebuilt
    [`ghcr.io/edgehero/pi-dispatch-receiver`](https://github.com/edgehero/pi-dispatch/pkgs/container/pi-dispatch-receiver)
