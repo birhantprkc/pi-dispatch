@@ -57,6 +57,19 @@ Use them like this:
 
 The confirm is the approval step. Treat a decline as a final, legitimate answer.
 
+## Setting up a deployment — `/dispatch setup`, and why you cannot run it
+
+When the tools report no reachable deployment (queue unreachable, no configured paths), the fix is the
+first-run wizard — and it is **operator-typed only**: there is no model-callable setup tool, on purpose.
+Tell the operator to type `/dispatch setup`. It will, with a consent step per action: create a deployment
+folder, npm-install the pinned runtime into it, hand the terminal to `pi-dispatch up` (whose own y/N
+prompts gate the docker actions), optionally install the worker as a user-level service, write the
+deployment pointer so the panel finds everything afterwards, and offer a first trigger for the repo the
+session is in. What it will NOT do, ever: write into the operator's repo (the `ai-trigger: allow` line is
+printed for them to commit), accept a credential through a dialog, or run anything with `--yes`.
+Do not try to reproduce the wizard's steps through other tools or shell access — the sequencing exists
+so each mutation carries its own human gate.
+
 ## Staged packages — `run.packages`, and why you cannot set it
 
 When a trigger fires, the job loads the third-party **pi packages the operator staged** into their global

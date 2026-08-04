@@ -33,6 +33,11 @@
  * ships an `operate-pi-dispatch` skill, advertised via `resources_discover`, that tells
  * the model how to use those human-in-the-loop write gates.
  *
+ * `/dispatch setup` (issue #92) runs the guided deployment wizard (setup-wizard.ts); a bare
+ * `/dispatch` on a host with no deployment at all offers it, and a one-time session_start
+ * nudge names it on a fresh host. The wizard sequences the worker CLI's own consented
+ * commands and writes the deployment pointer this factory applies above.
+ *
  * Supported pi version: 0.80.7. The factory registers nothing unless every API
  * member it consumes is present; on a miss it names the member and the
  * supported version on stderr and returns.
@@ -76,6 +81,10 @@ import { buildSandboxRunArgs, launchSandbox as spawnSandbox, resolveSandbox, san
 import { readManifest } from "@edgehero/pi-dispatch/sandbox-store";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView, renderCosts, renderWhatIf } from "./render.mjs";
 import { makeDashboard, createDashboardDeps } from "./dashboard.ts";
+// Only the nudge is loaded eagerly (it must register its session_start handler at factory time); the
+// wizard itself stays behind the dispatch handler's lazy import. The setup-wizard module imports
+// buildTriggerEntry back from here -- a cycle on paper, but both sides only call across it at runtime.
+import { registerNudge } from "./setup-wizard.ts";
 import { matchesKey } from "./keys.mjs";
 
 // The single source of truth for the ExtensionAPI surface this extension
@@ -90,7 +99,7 @@ const REBUILT_NOTICE = (reason: string) =>
   `replaced invalid settings file (${reason}) — other keys were lost`;
 
 const USAGE =
-  "usage: /dispatch <status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset>";
+  "usage: /dispatch <status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset|setup>";
 
 const KNOWN_SUBCOMMANDS = [
   "status",
@@ -105,6 +114,7 @@ const KNOWN_SUBCOMMANDS = [
   "settings",
   "set",
   "unset",
+  "setup",
 ] as const;
 
 export default function admin(pi: ExtensionAPI): void {
@@ -135,13 +145,14 @@ export default function admin(pi: ExtensionAPI): void {
 
   pi.registerCommand("dispatch", {
     description:
-      "pi-dispatch admin: status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset",
+      "pi-dispatch admin: status|pause|resume|run|runs|logs|budget|costs|triggers|settings|set|unset|setup",
     getArgumentCompletions: (prefix) => completeArguments(prefix),
     handler: async (args, ctx) => dispatch(pi, args, ctx),
   });
 
   registerTools(pi);
   registerSkill(pi);
+  registerNudge(pi);
 }
 
 /**
@@ -655,7 +666,7 @@ const PR_ACTION_VOCAB: Record<string, { hint: string; dflt: string }> = {
   azure: { hint: "created updated", dflt: "updated" },
 };
 
-function buildTriggerEntry(kind: string, f: any): any {
+export function buildTriggerEntry(kind: string, f: any): any {
   if (kind === "cron") {
     // Optional per-entry provider/model/maxTurns pass through to job.data (highest precedence); omitted when
     // blank so the value still resolves against the settings overlay/env at job start (triggers.mjs:127-131).
@@ -744,6 +755,32 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   if (pnote) notify?.(pnote, "warning");
 
   if (sub === "") {
+    // Detection decides what a bare /dispatch means (issue #92). Lazy import: the wizard module loads
+    // only on the bare command and `setup`, never for the read subcommands or the LLM tools.
+    const { detectDeployment, runSetupWizard } = await import("./setup-wizard.ts");
+    const det = await detectDeployment({ env: process.env, cwd: ctx?.cwd });
+    if (det.state === "none") {
+      // Nothing anywhere: offer the wizard instead of opening a panel onto an empty deployment. The
+      // confirm is the offer -- a decline (or a build without dialogs) degrades to the usage line.
+      if (typeof ctx?.ui?.confirm === "function") {
+        const ok = await ctx.ui.confirm(
+          "pi-dispatch setup",
+          "No deployment found (no pointer, no env, no config here, queue unreachable). Set one up now?",
+        );
+        if (ok) {
+          await runSetupWizard(paths, ctx, notify, { openDashboardFn: openDashboard });
+          return;
+        }
+      }
+      notify?.(`${USAGE} — run /dispatch setup when you are ready`, "info");
+      return;
+    }
+    if (det.state === "cwd" || det.state === "reachable") {
+      // A deployment that works only from this directory (cwd scaffold) or was merely probed
+      // (reachable queue, no config wired): open the panel as always, plus ONE hint that a pointer
+      // would make it work from anywhere. "pointer"/"env" open with no hint -- exactly as today.
+      notify?.(`using ${det.detail} — /dispatch setup can write a deployment pointer so this works from anywhere`, "info");
+    }
     await openDashboard(paths, ctx, notify);
     return;
   }
@@ -830,6 +867,14 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
     }
     case "unset": {
       applyUnset(paths.settingsFile, tokens, notify);
+      return;
+    }
+    case "setup": {
+      // Same lazy import as the bare branch; openDashboard rides in as a dep so the wizard's final
+      // step (and its "Open the panel anyway" escape) reuse this module's opener without a cycle at
+      // evaluation time.
+      const { runSetupWizard } = await import("./setup-wizard.ts");
+      await runSetupWizard(paths, ctx, notify, { openDashboardFn: openDashboard });
       return;
     }
     default:

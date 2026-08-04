@@ -41,7 +41,9 @@ function extractInterface(src, name) {
 test("(a) the pinned extension types still declare every member the admin depends on", () => {
   // registerCommand/registerTool/sendMessage are pi.* members; getArgumentCompletions, custom, notify are
   // the command/ui surfaces the handler, logs viewer and dashboard reach through ctx. executionMode is the
-  // ToolDefinition field the pause/resume tools set to "sequential".
+  // ToolDefinition field the pause/resume tools set to "sequential". confirm/select/input are the dialog
+  // primitives the CRUD driver and the setup wizard run on, and session_start is the event the wizard's
+  // one-time nudge registers for -- a pi upgrade moving any of them must fail here, not on an operator.
   const needles = [
     "registerCommand(name",
     "registerTool<TParams",
@@ -49,6 +51,10 @@ test("(a) the pinned extension types still declare every member the admin depend
     "getArgumentCompletions",
     "custom<T>(",
     "notify(message",
+    "confirm(title",
+    "select(title",
+    "input(title",
+    "session_start",
     "executionMode",
   ];
   for (const needle of needles) {

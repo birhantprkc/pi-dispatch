@@ -397,6 +397,12 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   false; print/headless). The operator-typed overlay CRUD and the confirm-gated tools reach the **same**
   validated, atomic `writeTriggers`/`writeSettings`. `dispatch_run` still takes **no spend-knob argument**
   (`model`/`maxTurns`/`dailyCap`/`concurrency`).
+  Since issue #92 the extension also carries the **first-run path**: `/dispatch setup`
+  (operator-typed only — deliberately no model-callable tool; `DES-FIRST-RUN-SETUP-WIZARD`), a
+  detection tree on bare `/dispatch` that offers setup **only** when no deployment exists anywhere
+  (pointer, env, cwd scaffold all absent AND the queue unreachable — an ops outage on a configured
+  deployment keeps the unreachable banner, never an offer), and a once-ever notify-only
+  `session_start` nudge.
 - **Scope**: The operator's interactive session on the worker host. The admin surface triggers no jobs
   except the gated `dispatch_run` enqueue, and is never materialised into a job's `/job` inputs —
   `INT-CONTAINER-JOB-INPUTS` mounts the serviced repo's own `.pi/` extensions, not this one.
@@ -431,7 +437,11 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   cap; given `/dispatch logs`, when
   the raw `.log` renders, then it renders in the overlay viewer and is never returned as a tool result or
   sent as a message into model context; given an operator pi whose API surface lacks any required member,
-  when the extension loads, then it registers nothing and reports the unsupported version loudly.
+  when the extension loads, then it registers nothing and reports the unsupported version loudly;
+  given bare `/dispatch` with no deployment anywhere and the setup offer **declined**, then nothing
+  was spawned and nothing was written; given a configured deployment whose queue is down, then the
+  panel opens with the unreachable banner and no setup offer; given a second pi startup after the
+  nudge fired once, then no nudge renders.
 
 ## REQ-AI-TRIGGERED-RUNS
 
@@ -954,7 +964,10 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   shipped deploy/ templates with computed absolutes (`process.execPath`, the real repo root — the
   shipped `/usr/bin/node` literal does not exist on an nvm host) and installs **user-level** by
   default; system-wide stays a printed sudo command, never executed. Not job execution, not
-  forge-side configuration (webhooks, branch protection, App installation), not the admin extension.
+  forge-side configuration (webhooks, branch protection, App installation). The admin extension's
+  `/dispatch setup` wizard (issue #92, `DES-FIRST-RUN-SETUP-WIZARD`) is **in scope as a driver, not
+  as a power**: it reaches these same CLI actions through their own consent gates and adds only the
+  deployment pointer (`INT-DEPLOYMENT-POINTER-CONTRACT`).
 - **Why**: The quickstart was five hand-typed infra chores whose commands were already fixed strings —
   automation removes typing, not decisions. The decisions stay human: every mutating action is printed
   verbatim and runs only on an explicit accept (y/N, default No, No on non-TTY), because "pulled onto
@@ -994,6 +1007,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | First-run setup joins the admin surface (issue #92). **REQ-ADMIN-VIA-PI-EXTENSION amended**: `/dispatch setup` (operator-typed only — deliberately no model-callable tool), the bare-`/dispatch` detection tree (the offer appears ONLY when pointer, env, and cwd scaffold are all absent AND the queue is unreachable — a configured deployment with a down queue keeps the banner, never an offer), and a once-ever notify-only `session_start` nudge; Acceptance gains declined-offer-⇒-nothing-spawned-nothing-written, no-offer-over-an-outage, and the nudge latch. **REQ-DEPLOYMENT-BOOTSTRAP Scope amended**: "not the admin extension" becomes the carve-in — the wizard is a *driver, not a power*: it reaches the same CLI actions through their own consent gates and adds only the deployment pointer. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no wizard path reserves budget, enqueues, or spends — setup ends at the panel, not at a job. |
 | 2026-08-02 | Process supervision joins the bootstrap requirement (issue #80). **REQ-DEPLOYMENT-BOOTSTRAP Scope widened**: `pi-dispatch service` (render/install/uninstall/status/start/stop/restart `--drain`) — user-level by default, sudo commands printed never executed, per-OS honesty (macOS login-scoped because Docker Desktop is; Windows via operator-installed nssm, never Task Scheduler — its `TerminateProcess` hard-kill is the recorded rejection), `restart --drain` composing the durable pause → wait-idle → restart → resume ritual the README previously spelled out by hand, and a timed-out drain leaves the queue paused rather than un-pausing over a live job. **REQ-SPEND-CAPS-MULTI-WINDOW / CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: supervision changes when the worker runs, never what a run may spend. |
 | 2026-08-02 | Consented bootstrap (issue #80). Added **REQ-DEPLOYMENT-BOOTSTRAP**: `pi-dispatch up [--yes]` and `doctor --fix` take a fresh machine to a preflighted deployment through create-only scaffolds and per-action consented host mutations — every mutating command printed verbatim, y/N default No (No on non-TTY), closed fix tiers with an explicit never-set (malformed-config rewrites, triggers/pause-windows content, trigger-named `run.image`, semantic env guesses), `WEBHOOK_SECRET` set only when empty and never printed. Automation removes typing, never decisions: the consent keypress preserves SECURITY.md's "pulled onto that host yourself" property that a silent bootstrap would erase. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no bootstrap path reserves budget, enqueues, or spends — `up` ends at doctor, not at a job. **REQ-GLOBAL-PI-OVERLAY UNCHANGED, checked**: doctor's overlay obligations are cited by the new REQ, not moved; `--fix`'s overlay actions (auth.json delete, import-pi restage) re-execute existing gates. |
 | 2026-08-02 | Doctor grows the missing receiver-side preflight (issue #80). **REQ-BRANCH-PROTECTION-PRECONDITION** amended: `doctor` now states at setup time that github branch protection cannot be preflighted statically (github triggers take their repo from each delivery — `run.repository` is azure-only) and names the actual enforcement point, per job pre-spend; a read-only capped `gh api` preflight helper ships for when repos are statically known, warn-never-fail, never offering to enable protection. Doctor also warns on the receiver-boot hard-requirements it previously ignored (WEBHOOK_SECRET; Forgejo and Azure credentials mirroring the existing GitLab block), gated on which forges the triggers file actually names, preserving warn-not-fail ("a deployment can legitimately be mid-setup") and presence-only secret checks. **REQ-TRIGGER-AUTHOR-GATE UNCHANGED, checked**: every new check reads state; none writes or gates anything. **CONST-MERGE-NEVER-AUTOMATIC UNCHANGED, checked**: the preflight surfaces the backstop's precondition earlier; the backstop itself is untouched. |

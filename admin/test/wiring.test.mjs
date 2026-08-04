@@ -17,6 +17,9 @@ import { join } from "node:path";
  * triggers) are covered in read-model.test.mjs, not here.
  */
 process.env.PI_LOGS_DIR = mkdtempSync(join(tmpdir(), "admin-wiring-"));
+// Hermeticity for the setup detection/nudge paths: pointerPath() and the nudge marker derive from
+// PI_CODING_AGENT_DIR, and no test run may ever read (or write!) the real ~/.pi/agent.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "admin-wiring-agent-"));
 
 const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { createJiti } = piRequire("jiti");
@@ -111,6 +114,50 @@ test("an unknown subcommand notifies and never touches the model channel", async
   await def.handler("bogus", unknown.ctx);
   assert.match(unknown.notes[0][0], /unknown subcommand/);
   assert.equal(calls.sendMessage.length, 0, "usage paths must not send into model context");
+});
+
+test("setup with a ctx lacking dialogs degrades to a notice, never the model channel", async () => {
+  const { calls, def } = await loadRegistered();
+  const ctx = fakeCtx({ withCustom: true }); // notify + custom, but no input/select/confirm
+  await def.handler("setup", ctx.ctx);
+  assert.ok(ctx.notes.some(([m]) => /dialogs|newer pi/.test(m)), "the missing-dialog notice is shown");
+  assert.equal(ctx.customCalls.length, 0, "no overlay opens for a wizard that cannot ask anything");
+  assert.equal(calls.sendMessage.length, 0);
+});
+
+/**
+ * The bare command on a host with NOTHING configured (issue #92): no pointer (agent dir is a pinned
+ * empty tmpdir), none of the path env vars, no cwd scaffold (the test runs from admin/), and a queue
+ * probe pinned to a dead port -- port 1 refuses immediately on every host, so the probe can never find
+ * a REAL dev Valkey on 6379 and go green under the test's feet. That state must surface the setup
+ * offer; a decline spawns nothing and degrades to the usage line. recordingPi still enforces USED_API
+ * throughout, so the detection/offer path cannot quietly grow a new pi member.
+ */
+test("bare /dispatch with nothing configured offers setup; a decline spawns nothing", async () => {
+  const keys = ["PI_LOGS_DIR", "PI_SETTINGS_FILE", "PI_TRIGGERS_FILE", "PI_PAUSE_WINDOWS_FILE", "PI_SUBSCRIPTIONS_FILE", "VALKEY_URL"];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) delete process.env[k];
+  process.env.VALKEY_URL = "redis://127.0.0.1:1";
+  try {
+    const { calls, def } = await loadRegistered();
+    const view = fakeCtx({ withCustom: true });
+    const confirms = [];
+    view.ctx.ui.confirm = async (title, message) => {
+      confirms.push([title, message]);
+      return false;
+    };
+    await def.handler("", view.ctx);
+    assert.equal(confirms.length, 1, "the offer confirm was shown exactly once");
+    assert.match(confirms[0][1], /No deployment found/);
+    assert.equal(view.customCalls.length, 0, "declined: no dashboard overlay, no wizard, nothing spawned");
+    assert.ok(view.notes.some(([m]) => /setup/.test(m)), "the decline degrades to the usage line naming setup");
+    assert.equal(calls.sendMessage.length, 0, "the offer path never touches the model channel");
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
 });
 
 /**
@@ -367,6 +414,8 @@ test("argument completion offers subcommands then run ids", async () => {
   const { def } = await loadRegistered();
   const subs = await def.getArgumentCompletions("s");
   assert.ok(Array.isArray(subs) && subs.some((i) => i.value === "status" || i.value === "settings"));
+  assert.ok(subs.some((i) => i.value === "setup"), "setup completes as a first token");
+  assert.deepEqual(await def.getArgumentCompletions("setu"), [{ value: "setup", label: "setup" }]);
   // Empty logs dir -> no ids to complete -> null (not []).
   assert.equal(await def.getArgumentCompletions("logs "), null);
   // No subcommand matches -> null.

@@ -36,7 +36,9 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
   pi-dispatch resume       resume taking jobs
   pi-dispatch status       show paused state + job counts
 
-Config comes from the environment (see .env.example); flags override it per run.`;
+Config comes from the environment (see .env.example); flags override it per run.
+Prefer being walked through all of this? The operator panel's /dispatch setup does every step
+with a consent per action:  pi install npm:@edgehero/pi-dispatch-admin`;
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
 	const cmd = argv[0];

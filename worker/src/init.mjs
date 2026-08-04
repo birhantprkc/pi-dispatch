@@ -73,5 +73,6 @@ Next:
   5. pi-dispatch worker                                 # drain the queue
 
 Operator panel (optional): pi install npm:@edgehero/pi-dispatch-admin   then   /dispatch
+  (or let the panel do all of the above: /dispatch setup walks these steps with a consent per action)
 `;
 }
