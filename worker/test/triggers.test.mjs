@@ -423,16 +423,48 @@ test("a mixed-forge file validates and preserves order, and each entry keeps its
 	assert.deepEqual(result.map((t) => t.run.kind), ["local", "github", "gitlab", "github", "gitlab", "github", "gitlab"]);
 });
 
-test("run.resume is an opt-IN, carried on all four trigger kinds", () => {
+test("run.resume is an opt-IN, carried on every trigger kind that can honour it", () => {
 	// Polarity is the OPPOSITE of run.packages, deliberately: staging a package is an operator act already
 	// performed, so a trigger opts OUT; persisting a transcript is a disclosure, so a trigger opts IN.
-	const [cron, label, comment, pr] = parse([
-		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/proj", flow: "tidy", task: "t", resume: true } },
+	//
+	// The three WEBHOOK kinds, not all four. Cron is refused at load by the test below -- `resolveSession`
+	// reaches only the forge preparers, so an armed cron trigger would arm nothing.
+	const [label, comment, pr] = parse([
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", resume: true } },
 		{ on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix", resume: true } },
 		{ on: { type: "pull_request", action: ["synchronize"] }, run: { kind: "github", flow: "review", resume: true } },
 	]);
-	for (const t of [cron, label, comment, pr]) assert.equal(t.run.resume, true, `${t.on.type} must carry run.resume`);
+	for (const t of [label, comment, pr]) assert.equal(t.run.resume, true, `${t.on.type} must carry run.resume`);
+});
+
+test("run.resume: true on a cron trigger refuses at load, naming the field and the trigger kind", () => {
+	// The defect this closes: the flag was accepted, documented, rode onto job data (schedules.mjs) and did
+	// exactly nothing -- `resolveSession` is passed only to the forge preparers (prepare.mjs), the local
+	// branch returns before it is in scope, and prepare-local.mjs has no session code. Accepted-and-ignored
+	// is how an operator comes to trust a field that does nothing, which is validateReplicas' own argument.
+	assert.throws(
+		() => parse([withRun(CRON, { resume: true })]),
+		(e) => isConfigError(e) && /run\.resume/.test(e.message) && /cron trigger/.test(e.message) && e.message.includes("nightly-tidy") && e.message.includes(PATH),
+		"a cron trigger that armed run.resume must fail loud at load, naming itself",
+	);
+	// NOT YET COVERED, not impossible -- validateReplicas' distinction, and the two are different facts.
+	// The local key exists (session-key.mjs keys a cron job on its scheduler id); nothing reaches it.
+	assert.throws(() => parse([withRun(CRON, { resume: true })]), (e) => /not yet covered/.test(e.message) && !/never|impossible/.test(e.message));
+});
+
+test("resume:false and absent still normalize on a cron trigger, byte-identically to today", () => {
+	// The property that must not regress. Only `true` is refused: `false` IS the documented default, so
+	// refusing it would refuse an operator for writing down the behaviour they already have -- and both
+	// values still have to reach schedules.mjs's `data` unchanged.
+	const [absent] = parse([CRON]);
+	assert.equal(absent.run.resume, undefined);
+	assert.equal("resume" in absent.run, true, "the key stays present-and-undefined, so a consumer reads one shape");
+	const [explicit] = parse([withRun(CRON, { resume: false })]);
+	assert.equal(explicit.run.resume, false, "an explicit false is preserved, not collapsed to absent");
+	// The whole normalized entry, keys and values, against the unflagged one -- a pin on the SHAPE rather
+	// than on the one field, because `data` is built by spreading these.
+	assert.deepEqual(Object.keys(explicit.run), Object.keys(absent.run));
+	assert.deepEqual({ ...explicit.run, resume: undefined }, absent.run);
 });
 
 test("an unflagged trigger normalizes with resume absent -- byte-identical to before the feature", () => {

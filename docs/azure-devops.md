@@ -58,11 +58,11 @@ Then create Service Hook subscriptions (Project Settings → Service hooks → W
 | Pull request created / updated | the pull_request trigger |
 | Pull request commented on | the comment trigger, on a PR |
 
-Two things the receiver needs regardless of forge: `WEBHOOK_SECRET`, which its config requires with no
-default, and a GitHub identity that resolves at boot, because that resolution is not conditional on your
-triggers naming GitHub the way the Azure, GitLab and Forgejo arms are. With `GITHUB_AUTH_SOURCE` unset (the
-default is `gh`) that means a logged-in `gh` CLI on the host. An Azure-only deployment still needs both,
-which is a wart rather than intended design (issue #99).
+An Azure-only deployment needs nothing from GitHub. Every forge arm is conditional: the receiver mounts a
+forge's route, resolves its identity for the bot-loop guard, and requires its credentials only when your
+triggers name that forge. So no `WEBHOOK_SECRET` and no `gh` login are needed here, and `/` (the GitHub
+endpoint) answers 404 rather than 401, because an endpoint that answers is one you could believe is armed.
+Add a `github` trigger later and both become required again, as they should.
 
 Then start it: `pi-dispatch-receiver` from your deployment folder, where `serve` is the default command, or
 the container profile instead (`docker compose -f deploy/docker-compose.yml --profile receiver up -d`); the
@@ -128,15 +128,14 @@ whole trimmed string when that string is itself nothing but an address. The disp
 attacker-settable: someone who names themselves `pi-bot@example.com is not me` must not read as the
 harness, or as anyone else.
 
-**A current limitation, and it is the one to know about.** Azure's Graph has no lookup-by-email endpoint, so
-the work-item path fetches the organization's user list and filters it locally. That fetch is a **single
-page**, and the continuation token is not followed. In an organization large enough for that list to
-paginate, an actor who falls outside the first page resolves to nobody, which is **determinate**: the gate
-refuses, the receiver answers **204**, and the run never happens. The symptom is work-item triggers that
-simply never fire for some people while working for others, behind a 204 that looks exactly like a stranger
-being correctly refused. Pull requests are unaffected, because a PR names its actor by GUID and that is a
-direct descriptor lookup. If work-item triggers are silent for a subset of your members, suspect this before
-your triggers file.
+**How the email path scales, and its one bound.** Azure's Graph has no lookup-by-email endpoint, so the
+work-item path fetches the organization's user list and filters it locally, following the continuation
+token across pages until it finds the actor. An actor on the first page still costs exactly one request.
+The walk is bounded at 20 pages, and reaching that bound is reported as **indeterminate**, not as a
+refusal: the receiver answers **503** and the delivery is redelivered, because "we could not finish
+looking" and "you are not allowed" are different answers and only one of them should look like a refusal.
+An actor genuinely absent from a list that ends is still a determinate refusal (204). Pull requests skip
+all of this: a PR names its actor by GUID, which is a direct descriptor lookup.
 
 Your `AZURE_TOKEN` needs to be able to read the Graph (`vso.graph`). If it cannot, every delivery answers
 503 rather than silently admitting or refusing anyone.
@@ -176,11 +175,8 @@ docker build -f image/Dockerfile.azure -t pi-job:azure \
   --build-arg BASE=ghcr.io/edgehero/pi-job:latest .
 ```
 
-`--build-arg BASE=...` is **required**, not decoration, until the Dockerfile's default is fixed:
-`image/Dockerfile.azure` still declares `ARG BASE=ghcr.io/edgehero/pi-dispatch-job:latest`, which is not a
-published image (the published one is `ghcr.io/edgehero/pi-job`), so a build that omits the arg fails
-pulling its own base. Point it at the published image as above, or at whatever you tagged the default image
-locally (`pi-job:latest`).
+`--build-arg BASE=...` is optional now that the Dockerfile defaults to the published image. Pass it when
+you want a different base: whatever you tagged locally (`pi-job:latest`), or your own derived image.
 
 Name it on the trigger with `run.image`. If you forget, the job is **refused before it costs anything**:
 the image declares which forges it can serve (`dev.pi-dispatch.forges`) and the pre-spend preflight reads

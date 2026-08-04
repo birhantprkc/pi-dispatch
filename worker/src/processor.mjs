@@ -9,18 +9,21 @@ import { EXIT_COMPLETED, EXIT_INFRA, EXIT_POLICY } from "./exit-code.mjs";
  * The order is the contract, and every step before `runContainer` must be free of provider spend:
  *
  *   0. refuse a job image this host does not have  -- INT-CONTAINER-RUNTIME-CONTRACT
- *   1. mint a scoped token (GitHub jobs, and local jobs opted in via `github: true`)
+ *   1. REFUSE an armed `run.resume` with no session store to persist into (the one fail-CLOSED case)
+ *                                                 -- REQ-RESUMABLE-SESSION
+ *   2. mint a scoped token (GitHub jobs, and local jobs opted in via `github: true`)
  *                                                 -- CONST-TOKEN-SCOPED-PER-JOB
- *   2. REFUSE an unprotected default branch (GitHub jobs only -- a local job has no repo)
+ *   3. REFUSE an unprotected default branch (GitHub jobs only -- a local job has no repo)
  *                                                 -- REQ-BRANCH-PROTECTION-PRECONDITION
- *   3. resolve the default-branch SHA (fresh API), clone at it, materialise .pi/, write the prompt
- *   4. reserve a budget slot                      -- CONST-BUDGET-BEFORE-TOKENS
- *   5. ONLY NOW run the container (the only step that spends provider tokens)
- *   6. map the container exit code to retry-vs-success
+ *   4. resolve the default-branch SHA (fresh API), clone at it, materialise .pi/, write the prompt
+ *   5. reserve a budget slot                      -- CONST-BUDGET-BEFORE-TOKENS
+ *   6. ONLY NOW run the container (the only step that spends provider tokens)
+ *   7. map the container exit code to retry-vs-success
  *
  * Budget is reserved as late as possible but strictly before the container, so a refusal from an
- * earlier free gate (unprotected repo, clone failure) never consumes a daily slot. The container
- * is the only thing that spends money, so "before tokens" means "before this line".
+ * earlier free gate (unprotected repo, an armed resume with no store, clone failure) never consumes a
+ * daily slot. The container is the only thing that spends money, so "before tokens" means "before this
+ * line".
  *
  * Returns a result object on a non-retryable outcome; THROWS on a retryable (infra) one so BullMQ
  * retries per `attempts`. The caller (the BullMQ processor) turns the thrown/returned distinction
@@ -41,6 +44,17 @@ export async function runJob(job, deps) {
 		// the store, on a COMPLETED exit only. Never throws. The default is a no-op so a wiring that omits
 		// it behaves exactly as before -- no store, no promotion, no session in the record.
 		promoteSession = () => null,
+		// The session store's root, or null when the feature is unavailable (REQ-RESUMABLE-SESSION). Read
+		// ONLY to answer the fail-closed gate below -- nothing here opens it, and it never reaches the
+		// container env (docker-run.mjs mounts a per-job COPY, never the store).
+		//
+		// The default is the env read config.mjs itself performs (`env.PI_SESSIONS_DIR || null`) rather than
+		// a bare `null`, and the difference is not cosmetic. A `null` default would make the gate refuse
+		// EVERY armed job under any wiring that does not pass this key -- a false refusal that looks exactly
+		// like the true one -- whereas the env is the single source both readers derive from, so the two
+		// cannot disagree about whether a store exists. A wiring may still pass `sessionsDir` explicitly to
+		// make the seam visible; it resolves to the same value.
+		sessionsDir = process.env.PI_SESSIONS_DIR || null,
 		// (job) => scoped short-lived token. Takes the JOB, not the repo: which forge mints -- and therefore
 		// which credential the container gets -- is a property of `job.kind`, and only the wiring knows the
 		// map. Called for forge-backed jobs and for local jobs opted in via `github: true`; unflagged local
@@ -139,6 +153,41 @@ export async function runJob(job, deps) {
 			// the refund path below: a no-op pre-reserve, and still honest if this gate ever moves.
 			// provider/model attribute even this pre-container death; no usage -- nothing ran to emit one.
 			throw new InfraRetry("docker unavailable, image preflight could not run", { reason: "container-never-started", provider: job.provider ?? null, model: job.model ?? null });
+		}
+
+		// REQ-RESUMABLE-SESSION's one fail-CLOSED case. Everything else in that feature fails OPEN and
+		// NAMES itself -- absent, expired, too-large, unparseable, locked, no key -- because a cold start is
+		// a correct run. This one cannot be: with no `sessionsDir`, resolveSession returns null
+		// (session-store.mjs), so nothing is staged, no /session is mounted, the transcript dies with the
+		// container, and the NEXT job on that key cold-starts too. The job would exit 0 and look like the
+		// feature worked. That is an operator who believes a disclosure is on while it is off, with a green
+		// run to confirm the belief -- the inversion validatePackagesFlag's comment describes one flag over,
+		// arriving from the other direction.
+		//
+		// PLACEMENT IS THE POINT. Free, determinate, credential-less and I/O-less -- the answer is two
+		// values already in hand -- so it belongs among the free policy refusals and strictly before
+		// anything that spends: before the mint (no credential is needed to know the answer, so none is
+		// created only to be discarded), before the branch check's API call, before prepareWorkspace's
+		// clone, before checkTokenCap's read and before reserveBudget's INCR -- hence `budgetReserved:
+		// false`. It sits AFTER the image preflight for the reporting reason the token-cap comment below
+		// already states: a missing image blocks EVERY job of EVERY kind on this host, so it is the one an
+		// operator must fix first either way, while this blocks only the triggers that armed the flag.
+		//
+		// Strict `=== true`, the same test prepare-github.mjs uses to decide whether to resolve a session at
+		// all, so the gate and the feature cannot disagree about what "armed" means. Kind-agnostic on
+		// purpose: only forge jobs can arm the flag today (triggers.mjs refuses it on cron, and a CLI or
+		// chained job has no trigger entry that could set it), but a gate written as an enumeration of kinds
+		// is a gate the next kind skips silently.
+		if (job.resume === true && !sessionsDir) {
+			await comment(job, "Refused: this trigger set `run.resume` but PI_SESSIONS_DIR is unset, so there is nowhere to persist the transcript -- the job would run with no session and still report success. Set PI_SESSIONS_DIR to a private directory outside every repo, or drop `run.resume` from this trigger. Not run.");
+			// The variable NAME, never a value: there is no path to print here (its absence IS the refusal),
+			// and the store's path is the one setting SECURITY.md calls a PII store. `kind` is host-assigned,
+			// the same PII class as the `repo` on the branch refusal below.
+			log("refused_sessions_dir_unset", { kind: job.kind ?? null });
+			// exitCode/turns/tokens null and budgetReserved false: refused pre-container AND pre-reserve,
+			// exactly as the image refusals above. RETURNED, not thrown: an unset environment variable is
+			// determinate, and no number of retries sets it (CONST-RETRY-INFRA-ONLY).
+			return { outcome: "policy", reason: "sessions-dir-unset", exitCode: null, turns: null, tokens: null, provider: job.provider ?? null, model: job.model ?? null, budgetReserved: false }; // return => not retried
 		}
 
 		if (wantsForgeToken) {

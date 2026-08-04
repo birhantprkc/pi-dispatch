@@ -1227,7 +1227,7 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   `GITHUB_TOKEN`/`GH_TOKEN` (`INT-CONTAINER-RUNTIME-CONTRACT`), so the flow can use the `gh` CLI. A
   non-boolean value is refused at load; with `GITHUB_AUTH_SOURCE=app` a `run.github` job refuses at mint
   time — an installation token is per-repo, and a local job has no repo to scope it to.
-- **`run.resume` (ALL FOUR trigger kinds, optional boolean) — an opt-IN, and the polarity is deliberate.**
+- **`run.resume` (github/gitlab/forgejo/azure triggers, optional boolean) — an opt-IN, and the polarity is deliberate.**
   Absent or `false` = today's behaviour: no transcript on disk, no `/session` mount, byte-identical argv.
   `true` = this trigger's jobs continue the session the previous job for the same key produced
   (`REQ-RESUMABLE-SESSION`, `INT-SESSION-STORE-CONTRACT`). The polarity is the **opposite** of
@@ -1237,9 +1237,22 @@ and selects the `on.type` it owns (worker: `cron`; receiver: `label`, `comment`,
   contents and its own reasoning, written to host disk and replayed into a later job — and disclosures
   default off. Non-boolean is refused at load, and here the damaging misreading runs the other way from
   `run.packages`': a truthy `"false"` string reads to an operator as an opt-out and would arm the
-  disclosure instead. Carried on all four kinds rather than cron-only like `run.github`, for `run.image`'s
-  reason: continuing a conversation is a property of the FLOW. A cron job keys on its own scheduler id,
-  which is the one key in this feature chosen by nobody untrusted.
+  disclosure instead. **`run.resume: true` on a `cron` trigger is refused at load**, on `run.replicas`'
+  precedent and with its own reason: `resolveSession` is handed to the forge preparers only, so a local job
+  would stage no transcript, mount no `/session` and promote nothing, then exit `0` as though it had — the
+  same believed-on-while-off inversion the flag's polarity exists to prevent, arriving through the wiring
+  instead of through a string. It is *not yet covered* rather than impossible: `session-key.mjs` already
+  derives a local key from the scheduler id, which is the one key in this feature chosen by nobody
+  untrusted, and nothing reaches it. Only `true` is refused; `false` and absent still validate and still
+  land in `data` byte-identically, because `false` is the documented default and refusing it would refuse
+  an operator for writing down present behaviour. That asymmetry with `run.replicas` — which refuses ANY
+  value on cron — is deliberate: `1` is itself a no-op flag, where `false` is the truth.
+  **A second refusal is pre-spend, not at load**: an armed trigger whose deployment has no
+  `PI_SESSIONS_DIR` refuses every delivery as `sessions-dir-unset` (`INT-RUN-HISTORY-FILE-CONTRACT`'s enum)
+  before the mint, the clone and the budget reservation — fail-CLOSED, the one case in this feature that
+  does not fail open, since a cold start is a correct run and a silently sessionless armed job is not. The
+  triggers file cannot answer that one: whether a store exists is deployment state, not file content, so
+  `doctor` is the load-time warning and the per-delivery refusal is the enforcement.
 - **`run.packages` (ALL FOUR trigger kinds, optional boolean) — an opt-OUT**: absent or `true` = the
   worker emits `PI_PACKAGES` with the container paths of the pi packages the operator staged into the
   global overlay (`INT-PI-PACKAGES-FILE-CONTRACT`, `INT-CONTAINER-RUNTIME-CONTRACT`), so the flow gets
@@ -1508,7 +1521,7 @@ worker reads.
     "flow":    "<flow name>" | null,
     "startedAt": "<ISO-8601>", "endedAt": "<ISO-8601>",
     "outcome":   "completed" | "policy" | "failed",
-    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|job-image-missing|job-image-replicas-unsupported|...>" | null,
+    "reason":    "<fixed enum: worker-abort|over-budget|unprotected-branch|runner-policy|container-never-started|settings-overlay-invalid|job-image-missing|job-image-replicas-unsupported|sessions-dir-unset|...>" | null,
     "exitCode":  <int> | null,
     "turns":     <int> | null,
     "tokens":    { "input": <int>, "output": <int>, "total": <int>, "cost": <number>,          // per-job usage totals; null when the container died before the exit line
@@ -1959,6 +1972,7 @@ recorded repair is re-running `/dispatch setup` (or editing the pointer by hand)
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | Documentation audit fallout (issue #99). **INT-TRIGGERS-FILE-CONTRACT** amended on `run.resume`, which this file had described as carried on **ALL FOUR** kinds for a month while the wiring covered three: `resolveSession` is handed to the forge preparers only, so a cron job with the flag armed staged no transcript, mounted no `/session`, promoted nothing and exited `0` as though it had. That is the flag's own believed-on-while-off inversion reached through the wiring rather than through a truthy `"false"` string, so the fix is `run.replicas`' fix: **refused at load**, worded *not yet covered* rather than impossible, because `session-key.mjs` already derives the local key from the scheduler id and nothing reaches it. Only `true` is refused — `false` and absent still validate and still land in `data` byte-identically, since `false` is the documented default and refusing an operator for writing down present behaviour would also change a shape pinned as byte-identical; the asymmetry with `run.replicas` (which refuses ANY value on cron) is recorded rather than left to read as an oversight, `1` being a no-op flag where `false` is the truth. The same bullet gains the **pre-spend** half, which the triggers file cannot answer by construction: whether a session store exists is deployment state, not file content, so an armed trigger under a deployment with no `PI_SESSIONS_DIR` is refused per delivery and `doctor` keeps the load-time warning. **INT-RUN-HISTORY-FILE-CONTRACT**: the `reason` enum gains one token, **`sessions-dir-unset`**, on `job-image-missing`'s precedent — a policy outcome with `budgetReserved: false`, since it is answered from two values already in hand before the mint, the branch check, the clone, the token-cap read and the budget INCR. Its shape follows `settings-overlay-invalid`'s (`<config artifact>-<its bad state>`) and its words are the spec's own, so the token greps to the text that mandates it. The nested `session.reason` enum's **`disabled`** was audited as unimplemented and is **UNCHANGED, checked**: the runner produces it (`image/runner/src/session.mjs`) whenever no session file is mounted, which is every unarmed job, so the entry was right and the audit finding was wrong. **INT-SESSION-STORE-CONTRACT UNCHANGED, checked**: the store's own no-`sessionsDir` return is now unreachable in a wired worker and kept as the DI-seam backstop, which changes no byte of its contract. |
 | 2026-08-04 | The panel learns to find a deployment built elsewhere (issue #92). Added **INT-DEPLOYMENT-POINTER-CONTRACT**: `<agent dir>/pi-dispatch-deployment.json` (override `PI_DISPATCH_DEPLOYMENT_FILE`), an allowlisted absolute-paths-only env map layered UNDER the operator's env once at extension load — env wins key by key, the worker/receiver never read it, and `PI_DISPATCH_RUN_ROOTS`/credentials in the file have no effect by construction (a pointer that widened the AI-run allowlist would be a second unreviewed door to a gated capability). Deliberate divergence from INT-SUBSCRIPTIONS' loud version refusal, recorded in the entry: a broken/newer pointer degrades to exactly the pre-pointer behavior with a one-line surfaced notice, never a throw — the read-model's never-throw doctrine outranks fail-loud here because the pointer is an availability aid, not a data file. **INT-SUBSCRIPTIONS-FILE-CONTRACT / INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: the pointer changes how their Locations are *found*, not what the files contain. |
 | 2026-08-02 | Polling producer (issue #81). **INT-WEBHOOK-PAYLOAD-SUBSET** amended: the subset may be synthesized from REST objects by `pi-dispatch-receiver poll` (`DES-GH-POLLING-TRANSPORT`), feeding the same pure `filter()` — parity pinned by dual-form tests; `poll-*` delivery ids share the `gh-` dedup space disjointly; the headers/HMAC row explicitly does not apply to synthesized subsets (no inbound delivery exists — TLS + the operator's credential is the transport trust). **REQ-DEDUP-BY-DELIVERY-GUID UNCHANGED, checked**: poll ids are stable across poller restarts by construction (event id / comment id / PR+head-sha), which is the retry-stability property the REQ demands of any id source. **INT-GITLAB/FORGEJO/AZURE-PAYLOAD-SUBSET UNCHANGED, checked**: polling is GitHub-only in this slice. |
 | 2026-08-02 | Receiver start path + triggers-default unification (issue #80). **INT-TRIGGERS-FILE-CONTRACT** amended: the receiver no longer *requires* `PI_TRIGGERS_FILE` — it falls back to `./triggers.json` in its working directory, the exact file `pi-dispatch init` scaffolds, and refuses to start when neither exists. The old default was the committed `deploy/triggers.json` (live demo triggers): an operator who edited the init scaffold and started the receiver without the env var silently ran the demo rules — a cwd default makes the reviewed file the operator just edited the one that fires. The admin extension's `resolvePaths` moves to the same cwd defaults for triggers/pause-windows/subscriptions (**INT-SUBSCRIPTIONS-FILE-CONTRACT** Location updated; **INT-PAUSE-WINDOWS-FILE-CONTRACT** UNCHANGED, checked — its Location is env-or-off for the *worker*, and the admin default is not part of that contract's shape). The receiver also gains its own bin, `pi-dispatch-receiver` (`receiver/src/cli.mjs`, `serve` by default): a `receiver` case in the worker CLI would invert the receiver→worker workspace dependency, and until now the only start command on record was inside `deploy/receiver.service`. **INT-WEBHOOK-PAYLOAD-SUBSET UNCHANGED, checked**: the bin changes how the process starts, not what it accepts or enqueues. |

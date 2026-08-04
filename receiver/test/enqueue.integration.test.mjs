@@ -31,8 +31,10 @@ function forgeTriggers({ knownFlows, ...group }) {
 	return { github: group, knownFlows };
 }
 
+// `servesGithub: true` is what mounts `/` (issue #99); this is a github-serving deployment, so it says so.
 const cfg = {
 	webhookSecret: SECRET,
+	servesGithub: true,
 	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: null },

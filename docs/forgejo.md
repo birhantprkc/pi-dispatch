@@ -44,11 +44,11 @@ The path matters. Forgejo sends `X-Forgejo-*`, `X-Gitea-*` **and** `X-GitHub-*` 
 header cannot tell it apart from GitHub — and a sender that could choose which gate it faced would choose
 the weakest one available. You pick the path when you configure the hook; the sender never picks.
 
-**4. Two things the receiver needs regardless of forge.** `WEBHOOK_SECRET` is required and has no default,
-and a GitHub identity has to resolve at boot: unlike the Forgejo, GitLab and Azure arms, the receiver's
-GitHub identity resolution is not conditional on your triggers naming GitHub. With `GITHUB_AUTH_SOURCE`
-unset (the default is `gh`) that means a logged-in `gh` CLI on the host. A Forgejo-only deployment still
-needs both, which is a wart rather than intended design (issue #99).
+**4. A Forgejo-only deployment needs nothing from GitHub.** Every forge arm is conditional: the receiver
+mounts a forge's route, resolves its identity for the bot-loop guard, and requires its credentials only
+when your triggers name that forge. So no `WEBHOOK_SECRET` and no `gh` login are needed here, and `/`
+(the GitHub endpoint) answers 404 rather than 401, because an endpoint that answers is one you could
+believe is armed. Add a `github` trigger later and both become required again, as they should.
 
 **5. Start it.** `pi-dispatch-receiver` from your deployment folder; `serve` is the default command, so
 there is nothing to type after the name. A container profile is the alternative

@@ -30,18 +30,14 @@ PI_SESSION_MAX_BYTES=8388608   # default 8 MiB; 0 = no cap
 ```
 
 `pi-dispatch doctor` reports the store whenever a trigger arms the flag, and fails that check when
-`PI_SESSIONS_DIR` is unset. Treat it as your only signal, because a trigger that sets `"resume": true`
-with no store configured is **not** refused today: `resolveSession` returns null, the container gets no
-`/session` mount, and the job runs cold and completes green, indistinguishable from a job that never set
-the flag.
-
-> **Known gap.** `REQ-RESUMABLE-SESSION` specifies this one case as fail-closed: an armed trigger with
-> `PI_SESSIONS_DIR` unset should be a pre-spend policy refusal, precisely so it cannot run unpersisted and
-> look like it worked. That refusal is **not implemented**. The worker's pre-spend policy returns are the
-> image, forge and replica preflights, branch protection and the daily token cap; there is no session gate
-> among them, and two comments in `worker/src/session-store.mjs` point at a processor refusal that does not
-> exist. Until it lands, run `doctor` rather than assuming a missing store announces itself. Tracked in the
-> repo's issues.
+`PI_SESSIONS_DIR` is unset. **One case fails closed**: a trigger that sets `"resume": true` with no store
+configured is refused **before it costs anything**, as a policy refusal that reserves no budget slot and
+starts no container, rather than running unpersisted and looking like it worked. That is the whole reason
+the refusal exists: a green run is exactly how an operator comes to believe a feature is on while it is
+off. It lands in the run record as `"reason": "sessions-dir-unset"` and comments on the issue naming the
+two ways out, set the variable or drop the flag. The refusal is per delivery rather than at load, because
+whether a store exists is a property of the deployment and not of the triggers file; `doctor` is what
+tells you before the first delivery arrives.
 
 ## Read this before you enable it
 
@@ -104,13 +100,12 @@ The issue and pull-request cases converge because they are the same branch: issu
 `pi/issue-7`, and a later comment on PR #8 resolves that same branch. That join is why a branch is the key
 and not a number.
 
-**Cron resume is not wired up yet.** `run.resume` is accepted on a cron trigger at config load and rides
-onto the job's data, but the session store is handed only to the forge preparers: a `kind: "local"` job
-returns from `prepareWorkspace` before that point, so nothing ever resolves a key for it. A nightly job
-that arms the flag is therefore accepted and then silently ignored, with no `/session` mount and nothing in
-the run record to say so. A key for it exists in principle (the trigger's own `on.id`, operator-authored
-and stable across fires), which is what makes this a gap rather than a decision. It is tracked as one, like
-the missing fail-closed refusal in the Known gap above.
+**Cron resume is refused at load, not yet covered.** The session store is handed only to the forge
+preparers: a `kind: "local"` job returns from `prepareWorkspace` before that point, so nothing would ever
+resolve a key for it. Rather than accept a flag that does nothing, `run.resume` on a cron trigger is
+refused fail-loud when the triggers file loads, the same way `run.replicas` is. A key for it exists in
+principle (the trigger's own `on.id`, operator-authored and stable across fires), so this is a gap to
+close rather than a permanent limit, and the refusal says so.
 
 ## When it silently doesn't resume
 

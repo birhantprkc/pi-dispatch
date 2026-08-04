@@ -136,6 +136,10 @@ test("a job with no key gets no mount at all -- byte-identical to a pre-feature 
 });
 
 test("an unset PI_SESSIONS_DIR yields no session rather than a temp-dir default", () => {
+	// The BACKSTOP, not the live behaviour: an armed job never gets this far, because processor.mjs returns
+	// a `sessions-dir-unset` policy refusal pre-spend (REQ-RESUMABLE-SESSION's one fail-closed case). Pinned
+	// anyway because the store and the preparer are both injected, so neither can assume its caller came
+	// through that gate -- and a null here is the same no-mount, nothing-written shape as no key at all.
 	const store = makeSessionStore({ sessionsDir: null, ttlDays: 14, maxBytes: 1000 });
 	assert.equal(store.resolveSession(ghIssue, { jobDir: "/tmp", piVersion: PI }), null);
 });

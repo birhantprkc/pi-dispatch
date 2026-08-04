@@ -20,6 +20,9 @@ function withTriggers(json) {
 	return () => loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
 }
 
+// `validTriggers` names github rules, so every case below is a GITHUB-SERVING deployment and the secret
+// requirement is exactly what it always was. The conditional half -- a deployment that serves no github --
+// is pinned in its own section at the foot of this file (issue #99).
 test("missing WEBHOOK_SECRET is a config error -- never boot unable to verify signatures", () => {
 	assert.throws(() => loadReceiverConfig({}, validTriggers), (e) => e.piDispatchConfig === true);
 });
@@ -378,4 +381,125 @@ test("a partially-configured gitlab endpoint refuses at boot rather than half-ar
   assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_WEBHOOK_SECRET: undefined }, validTriggers), (e) => e.piDispatchConfig === true);
   assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_TOKEN: undefined }, validTriggers), (e) => e.piDispatchConfig === true);
   assert.throws(() => loadReceiverConfig({ ...glEnv, GITLAB_TOKEN: "   " }, validTriggers), (e) => e.piDispatchConfig === true);
+});
+
+// --- servesGithub: whether this deployment terminates GitHub webhooks at all (issue #99) -----------
+//
+// The property is the loader's single answer to that question, and three things read it: the
+// WEBHOOK_SECRET requirement here, whether `/` is mounted (receiver.mjs), and whether boot resolves the
+// harness's GitHub identity to arm the bot-loop guard (start.mjs). The regression it fixes was a
+// GitLab-only deployment being unable to boot at all -- it had to supply a webhook secret for an endpoint
+// it did not run, and (via the gh default auth source) install and log into the GitHub CLI. Both
+// DIRECTIONS are pinned here: a github-free deployment must not need either, and a github-serving one
+// must still refuse exactly as loudly as it always did.
+
+const GITLAB_ONLY_JSON = JSON.stringify({
+	triggers: [
+		{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "gitlab", flow: "gl-fix" } },
+		{ on: { type: "comment", phrase: "@pi" }, run: { kind: "gitlab", flow: "gl-triage" } },
+	],
+});
+const gitlabOnlyTriggers = { fileExists: () => true, readFile: () => GITLAB_ONLY_JSON };
+
+test("a gitlab-only triggers file leaves servesGithub false, and WEBHOOK_SECRET is then NOT required", () => {
+	// The whole defect in one assertion: this deployment has no github endpoint, so there is no delivery
+	// for a webhook secret to verify and demanding one blocked a supported deployment outright.
+	const c = loadReceiverConfig({ GITLAB_WEBHOOK_MODE: "token", GITLAB_WEBHOOK_SECRET: "gl-secret", GITLAB_TOKEN: "glpat-x" }, gitlabOnlyTriggers);
+	assert.equal(c.servesGithub, false, "an empty github group means a signed delivery could match nothing");
+	assert.equal(c.webhookSecret, undefined, "absent stays absent -- nothing reads it, and servesGithub says why");
+	assert.ok(c.gitlab, "the forge it DOES serve is configured, which is the point of the deployment");
+});
+
+test("servesGithub is false with no forge configured at all -- an empty github group is the signal, not the env", () => {
+	// No GITLAB_* either: the decision is read off the triggers FILE, so it does not quietly depend on
+	// another forge's block being present to relieve the github requirement.
+	const c = loadReceiverConfig({}, gitlabOnlyTriggers);
+	assert.equal(c.servesGithub, false);
+	assert.doesNotThrow(() => loadReceiverConfig({}, gitlabOnlyTriggers));
+});
+
+test("a github trigger sets servesGithub true, and a missing WEBHOOK_SECRET is still the same configError", () => {
+	assert.equal(loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, validTriggers).servesGithub, true);
+	// Identical tagging and identical message to before the change: the endpoint exists, so the secret is
+	// the trust boundary and its absence must still stop the boot dead.
+	assert.throws(
+		() => loadReceiverConfig({}, validTriggers),
+		(e) => e.piDispatchConfig === true && /WEBHOOK_SECRET is required/.test(e.message) && /cannot verify signatures/.test(e.message),
+	);
+	assert.throws(() => loadReceiverConfig({ WEBHOOK_SECRET: "   " }, validTriggers), (e) => e.piDispatchConfig === true);
+});
+
+test("ANY github webhook rule type arms servesGithub -- label, comment, or pull_request alone", () => {
+	// One case per group field, because the decision reads all three and a forgotten one would be a
+	// deployment whose only trigger is a comment (or a PR rule) silently losing its endpoint.
+	const cases = {
+		label: { on: { type: "label", any: ["pi:x"] }, run: { kind: "github", flow: "fix" } },
+		comment: { on: { type: "comment", phrase: "@pi" }, run: { kind: "github", flow: "fix" } },
+		pull_request: { on: { type: "pull_request", action: ["opened"] }, run: { kind: "github", flow: "fix" } },
+	};
+	for (const [kind, trigger] of Object.entries(cases)) {
+		const fs = { fileExists: () => true, readFile: () => JSON.stringify({ triggers: [trigger] }) };
+		assert.equal(loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, fs).servesGithub, true, `a lone github ${kind} rule must arm the endpoint`);
+		assert.throws(() => loadReceiverConfig({}, fs), (e) => e.piDispatchConfig === true, `a lone github ${kind} rule must still require the secret`);
+	}
+});
+
+test("an explicit GITHUB_AUTH_SOURCE sets servesGithub true with no github triggers -- explicit intent wins", () => {
+	// An operator who names an auth source has said "GitHub" out loud, and may be arming the receiver
+	// before the first rule exists. Respecting that also keeps boot byte-identical for everyone who sets it.
+	for (const source of ["gh", "pat", "app"]) {
+		const env = {
+			WEBHOOK_SECRET: "shh",
+			GITHUB_AUTH_SOURCE: source,
+			...(source === "pat" ? { GITHUB_PAT: "ghp_x" } : {}),
+			...(source === "app" ? { GITHUB_APP_ID: "1", GITHUB_APP_INSTALLATION_ID: "2", GITHUB_APP_PRIVATE_KEY_PATH: "/k.pem" } : {}),
+		};
+		const c = loadReceiverConfig(env, gitlabOnlyTriggers);
+		assert.equal(c.servesGithub, true, `GITHUB_AUTH_SOURCE=${source} is an explicit statement that this deployment serves github`);
+		// And with the endpoint armed, the secret is required again -- the two move together, always.
+		assert.throws(
+			() => loadReceiverConfig({ ...env, WEBHOOK_SECRET: undefined }, gitlabOnlyTriggers),
+			(e) => e.piDispatchConfig === true && /WEBHOOK_SECRET/.test(e.message),
+			`GITHUB_AUTH_SOURCE=${source} must re-impose the secret requirement`,
+		);
+	}
+});
+
+test("the default auth source does NOT arm servesGithub -- github.source cannot distinguish default from choice", () => {
+	// loadGitHubAuth defaults `source` to "gh", so reading the PARSED block would answer yes for every
+	// deployment on earth and re-create the defect. The decision reads env.GITHUB_AUTH_SOURCE itself.
+	const c = loadReceiverConfig({}, gitlabOnlyTriggers);
+	assert.equal(c.github.source, "gh", "the block still defaults, exactly as the worker's does");
+	assert.equal(c.servesGithub, false, "a defaulted source is not an operator saying github");
+});
+
+test("a github auth block error is reported as itself, never laundered into a WEBHOOK_SECRET complaint", () => {
+	// Ordering: triggers and the auth block parse BEFORE the conditional secret check, so a typo'd source
+	// on a secretless deployment names the typo. The reverse order would send the operator hunting for a
+	// secret they do not need.
+	assert.throws(
+		() => loadReceiverConfig({ GITHUB_AUTH_SOURCE: "gitthub" }, gitlabOnlyTriggers),
+		(e) => e.piDispatchConfig === true && /GITHUB_AUTH_SOURCE/.test(e.message),
+	);
+});
+
+test("reloadTriggers does NOT recompute servesGithub -- a live edit can never mount / with an unarmed guard", () => {
+	// The fail-safe direction, asserted so nobody "fixes" it into the unsafe one: `/` being mounted and the
+	// harness's GitHub identity being resolved are both boot facts, so the property that gates them stays a
+	// boot decision. A live edit that adds a github rule leaves the endpoint 404ing until a restart.
+	const cfg = loadReceiverConfig({}, gitlabOnlyTriggers);
+	assert.equal(cfg.servesGithub, false);
+	const withGithub = JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:x"] }, run: { kind: "github", flow: "fix" } }] });
+	const res = reloadTriggers({}, cfg, { fileExists: () => true, readFile: () => withGithub });
+	assert.deepEqual(res, { ok: true }, "the reload itself succeeds -- the new rules ARE live for every configured forge");
+	assert.equal(cfg.triggers.github.label.length, 1, "and the github group is loaded, so nothing is silently dropped");
+	assert.equal(cfg.servesGithub, false, "but the endpoint stays absent: no route without a bot-loop guard");
+});
+
+test("a present WEBHOOK_SECRET on a github-free deployment is passed through untouched, not rejected", () => {
+	// A deployment may share one env file across services. An unused secret is not an error -- it is just
+	// unread, and `servesGithub: false` is what says the `/` endpoint it belongs to does not exist.
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, gitlabOnlyTriggers);
+	assert.equal(c.servesGithub, false);
+	assert.equal(c.webhookSecret, "shh");
 });

@@ -32,9 +32,12 @@ import { sessionKeyFor } from "./session-key.mjs";
  *
  * NEVER THROWS. Every path returns `{ resume, reason, ... }` or null-ish, because a disk fault must not
  * fail a prepare that only asked whether there was a transcript -- the posture makeFindPreviousRun
- * already sets. The one fail-CLOSED case lives in the processor, not here: a trigger that armed
- * run.resume while PI_SESSIONS_DIR is unset is a pre-spend policy refusal, because running it silently
- * without persistence is the failure validatePackagesFlag's own comment describes.
+ * already sets. The one fail-CLOSED case lives in the processor, not here, and it is a gate this module is
+ * never asked: runJob returns a `sessions-dir-unset` policy refusal for a job whose trigger armed
+ * `run.resume` while `sessionsDir` is null (processor.mjs, before the mint and before reserveBudget), so a
+ * job that reaches `resolveSession` at all has already been proven to have somewhere to persist to.
+ * Refused rather than run, because running it silently without persistence is the failure
+ * validatePackagesFlag's own comment describes.
  */
 
 /** Container-side name, fixed. Nothing key-derived crosses the boundary -- see makeSessionStore. */
@@ -68,7 +71,13 @@ export function makeSessionStore({
 	 */
 	function resolveSession(job, { jobDir, resolved = {}, piVersion = null } = {}) {
 		try {
-			if (!sessionsDir) return null; // feature unavailable; the processor refuses armed triggers earlier
+			// Unreachable in a wired worker, and deliberately kept: resolveSession is only ever called for a
+			// job that armed run.resume (prepare-github.mjs), and processor.mjs refuses exactly that job
+			// pre-spend when this is null -- the `sessions-dir-unset` policy return. This stays as the
+			// DI-seam backstop, because both the store and the preparer are injected and neither can assume
+			// the caller came through that gate; a null here is the same no-mount, nothing-written shape a
+			// pre-feature job had.
+			if (!sessionsDir) return null;
 			const key = sessionKeyFor(job, resolved);
 			// No key is not a failure and not a degradation: this job has no durable identity (a fork PR, a
 			// CLI run, an unresolvable head ref), so it gets no mount and no transcript on disk.

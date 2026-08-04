@@ -6,11 +6,14 @@
  * agent. It only produces jobs; it never runs pi.
  *
  * CONST-TRIGGER-AUTHOR-GATE: `selfId` is the bot-loop guard's sole input -- the filter drops any event
- * whose `sender.id` is our own. Resolving it is therefore a HARD-FAIL boot invariant: if identity does
- * not resolve, the rejection propagates and the server is NEVER created. A receiver that listened
- * without `selfId` would run the guard disarmed, and its own completion comments would re-trigger jobs
- * -- an unbounded paid recursion. The worker's auth is best-effort because it can fail a github job
- * per-job; the receiver has no such per-job fallback, so identity resolution is a boot gate.
+ * whose `sender.id` is our own. Resolving it is therefore a HARD-FAIL boot invariant WHEREVER A FORGE
+ * ENDPOINT IS LIVE: if identity does not resolve, the rejection propagates and the server is NEVER
+ * created. A receiver that listened without `selfId` would run the guard disarmed, and its own completion
+ * comments would re-trigger jobs -- an unbounded paid recursion. The worker's auth is best-effort because
+ * it can fail a github job per-job; the receiver has no such per-job fallback, so identity resolution is a
+ * boot gate. Every arm here is gated on its own forge being configured, github included (`cfg.servesGithub`,
+ * issue #99) -- an arm whose endpoint does not exist has no guard to arm, and the invariant that matters is
+ * that the two are decided by the SAME property, never separately.
  *
  * The receiver resolves identity ONLY. It holds no per-repo tokens: minting a scoped token is the
  * worker's job, per container, per job (CONST-TOKEN-SCOPED-PER-JOB).
@@ -58,11 +61,29 @@ export async function startReceiver(
 
 	const cfg = loadReceiverConfig(env);
 
-	// HARD-FAIL identity resolution -- NO try/catch. A throw here (absent/bad github auth, unresolvable
-	// id) propagates and the server below is never created: without selfId the bot-loop guard cannot
-	// run, so refusing to boot is the only safe outcome.
-	const { selfId } = await makeAuth(cfg.github);
-	log({ event: "self_identity", id: selfId, source: cfg.github.source });
+	// The GitHub arm, when the deployment actually serves GitHub -- now conditional, exactly like the three
+	// sibling arms below (issue #99). It was unconditional, and since GITHUB_AUTH_SOURCE defaults to `gh` and
+	// the gh path shells out to `gh auth token`, a GitLab-only deployment could not boot without installing
+	// and logging into the GitHub CLI it has no use for.
+	//
+	// SKIPPING THIS IS ONLY SAFE BECAUSE THE ROUTE IS ALSO ABSENT. `cfg.servesGithub` gates both: this
+	// identity resolution AND whether `makeReceiver` mounts `/` at all. `selfId` is the bot-loop guard's sole
+	// input, so the two MUST stay coupled -- if a future change mounts `/` unconditionally again, this
+	// resolution has to come back with it, or the github endpoint would run its guard disarmed and the
+	// harness's own completion comments would re-trigger jobs forever. Read that as: never make one of these
+	// two conditions unconditional without the other.
+	let selfId;
+	if (cfg.servesGithub) {
+		// HARD-FAIL identity resolution -- NO try/catch. A throw here (absent/bad github auth, unresolvable
+		// id) propagates and the server below is never created: without selfId the bot-loop guard cannot
+		// run, so refusing to boot is the only safe outcome.
+		({ selfId } = await makeAuth(cfg.github));
+		log({ event: "self_identity", id: selfId, source: cfg.github.source });
+	} else {
+		// Said out loud, because the alternative is an operator staring at a label trigger that does nothing.
+		// The two ways out are the two signals `decideServesGithub` reads, so the line names both.
+		log({ event: "github_arm_skipped", reason: "no github triggers and GITHUB_AUTH_SOURCE unset" });
+	}
 
 	// Ride-out connection (no failFast): the receiver is long-running and should survive a Valkey
 	// restart, not give up on a transient disconnect.

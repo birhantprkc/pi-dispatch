@@ -17,8 +17,12 @@ function forgeTriggers({ knownFlows, ...group }) {
 	};
 }
 
+// `servesGithub: true`: a deployment serving BOTH forges, which is what the routing test below needs -- a
+// forgejo delivery sent to `/` must reach the github arm and be refused by github's secret. On a
+// github-free deployment `/` does not exist at all (issue #99), and that is pinned in receiver.test.mjs.
 const cfg = {
 	webhookSecret: "gh-secret",
+	servesGithub: true,
 	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: "triage" },

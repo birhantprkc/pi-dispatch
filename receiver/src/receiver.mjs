@@ -88,19 +88,34 @@ export function parseSubset(payload) {
  * even tell two forges apart reliably, and a request that could select which gate it faced would always
  * select the weakest one available.
  *
- * `/` stays mapped to GitHub. Existing deployments configured their webhook URL before any path existed,
- * and silently 404-ing them would look exactly like the harness being down.
+ * `/` stays mapped to GitHub -- for a deployment that SERVES GitHub. Existing deployments configured their
+ * webhook URL before any path existed, and silently 404-ing them would look exactly like the harness being
+ * down, so the path itself never moves.
  *
  * A forge with no configuration gets no route at all -- not a route that answers 401. An endpoint that
- * responds to an unconfigured forge is an endpoint an operator can believe is armed.
+ * responds to an unconfigured forge is an endpoint an operator can believe is armed. GitHub is no longer
+ * the exception to that rule (issue #99): a GitLab-only / Forgejo-only / Azure-only deployment has
+ * `cfg.servesGithub === false`, builds no github handler, and 404s `/`.
+ *
+ * The github arm is gated on `cfg.servesGithub` being TRUTHY, not on it not being `false`, and that
+ * direction is load-bearing. `start.mjs` skips resolving the harness's GitHub identity when the property is
+ * off, so a config object that somehow reached here without the property would otherwise mount `/` with
+ * `selfId === undefined` -- a live endpoint whose bot-loop guard compares every `sender.id` against
+ * undefined, i.e. never drops the harness's own comments. Absent property therefore means no route; the
+ * failure of a forgotten property is a 404 an operator sees, never a paid recursion they get billed for.
  */
 export function makeReceiver({ queue, selfId, cfg, log, gitlab = null, forgejo = null, azure = null }) {
-	const github = makeGitHubHandler({ queue, selfId, cfg, log });
+	// Built only when the deployment serves GitHub. Construction is not free of the secret either: the
+	// `new Webhooks({ secret })` inside makeVerifiedHandler throws "options.secret required" on an absent
+	// one, so not building the arm is what lets a github-free deployment legitimately have no secret --
+	// no placeholder, nothing papered over, and no handler holding a secret nobody chose.
+	const github = cfg.servesGithub ? makeGitHubHandler({ queue, selfId, cfg, log }) : null;
 
 	// A TABLE, built once, rather than one `if` per forge. Two forges made that a single branch; four make
 	// it a chain, and a chain is where one arm quietly ends up checked after the fallthrough. A path present
 	// with a null handler is a CONFIGURED-OFF forge and answers 404; a path absent from the table entirely
-	// falls through to GitHub, which is what keeps `/` working.
+	// falls through to GitHub, which is what keeps `/` working -- and a configured-off GitHub answers the
+	// same 404 from the fallthrough itself, below.
 	const routes = {
 		"/gitlab": gitlab ? makeGitLabHandler({ queue, cfg, log, ...gitlab }) : null,
 		"/forgejo": forgejo ? makeForgejoHandler({ queue, cfg, log, ...forgejo }) : null,
@@ -116,6 +131,12 @@ export function makeReceiver({ queue, selfId, cfg, log, gitlab = null, forgejo =
 			if (!handler) return respond(res, 404, { error: `${path.slice(1)} webhooks are not configured` });
 			return await handler(req, res);
 		}
+		// The GitHub fallthrough (`/` and anything unrouted). Absent when the deployment serves no GitHub, and
+		// 404 rather than 401 or 405 for the same reason the table's null arms are: a status that discusses
+		// credentials or methods says "armed, and you got something wrong", and an operator who reads that
+		// about an endpoint that cannot fire anything will go hunting for a mis-keyed secret for an hour. The
+		// message is spelled out rather than derived from `path`, which is "/" here and would slice to nothing.
+		if (!github) return respond(res, 404, { error: "github webhooks are not configured" });
 		return await github(req, res);
 	};
 }
