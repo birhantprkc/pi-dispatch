@@ -634,18 +634,32 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-FIRST-RUN-SETUP-WIZARD
 
-- **Decision**: `/dispatch setup` (and, when bare `/dispatch` detects no deployment anywhere, an
-  offered confirm into the same flow) walks an operator from a console-only install to a working
-  deployment: choose a deployment dir (default `~/pi-dispatch`, never the repo) → consented
+- **Decision**: `/dispatch setup` is **the default setup route** (issue #96): when bare `/dispatch`
+  detects no deployment anywhere, it lands **directly in the wizard's opening choice** — the select
+  (Guided setup / Open the panel anyway / Cancel) *is* the consent, replacing the earlier yes/no
+  offer; a configured deployment with a down queue still never enters the wizard (the unreachable
+  banner rule is load-bearing and unchanged). The flow: choose a deployment dir (default
+  `~/pi-dispatch`, never the repo) → **Docker pre-check** (a capture probe distinguishing
+  not-on-PATH from daemon-down; on failure a Re-check / Continue anyway / Stop loop with per-OS
+  pointers — never a piped installer; `up`'s own hard refusal stays as defense in depth) → consented
   `npm install @edgehero/pi-dispatch@<RUNTIME_VERSION>` into it → hand the terminal to
   `npx pi-dispatch up` → optional `service install` → write the deployment pointer
   (`INT-DEPLOYMENT-POINTER-CONTRACT`, JSON shown verbatim) → provider key **printed, never
-  written** → optional `setup github` hand-off → optional first trigger for the repo the session
-  sits in (cron pre-filled with the folder, flow picked from its `.pi/skills/` via the shared
-  `SKILL_NAME_RE`, the in-place-edit warning printed, the `ai-trigger: allow` line **printed, never
-  written** — repo files stay the operator's, and the gate reads committed HEAD anyway) → the panel.
+  written** → optional `setup github` hand-off → **trigger-edge choice** (install the webhook
+  receiver as a service — a consented `npm install @edgehero/pi-dispatch-receiver@<RECEIVER_VERSION>`
+  then `service install --receiver`; or run it with docker compose — the compose file ships in the
+  runtime package and is copied create-only into the deployment dir before a consented
+  `--profile receiver up -d`; or show the polling command; or skip) → optional first trigger for the
+  repo the session sits in (cron pre-filled with the folder, flow picked from its `.pi/skills/` via
+  the shared `SKILL_NAME_RE`, the in-place-edit warning printed, the `ai-trigger: allow` line
+  **printed, never written** — repo files stay the operator's, and the gate reads committed HEAD
+  anyway) → the panel.
   A once-ever `session_start` nudge (`reason: "startup"`, notify-only, marker-file latch) points at
-  the command. Every step is individually declinable and declines continue converge-style.
+  the command, and a once-per-process **skew notice** on bare `/dispatch` says when the deployed
+  runtime is older than the console's pin ("run /dispatch setup to upgrade" — re-running setup is
+  the upgrade path, made safe by the post-install version assertion). Both version pins carry
+  anti-drift tests (`RUNTIME_VERSION` ↔ worker, `RECEIVER_VERSION` ↔ receiver). Every step is
+  individually declinable and declines continue converge-style.
 - **Mechanics, chosen for pi's real constraints**: dialogs-first, **overlay-per-handoff** — the
   wizard is a plain `ui.select/input/confirm` chain, and each terminal-needing child runs inside a
   short-lived `ctx.ui.custom` overlay that exists only to hold the `tui` handle for the
@@ -1649,6 +1663,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | The front door becomes the default route (issue #96). **DES-FIRST-RUN-SETUP-WIZARD amended**: bare `/dispatch` with nothing configured lands directly in the wizard's opening select — the select is the consent, replacing the yes/no offer; the outage rule is restated load-bearing (a configured deployment with a down queue keeps the banner, never the wizard). Two steps join the flow: a Docker pre-check (capture probe, Re-check/Continue/Stop loop, per-OS pointers, never a piped installer) and a trigger-edge choice (receiver as a service via a consented pinned `@edgehero/pi-dispatch-receiver` install + `service install --receiver`; compose profile with the compose file now shipped in the runtime package and copied create-only; or the polling command printed). A once-per-process skew notice makes re-running setup the visible upgrade path. **Fixed in the same change, recorded plainly**: `service` units were broken for every npm deployment — the renderer derived a "repo root" two directories above its module, which in an npm install is the scope directory, so ExecStart/EnvironmentFile/wrapper paths all pointed at nothing; units now anchor on the deployment dir (WorkingDirectory, `.env`, logs) and resolved script paths (the CLI beside the service module; the receiver via `import.meta.resolve`), the wrapper execs the argv the render substituted instead of guessing, and npm-layout fixtures now exist so the seam that masked this cannot mask it again. **CONST-RETRY-INFRA-ONLY UNCHANGED, checked**: the exit-2 conversion survives the wrapper contract change, asserted against the real shipped wrapper. pi compatibility becomes strategy instead of luck: the peer widens to the `"*"` range pi's own packages doc prescribes for host-provided packages (the exact devDep pin stays the tested marker), a runtime advisory names an untested pi version on first `/dispatch` (never a refusal — the capability probe stays the only hard gate), and a weekly canary installs latest pi into a scratch dir (never the repo root — the pinned assertions must keep asserting the pin) and fails CI when any used API member or type needle disappears. |
 | 2026-08-04 | The console becomes the front door (issue #92). Added **DES-FIRST-RUN-SETUP-WIZARD**: `/dispatch setup` + the bare-`/dispatch` no-deployment offer + a once-ever startup nudge, built as dialogs-first with **overlay-per-handoff** (the `tui` suspend handle exists only inside a `ctx.ui.custom` factory; dialogs cannot run under a capturing overlay; stdin is unreadable while suspended — so each attached child gets its own short-lived overlay, and the child's OWN consent gates are the host-mutation consents: the wizard forwards `--yes` to nothing). npm step under import-pi's spawn doctrine, with the recorded reasoning for `--ignore-scripts` on our own runtime (pure-JS deps; msgpackr's native accel is optional with a JS fallback). No new tier, no new powers, no model-callable tool; the only novel artifact is the pointer file (INT-DEPLOYMENT-POINTER-CONTRACT). Rejected on the record: long-lived wizard overlay, clone reuse, detached worker, credential dialogs, auto-writing `ai-trigger: allow` (two keys stay two keys). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the wizard bootstraps host processes, never hosts them. **DES-CLI-SURFACE UNCHANGED, checked**: every tier the wizard drives is entered through that entry's own gates. |
 | 2026-08-02 | The public URL becomes optional (issue #81, second half). Added **DES-GH-POLLING-TRANSPORT**: `pi-dispatch-receiver poll` synthesizes INT-WEBHOOK-PAYLOAD-SUBSET shapes from REST responses (issue events / comments / open PRs; ETag 304s are rate-limit-free; first boot never replays history; per-repo failures never kill the loop) and feeds the unchanged pure `filter()` + shared enqueue with `poll-*` delivery ids — the receiver stays the default and the low-latency path. Trust framing recorded: TLS with the operator's own credential replaces HMAC because authentication points the other way; `WEBHOOK_SECRET` is not required in poll mode, still hard-required for `serve`. The Actions-runner transport is rejected on the record (merge-gated workflow code executing on the worker host = merge-to-default becomes host code execution outside the container boundary). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the poller is the same always-on process class, just a different transport. **CONST-ISSUE-TEXT-IS-DATA UNCHANGED, checked**: the poller never interprets bodies. |
 | 2026-08-02 | The App path becomes the easy path (issue #81). Added **DES-GH-APP-MANIFEST-SETUP**: `pi-dispatch setup github` runs GitHub's App Manifest flow against a throwaway loopback listener — one browser click returns app id + PEM + webhook secret via the unauthenticated single-use conversion endpoint; every `.env` line is shown before one explicit consent, the PEM lands 0600 and never clobbers, an existing `WEBHOOK_SECRET` is kept (replacing it would invalidate working deliveries), installation-id discovery uses a deliberately hand-rolled ~15-line `node:crypto` RS256 JWT (auditable, once-at-setup; job-time minting stays `@octokit/auth-app`, unchanged), and `--no-webhook` creates the hook-inactive shape the polling transport will consume. No `--yes` on this wizard — these writes carry credentials. Rejected on the record: a maintainer-registered device-flow client (maintainer dependency in a self-hosted trust chain) and auto-installing the App (automating a consent screen defeats it). **CONST-TOKEN-SCOPED-PER-JOB UNCHANGED, checked**: the wizard changes how credentials are *acquired*, not how job tokens are minted or scoped. **CONST-HMAC-OVER-RAW-BODY UNCHANGED, checked**: the webhook secret the flow mints feeds the same verify path. |

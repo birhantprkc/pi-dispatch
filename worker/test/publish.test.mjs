@@ -22,10 +22,13 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const WORKER_DIR = join(REPO_ROOT, "worker");
 const RECEIVER_DIR = join(REPO_ROOT, "receiver");
 
-// The deploy templates `pi-dispatch service` renders (see TEMPLATE_PINS in src/service.mjs) plus the
-// wrapper scripts the rendered units invoke — the full set worker/deploy must mirror and ship.
+// The deploy templates `pi-dispatch service` renders (see TEMPLATE_PINS in src/service.mjs), the
+// wrapper scripts the rendered units invoke, and the compose file the docs point every deployment at
+// (an npm install has no repo checkout to read deploy/docker-compose.yml from) — the full set
+// worker/deploy must mirror and ship.
 const MIRRORED_DEPLOY = [
 	"com.pi-dispatch.worker.plist",
+	"docker-compose.yml",
 	"nssm-install.cmd",
 	"receiver.service",
 	"worker-env-wrapper.cmd",
@@ -52,7 +55,7 @@ test("sync: every worker/deploy template is byte-identical to its root deploy/ t
 	assert.deepEqual(
 		readdirSync(join(WORKER_DIR, "deploy")).sort(),
 		MIRRORED_DEPLOY,
-		"worker/deploy must hold exactly the templates the service renderer reads — nothing missing, no strays",
+		"worker/deploy must hold exactly the templates the service renderer reads plus the shipped compose file — nothing missing, no strays",
 	);
 	for (const name of MIRRORED_DEPLOY) {
 		assert.equal(

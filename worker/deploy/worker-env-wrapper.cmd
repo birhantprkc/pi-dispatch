@@ -2,10 +2,21 @@
 REM UNTESTED EXAMPLE -- a starting point for a Windows service, not a shipped, verified unit. Adapt it.
 REM
 REM pi-dispatch launcher for Windows service managers (nssm; see deploy/nssm-install.cmd). Windows
-REM services have no `.env` mechanism, so this wrapper loads `.env` from the repo root itself, then
-REM launches node. It reads ONLY the declared `.env` (see `.env.example`), never the host user profile:
-REM the container-boundary rules require an explicit, auditable variable set. Nothing here contains a
-REM credential -- the secrets live in `.env`, which is gitignored and read at runtime.
+REM services have no `.env` mechanism, so this wrapper loads `.env` from the current directory itself,
+REM then runs the command it was handed. It reads ONLY the declared `.env` (see `.env.example`), never
+REM the host user profile: the container-boundary rules require an explicit, auditable variable set.
+REM Nothing here contains a credential -- the secrets live in `.env`, which is gitignored and read at
+REM runtime.
+REM
+REM CONTRACT (issue #96 -- mirrors the .sh twin; nothing is guessed from this script's location):
+REM   - The current directory IS the deployment folder. nssm's AppDirectory guarantees it, set both by
+REM     deploy/nssm-install.cmd and by `pi-dispatch service install`. The old `cd /d "%~dp0.."`
+REM     self-guess was right only in a repo checkout; under `npm install` this script lives at
+REM     node_modules\@edgehero\pi-dispatch\deploy\, whose parent is the package -- no `.env` there.
+REM   - The arguments ARE the command, e.g.:  C:\path\to\node.exe C:\...\src\cli.mjs worker
+REM     `pi-dispatch service install` passes them via nssm AppParameters. This wrapper no longer
+REM     decides WHAT to run -- only the env it runs in and what its exit code means -- so an empty
+REM     argument list is a configuration error, refused below.
 REM
 REM TRAP: inside pi, ANTHROPIC_OAUTH_TOKEN silently takes precedence over ANTHROPIC_API_KEY. Set exactly
 REM one in `.env`.
@@ -20,23 +31,21 @@ REM multiple services. Requires the AOF-enabled Valkey from deploy/docker-compos
 
 setlocal
 
-REM Resolve repo root relative to this script (deploy\ is one level down).
-cd /d "%~dp0.." || exit /b 1
+if "%~1"=="" (
+  echo worker-env-wrapper: no command given -- expected: worker-env-wrapper.cmd node-path script-path [args...]; re-render with: pi-dispatch service render 1>&2
+  exit /b 1
+)
 
 if not exist ".env" (
-  echo worker-env-wrapper: .env not found in "%CD%" 1>&2
+  echo worker-env-wrapper: .env not found in "%CD%" -- this wrapper must be started in the deployment folder, the service's nssm AppDirectory; it no longer guesses a location from its own path 1>&2
   exit /b 1
 )
 
 for /f "usebackq eol=# tokens=1,* delims==" %%A in (".env") do set "%%A=%%B"
 
-REM One wrapper serves both daemons (see the .sh twin): no argument runs the worker; `receiver`
-REM (passed by `pi-dispatch service --receiver`) runs the webhook receiver.
-if "%~1"=="receiver" (
-  node receiver\src\start.mjs
-) else (
-  node worker\src\cli.mjs worker
-)
+REM The argv runs verbatim -- absolute node, absolute script, composed by `pi-dispatch service` (see
+REM the .sh twin for the whole contract).
+%*
 set "RC=%ERRORLEVEL%"
 
 REM Exit 2 is EXIT_POLICY (worker\src\exit-code.mjs): a determinate config/budget refusal. nssm's

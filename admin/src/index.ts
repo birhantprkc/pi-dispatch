@@ -34,15 +34,25 @@
  * the model how to use those human-in-the-loop write gates.
  *
  * `/dispatch setup` (issue #92) runs the guided deployment wizard (setup-wizard.ts); a bare
- * `/dispatch` on a host with no deployment at all offers it, and a one-time session_start
- * nudge names it on a fresh host. The wizard sequences the worker CLI's own consented
- * commands and writes the deployment pointer this factory applies above.
+ * `/dispatch` on a host with no deployment at all ENTERS it directly -- the wizard's own first
+ * select is the consent -- and a one-time session_start nudge names it on a fresh host. The
+ * wizard sequences the worker CLI's own consented commands and writes the deployment pointer
+ * this factory applies above. A bare `/dispatch` against a POINTED-AT deployment whose installed
+ * runtime differs from the pinned one says so once per process, and names setup as the fix.
  *
- * Supported pi version: 0.80.7. The factory registers nothing unless every API
- * member it consumes is present; on a miss it names the member and the
- * supported version on stderr and returns.
+ * Tested pi version: 0.80.7 (SUPPORTED_PI_VERSION). The gate is the capability
+ * probe, not the version: the factory registers nothing unless every API member
+ * it consumes is present; on a miss it names the member and the tested version
+ * on stderr and returns. A pi that DIFFERS from the pin but passes the probe
+ * loads normally -- the mismatch becomes a one-line info advisory drained by the
+ * next /dispatch, never a refusal (issue #96: a merely newer pi must not scare
+ * or block anyone).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// A VALUE import, deliberately its own line: the type-only line above is regex-anchored by
+// pinned-extension-api.test.mjs and must keep its exact shape. VERSION is the HOST's pi version --
+// build.mjs keeps pi external, so this resolves against whatever pi actually loaded the extension.
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import {
@@ -70,7 +80,14 @@ import {
 // extension at a deployment built in another directory. Layered into process.env once at factory load
 // (the operator's env always wins), so resolvePaths stays env-only by contract while every one of its
 // call sites below is covered without a signature change.
-import { applyDeploymentPointer, takePointerNotice } from "./deployment-pointer.mjs";
+// readPointer/pointerPath join the import for ONE reader: the bare command's version-skew notice, which
+// needs the pointed-at `deploymentDir` to find the deployment's installed runtime. readPointer stays pure
+// (it never stats that dir) -- the stat lives at the call site below, which is exactly where the pointer
+// module's documented purity says it belongs.
+import { applyDeploymentPointer, pointerPath, readPointer, takePointerNotice } from "./deployment-pointer.mjs";
+// The only fs use in this module: the skew notice reads one package.json through the wizard's own reader.
+// Everything else fs-shaped goes through read-model.mjs by design.
+import * as nodeFs from "node:fs";
 import { foldCosts, whatIfFlow } from "./costs.mjs";
 // The REAL pricing façade. costs.mjs may not hold a module-scope worker/pricing import by contract (the
 // fold is pure; tests inject a canned fake) -- index.ts is where the fs-adjacent assembly lives, so the
@@ -92,6 +109,42 @@ import { matchesKey } from "./keys.mjs";
 export const USED_API = ["registerCommand", "registerTool", "sendMessage", "on"] as const;
 
 export const SUPPORTED_PI_VERSION = "0.80.7";
+
+/**
+ * The advisory for running on a pi that is not the tested pin (issue #96). Pure over its two inputs
+ * so the comparison is unit-testable without faking a pi install. Equal versions mean nothing to
+ * say; pi's own "0.0.0" fallback (config.js: `VERSION = pkg.version || "0.0.0"` when its
+ * package.json is unreadable) means UNKNOWN, not different -- comparing it would report a bogus
+ * mismatch on an install the capability probe already vets for real.
+ */
+export function computePiVersionAdvisory(version: string, supported: string): string | undefined {
+  if (version === supported || version === "0.0.0") return undefined;
+  return (
+    `pi-dispatch admin: running on pi ${version}, tested with pi ${supported} — things should ` +
+    `work; report anything odd, and check for a newer @edgehero/pi-dispatch-admin`
+  );
+}
+
+// The retained advisory, drained once by the next /dispatch (the takePointerNotice idiom). Computed
+// at factory time but NEVER printed there: a successful load is silent, and load.test.mjs pins the
+// refusal path to exactly one stderr line. Memoized like deployment-pointer's appliedOnce -- pi may
+// in principle evaluate the factory more than once, and a re-evaluation must not re-arm an advisory
+// the operator already saw.
+let piVersionAdvisory: string | undefined;
+let piVersionCheckDone = false;
+
+/**
+ * The deployment/console skew latch -- piVersionAdvisory's twin, and once per PROCESS for the same
+ * reason: the two versions cannot change under a running pi, so saying it on every bare `/dispatch`
+ * would be nagging, not informing. Set only when the notice actually fires, so a session that never
+ * had skew never burns the latch.
+ */
+let runtimeSkewNoticed = false;
+
+/** TEST-ONLY: arm the advisory directly (under the pinned devDep pi the natural computation is a no-op). */
+export function _setPiVersionAdvisoryForTests(message: string | undefined): void {
+  piVersionAdvisory = message;
+}
 
 const CHANNEL = "pi-dispatch-admin";
 
@@ -126,6 +179,15 @@ export default function admin(pi: ExtensionAPI): void {
       );
       return;
     }
+  }
+
+  // The probe above is the gate; the version is only an advisory (issue #96). A pi that differs
+  // from the tested pin yet still carries every consumed member must not scare or block anyone, so
+  // the mismatch is computed here -- after the probe PASSES, so a refused load stays a one-line
+  // no-op -- and surfaced by the next /dispatch, never printed at load.
+  if (!piVersionCheckDone) {
+    piVersionCheckDone = true;
+    piVersionAdvisory = computePiVersionAdvisory(VERSION, SUPPORTED_PI_VERSION);
   }
 
   // Layer the setup wizard's deployment pointer into process.env exactly once, before anything can call
@@ -754,26 +816,55 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   const pnote = takePointerNotice();
   if (pnote) notify?.(pnote, "warning");
 
+  // Drain the factory's version advisory the same way, once per process -- and at "info", not
+  // "warning": a different-but-capable pi is a heads-up, not a defect (issue #96). Sits before the
+  // sub dispatch below, so every subcommand (and the bare command) passes it.
+  if (piVersionAdvisory) {
+    notify?.(piVersionAdvisory, "info");
+    piVersionAdvisory = undefined;
+  }
+
   if (sub === "") {
     // Detection decides what a bare /dispatch means (issue #92). Lazy import: the wizard module loads
     // only on the bare command and `setup`, never for the read subcommands or the LLM tools.
-    const { detectDeployment, runSetupWizard } = await import("./setup-wizard.ts");
+    const { detectDeployment, runSetupWizard, readInstalledVersion, runtimeDirFor, RUNTIME_VERSION } = await import(
+      "./setup-wizard.ts"
+    );
     const det = await detectDeployment({ env: process.env, cwd: ctx?.cwd });
     if (det.state === "none") {
-      // Nothing anywhere: offer the wizard instead of opening a panel onto an empty deployment. The
-      // confirm is the offer -- a decline (or a build without dialogs) degrades to the usage line.
-      if (typeof ctx?.ui?.confirm === "function") {
-        const ok = await ctx.ui.confirm(
-          "pi-dispatch setup",
-          "No deployment found (no pointer, no env, no config here, queue unreachable). Set one up now?",
-        );
-        if (ok) {
-          await runSetupWizard(paths, ctx, notify, { openDashboardFn: openDashboard });
-          return;
-        }
-      }
-      notify?.(`${USAGE} — run /dispatch setup when you are ready`, "info");
+      // Nothing anywhere: the wizard IS what a bare /dispatch means here, so it is entered DIRECTLY.
+      // There used to be a confirm in front of it ("…set one up now?"); it is gone on purpose. The
+      // wizard's own step-1 select -- Guided setup / Open the panel anyway / Cancel -- is the consent,
+      // and it is a better one: it offers the panel as a real third answer instead of dead-ending a
+      // decline at a usage line. A confirm asking permission to ask was one keypress that bought
+      // nothing, and nothing is spawned or written before that select answers.
+      //
+      // The degrade for a ctx without dialogs is the wizard's own capability gate (it notifies once and
+      // returns), so there is deliberately NO notify here: two notices for one degrade reads like two
+      // separate failures. `initialDetection` hands over the verdict just computed -- one keypress must
+      // not cost two detections, queue probe included.
+      await runSetupWizard(paths, ctx, notify, { openDashboardFn: openDashboard, initialDetection: det });
       return;
+    }
+    if (det.state === "pointer" && !runtimeSkewNoticed) {
+      // Version skew between the deployment and this console (issue #96's other half): the pointer names
+      // the folder, the folder's `node_modules` names the runtime version it actually runs, and this
+      // admin pins the version it was reviewed against. Different is worth ONE line -- `/dispatch setup`
+      // converges it, because its install step is a no-op when the pin already matches.
+      //
+      // Absent or unreadable ⇒ SILENCE, deliberately: an operator running the worker straight from a
+      // clone has no `node_modules/@edgehero/pi-dispatch` to read, has made a deliberate choice, and
+      // would be scolded for it every session by a notice that guessed instead of knowing.
+      const ptrRes: any = readPointer({ path: pointerPath(process.env) });
+      const deploymentDir = ptrRes.pointer?.deploymentDir;
+      const installed = deploymentDir ? readInstalledVersion(nodeFs, runtimeDirFor(deploymentDir)) : undefined;
+      if (typeof installed === "string" && installed !== RUNTIME_VERSION) {
+        runtimeSkewNoticed = true;
+        notify?.(
+          `deployment runtime ${installed}, this console pins ${RUNTIME_VERSION} — run /dispatch setup to upgrade`,
+          "warning",
+        );
+      }
     }
     if (det.state === "cwd" || det.state === "reachable") {
       // A deployment that works only from this directory (cwd scaffold) or was merely probed

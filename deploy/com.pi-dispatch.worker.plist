@@ -5,10 +5,18 @@
   unit. Adapt it. The Linux/systemd equivalent is deploy/worker.service.
 
   ProgramArguments points at deploy/worker-env-wrapper.sh; that wrapper is what loads `.env`, because
-  launchd has no EnvironmentFile mechanism. NO secrets are inlined here: there is deliberately no
-  EnvironmentVariables dict, since that would commit credentials into this file. The wrapper reads
-  `.env` at runtime instead (note the ANTHROPIC_OAUTH_TOKEN over ANTHROPIC_API_KEY precedence trap
-  documented in the wrapper).
+  launchd has no EnvironmentFile mechanism. The wrapper's contract (issue #96; see its header): it
+  sources ./.env from the WorkingDirectory below (which makes that key load-bearing, not a nicety)
+  and then runs the REST of ProgramArguments as the command. When hand-editing this template, append
+  the command after the wrapper path, e.g.
+      <string>/usr/bin/node</string>
+      <string>/opt/pi-dispatch/worker/src/cli.mjs</string>
+      <string>worker</string>
+  (`pi-dispatch service render` composes exactly that argv with this host's real paths; the wrapper
+  refuses an empty argv rather than guessing what to run). NO secrets are inlined here: there is
+  deliberately no EnvironmentVariables dict, since that would commit credentials into this file. The
+  wrapper reads `.env` at runtime instead (note the ANTHROPIC_OAUTH_TOKEN over ANTHROPIC_API_KEY
+  precedence trap documented in the wrapper).
 
   Graceful shutdown needs NO macOS-specific code: `launchctl bootout` sends SIGTERM, which the wrapper
   forwards to node (a trap + kill; its former `exec` is gone, see the wrapper's own comments), and the
@@ -21,8 +29,10 @@
   (exit 2, a determinate config/budget refusal) into a clean exit 0: a policy refusal stays stopped
   instead of relaunch-looping against a paid provider.
 
-  Per-host PLACEHOLDERS: replace /opt/pi-dispatch (the repo root, used in ProgramArguments and
-  WorkingDirectory) and /opt/pi-dispatch/logs (StandardOutPath, StandardErrorPath) with your paths.
+  Per-host PLACEHOLDERS: replace /opt/pi-dispatch (the deployment folder, used in ProgramArguments and
+  WorkingDirectory; the folder that holds your `.env`) and /opt/pi-dispatch/logs (StandardOutPath,
+  StandardErrorPath; create the directory yourself, launchd will not) with your paths, and append the
+  command argv to ProgramArguments as described above.
 
   One worker per host (DES-CONCURRENCY-3): parallelism is PI_CONCURRENCY inside the one process.
   Requires the AOF-enabled Valkey from deploy/docker-compose.yml.

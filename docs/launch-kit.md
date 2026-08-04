@@ -26,6 +26,15 @@ CLI, a cron schedule, or a GitHub issue. You bake your own toolchain into the im
 Chromium, so a flow can build a frontend, screenshot it, and iterate on the render), and a live `/dispatch`
 admin panel shows the queue, spend meters, run history, and triggers.
 
+**The install line** (use this everywhere; the scoped form only, per the naming rule above):
+
+```
+pi install npm:@edgehero/pi-dispatch-admin      # then, in pi:  /dispatch
+```
+
+With nothing configured, `/dispatch` walks the whole setup with a consent per step. For servers and
+headless hosts the same setup is `npx @edgehero/pi-dispatch up` in a fresh folder.
+
 ---
 
 ## Show HN
@@ -54,6 +63,11 @@ pi-dispatch is the operational layer that closes them, and nothing else:
 - A live admin panel (a pi extension): queue state, day/week/month spend meters, run history
   with per-job token+cost accounting, and editable triggers — plus per-repo "quiet hours" that
   defer runs between certain times and resume automatically.
+
+Setup is the panel's job too. `pi install npm:@edgehero/pi-dispatch-admin`, then `/dispatch`:
+with nothing configured it walks the whole deployment with a consent per step, and lands you in
+the panel. Servers and headless hosts get the same thing as plain commands
+(`npx @edgehero/pi-dispatch up`).
 
 I've tried to be honest about the threat model rather than hand-wave it: the whole thing runs
 untrusted, adversarial input through an unrestricted agent on purpose, so SECURITY.md states
