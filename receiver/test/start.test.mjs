@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { startReceiver } from "../src/start.mjs";
@@ -20,6 +23,60 @@ const throwingAuth = async () => {
 	throw Object.assign(new Error("no identity"), { piDispatchConfig: true });
 };
 const stubQueue = () => ({ add: async () => {}, close: async () => {} });
+
+/**
+ * A gitlab-only triggers file, written to a real temp path because `startReceiver` owns its own
+ * `loadReceiverConfig` call and reads the filesystem itself (only the network/socket collaborators are
+ * injectable). This is the deployment shape that could not boot at all before issue #99: no github rules,
+ * so no `/` endpoint, so no webhook secret to supply and no `gh` CLI to install.
+ */
+const GITLAB_ONLY_TRIGGERS_PATH = (() => {
+	const dir = mkdtempSync(join(tmpdir(), "receiver-start-gitlab-only-"));
+	const path = join(dir, "triggers.json");
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:frontend"] }, run: { kind: "gitlab", flow: "gl-fix" } }] }), "utf8");
+	return path;
+})();
+
+/** A gitlab-only env: the gitlab endpoint fully configured, and NOTHING naming github -- no secret, no source. */
+function gitlabOnlyEnv(overrides = {}) {
+	return {
+		PI_TRIGGERS_FILE: GITLAB_ONLY_TRIGGERS_PATH,
+		GITLAB_WEBHOOK_MODE: "token",
+		GITLAB_WEBHOOK_SECRET: "gl-secret",
+		GITLAB_TOKEN: "glpat-x",
+		...overrides,
+	};
+}
+
+/** The gitlab arm's injected collaborators, so the boot touches no GitLab instance. */
+const gitlabFakes = {
+	resolveGitLabSelfId: async () => 4242,
+	makeResolveAuthority: () => async () => ({ authorized: true }),
+};
+
+/**
+ * Run `fn` with `process.stdout.write` captured, returning the receiver's single-object log LINES parsed
+ * back. `startReceiver` writes them itself (the sink is deliberately not injectable -- one line, one
+ * object, one place), so capturing the stream is how a boot decision gets asserted.
+ */
+async function bootLogLines(fn) {
+	const chunks = [];
+	const real = process.stdout.write.bind(process.stdout);
+	process.stdout.write = (chunk) => {
+		chunks.push(String(chunk));
+		return true;
+	};
+	try {
+		await fn();
+	} finally {
+		process.stdout.write = real;
+	}
+	return chunks
+		.join("")
+		.split("\n")
+		.filter((line) => line.startsWith("{"))
+		.map((line) => JSON.parse(line));
+}
 
 /** A createServer fake that records the handler and the listen args and never opens a socket. */
 function capturingServer() {
@@ -150,4 +207,79 @@ test("the makeReceiver handler is wired to createServer and a signed delivery en
 	assert.equal(adds.length, 1);
 	assert.equal(adds[0].data.kind, "github");
 	assert.equal(adds[0].data.flow, "frontend-fix");
+});
+
+// --- the github arm is conditional, like the other three (issue #99) -------------------------------
+//
+// Before this, `makeAuth(cfg.github)` ran unconditionally at boot while the gitlab/forgejo/azure arms were
+// each gated on their own config. With GITHUB_AUTH_SOURCE defaulting to `gh`, that meant a GitLab-only
+// deployment had to have the GitHub CLI installed and logged in -- and a WEBHOOK_SECRET for an endpoint it
+// never served -- or it could not start. Both directions are pinned: skipped when github is not served,
+// still a hard-fail boot gate when it is.
+
+test("a gitlab-only deployment boots without ever calling makeAuth, and says so in one log line", async () => {
+	const { captured, createServer } = capturingServer();
+	// An auth fake that FAILS the test if it is reached, rather than one that returns a stub: the property is
+	// "never called", and a stub would let a silent regression (github arm still resolving identity) pass.
+	const forbiddenAuth = async () => assert.fail("makeAuth must not be called on a deployment that serves no github");
+
+	const lines = await bootLogLines(async () => {
+		const server = await startReceiver(gitlabOnlyEnv(), { makeAuth: forbiddenAuth, makeQueueFn: stubQueue, createServer, ...gitlabFakes });
+		assert.ok(server, "the receiver boots and returns its server -- this deployment could not start at all before");
+	});
+
+	assert.equal(captured.listen.port, 3000, "it really listened, on the usual port");
+	assert.equal(typeof captured.handler, "function");
+
+	// The skip is EXPLICIT in the log, so an operator debugging "my label trigger does nothing" sees the
+	// reason on the boot line instead of inferring it from an absent one.
+	const skipped = lines.find((l) => l.event === "github_arm_skipped");
+	assert.ok(skipped, `the skip must be logged; boot lines were: ${JSON.stringify(lines)}`);
+	assert.match(skipped.reason, /github triggers/);
+	assert.match(skipped.reason, /GITHUB_AUTH_SOURCE/, "the reason names both signals, which are the two ways out");
+	assert.equal(lines.some((l) => l.event === "self_identity" && l.forge === undefined), false, "no github identity line, because no github identity was resolved");
+	// The gitlab arm is untouched by any of this: its own identity resolution still ran, hard-fail as ever.
+	assert.equal(lines.find((l) => l.event === "self_identity" && l.forge === "gitlab")?.id, 4242);
+});
+
+test("a github-serving deployment still HARD-FAILS when makeAuth throws -- no server, guard never disarmed", async () => {
+	// The unchanged direction. `baseEnv()` reads the committed github triggers file, so servesGithub is true
+	// and identity resolution is the boot gate it always was (the sibling test at the top of this file
+	// asserts the same for the default env; this one states the coupling in servesGithub's terms).
+	const { captured, createServer } = capturingServer();
+	await assert.rejects(
+		startReceiver(baseEnv(), { makeAuth: throwingAuth, makeQueueFn: stubQueue, createServer }),
+		(e) => e.piDispatchConfig === true,
+	);
+	assert.equal(captured.handler, undefined, "the handler must never be built without selfId");
+	assert.equal(captured.listen, undefined, "the receiver must never listen without the bot-loop guard");
+});
+
+test("an explicit GITHUB_AUTH_SOURCE re-arms the boot gate even with no github triggers", async () => {
+	// Explicit intent wins in the loader, and this is what that costs: the endpoint exists, so identity
+	// resolution is mandatory again and an unresolvable one is still a refusal to boot.
+	const { captured, createServer } = capturingServer();
+	const env = gitlabOnlyEnv({ WEBHOOK_SECRET: SECRET, GITHUB_AUTH_SOURCE: "pat", GITHUB_PAT: "ghp_x" });
+	await assert.rejects(
+		startReceiver(env, { makeAuth: throwingAuth, makeQueueFn: stubQueue, createServer, ...gitlabFakes }),
+		(e) => e.piDispatchConfig === true,
+	);
+	assert.equal(captured.listen, undefined, "an armed github endpoint with no identity must not listen");
+});
+
+test("a github-free deployment 404s `/` -- the skipped identity resolution and the absent route are one decision", async () => {
+	// The coupling, end to end through the real wiring: `selfId` is undefined here, so a mounted `/` would
+	// run the bot-loop guard comparing every sender against undefined. The route must therefore be gone, and
+	// this asserts it through the handler startReceiver actually built rather than through makeReceiver alone.
+	const { captured, createServer } = capturingServer();
+	await bootLogLines(() =>
+		startReceiver(gitlabOnlyEnv(), { makeAuth: async () => assert.fail("no github arm here"), makeQueueFn: stubQueue, createServer, ...gitlabFakes }),
+	);
+
+	const payload = JSON.stringify({ action: "labeled", sender: { id: 1 }, repository: { full_name: "octo/repo" }, issue: { number: 42, labels: [{ name: "pi:frontend" }] } });
+	const req = mockReq({ headers: headersFor("issues", "d-nogithub", payload) });
+	req.url = "/";
+	const res = mockRes();
+	await drive(captured.handler, req, res, payload);
+	assert.equal(res.statusCode, 404, "not 401: an endpoint that answers is an endpoint an operator can believe is armed");
 });

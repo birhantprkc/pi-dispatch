@@ -37,7 +37,7 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 
 | Trigger | Who can start a job | Undo |
 |---|---|---|
-| **GitHub webhook** — label or `@pi` comment | A collaborator. The label *is* the approval step. | Decline the PR |
+| **GitHub webhook** — label, `@pi` comment, or PR activity | A collaborator. Applying a label is a permission **GitHub itself** restricts to collaborators, so the label doubles as the approval step; it is not a check we make. Comment and PR auto-action triggers are author-gated here. | Decline the PR |
 | **GitLab webhook** — label, `@pi` comment, or MR activity | A project member with **Developer access or above**, resolved from the API on every delivery. The label is **not** the approval step — see below. | Decline the MR |
 | **Forgejo webhook** — label, `@pi` comment, or PR activity | A collaborator with **admin or write** permission, resolved from the API on every delivery — labels included. | Decline the PR |
 | **Azure DevOps service hook** — work-item tag, `@pi` comment, or PR activity | A **project member**, resolved from the Graph API on every delivery. A work item names the actor only by email address. | Decline the PR |
@@ -67,6 +67,11 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   COLLABORATOR}`, and label triggers require an allowlisted label — since only collaborators can apply
   labels, **the label is the human approval step**, not a routing hint. A stranger's issue sits until a
   maintainer labels it.
+  `pull_request` triggers split the same way, and the split is worth stating because half of it is not a
+  check. The **auto** actions (`opened`, `synchronize`, `reopened`) are hard-gated on the PR author's
+  `author_association`, hard-coded and never config-optional, so a stranger's fork PR cannot launch a paid
+  run. A `pull_request` + `labeled` trigger performs **no author check at all**, deliberately: the label
+  predicate *is* the approval there, resting on the same GitHub permission the issue-label path rests on.
 - **Who can trigger, on GitLab — and why the rule is different there.** That reasoning does not hold on
   GitLab: the minimum role for managing labels has differed across versions, Ultimate's **custom roles**
   can grant it at any level, and **a Guest can set labels on an issue they are creating**, so a stranger
@@ -75,24 +80,36 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   project `access_level >= 30` (Developer). Group-inherited membership counts; a lookup that cannot
   complete answers 503 and is redelivered rather than silently dropped. `OQ-013` records the residual:
   this gate depends on a network call, and on a role table that varies by version and edition.
-- **Webhook authenticity.** Every source is verified over the **raw** body, timing-safe, before parsing.
-  Without this every other gate collapses, because the label and author checks would be reading fields
-  from a body nobody authenticated. GitHub: the `X-Hub-Signature-256` HMAC. GitLab: either the
-  `webhook-signature` HMAC (19.0+) or an `X-Gitlab-Token` compare — you declare which, and only that one
-  is accepted, so a sender cannot choose the weaker gate. **Token mode is genuinely weaker**: it proves
-  the sender knew a secret, and nothing at all about whether the body arrived as it was sent. Prefer
-  `signature` where your instance supports it.
-  The receiver may run **containerised** (`docker compose --profile receiver up`, issue #82) — that
-  changes none of the above: HMAC-before-parse is the same code, the container mounts `triggers.json`
-  read-only and **no docker socket**, and the worker stays a host process either way.
+- **Webhook authenticity, and what "authenticity" means per arm.** What holds **universally is the
+  ordering**: the body is read as **raw** bytes, the delivery's credential is checked timing-safe, and only
+  then is anything parsed. Without that ordering every other gate collapses, because the label and author
+  checks would be reading fields from a body nobody authenticated.
+  What the check *proves* differs by arm, and only two of the four authenticate the **bytes**. GitHub
+  (`X-Hub-Signature-256`) and GitLab in `signature` mode (`webhook-signature`, 19.0+) **MAC the body**, so a
+  modified body fails. GitLab in `token` mode (`X-Gitlab-Token`) and **both** Azure DevOps modes (HTTP Basic,
+  or a static header) authenticate only the **sender**: they prove somebody knew a secret and say nothing at
+  all about whether the body arrived as it was sent, so anyone holding that secret can compose an arbitrary
+  delivery. On GitLab you declare which mode you accept and only that one is accepted, so a sender cannot
+  choose the weaker gate: prefer `signature` where your instance supports it. Azure has no stronger mode to
+  prefer (its own bullet below states the consequences). One implementation detail, recorded because the code
+  records it: Azure's constant-time compare returns early on a length mismatch, so the secret's **length**
+  leaks even though its content does not.
+  The receiver may run **containerised** (`docker compose -f deploy/docker-compose.yml --profile receiver up`,
+  issue #82; the `-f` is load-bearing, because that file's relative paths resolve against `deploy/` and not
+  your cwd). That changes none of the
+  verification above: it is the same code, the container mounts `triggers.json` read-only and **no docker
+  socket**, and the worker stays a host process either way. It does change **where your secrets live**: the
+  profile declares `env_file: ../.env`, so the operator's *whole* `.env` (every forge token and
+  `WEBHOOK_SECRET`) is injected into that container.
   **Polling mode has no webhook surface at all** (`pi-dispatch-receiver poll`, issue #81): GitHub
   events are *fetched* over TLS with your own credential rather than delivered to a public port, so
   there is no signature to verify and nothing to forge against — the HMAC gate defends the webhook
   path; polling removes the path. Every author/label/bot-loop/dedup gate still runs, on the same
   fields, through the same pure filter. The cost is ~60s of trigger latency.
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
-  memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
-  between mutually-untrusting issue authors.
+  memory/CPU/pids limits, `--rm`, all from the worker's own argv, plus a non-root user which comes from the
+  **image** and not the argv (see *What is NOT defended* for why that distinction matters). Per-job rather
+  than per-session, so state cannot leak between mutually-untrusting issue authors.
   **An operator can re-open a finished run's sandbox** (`pi-dispatch sandbox`, `docs/sandbox.md`), and
   that does not weaken this: the *job* container is still single-use and still gone the moment it exits.
   A sandbox is a **new** container, built from the same argv builder so it carries every flag above by
@@ -103,10 +120,21 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Credential scope.** A repo-scoped, short-lived token minted per job — a GitHub App installation
   token, or a single-owner fine-grained PAT. Its narrow scope and short expiry bound **where** and for
   **how long** an injected agent can act within that repo. See *What is NOT defended*.
-- **CI integrity — on GitHub.** The token is minimally-permissioned — `contents` and `pull-requests`,
-  **not** `workflows`, which is a separate scope. For a fine-grained PAT this is an operator-set property.
-  An injected agent therefore cannot rewrite `.github/workflows/` even though it can write code. This one
-  holds.
+- **CI integrity, on the App path or a narrowed PAT.** A GitHub App installation token grants `contents`
+  and `pull_requests` write and **not** `workflows`, which is a separate scope; on a fine-grained PAT the
+  same narrowing is an operator-set property. On those two sources an injected agent cannot rewrite
+  `.github/workflows/` even though it can write code.
+  **It does NOT hold under the shipped default.** `GITHUB_AUTH_SOURCE=gh` is the default, and it mints your
+  own `gh auth token` **verbatim**: the whole operator login, which routinely carries the `workflow` scope.
+  On that source an injected agent **can** rewrite your workflow files. `pi-dispatch doctor` lists
+  `workflow` among the broad scopes it warns about by name, so that warning is your signal, and it is the
+  only one you get. See *Operator responsibilities* for the same fact stated from the credential side.
+  **What the App grants is also wider than `contents` + `pull_requests`.** The manifest this project mints
+  asks for `contents: write`, `pull_requests: write`, `issues: write` and `metadata: read`. `issues: write`
+  exists for the comment-back path (a job replies on the issue that triggered it), and it is real authority:
+  with it an injected agent can close issues and edit or delete comments. The constitution's stated ideal
+  (`CONST-TOKEN-SCOPED-PER-JOB`, "contents + pull-requests only") is **narrower than what ships**; this
+  paragraph is that gap, written down.
   **It does NOT hold on GitLab.** A project access token needs `api` to post a note, and `api` grants full
   project API read/write; `write_repository` alone already permits pushing `.gitlab-ci.yml`. GitLab offers
   no contents-vs-CI split, so an injected agent on a GitLab job **can** rewrite your pipeline definition,
@@ -134,6 +162,12 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
 - **Spend.** A daily cap checked *before* tokens are spent, a per-job turn budget enforced by our runner
   (pi has no turn limit of its own), and a 30-minute container wall-clock timeout. An agent that concluded
   "I can't fix this" is a success and is never blind-retried.
+- **A policy refusal is never restarted into a second bill.** `pi-dispatch service` installs the worker as a
+  user-level unit, and on all three platforms exit 2 (a determinate config or budget refusal) is excluded
+  from restart: systemd's `RestartPreventExitStatus=2`, nssm's `AppExit 2 Exit`, and, because launchd's
+  `KeepAlive` cannot exclude a single exit code, a wrapper that converts exit 2 into a clean exit so the unit
+  stays stopped. Only infra failures are worth retrying; paying again for the same broken config is not. The
+  `--system` scope **prints** a unit for you to install yourself: the command never executes a privileged one.
 
 - **Azure DevOps webhook authenticity is weaker than every other arm's, and this is not a footnote.**
   Service Hooks offer no HMAC of any kind — only HTTP Basic or a static header — so the credential proves
@@ -184,9 +218,13 @@ Stated openly rather than discovered later:
   registering a `dispatch_*` tool, it will be dropped in job containers. The drop is logged; rename it.
 - **A job image this project did not build is not verified, and per-trigger images make that reachable per
   flow.** A trigger's `run.image` names the container its jobs run in; absent, they run `PI_JOB_IMAGE`.
-  Whichever it is, the *isolation* holds — `--cap-drop=ALL`, non-root, `/job` read-only, the closed env
-  allowlist and the four mounts are all built by the worker's `docker run` argv, so nothing an image contains
-  can weaken them. What is **not** checked is the image's contents, and every way that can be wrong fails
+  Whichever it is, the *isolation* holds: `--cap-drop=ALL`, `--security-opt no-new-privileges`, the
+  memory/CPU/pids limits, `/job` read-only, the closed env allowlist and the mount set (four mounts, five
+  once `run.resume` is armed) are all built by the worker's `docker run` argv, so nothing an image contains
+  can weaken them. **Non-root is not in that argv.** It is `USER pi` in the image itself, as the trust table
+  above says, and that is exactly why an unconformant image can lose it: `docs/job-image.md` requires a
+  non-root runtime user with a writable agent dir, and nothing here verifies that the image you named
+  honours it. What is **not** checked is the image's contents, and every way that can be wrong fails
   **silently**: absent guardrails at `/opt/pi-dispatch/HARD_RULES.md` remove the safety floor with no error;
   a stale pi turns jobs into no-ops that report success; wrong exit codes make the queue pay to retry work
   that can never succeed; and the loader flags above are **per image**, so a multi-tenant deployment that
@@ -249,10 +287,14 @@ Stated openly rather than discovered later:
   needs discovery turned back off **and** the GitHub App token path, neither of which is the default.
 - **An agent that can write a folder can self-authorize a flow by committing to it.** Making a flow
   AI-triggerable is a committed `ai-trigger: allow` in the folder's `.pi/`, so an agent that can write the
-  folder can commit that opt-in, after which a **later** operator or CLI action could run that flow. This
-  is bounded by the local trust model — "whatever can write the folder can trigger it" — and by the
+  folder can commit that opt-in. Be precise about what that buys, because the obvious reading is wrong: the
+  gate is read **only** by the AI-initiated paths (the `dispatch_run` tool, and a job's own outbox chain
+  request), so what a planted opt-in buys an attacker is a **later AI-initiated run** of that flow, the kind
+  a prompt injection in the operator's session could reach. The operator's own path skips the gate entirely,
+  because typing the command *is* the approval, so an operator or CLI run of that flow never needed an opt-in
+  at all. It is bounded by the local trust model ("whatever can write the folder can trigger it") and by the
   **pre-agent SHA** the gate reads at: the SHA forecloses self-authorization within the **same** job and
-  its own children, but it does **not** stop a later operator or CLI run of the planted flow. Both halves
+  its own children, but it does **not** stop a later AI-initiated run of the planted flow. Both halves
   hold; neither is undo.
 - **A prompt injection in the operator's session can invoke `dispatch_run` — a paid run with no undo, and
   it is NOT money-safe.** `dispatch_run` is a **third** model-callable tool alongside reads and
@@ -261,7 +303,14 @@ Stated openly rather than discovered later:
   blast-radius, not prevented, by **six** independent limits: the folder allowlist `PI_DISPATCH_RUN_ROOTS`
   (realpath + containment); the committed per-flow opt-in (default deny, read at a pre-agent SHA); the
   dirty-tree refusal (no force option); no spend-knob parameters on the tool; a per-hour rate limit; and
-  the daily cap (`CONST-BUDGET-BEFORE-TOKENS`). Do not read it as money-safe or reversible — it is neither.
+  the daily cap (`CONST-BUDGET-BEFORE-TOKENS`).
+  One supporting fact about that allowlist, because `/dispatch setup` writes a file that could otherwise
+  widen it: the **deployment pointer** resolves paths only, through an allowlist of exactly six path/URL
+  keys. `PI_DISPATCH_RUN_ROOTS` is excluded **by construction**, as is every credential-shaped key, because a
+  pointer that could widen the AI-run folder allowlist would be a second, unreviewed door to the very
+  capability this bullet is bounding. Anything else in the file is dropped silently, and the pointer never
+  overwrites a variable you exported yourself.
+  Do not read `dispatch_run` as money-safe or reversible — it is neither.
 
 - **A resumed session hands one job's transcript to the next job on the same key.** With
   `"resume": true` on a trigger, the agent's full working history — tool output, file contents, its own
@@ -294,9 +343,11 @@ Stated openly rather than discovered later:
 - Do not blanket-forward host environment into job containers. Pass only the variables the configured
   provider needs. In particular `ANTHROPIC_OAUTH_TOKEN` silently takes precedence over
   `ANTHROPIC_API_KEY`, so a stray variable in the host environment can quietly redirect which credential
-  a job spends. Every minted-token name — `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GL_TOKEN` — is
-  refused in `PI_FORWARD_ENV` at config load: the worker sets them from the per-job mint, and a forwarded
-  operator token would silently override it.
+  a job spends. Every minted-token name is refused in `PI_FORWARD_ENV` at config load, across all four
+  forges: `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `GL_TOKEN`, `FORGEJO_TOKEN`, `GITEA_SERVER_TOKEN`,
+  `AZURE_DEVOPS_EXT_PAT` and `SYSTEM_ACCESSTOKEN`. The worker sets them from the per-job mint, and a
+  forwarded operator token would silently override it. That list is derived from one row per forge rather
+  than hand-maintained, so a forge added to the mint cannot be missed here.
 - **With `GITHUB_AUTH_SOURCE=gh` (the default), your entire gh login reaches every token-carrying job.**
   The minted value is your own full-scope `gh auth token`, and `pi-dispatch doctor` warns and names the
   scopes it carries (calling out broad ones like `admin:org`, `delete_repo`, `workflow`). Prefer a
@@ -376,6 +427,16 @@ Stated openly rather than discovered later:
   It is operator-present, processes no adversarial input, and holds no harness credentials — which is why
   pi running here is scoped out of the container-per-job constraint. Raw job logs are untrusted container
   output, and the extension never routes them into model context.
+  **It does, however, install and execute host software.** `/dispatch setup` is the guided path and it is not
+  read-only: it runs `npm install @edgehero/pi-dispatch@<pinned version> --ignore-scripts --omit=dev` into a
+  directory you name, then spawns that runtime's own CLI (`up`, `service install`, `setup github`) attached to
+  your terminal. Each of those sits behind a confirm showing the exact command and directory first, nothing
+  is auto-accepted (the child's own y/N prompts still run), and the install is followed by a hard-stop
+  assertion on the installed version, because npm has reported success over a wrong or absent install before.
+  `--ignore-scripts` is load-bearing here exactly as it is for `import-pi`: **without it the lifecycle scripts
+  of that package and every transitive dependency would run AS YOU, ON YOUR HOST**, at install time, which is
+  a host compromise and not a job one. So: no port, no harness credential, and still the same trust as shell
+  access, which is where `/dispatch setup` stops being theoretical.
 - **The dashboard writes to your terminal's clipboard only on your keystroke.** The `y`/`Y` copy keys in
   the run drill-in emit an OSC 52 sequence — the standard way a terminal application hands text to the
   local clipboard, including over SSH. What crosses is a host-assigned job id or a target URL derived

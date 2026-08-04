@@ -1,7 +1,8 @@
 # Forgejo (and Gitea) triggers
 
-A Forgejo issue labelled by a collaborator starts the same job a GitHub one does: same queue, same
-container, same budget, same pause windows, same run history.
+A Forgejo issue labelled by someone holding `write` or `admin` on the repository starts the same job a
+GitHub one does: same queue, same container, same budget, same pause windows, same run history. A `read`
+collaborator is refused.
 
 ```jsonc
 { "on": { "type": "label", "any": ["pi:fix"] },
@@ -43,6 +44,18 @@ The path matters. Forgejo sends `X-Forgejo-*`, `X-Gitea-*` **and** `X-GitHub-*` 
 header cannot tell it apart from GitHub — and a sender that could choose which gate it faced would choose
 the weakest one available. You pick the path when you configure the hook; the sender never picks.
 
+**4. A Forgejo-only deployment needs nothing from GitHub.** Every forge arm is conditional: the receiver
+mounts a forge's route, resolves its identity for the bot-loop guard, and requires its credentials only
+when your triggers name that forge. So no `WEBHOOK_SECRET` and no `gh` login are needed here, and `/`
+(the GitHub endpoint) answers 404 rather than 401, because an endpoint that answers is one you could
+believe is armed. Add a `github` trigger later and both become required again, as they should.
+
+**5. Start it.** `pi-dispatch-receiver` from your deployment folder; `serve` is the default command, so
+there is nothing to type after the name. A container profile is the alternative
+(`docker compose -f deploy/docker-compose.yml --profile receiver up -d`), and the README lays out the
+choice. The third way the README offers, `pi-dispatch-receiver poll`, cannot serve this forge: the poller
+reads api.github.com and has no Forgejo path at all.
+
 ## Actions are Forgejo's own words
 
 This is the one that would otherwise cost you an afternoon. Forgejo reports a label change as
@@ -61,6 +74,30 @@ message at load rather than a trigger that never fires.
 counterpart to inherit that rule from. It drops under its own reason, so you can see it was recognised and
 refused rather than not understood.
 
+It is not alone in that bucket. `closed`, `edited`, `assigned`, `unassigned`, `milestoned`, `demilestoned`,
+`reviewed`, `review_requested` and `review_request_removed` are recognised and deliberately not actionable
+too, and all of them drop as `action-not-actionable`. A trigger that never fires on one of those was seen
+and refused, not misunderstood.
+
+## Labels match the whole current set, not the diff
+
+The label route fires on `opened`, `labeled` and `reopened`, and the set your predicate is tested against is
+**the labels the issue carries at that moment**, not the labels the event added. This is the one place
+Forgejo differs from the GitLab and Azure arms in a way that costs money: both of those match the diff
+precisely so that later activity on an already-labelled item cannot fire again. Here it can.
+
+- Adding your trigger label fires, as expected.
+- Adding a **second, unrelated** label to an already-labelled issue fires **again**: the current set still
+  matches your predicate.
+- **Reopening** an already-labelled issue fires **again**, for the same reason.
+- An issue **opened** with the label already on it fires once.
+- Removing a label fires nothing (`label_cleared`, above).
+
+Each of those is a separate paid run, and delivery dedup does not help: they are distinct deliveries, not
+retries of one. What does bound it is the ignored bucket above, so a retitle or a reassignment of a labelled
+issue fires nothing. If the re-fires matter to your budget, take the trigger label off once the job has
+started.
+
 ## Who can trigger a job
 
 The actor's repository permission is resolved from
@@ -75,6 +112,14 @@ approval, this check is redundant rather than wrong, which is the cheaper direct
 A lookup that **could not be completed** — a 5xx, a dead socket, a revoked token — answers **503**, not
 204. Forgejo redelivers, and the stable delivery GUID dedups the retry. Answering 204 there would drop real
 work during an outage behind a response indistinguishable from a stranger being correctly refused.
+
+**Know what that looks like, because 403 lands there too.** Only two answers from the permission endpoint
+are determinate: a 200 carrying a permission string, and a 404 (no such collaborator here), which is the
+refusal. Every other status, **403 included**, is indeterminate. So if the harness token cannot read another
+user's permission on that endpoint, nothing fires and nothing is silently dropped either: the receiver logs
+`forgejo_permission_lookup_failed` with the status in the reason, answers **503**, and Forgejo redelivers,
+for as long as its retry policy allows. Repeated 503s against one delivery id are the signature. Look at the
+token's permissions before you look at the trigger.
 
 ## The scope trade-off
 

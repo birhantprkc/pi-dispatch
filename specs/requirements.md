@@ -803,11 +803,18 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
 
 - **Statement**: A trigger may set `run.resume: true`, and a job whose **key** resolves shall then run on
   the session transcript the previous job for that key produced, instead of a fresh one. The key is
-  derived, never looked up: `(repository, head branch)` for a forge job, the scheduler id for a cron job.
-  Absent or `false` is today's behaviour exactly — no transcript is written, no mount is created, and the
-  docker argv is byte-identical to one built before this feature existed.
-- **Scope**: All four trigger kinds, both forges. A CLI `pi-dispatch run` and a chained `/outbox` child
-  have no trigger entry that could arm the flag and therefore never resume.
+  derived, never looked up: `(forge, repository, head branch)` for a forge job, and the scheduler id for a
+  cron job **once the local path is wired** (see Scope). Absent or `false` is today's behaviour exactly —
+  no transcript is written, no mount is created, and the docker argv is byte-identical to one built before
+  this feature existed.
+- **Scope**: Forge triggers, all four forges. A CLI `pi-dispatch run` and a chained `/outbox` child have
+  no trigger entry that could arm the flag and therefore never resume. **Cron is refused at load, not
+  silently ignored** (issue #99): the session store is handed only to the forge preparers, so a `local`
+  job would never resolve a key, and `run.resume` on a cron trigger is a fail-loud `configError` naming
+  the field and the reason — `run.replicas`' precedent, for `run.replicas`' reason ("a field accepted
+  where it does nothing is how an operator comes to trust one that does nothing"). The key material for a
+  cron job exists in `session-key.mjs`, so this is a gap to close rather than a limit, and the refusal
+  message says so.
 - **Why**: A follow-up job on a pull request is a cold start today — new container, fresh clone, empty
   transcript — so the agent re-explores the repository and re-derives the decisions it made an hour ago
   before it can act on a two-line review comment. Nothing about that was wrong; resuming was never a case
@@ -1012,6 +1019,7 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | The audit's session findings (issue #99). **REQ-RESUMABLE-SESSION amended**: Statement and Scope now match the code. The "one case fails CLOSED" clause was specified and never built, so an armed `run.resume` with `PI_SESSIONS_DIR` unset ran cold and completed green, indistinguishable from a job that never set the flag, which is precisely the belief-confirming failure the clause was written to stop; the pre-spend policy refusal now exists, reserving no budget slot and starting no container. Cron moves out of Scope's "all four trigger kinds": the session store reaches only the forge preparers, so a local job could never resolve a key, and `run.resume` on a cron trigger is refused fail-loud at load rather than accepted and ignored (`run.replicas`' precedent and its reason). The key material for cron exists in `session-key.mjs`, so the refusal names it as a gap to close, not a limit. Key material spelled as `(forge, repository, head branch)` — the forge kind was always the first component. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: the new gate is free and pre-reserve, in the same band as the image and branch-protection refusals. |
 | 2026-08-04 | The wizard becomes the default route (issue #96). **REQ-ADMIN-VIA-PI-EXTENSION Acceptance amended**: bare `/dispatch` with nothing configured lands directly in the wizard's opening select (Cancel spawns nothing, writes nothing — the select is the consent); an untested-but-complete pi version is one info advisory on first `/dispatch`, never a refusal; a runtime older than the console's pin is one skew notice pointing at `/dispatch setup`. The outage and nudge-latch clauses are unchanged in substance and restated. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: the new steps (Docker pre-check, trigger-edge choice) spawn only consented infrastructure commands; nothing reserves budget or enqueues. **REQ-DEPLOYMENT-BOOTSTRAP UNCHANGED, checked**: the wizard still drives the CLI's own gates; the service-unit re-anchoring fix (recorded in design.md) changes where units point, not what may be automated. |
 | 2026-08-04 | First-run setup joins the admin surface (issue #92). **REQ-ADMIN-VIA-PI-EXTENSION amended**: `/dispatch setup` (operator-typed only — deliberately no model-callable tool), the bare-`/dispatch` detection tree (the offer appears ONLY when pointer, env, and cwd scaffold are all absent AND the queue is unreachable — a configured deployment with a down queue keeps the banner, never an offer), and a once-ever notify-only `session_start` nudge; Acceptance gains declined-offer-⇒-nothing-spawned-nothing-written, no-offer-over-an-outage, and the nudge latch. **REQ-DEPLOYMENT-BOOTSTRAP Scope amended**: "not the admin extension" becomes the carve-in — the wizard is a *driver, not a power*: it reaches the same CLI actions through their own consent gates and adds only the deployment pointer. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no wizard path reserves budget, enqueues, or spends — setup ends at the panel, not at a job. |
 | 2026-08-02 | Process supervision joins the bootstrap requirement (issue #80). **REQ-DEPLOYMENT-BOOTSTRAP Scope widened**: `pi-dispatch service` (render/install/uninstall/status/start/stop/restart `--drain`) — user-level by default, sudo commands printed never executed, per-OS honesty (macOS login-scoped because Docker Desktop is; Windows via operator-installed nssm, never Task Scheduler — its `TerminateProcess` hard-kill is the recorded rejection), `restart --drain` composing the durable pause → wait-idle → restart → resume ritual the README previously spelled out by hand, and a timed-out drain leaves the queue paused rather than un-pausing over a live job. **REQ-SPEND-CAPS-MULTI-WINDOW / CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: supervision changes when the worker runs, never what a run may spend. |

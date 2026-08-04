@@ -29,9 +29,15 @@ PI_SESSIONS_TTL_DAYS=14        # default 14; 0 = keep forever
 PI_SESSION_MAX_BYTES=8388608   # default 8 MiB; 0 = no cap
 ```
 
-A trigger that sets `"resume": true` while `PI_SESSIONS_DIR` is unset is **refused before it costs
-anything**, rather than running unpersisted and looking like it worked. `pi-dispatch doctor` reports the
-store whenever a trigger arms the flag.
+`pi-dispatch doctor` reports the store whenever a trigger arms the flag, and fails that check when
+`PI_SESSIONS_DIR` is unset. **One case fails closed**: a trigger that sets `"resume": true` with no store
+configured is refused **before it costs anything**, as a policy refusal that reserves no budget slot and
+starts no container, rather than running unpersisted and looking like it worked. That is the whole reason
+the refusal exists: a green run is exactly how an operator comes to believe a feature is on while it is
+off. It lands in the run record as `"reason": "sessions-dir-unset"` and comments on the issue naming the
+two ways out, set the variable or drop the flag. The refusal is per delivery rather than at load, because
+whether a store exists is a property of the deployment and not of the triggers file; `doctor` is what
+tells you before the first delivery arrives.
 
 ## Read this before you enable it
 
@@ -43,7 +49,7 @@ raw log, a transcript has to exist for the feature to work at all.
 Put the store outside every git repository. The shipped `.gitignore` covers the conventional layout
 (a `sessions/` directory) and cannot cover a path it has never seen.
 
-**Who can be handed one.** Sessions are keyed by `(repository, head branch)`, and a branch name is chosen
+**Who can be handed one.** Sessions are keyed by `(forge, repository, branch)`, and a branch name is chosen
 by anyone who can push to your repository. It is tempting to reason that `pi/issue-7` names issue 7's
 work forever — it does not. That branch name is something the agent was *asked* to use; nothing verifies
 it, and branches, unlike issue numbers, can be deleted and re-created by someone else. So the population
@@ -88,15 +94,18 @@ and the disclosure is permanent and silent.
 |---|---|
 | issue label / comment on an issue | the `pi/issue-<n>` branch the job is told to push to |
 | comment / activity on a pull request | the PR's head branch, read from the forge API |
-| cron | the trigger's own `on.id` |
 | `pi-dispatch run`, chained `/outbox` jobs | nothing — these never resume |
 
 The issue and pull-request cases converge because they are the same branch: issue #7's job opens PR #8 on
 `pi/issue-7`, and a later comment on PR #8 resolves that same branch. That join is why a branch is the key
 and not a number.
 
-Cron is the safest case here and worth knowing about on its own: a nightly job that remembers what it did
-last night, keyed on an id you wrote yourself.
+**Cron resume is refused at load, not yet covered.** The session store is handed only to the forge
+preparers: a `kind: "local"` job returns from `prepareWorkspace` before that point, so nothing would ever
+resolve a key for it. Rather than accept a flag that does nothing, `run.resume` on a cron trigger is
+refused fail-loud when the triggers file loads, the same way `run.replicas` is. A key for it exists in
+principle (the trigger's own `on.id`, operator-authored and stable across fires), so this is a gap to
+close rather than a permanent limit, and the refusal says so.
 
 ## When it silently doesn't resume
 
@@ -108,14 +117,22 @@ Every one of these is a **cold start, never a failed job**, and every one is nam
 | `absent` | first run for this key, or the previous one produced nothing |
 | `expired` | older than `PI_SESSIONS_TTL_DAYS` |
 | `too-large` | over `PI_SESSION_MAX_BYTES` |
-| `unparseable` | the file is not a valid pi session; it is quarantined and a fresh one started |
-| `not-a-regular-file` | refused — the store only ever reads regular files |
+| `unparseable` | the first line is not a pi session header. Nothing is quarantined: the canonical file stays where it is and is re-read and re-rejected on every run, until the TTL reaper sweeps the key or a completed run promotes a replacement over it |
+| `not-a-regular-file` | ignored, not refused: the check is an `lstat`, so a symlink planted in `/session` is never followed, and the job runs cold |
 | `pi-version-changed` | the job image ships a different pi than wrote the transcript |
-| `locked` | another job holds this key; this one runs cold rather than interleaving |
 
 `pi-version-changed` is the one that surprises people. A transcript can outlive the pi that wrote it, and
 an older session's stored tool-call arguments may not match a newer pi's tool schema. Rather than fail
-mid-run, the resume is refused. **Upgrading the job image resets every transcript**, by design.
+mid-run, the resume is refused. **Upgrading the job image costs every key one cold start**, by design:
+nothing is deleted, each key simply cold-starts the first time its stamped version fails to match, and its
+next completed run rewrites both the transcript and the stamp.
+
+One further reason reaches `session.reason` without being a read-path outcome at all: `locked`. Only
+`promoteSession` produces it, on a **completed** run whose key was already held by another job's exclusive
+promotion lock. That run discards its own copy rather than clobbering the other's, and the reason is
+recorded to explain why the next run for the key will not see this run's work. Two jobs on one pull request
+inside one runtime is a real shape (`REQ-QUEUE-BURST-NO-DROP`), and last-write-wins there would interleave
+two agents' turns into one transcript.
 
 ## Cost
 
@@ -132,6 +149,7 @@ that bounds how long a conversation accumulates.
 ```
 <PI_SESSIONS_DIR>/<hash>/current.jsonl   the transcript
 <PI_SESSIONS_DIR>/<hash>/pi-version      which pi wrote it
+<PI_SESSIONS_DIR>/<hash>/lock            the one-writer promotion lock; absent when free
 ```
 
 The directory name is a hash, not a readable path, so a branch name never becomes a filesystem path and a

@@ -26,17 +26,28 @@ read-only mount cannot deliver those. That is the whole boundary:
 If two flows want different toolchains, the alternative is one image holding the *union* of both — which
 only ever grows, because removing anything might break the other flow.
 
-## Two starting points
+## Three starting points
 
-**Copy `image/Dockerfile` and add to it.** The honest recommendation: you inherit every property in the
-checklist below for free, and the only thing you own is your own `RUN apt-get install …` layer.
+**`FROM ghcr.io/edgehero/pi-job:latest` and add a layer.** The cheapest and the most common, and the one to
+reach for first: the pinned base, the pinned pi, the runner, the entrypoint, the guardrails floor and the
+`dev.pi-dispatch.*` labels are all **inherited** rather than restated, so a second copy of those pins is not
+a second thing to forget to bump. Re-declare only a label whose truth your layer changed.
+`image/Dockerfile.azure` is exactly this shape: `ARG BASE` plus `FROM ${BASE}`, one Azure CLI layer, and a
+single re-declared `dev.pi-dispatch.forges` with `azure` appended (see
+[azure-devops.md](azure-devops.md), which also names the `--build-arg BASE=…` you need).
+
+**Copy `image/Dockerfile` and add to it.** You inherit every property in the checklist below for free, and
+the only thing you own is your own `RUN apt-get install …` layer. Prefer this over the layer above only when
+you need to change something *inside* the base build (a different base distro, a different pi pin).
 
 **Start from scratch.** Then the next section is a contract, not advice.
 
 ## The conformance checklist
 
-The worker assumes all of this and verifies none of it at run time. **Every item fails silently or late**
-— that is why the list exists.
+The worker verifies exactly **three declarations** an image makes about itself (the three
+`dev.pi-dispatch.*` labels at the bottom of the table, all read off one `docker image inspect` before the job
+spends anything) and **assumes everything else**. Every assumed item fails silently or late, which is why the
+list exists.
 
 | What | What breaks without it | Loud or silent |
 |---|---|---|
@@ -48,11 +59,21 @@ The worker assumes all of this and verifies none of it at run time. **Every item
 | `PLAYWRIGHT_BROWSERS_PATH`, `PLAYWRIGHT_MCP_BROWSER`, `PLAYWRIGHT_MCP_SANDBOX` baked in | Frontend flows fail to launch a browser, or launch the wrong one | mixed |
 | Fonts installed | Chromium renders tofu boxes: screenshots look plausible and contain no legible text | **silent** |
 | The loader flags in `image/runner/src/loader.mjs` | **Security posture is per-image.** A deployment that turned repo-file discovery off for multi-tenancy in one image **has not turned it off in another** | **silent** |
+| Label `dev.pi-dispatch.pi-version` = the pi the image actually carries | The worker reads it pre-spend and treats an absent one as **"never resume"**, the safe direction. Every `run.resume` job then cold-starts: correct, paid for in full, and invisible | **silent** (deliberately) |
+| Label `dev.pi-dispatch.forges` = the forges this image can serve | An **exclusion** list. A label that omits a forge refuses that forge's jobs pre-spend (`job-image-forge-unsupported`); a label naming a forge whose CLI is *not* installed is worse than none, turning that refusal into a paid container that fails at step 3 | loud, pre-spend |
+| Label `dev.pi-dispatch.capabilities` = the optional features it honours (`replicas`) | An **inclusion** list. An image without the label is refused **every** replica job pre-spend (`job-image-replicas-unsupported`), because a floor that hard-codes `pi/issue-<n>` would make both replicas converge on one branch | loud, pre-spend |
+
+The two list labels have **opposite polarities**, deliberately: `forges` excludes, so no claim excludes
+nothing and an unlabelled image is admitted everywhere; `capabilities` includes, so no claim includes nothing
+and an unlabelled image is refused every replica job. One rule underlies both, that an image declaring
+nothing gets no benefit of the doubt about what it contains, and neither costs an ordinary job anything.
+`image/Dockerfile` declares all three, so a layer built on top of it inherits all three.
 
 The isolation itself is *not* on this list, and deliberately so: `--cap-drop=ALL`, `no-new-privileges`, the
-memory/cpu/pids/shm limits and the four mounts are all applied by the **worker's `docker run` argv**, so
-they hold for any image you name. Nothing an image contains can weaken them. What an image decides is
-what is *inside* the box, not what the box can do.
+memory/cpu/pids/shm limits and the mounts (up to five: `/job:ro`, `/workspace`, `/outbox` on local jobs,
+`/session` on an armed resume, `/opt/pi-global:ro` when an overlay is configured) are all applied by the
+**worker's `docker run` argv**, so they hold for any image you name. Nothing an image contains can weaken
+them. What an image decides is what is *inside* the box, not what the box can do.
 
 ## Verify it
 
@@ -60,8 +81,12 @@ what is *inside* the box, not what the box can do.
 ./image/verify-image.sh my-python:1.2.0
 ```
 
-That script is this checklist in executable form, and it is the **same** definition CI runs against the
-image this repo builds — so the list above, the script, and the gate cannot drift apart.
+That script is a **superset** of this checklist, and it is the same definition CI runs against the image this
+repo builds, so the script and the gate cannot drift apart. Beyond the rows above it also asserts that `bash`
+is present (`pi-dispatch sandbox` re-opens a finished run with `--entrypoint bash`, and `TMOUT` is a bash
+feature), that `gh`, `glab` and `tea` are on PATH, that the `dev.pi-dispatch.forges` label matches the CLIs
+actually installed, and that `dev.pi-dispatch.capabilities` matches the baked guardrails. Those last two are
+the ones worth knowing about: **a label must not lie**, because the worker trusts it pre-spend.
 
 **Run it on the machine that holds the image.** That is not a limitation to work around, it is the only
 place the check means anything: jobs launch with `--pull=never`, so the images pi-dispatch can actually run
@@ -82,6 +107,10 @@ the loader flags carry the posture you expect. Running a container can observe b
 1. **Build or pull it on the machine running the worker.** Jobs launch with `--pull=never`, so the worker
    will **never** fetch an image at job time. This is on purpose: an image name is per-trigger config, and
    a typo must not become a silent pull-and-execute of whatever answers to that name in a registry.
+   `pi-dispatch up` will do the pull and the re-tag for you (consent prompted per action), but **only for the
+   deployment default**: `ghcr.io/edgehero/pi-job:latest`, tagged `pi-job:latest`. It never pulls a
+   trigger-named `run.image`, and `doctor --fix` does not offer to either. Each custom image is a per-flow
+   trust posture you chose, so fetching it stays yours.
 2. **Name it** in `triggers.json` as `run.image`.
 3. **Check it**: `pi-dispatch doctor` lists every distinct image your triggers name, fails on one that is
    not present, and warns on one whose entrypoint does not look like the runner.
@@ -95,9 +124,14 @@ more.
 
 ## What this project does not check for you
 
-Presence, and only presence. Nothing here inspects an image's contents, and existence is not conformance.
-An image you build carries its own pi version, its own runner, its own guardrails floor and its own loader
-posture, and none of them are reachable by anything in this repo — see `OQ-012` in
+Presence, plus the three declarations an image makes about itself. Nothing computes a conformance **verdict**
+from an image's contents at job time, and existence is not conformance. The exceptions are narrow and worth
+naming so the boundary is legible: the pre-spend preflight reads those three labels, `doctor` sniffs an
+image's entrypoint and warns when it does not look like the runner's `entrypoint.sh`, and `verify-image.sh`
+(which you run yourself, on the host, deliberately) does start containers and grep the baked `HARD_RULES.md`.
+Only the first of those three is on the job path, and it reads **labels**, not contents. An image you build
+carries its own pi version, its own runner, its own guardrails floor and its own loader posture, and a label
+is the image's **claim** about the first three, never a measurement of them. See `OQ-012` in
 [`specs/open-questions.md`](../specs/open-questions.md) for the honest statement of that gap and what would
 close it. Reporting a conformance verdict that had not actually been computed would be worse than reporting
 none.

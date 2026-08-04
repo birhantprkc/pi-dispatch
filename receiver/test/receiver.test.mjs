@@ -15,8 +15,13 @@ const SELF_ID = 999;
 function forgeTriggers({ knownFlows, ...group }) {
 	return { github: group, knownFlows };
 }
+// `servesGithub: true` is what mounts `/` at all (issue #99): the loader decides it from the triggers file
+// plus GITHUB_AUTH_SOURCE, and this fixture is a github-serving deployment, so it says so explicitly. A
+// fixture that omitted it would 404 every delivery below, which is the point of the pair of tests at the
+// bottom of this file.
 const cfg = {
 	webhookSecret: SECRET,
+	servesGithub: true,
 	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: null },
@@ -331,6 +336,7 @@ test("NONE-author comment is dropped 204, nothing enqueued", async () => {
 /** The label config above, with `replicas` on the matched rule. */
 const replicaCfg = {
 	webhookSecret: SECRET,
+	servesGithub: true,
 	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix", replicas: 2 }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: null },
@@ -385,6 +391,74 @@ test("a throw on the SECOND replica answers 503 and leaves the first enqueued --
 
 	assert.equal(res.statusCode, 503, "retryable, so GitHub redelivers");
 	assert.deepEqual(calls, [`gh-${delivery}-r1`], "replica 1 is already in the queue and stays there");
+});
+
+// --- the `/` route exists only where github is served (issue #99) ----------------------------------
+
+/**
+ * A GitLab-only deployment as the loader produces it: `servesGithub: false`, no webhook secret (there is
+ * no endpoint for one to protect), and an empty github group. The github arm is not built at all, so `/`
+ * has no handler -- and `selfId` is undefined here on purpose, because a deployment that resolves no
+ * GitHub identity is exactly the one that must not be answering GitHub deliveries.
+ */
+const githubFreeCfg = {
+	servesGithub: false,
+	triggers: {
+		github: { label: [], comment: null, pullRequest: [] },
+		gitlab: { label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "gl-fix" }], comment: null, pullRequest: [] },
+		knownFlows: new Set(["gl-fix"]),
+	},
+};
+
+test("POST / on a github-free deployment is 404 -- not 401, not 405 -- and nothing is enqueued", async () => {
+	// 404 for the same reason the other three forges' unconfigured paths answer 404: a 401 says "armed, and
+	// you got the secret wrong", and an operator who reads that will spend an hour rotating a secret for an
+	// endpoint that does not exist. 405 would be just as misleading -- it discusses the method of a live
+	// endpoint. The status has to say "there is nothing here".
+	const { calls, queue } = recordingQueue();
+	const handler = makeReceiver({ queue, selfId: undefined, cfg: githubFreeCfg, log: () => {} });
+
+	const raw = JSON.stringify(LABELED_PAYLOAD);
+	const post = mockRes();
+	await drive(handler, mockReq({ headers: headersFor("issues", "d-nogithub", raw) }), post, raw);
+	assert.equal(post.statusCode, 404);
+	assert.match(String(post.body), /not configured/, "the body says the forge is unconfigured, like every other arm's 404");
+	assert.equal(calls.length, 0, "and no job: an absent endpoint cannot spend money");
+
+	// A well-formed GET must not fall through to the verified handler's 405 either -- that would be a live
+	// endpoint discussing methods.
+	const get = mockRes();
+	await drive(handler, mockReq({ method: "GET", headers: {} }), get, undefined);
+	assert.equal(get.statusCode, 404, "not 405");
+});
+
+test("an unrouted path on a github-free deployment is 404 too -- the fallthrough itself is gone", async () => {
+	// `/` and every unrouted path share the github fallthrough, so removing the arm must remove all of it.
+	const { queue } = recordingQueue();
+	const handler = makeReceiver({ queue, selfId: undefined, cfg: githubFreeCfg, log: () => {} });
+	const raw = JSON.stringify(LABELED_PAYLOAD);
+	const req = mockReq({ headers: headersFor("issues", "d-unrouted", raw) });
+	req.url = "/anything";
+	const res = mockRes();
+	await drive(handler, req, res, raw);
+	assert.equal(res.statusCode, 404);
+});
+
+test("the SAME bad-signature delivery is still 401 where github IS served -- both directions, one pair", async () => {
+	// The regression this pair pins is bidirectional: making `/` conditional must not soften the trust
+	// boundary for the deployments that do serve github. Same bytes, same tampered signature, two configs.
+	const raw = JSON.stringify(LABELED_PAYLOAD);
+	const headers = headersFor("issues", "d-pair", raw, raw + "tampered");
+
+	const served = mockRes();
+	const { calls, queue } = recordingQueue();
+	await drive(makeReceiver({ queue, selfId: SELF_ID, cfg, log: () => {} }), mockReq({ headers }), served, raw);
+	assert.equal(served.statusCode, 401, "github served: the HMAC boundary answers, exactly as before");
+
+	const free = mockRes();
+	await drive(makeReceiver({ queue, selfId: undefined, cfg: githubFreeCfg, log: () => {} }), mockReq({ headers }), free, raw);
+	assert.equal(free.statusCode, 404, "github not served: there is no boundary to fail, because there is no endpoint");
+	assert.equal(calls.length, 0);
 });
 
 test("an unflagged trigger still enqueues EXACTLY once, with no replica key and today's jobId", async () => {

@@ -859,6 +859,47 @@ export async function collectChecks(env, seams) {
 		});
 	}
 
+	// REQ-SCOPED-PAUSE-WINDOWS, the panel-writes-what-the-worker-ignores trap (issue #99). Three defaults
+	// that are individually defensible and together silent:
+	//
+	//   - `pi-dispatch init` SCAFFOLDS ./pause-windows.json and leaves PI_PAUSE_WINDOWS_FILE commented out;
+	//   - the admin panel defaults to ./pause-windows.json in its OWN cwd, so `w` reads and WRITES that file
+	//     and reports every window it adds as applied live;
+	//   - the worker has NO cwd default (config.mjs: `?? null`, and null means the feature is off).
+	//
+	// So an operator adds quiet hours in the panel, is told it is live, and nothing ever pauses -- the one
+	// failure mode where the UI actively asserts the opposite of the truth. The worker's fail-closed default
+	// is deliberate and is NOT changed here: a worker must not start honouring a file nobody pointed it at,
+	// least of all one that stops paid work. The mismatch is a deployment fact, so doctor is where it
+	// belongs. Warn, never fail, like every other setup-shaped check: a deployment can legitimately be
+	// mid-setup, and a scaffolded file the operator never intended to use is not a fault.
+	//
+	// Empty counts as unset, mirroring `if (config.pauseWindowsFile)` at the worker's own load site.
+	//
+	// NEVER TIER, deliberately no fixAction: doctor cannot know which path the operator meant. This cwd is
+	// doctor's, not necessarily the worker's (a service manager sets its own), and writing an env line into
+	// .env would be doctor guessing a semantic value -- the same refusal PI_GLOBAL_ALLOW_EXTENSIONS gets.
+	// The fix line names the variable and the absolute path, and the operator decides.
+	//
+	// SUBSCRIPTIONS GET NO SUCH CHECK, checked rather than assumed: ./subscriptions.json is scaffolded by the
+	// same init and PI_SUBSCRIPTIONS_FILE is commented out the same way, but the admin extension is its ONLY
+	// reader and writer (nothing reads it at job time), and the admin's own default IS ./subscriptions.json
+	// (admin/src/read-model.mjs) -- so with the variable unset the one component that cares already finds the
+	// scaffolded file. There is no second reader to disagree with, hence no trap, hence no warn: a line that
+	// fires where nothing is broken teaches operators to skim past the ones that matter.
+	{
+		const pauseWindowsFile = env.PI_PAUSE_WINDOWS_FILE;
+		const scaffolded = join(cwd, "pause-windows.json");
+		if ((typeof pauseWindowsFile !== "string" || pauseWindowsFile.trim() === "") && fileExists(scaffolded)) {
+			checks.push({
+				ok: false,
+				warn: true,
+				label: `${scaffolded} exists but PI_PAUSE_WINDOWS_FILE is unset -- the worker ignores it, so scoped pauses are OFF`,
+				fix: `set PI_PAUSE_WINDOWS_FILE=${scaffolded} in .env and restart the worker -- unset means the worker loads no windows at all, while the admin panel defaults to this same file and reports each window it writes as applied live; delete the file if this deployment has no quiet hours`,
+			});
+		}
+	}
+
 	// REQ-RESURRECTABLE-SANDBOX. A warning, never a failure: retention is a convenience, and the only thing
 	// worth surfacing is that finished runs' directories -- a repository clone plus the run's prompt.md and
 	// event.json, so issue text -- are sitting on disk, and how many. An operator who never opens a sandbox

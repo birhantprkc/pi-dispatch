@@ -10,7 +10,8 @@ inside a pause window while the rest of the queue keeps draining.
 
 ## Enable it
 
-Point `PI_PAUSE_WINDOWS_FILE` at a JSON file. Unset = the feature is off.
+Point `PI_PAUSE_WINDOWS_FILE` at a JSON file. **For the worker, unset means the feature is off**: nothing is
+defaulted, and no windows are read.
 
 ```bash
 # .env
@@ -27,13 +28,36 @@ PI_PAUSE_WINDOWS_FILE=/absolute/path/to/pause-windows.json
 
 The worker validates the file at boot (a malformed file **refuses startup**, fail-loud) and **live-reloads**
 it on change — an edit takes effect on the next job without a restart, and a bad edit keeps the last-good
-windows. The `deploy/pause-windows.json` in this repo is an empty template (`{ "windows": [] }`).
+windows. Two files in this repo to know apart: `pi-dispatch init` scaffolds an **empty**
+`./pause-windows.json` (`{ "windows": [] }`) in the deployment folder, and `pause-windows.example.json` at
+the repo root is the **populated** example to copy windows out of.
+
+### Set the variable, even though two other things behave as if you had
+
+Three parts of the system decide on this path independently, and only one of them treats unset as off:
+
+| Who | What it uses when `PI_PAUSE_WINDOWS_FILE` is unset |
+|---|---|
+| **The worker**, the only thing that actually defers a job | nothing: **the feature is off**, no windows are loaded |
+| `pi-dispatch init` | **scaffolds** `./pause-windows.json` and leaves the variable **commented out** in `.env` |
+| **The `/dispatch` panel** (and the `dispatch_pause_*` tools) | defaults to `./pause-windows.json` in **the panel's own cwd**, so it works from a deployment folder with no env wiring |
+
+Each is defensible alone. Together they compose into one silent trap: run `init`, then manage quiet hours
+through the panel, and you are editing a file **the worker never reads**. The panel answers
+`pause window added (live)`, the JSON on disk is correct, and nothing ever pauses.
+
+So set the variable, to an **absolute** path, in the worker's own environment, and make sure the panel
+resolves the same file (export it there too, or let `/dispatch setup` write a **deployment pointer**:
+`PI_PAUSE_WINDOWS_FILE` is on the pointer's env allowlist precisely so a panel started anywhere can find the
+worker's files). `pi-dispatch doctor` **warns on this exact mismatch**, a `pause-windows.json` in its cwd
+while the variable is unset, and says the worker ignores it so scoped pauses are off. It warns rather than
+fails, and offers no `--fix`, because only you know which path was meant.
 
 ## The window schema
 
 | Field | Required | Meaning |
 |---|---|---|
-| `scope` | **yes** | What the window applies to: a **repo** `"owner/name"` (github jobs), a **folder** host path (local/cron jobs), or `"*"` for **all** scopes. Matched exactly. |
+| `scope` | **yes** | What the window applies to: the job's **repo path** on **any** forge (GitHub, GitLab, Forgejo, Azure DevOps), the **folder** host path for a local/cron job, or `"*"` for **all** scopes. Matched exactly, so mind the segment count: GitHub and Forgejo are `owner/name`, but a GitLab project is `group/subgroup/project` and Azure DevOps is `org/project/repo`. The rule is just local → folder, anything else → repo, so a forge added later is scoped automatically. |
 | `from` | **yes** | Pause **start**, `"HH:MM"` 24-hour. |
 | `to` | **yes** | Resume time, `"HH:MM"` 24-hour. If `from > to` the window is **overnight** (spans midnight). `from == to` is rejected — a 24h pause isn't expressible; remove the trigger instead. |
 | `tz` | no (default `UTC`) | IANA timezone, e.g. `"Europe/Amsterdam"`, `"America/New_York"`. `from`/`to` are that zone's wall clock, DST-correct. |
@@ -59,9 +83,15 @@ windows. The `deploy/pause-windows.json` in this repo is an empty template (`{ "
   "days": ["mon","tue","wed","thu","fri"] }
 ```
 
-**A change-freeze between dates** — no runs for `acme/api`, all day, across a release window:
+**A change-freeze between dates**: `acme/api` frozen across a release window. Note the shape, `00:00` to
+`23:59` is a same-day window matched as `[from, to)`, so it leaves the final minute (`23:59`) **open**, and
+`from == to` is rejected by design, which means a true 24-hour window is not expressible in one entry. Either
+accept that minute or lay down two adjacent windows:
 ```json
-{ "scope": "acme/api", "from": "00:00", "to": "23:59", "dateFrom": "2026-08-10", "dateTo": "2026-08-14" }
+{ "windows": [
+  { "scope": "acme/api", "from": "00:00", "to": "12:00", "dateFrom": "2026-08-10", "dateTo": "2026-08-14" },
+  { "scope": "acme/api", "from": "12:00", "to": "00:00", "dateFrom": "2026-08-10", "dateTo": "2026-08-14" }
+] }
 ```
 
 **Everything, on weekends** — pause all scopes on Saturday/Sunday nights:
@@ -89,13 +119,14 @@ windows. The `deploy/pause-windows.json` in this repo is an empty template (`{ "
 
 ## Managing windows
 
-Three equivalent ways — all write the same validated file and take effect live:
+Three equivalent ways, all writing the same validated file and taking effect live, **provided the panel and
+the worker resolve `PI_PAUSE_WINDOWS_FILE` to the same path** (see [Enable it](#enable-it) above):
 
 1. **Edit the file.** Change `pause-windows.json`; the worker hot-reloads it (keeps the last-good set on a bad edit).
 2. **In the panel.** Open `/dispatch`, press `w` → **add, edit, or delete** a window through operator
    dialogs. Editing re-prompts each field with its current value, so a blank answer keeps it and you only
-   re-type what changes. The **PAUSES** section shows each window as `●` paused (with a resume countdown)
-   or `○` open.
+   re-type what changes. The **PAUSE WINDOWS** section shows each window as `●` paused (with a resume
+   countdown) or `○` open.
 3. **From an agent, human-gated.** The model tools `dispatch_pause_add` / `dispatch_pause_edit` /
    `dispatch_pause_delete` (and the read-only `dispatch_pauses`) let an agent manage windows — edit is a
    **partial** change (pass only the fields to alter; the rest keep their value) — but each write **pops an

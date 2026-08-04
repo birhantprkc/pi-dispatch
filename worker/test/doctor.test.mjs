@@ -611,6 +611,73 @@ test("doctor: a deployment with no run.replicas anywhere prints no replica line 
 	assert.doesNotMatch(text(), /run\.replicas/, "a deployment that does not use the feature is not told about it");
 });
 
+// -- the scaffolded pause-windows file the worker never reads (issue #99, REQ-SCOPED-PAUSE-WINDOWS) ----
+
+/**
+ * A deployment folder exactly as `pi-dispatch init` leaves it: both operator-authored config files
+ * scaffolded, and neither env var set. Real files with doctor's default `fileExists`, so the check is
+ * exercised against the filesystem it will actually read. Contents are irrelevant -- doctor never parses
+ * either file, and must not start.
+ */
+function scaffoldedCwd() {
+	const dir = mkdtempSync(join(tmpdir(), "pi-scaffold-"));
+	writeFileSync(join(dir, "pause-windows.json"), "[]\n");
+	writeFileSync(join(dir, "subscriptions.json"), JSON.stringify({ version: 1, subscriptions: [] }));
+	return dir;
+}
+const scaffoldDeps = (out, cwd) => ({ out, cwd, spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" });
+
+test("doctor: a scaffolded pause-windows.json with PI_PAUSE_WINDOWS_FILE unset warns, names the var, and never fails", async () => {
+	// The one failure mode where the UI asserts the opposite of the truth: the panel defaults to this same
+	// file, writes the window, and says it is live -- while the worker, having no cwd default, loaded none.
+	const cwd = scaffoldedCwd();
+	const { out, text } = capture();
+	const code = await runDoctor(imgEnv(), scaffoldDeps(out, cwd));
+	assert.ok(text().includes(`⚠ ${join(cwd, "pause-windows.json")} exists but PI_PAUSE_WINDOWS_FILE is unset`), "the warn names the file it found");
+	assert.ok(text().includes(`set PI_PAUSE_WINDOWS_FILE=${join(cwd, "pause-windows.json")}`), "the fix names the variable AND the absolute path");
+	assert.match(text(), /reports each window it writes as applied live/, "the consequence is stated, not just the mismatch");
+	assert.equal(code, 0, "warn, never fail -- a deployment can legitimately be mid-setup");
+	// The finding this check is deliberately NOT generalised to: subscriptions.json is scaffolded the same
+	// way and its env var is unset here too, but the admin extension is its only reader and defaults to this
+	// same path, so nothing is trapped and doctor says nothing.
+	assert.doesNotMatch(text(), /PI_SUBSCRIPTIONS_FILE|subscriptions\.json/, "no warn where there is no second reader to disagree");
+});
+
+test("doctor: with PI_PAUSE_WINDOWS_FILE set, the scaffolded file is not mentioned at all", async () => {
+	const cwd = scaffoldedCwd();
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_PAUSE_WINDOWS_FILE: join(cwd, "pause-windows.json") }), scaffoldDeps(out, cwd));
+	assert.doesNotMatch(text(), /PI_PAUSE_WINDOWS_FILE/, "a wired deployment gets no line -- the worker and the panel agree");
+});
+
+test("doctor: no scaffolded file, no line -- the feature-off deployment is not told about a file it has not got", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv(), scaffoldDeps(out, mkdtempSync(join(tmpdir(), "pi-bare-"))));
+	assert.doesNotMatch(text(), /pause-windows/, "nothing exists to be ignored");
+});
+
+test("doctor: an EMPTY PI_PAUSE_WINDOWS_FILE counts as unset, mirroring the worker's own load site", async () => {
+	// start.mjs gates on `if (config.pauseWindowsFile)`, so an empty value leaves the feature off exactly as
+	// an absent one does. A check that read only `undefined` would call that deployment wired.
+	const cwd = scaffoldedCwd();
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_PAUSE_WINDOWS_FILE: "   " }), scaffoldDeps(out, cwd));
+	assert.ok(text().includes(`⚠ ${join(cwd, "pause-windows.json")} exists but PI_PAUSE_WINDOWS_FILE is unset`));
+});
+
+test("doctor: the pause-windows mismatch is NEVER tier -- doctor cannot guess which path was meant", async () => {
+	// This cwd is doctor's, not necessarily the worker's, and writing an env line would be guessing a
+	// semantic value. The doctrine pin below enforces the allowed set generally; this asserts it at the
+	// check that would be most tempting to automate.
+	const cwd = scaffoldedCwd();
+	const checks = await collectChecks(imgEnv(), collectSeams(green, { cwd, nodeVersion: "22.19.0", probeValkey: async () => true }));
+	const c = checks.find((x) => /PI_PAUSE_WINDOWS_FILE is unset/.test(x.label));
+	assert.ok(c, "the check is present");
+	assert.equal(c.ok, false);
+	assert.equal(c.warn, true);
+	assert.equal(c.fixAction, undefined, "no offer: only the operator knows which file the worker will actually see");
+});
+
 // -- receiver preflight (issue #80): what receiver boot will refuse, said at doctor time --------------
 
 /** A triggers file with one forge label trigger of `kind`. Azure carries the `run.repository` its label
@@ -819,11 +886,18 @@ function promptRecorder(answer = false) {
 	return { fn, calls };
 }
 
-/** A validating triggers file whose one cron trigger sets run.resume (REQ-RESUMABLE-SESSION). */
+/**
+ * A validating triggers file whose one trigger sets run.resume (REQ-RESUMABLE-SESSION).
+ *
+ * A FORGE trigger, not a cron one: `run.resume: true` is refused on a local/cron entry (triggers.mjs --
+ * resolveSession is handed to the forge preparers only, so an armed cron job would stage nothing and still
+ * exit 0). The fixture has to be a file the SHARED parseTriggers really accepts, or readTriggerFacts
+ * swallows the refusal to zeroes and every resume assertion here passes for the wrong reason.
+ */
 function resumeTriggersFile() {
 	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-resume-")), "triggers.json");
-	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", resume: true };
-	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run }] }));
+	const run = { kind: "github", flow: "review", resume: true };
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:review"] }, run }] }));
 	return path;
 }
 
@@ -1157,9 +1231,12 @@ const collectSeams = (plan, extra = {}) => ({
 function fullyBrokenTriggersFile() {
 	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-broken-")), "triggers.json");
 	const triggers = [
-		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/repo", flow: "review", task: "t", image: "custom-img:1", resume: true } },
+		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/repo", flow: "review", task: "t", image: "custom-img:1" } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", replicas: 2 } },
-		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "gitlab", flow: "fix" } },
+		// `resume` rides a FORGE trigger, and not the replicating one: triggers.mjs refuses run.resume on a
+		// local entry AND refuses it beside run.replicas, so this is the only entry that can carry it. A
+		// fixture parseTriggers rejects would zero every count this pin depends on.
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "gitlab", flow: "fix", resume: true } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "forgejo", flow: "fix" } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "azure", flow: "fix", repository: "webapp" } },
 	];

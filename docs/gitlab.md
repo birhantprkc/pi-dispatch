@@ -62,13 +62,28 @@ The receiver verifies **exactly** the mode you declared. A delivery carrying the
 refused even if it is correct — otherwise a sender could pick which gate it faced, and it would always
 pick the weaker one.
 
-**4. Check it.** `pi-dispatch doctor` reports whether the token is set when your triggers name GitLab.
+**4. A GitLab-only deployment needs nothing from GitHub.** Every forge arm is conditional: the receiver
+mounts a forge's route, resolves its identity for the bot-loop guard, and requires its credentials only
+when your triggers name that forge. So no `WEBHOOK_SECRET` and no `gh` login are needed here, and `/`
+(the GitHub endpoint) answers 404 rather than 401, because an endpoint that answers is one you could
+believe is armed. Add a `github` trigger later and both become required again, as they should.
+
+**5. Check it.** `pi-dispatch doctor` reports whether the token, the verification mode and the webhook
+secret are set when your triggers name GitLab, plus `WEBHOOK_SECRET` for any forge at all.
+
+**6. Start it.** `pi-dispatch-receiver` from your deployment folder; `serve` is the default command, so
+there is nothing to type after the name. A container profile is the alternative
+(`docker compose -f deploy/docker-compose.yml --profile receiver up -d`), and the README lays out the
+choice. The third way the README offers, `pi-dispatch-receiver poll`, cannot serve this forge: the poller
+reads api.github.com and has no GitLab path at all.
 
 ## Self-hosted instances
 
-Set `GITLAB_URL` to your instance root and everything follows it — the receiver's verification and member
-lookup, the worker's API calls and clone URL, and `GITLAB_HOST` inside the job container so `glab` talks to
-your instance rather than gitlab.com. Nothing is hardcoded to gitlab.com; that value is only the default.
+Set `GITLAB_URL` to your instance root and everything follows it: the receiver's member lookup, the
+worker's API calls and clone URL, and `GITLAB_HOST` inside the job container so `glab` talks to your
+instance rather than gitlab.com. Nothing is hardcoded to gitlab.com; that value is only the default.
+(Webhook verification is the exception that needs nothing here, because it reads the delivery's own headers
+and the configured mode and secret, never an instance URL.)
 
 ```bash
 GITLAB_URL=https://gitlab.internal.example.com
@@ -83,9 +98,10 @@ your OS trusts is not automatically one Node trusts:
 NODE_EXTRA_CA_CERTS=/etc/ssl/certs/your-internal-ca.pem
 ```
 
-Without it, every call fails and the log names the reason — `fetch failed: self-signed certificate`, or
-`unable to verify the first certificate`. That message is the diagnosis; if you see it, this is what it
-means.
+Without it, every call fails, and the log names the reason rather than the bare `fetch failed` Node rejects
+with. The receiver's boot-time identity check reports `gitlab identity: GET /user failed (...)`, and inside
+those parentheses is the fetch's whole cause chain, joined with colons, so the certificate error itself is
+what you read. That message is the diagnosis; if you see it, this is what it means.
 
 The **job container** is a separate trust store: `git clone` and `glab` run inside it, so the CA has to be
 in the image. Add it to your own image (`docs/job-image.md`) — a `COPY` of the cert into
@@ -194,7 +210,9 @@ same budget and pause windows, the same run history, and the same rule that **th
 
 ## What is not supported
 
-- **Group-level webhooks.** Configure the webhook per project.
+- **Group-level webhooks.** Untested, and nothing refuses one: verification reads only the delivery's
+  headers, and the gate routes on the project id the payload carries. So do not expect an error if you
+  configure one; expect behaviour nobody has checked. Configure the webhook per project.
 - **Chaining from a GitLab job.** A forge job gets no `/outbox`, exactly as a GitHub job does not — its
   task text is adversarial input (`OQ-009`).
 - **Multiple GitLab instances in one deployment.** One `GITLAB_URL`.

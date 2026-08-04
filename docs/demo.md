@@ -7,12 +7,23 @@ recipe; it needs a real terminal, so it's yours to run (the panel can't be drive
 
 ## What to show (≈ 20–30s)
 
-1. `pi -e admin/src/index.ts` then `/dispatch` — the live panel: status header, spend meters, triggers,
-   pause windows, runs.
+1. `pi install npm:@edgehero/pi-dispatch-admin`, then `/dispatch`, for the live panel's six sections: status
+   header, spend & limits, triggers, pause windows, runs, settings. (From a checkout the dev form is
+   `pi -e admin/src/index.ts`; the published extension's entry point is its built `./dist/index.mjs`.)
 2. `↵` on a trigger → the MATCHES / RUNS / TRUST MODEL drill-in.
 3. `↵` on a run → the colored post-mortem.
-4. (optional) `w` → add a pause window; watch the PAUSES row flip to `● paused · resumes in …`.
-5. `q` to close.
+4. `c` → the COSTS view: the verdict line, the daily sparkline, the by-flow table, `t` to cycle
+   7d / 30d / mtd, `w` for the what-if on the selected flow. `Esc` backs out.
+5. (optional) `w` on the dashboard → the pause-window dialogs: a three-way select (add / edit / delete a
+   pause window), then seven prompts for an add. Watch a PAUSE WINDOWS row flip to
+   `● paused · resumes in …`.
+6. `q` to close.
+
+The footer is the shot list, in order:
+`↑↓↵ open · a add · w pauses · l logs · c costs · p pause · r resume · q quit`
+
+If the recording is for **onboarding** rather than for the README, lead with `/dispatch setup` instead: the
+guided wizard is the front door now, and a panel that opens already configured is the payoff shot.
 
 Run against a deployment with a little state (a couple of triggers, a finished run or two) so the panel isn't
 empty — start the stack (`docker compose -f deploy/docker-compose.yml up -d`), queue one local job, let it
@@ -32,19 +43,30 @@ Set Theme "Dracula"
 Set Padding 16
 
 Hide
-Type "pi -e admin/src/index.ts"  Enter
+# Assumes the extension is installed: pi install npm:@edgehero/pi-dispatch-admin
+# From a checkout, swap the next line for:  Type "pi -e admin/src/index.ts"
+Type "pi"  Enter
 Sleep 3s
 Show
 
 Type "/dispatch"  Enter
 Sleep 3s
-Down Sleep 500ms   Enter  Sleep 3s   Escape Sleep 1s   # a trigger drill-in
-Down Down Down Down Down Down  Enter  Sleep 3s  Escape Sleep 1s   # a run post-mortem
+Enter  Sleep 3s   Escape Sleep 1s                      # a trigger drill-in (selection starts on trigger 1)
+Tab  Sleep 500ms  Enter  Sleep 3s  Escape Sleep 1s     # a run post-mortem (Tab jumps triggers <-> runs)
+Type "c"  Sleep 3s  Type "t"  Sleep 2s  Escape Sleep 1s   # the COSTS view, one window flip
 Type "q"
 Sleep 1s
 ```
 
 Then: `vhs docs/demo.tape` → produces `docs/images/dispatch-demo.gif`.
+
+**Why `Tab` and not a row of `Down`s.** Selection is one flat list, triggers first and then runs, so a blind
+`Down` count only lands where you meant it against the exact fixture you recorded on. `Tab` jumps between the
+first trigger and the first row below the triggers, which needs no counting. Two fixture facts still bite:
+with a job **in flight** there is an ACTIVE row directly under the triggers, so `Tab` lands there instead of
+on a finished run (add one `Down`, or record with the queue idle), and in a **short** terminal sections
+collapse by priority (pause windows first, then settings, then triggers, then spend), which moves everything
+below them. Record at the `Set Height` above, on a fixture you control.
 
 ## Option B — asciinema + agg (records a real session)
 
@@ -61,7 +83,9 @@ An `.cast` file can also be uploaded to asciinema.org and embedded (autoplaying)
 - **README**: add the GIF near the top, under the existing SVG panel images.
 - **Social preview** (GitHub → Settings → General → Social preview): export a single crisp PNG frame of the
   panel — reuse `docs/images/dispatch-dashboard.svg` rendered to PNG until the GIF exists.
-- **pi.dev gallery card**: set `pi.video` (a hosted `.mp4`/`.gif` URL) or `pi.image` in the extension package's
-  `package.json` (see the packaging steps) so the listing shows the panel.
+- **pi.dev gallery card**: `admin/package.json` already carries `pi.image` (the banner PNG) next to
+  `pi.extensions` and `pi.skills`; repoint it at a panel frame, or add a `pi.video` field with a hosted
+  `.mp4`/`.gif` URL. `pi.video` would be **new** here (nothing in this repo sets it today), so check pi's own
+  manifest schema before relying on it. Submission context lives in [launch-kit.md](launch-kit.md).
 
 Keep the file small (< ~3 MB): trim to ~25s, cap width at ~1200px, and prefer the GIF for GitHub autoplay.

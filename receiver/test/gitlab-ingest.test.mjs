@@ -11,8 +11,13 @@ function forgeTriggers({ knownFlows, ...group }) {
 	return { github: { label: [], comment: null, pullRequest: [] }, gitlab: group, knownFlows };
 }
 
+// `servesGithub: true`: this fixture is a deployment serving BOTH forges, which is what lets the routing
+// test below assert that `/` still reaches the github arm (and is refused there for want of a signature)
+// rather than being served by the gitlab one. A github-free deployment 404s `/` instead -- issue #99, pinned
+// in receiver.test.mjs.
 const cfg = {
 	webhookSecret: "gh-secret",
+	servesGithub: true,
 	triggers: forgeTriggers({
 		label: [{ index: 0, predicate: { any: ["pi:frontend"] }, flow: "frontend-fix" }],
 		comment: { index: 1, phrase: "@pi", defaultFlow: "triage" },
