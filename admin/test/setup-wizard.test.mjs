@@ -56,7 +56,13 @@ function wizardUi({ select = [], input = [], confirm = [] } = {}) {
   return { ui, notes, seen };
 }
 
-/** Common recording deps for the step engine; every host-touching seam is a fake that records. */
+/**
+ * Common recording deps for the step engine; every host-touching seam is a fake that records.
+ *
+ * `probeDockerFn` defaults to a green answer for the same reason detectFn is canned: the docker
+ * pre-check (step 3) would otherwise exec a REAL `docker version` on whatever box runs the suite, which
+ * is neither offline nor deterministic. The docker step's own tests override it.
+ */
 function wizardDeps(overrides = {}) {
   const attached = [];
   const pointerWrites = [];
@@ -68,6 +74,7 @@ function wizardDeps(overrides = {}) {
     execPath: "/usr/bin/node-under-test",
     homedirFn: () => mkdtempSync(join(tmpdir(), "admin-setup-home-")),
     detectFn: async () => ({ state: "none", detail: "canned detection" }),
+    probeDockerFn: () => ({ ok: true }),
     runAttachedFn: async (_ctx, opts) => {
       attached.push(opts);
       return { code: 0 };
@@ -257,17 +264,116 @@ test("npmInstallArgs: the exact pinned, script-less argv with no filesystem path
   assert.ok(!args.some((a) => a.includes("--prefix")), "the install target is the spawn cwd, never a --prefix path");
 });
 
+test("npmInstallArgsFor: the SAME pinned, path-free argv for both packages, wrappers included", () => {
+  // The generalization must not weaken the win32 `shell: true` argument for EITHER package: the whole
+  // safety rests on argv carrying no filesystem path and one `name@version` token of module literals.
+  assert.deepEqual(
+    mod.npmInstallArgs(),
+    mod.npmInstallArgsFor("@edgehero/pi-dispatch", mod.RUNTIME_VERSION),
+    "the runtime wrapper is exactly the shared shape applied to its pin",
+  );
+  assert.deepEqual(
+    mod.receiverInstallArgs(),
+    mod.npmInstallArgsFor("@edgehero/pi-dispatch-receiver", mod.RECEIVER_VERSION),
+    "and so is the receiver's",
+  );
+  assert.equal(mod.receiverInstallArgs()[1], `@edgehero/pi-dispatch-receiver@${mod.RECEIVER_VERSION}`);
+  for (const args of [mod.npmInstallArgs(), mod.receiverInstallArgs()]) {
+    assert.equal(args[0], "install");
+    for (const flag of ["--omit=dev", "--omit=optional", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error"]) {
+      assert.ok(args.includes(flag), `${flag} survives for ${args[1]}`);
+    }
+    for (const a of args) {
+      assert.ok(!a.startsWith("/") && !a.startsWith(".") && !a.startsWith("\\"), `no path token in argv: ${a}`);
+      assert.ok(!a.includes("\\"), `no backslash in argv: ${a}`);
+    }
+    assert.ok(!args.some((a) => a.includes("--prefix")), "the install target is the spawn cwd, never a --prefix path");
+  }
+});
+
 test("npmSpawnOptions: npm.cmd + shell on win32, plain npm elsewhere, cwd is the deployment dir", () => {
   assert.deepEqual(mod.npmSpawnOptions("win32", "C:\\deploy"), { bin: "npm.cmd", options: { cwd: "C:\\deploy", shell: true } });
   assert.deepEqual(mod.npmSpawnOptions("linux", "/deploy"), { bin: "npm", options: { cwd: "/deploy" } });
   assert.deepEqual(mod.npmSpawnOptions("darwin", "/deploy"), { bin: "npm", options: { cwd: "/deploy" } });
 });
 
-// ── RUNTIME_VERSION anti-drift ───────────────────────────────────────────────────────────────────
+test("runtimeDirFor + readInstalledVersion: one spelling for both packages; absent/garbage is undefined", () => {
+  const dir = emptyDir();
+  assert.equal(mod.runtimeDirFor(dir), join(dir, "node_modules", "@edgehero", "pi-dispatch"), "the runtime is the default");
+  assert.equal(mod.runtimeDirFor(dir, "pi-dispatch-receiver"), join(dir, "node_modules", "@edgehero", "pi-dispatch-receiver"));
+  assert.equal(mod.readInstalledVersion(realFs, mod.runtimeDirFor(dir)), undefined, "absent reads undefined, never throws");
+  plantRuntime(dir, "0.0.9");
+  assert.equal(mod.readInstalledVersion(realFs, mod.runtimeDirFor(dir)), "0.0.9");
+  writeFileSync(join(mod.runtimeDirFor(dir), "package.json"), "{ not json");
+  assert.equal(mod.readInstalledVersion(realFs, mod.runtimeDirFor(dir)), undefined, "unparseable is undefined too — the skew notice's silence");
+});
+
+// ── the docker probe: three outcomes, three remedies ─────────────────────────────────────────────
+
+test("probeDocker: asks `docker version` with output discarded and sorts the two failure kinds", () => {
+  const calls = [];
+  assert.deepEqual(
+    mod.probeDocker((bin, args, opts) => {
+      calls.push([bin, args, opts]);
+      return "";
+    }),
+    { ok: true },
+  );
+  // The timeout is load-bearing: this is a SYNC exec on a dialog path, so a wedged docker socket must
+  // not be able to freeze pi's render loop.
+  assert.deepEqual(
+    calls,
+    [["docker", ["version"], { stdio: "ignore", timeout: 10_000 }]],
+    "the cheapest question, output discarded, bounded in time",
+  );
+
+  const killed = mod.probeDocker(() => {
+    throw Object.assign(new Error("spawnSync docker ETIMEDOUT"), { killed: true, signal: "SIGTERM" });
+  });
+  assert.match(killed.daemonDown, /ETIMEDOUT/, "a timeout kill is 'installed but not answering', not 'missing'");
+
+  const missing = mod.probeDocker(() => {
+    throw Object.assign(new Error("spawnSync docker ENOENT"), { code: "ENOENT" });
+  });
+  assert.deepEqual(missing, { missing: true }, "no binary on PATH");
+
+  const down = mod.probeDocker(() => {
+    throw Object.assign(new Error("Cannot connect to the Docker daemon"), { status: 1 });
+  });
+  assert.match(down.daemonDown, /exited 1/, "the CLI ran and refused: installed, daemon not up");
+
+  const odd = mod.probeDocker(() => {
+    throw new Error("something else entirely");
+  });
+  assert.match(odd.daemonDown, /something else entirely/, "an unclassifiable failure is still a state, never a throw");
+});
+
+test("dockerHint: per-OS vendor instructions, and NEVER a piped installer command", () => {
+  assert.match(mod.dockerHint("darwin"), /Docker Desktop/);
+  assert.match(mod.dockerHint("darwin"), /orbstack/i, "macOS gets the OrbStack alternative too");
+  assert.match(mod.dockerHint("win32"), /Docker Desktop/);
+  assert.match(mod.dockerHint("linux"), /docs\.docker\.com\/engine\/install/, "linux points at the distro-package docs");
+  for (const platform of ["darwin", "win32", "linux", "freebsd"]) {
+    const hint = mod.dockerHint(platform);
+    assert.ok(hint.length > 0, `${platform} still gets text (unknown platforms fall back)`);
+    assert.ok(
+      !/curl|wget|\|\s*(ba)?sh\b|Invoke-WebRequest|\biwr\b/i.test(hint),
+      `a wizard must never print a piped installer: ${hint}`,
+    );
+  }
+});
+
+// ── RUNTIME_VERSION / RECEIVER_VERSION anti-drift ────────────────────────────────────────────────
 
 test("RUNTIME_VERSION matches the in-repo worker/package.json version (release bumps stay atomic)", () => {
   const workerPkg = JSON.parse(readFileSync(fileURLToPath(new URL("../../worker/package.json", import.meta.url)), "utf8"));
   assert.equal(mod.RUNTIME_VERSION, workerPkg.version);
+});
+
+test("RECEIVER_VERSION matches the in-repo receiver/package.json version (same atomic-bump bolt)", () => {
+  const receiverPkg = JSON.parse(readFileSync(fileURLToPath(new URL("../../receiver/package.json", import.meta.url)), "utf8"));
+  assert.equal(mod.RECEIVER_VERSION, receiverPkg.version);
+  assert.equal(receiverPkg.name, "@edgehero/pi-dispatch-receiver", "and the package name the argv pins");
 });
 
 // ── runAttached: the suspend/spawn/restore bracket ───────────────────────────────────────────────
@@ -372,10 +478,123 @@ test("wizard: 'Open the panel anyway' short-circuits to the dashboard with the o
   assert.equal(seen.input.length, 0, "no later step ran");
 });
 
+test("wizard: initialDetection is honored — the caller's verdict is never re-detected", async () => {
+  // The bare-/dispatch caller detected already; one keypress must not cost two detections (queue probe
+  // included). detectFn THROWS here, so a re-detect fails the test instead of quietly costing a probe.
+  const { ui, notes } = wizardUi({ select: ["Cancel"] });
+  const { deps } = wizardDeps({
+    detectFn: async () => {
+      throw new Error("the wizard re-detected instead of using initialDetection");
+    },
+    initialDetection: { state: "none", detail: "handed over by the caller" },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui), ui.notify, deps);
+  assert.ok(notes.some((n) => /handed over by the caller/.test(n.m)), "the handed-over detail is what the operator reads");
+});
+
+// ── the docker pre-check (step 3) ─────────────────────────────────────────────────────────────────
+
+test("wizard: a green docker pre-check asks nothing and says nothing", async () => {
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  let probes = 0;
+  const { ui, notes, seen } = wizardUi({
+    select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
+    input: [dir],
+    confirm: [false, false, false], // up, pointer, github — all declined
+  });
+  const { deps } = wizardDeps({
+    probeDockerFn: () => {
+      probes++;
+      return { ok: true };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui), ui.notify, deps);
+  assert.equal(probes, 1, "probed exactly once");
+  assert.ok(!seen.select.some((s) => /Docker/.test(s.title)), "a healthy host is never asked about docker");
+  // No noise from THIS step (the later trigger-edge notice legitimately names `docker compose`).
+  assert.ok(
+    !notes.some((n) => /docker check|Docker is not ready|without a docker answer/.test(n.m)),
+    "a green probe says nothing at all",
+  );
+});
+
+test("wizard: a missing docker notifies the per-OS pointer text; 'Continue anyway' still installs", async () => {
+  const dir = emptyDir();
+  const { ui, notes, seen } = wizardUi({
+    select: ["Guided setup", "Continue anyway", "Skip", "Skip"], // intent, DOCKER GATE, worker, trigger edge
+    input: [dir],
+    confirm: [true, false, false, false], // install ACCEPTED, up/pointer/github declined
+  });
+  const { deps, attached } = wizardDeps({
+    platform: "darwin",
+    probeDockerFn: () => ({ missing: true }),
+    runAttachedFn: async (_ctx, opts) => {
+      attached.push(opts);
+      plantRuntime(dir, mod.RUNTIME_VERSION);
+      return { code: 0 };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui), ui.notify, deps);
+  const gate = seen.select.find((s) => /Docker is not ready/.test(s.title));
+  assert.deepEqual(gate.options, ["Re-check", "Continue anyway", "Stop"]);
+  const warned = notes.find((n) => /docker check/.test(n.m));
+  assert.equal(warned.t, "warning", "the remedy is on screen before the question is answered");
+  assert.match(warned.m, /no `docker` on PATH/);
+  assert.match(warned.m, /Docker Desktop/, "the macOS pointer text, per the injected platform");
+  assert.ok(!/curl|wget/i.test(warned.m), "never a piped installer");
+  // "Continue anyway" is not enforcement-by-our-probe: up runs its own docker checks and refuses there.
+  assert.equal(attached.length, 1, "the install step still ran");
+  assert.deepEqual(attached[0].args, mod.npmInstallArgs());
+});
+
+test("wizard: 'Stop' at the docker gate ends the wizard having spawned nothing", async () => {
+  const dir = emptyDir();
+  const { ui, notes, seen } = wizardUi({
+    select: ["Guided setup", "Stop"], // intent, DOCKER GATE
+    input: [dir],
+    confirm: [], // no consent gate is ever reached
+  });
+  const { deps, attached, pointerWrites, dashboards } = wizardDeps({
+    platform: "linux",
+    probeDockerFn: () => ({ daemonDown: "`docker version` exited 1" }),
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui), ui.notify, deps);
+  assert.equal(attached.length, 0, "nothing spawned");
+  assert.equal(pointerWrites.length, 0, "nothing written");
+  assert.equal(seen.confirm.length, 0, "no consent gate was reached");
+  assert.equal(dashboards.length, 0, "and no panel — a Stop is a stop");
+  assert.ok(notes.some((n) => /not answering/.test(n.m) && /docs\.docker\.com\/engine\/install/.test(n.m)), "the linux pointer text");
+  assert.ok(notes.some((n) => /stopped before anything was installed/.test(n.m)), "and says nothing was installed");
+});
+
+test("wizard: 'Re-check' re-probes, bounded — five probes, then it stops like Stop", async () => {
+  const dir = emptyDir();
+  let probes = 0;
+  const { ui, notes, seen } = wizardUi({
+    // One more Re-check than the bound can consume: the cap, not the answer source, must end this.
+    select: ["Guided setup", "Re-check", "Re-check", "Re-check", "Re-check", "Re-check"], // intent, then five Re-checks
+    input: [dir],
+    confirm: [], // no consent gate is ever reached
+  });
+  const { deps, attached, dashboards } = wizardDeps({
+    probeDockerFn: () => {
+      probes++;
+      return { missing: true };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui), ui.notify, deps);
+  assert.equal(probes, 5, "bounded at five probes — a stuck answer source cannot spin the wizard");
+  assert.equal(seen.select.filter((s) => /Docker is not ready/.test(s.title)).length, 4, "four gates for five probes");
+  assert.equal(attached.length, 0, "nothing was ever spawned");
+  assert.equal(dashboards.length, 0);
+  assert.ok(notes.some((n) => n.t === "error" && /still not ready after 5 checks/.test(n.m)), "the exhausted bound is said out loud");
+});
+
 test("wizard: declined confirms spawn NOTHING, and every step is still offered", async () => {
   const dir = emptyDir();
   const { ui, notes, seen } = wizardUi({
-    select: ["Guided setup", "Skip"],
+    select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
     input: [dir],
     confirm: [false, false, false, false], // install, up, pointer, github -- all declined
   });
@@ -384,7 +603,7 @@ test("wizard: declined confirms spawn NOTHING, and every step is still offered",
   assert.equal(attached.length, 0, "a declined confirm never reaches a spawn");
   assert.equal(pointerWrites.length, 0, "a declined pointer confirm writes nothing");
   assert.equal(seen.confirm.length, 4, "all four consent gates were offered despite the declines");
-  assert.equal(seen.select.length, 2, "intent + worker choice");
+  assert.equal(seen.select.length, 3, "intent + worker choice + trigger edge");
   assert.ok(notes.some((n) => /provider key/.test(n.m)), "the never-tier provider-key notice still fires");
   assert.ok(notes.some((n) => /setup finished/.test(n.m)));
   assert.equal(dashboards.length, 1, "the wizard still ends at the panel");
@@ -395,9 +614,9 @@ test("wizard: an accepted install spawns the exact npm shape and never clobbers 
   const dir = emptyDir();
   writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "custom-root" }));
   const { ui, seen } = wizardUi({
-    select: ["Guided setup", "Skip"],
+    select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
     input: [dir],
-    confirm: [true, false, false, false],
+    confirm: [true, false, false, false], // install ACCEPTED, up, pointer, github declined
   });
   const { deps, attached, dashboards } = wizardDeps({
     runAttachedFn: async (_ctx, opts) => {
@@ -421,7 +640,7 @@ test("wizard: an accepted install spawns the exact npm shape and never clobbers 
 test("wizard: a post-install version mismatch stops the wizard loudly — no later step runs", async () => {
   const dir = emptyDir();
   const { ui, notes, seen } = wizardUi({
-    select: ["Guided setup"],
+    select: ["Guided setup"], // intent only — the mismatch below stops the wizard
     input: [dir],
     confirm: [true], // accept the install; nothing later should be asked
   });
@@ -445,7 +664,7 @@ test("wizard: an already-pinned runtime skips the install silently-but-said", as
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, notes, seen } = wizardUi({
-    select: ["Guided setup", "Skip"],
+    select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
     input: [dir],
     confirm: [false, false, false], // up, pointer, github — no install confirm expected
   });
@@ -460,7 +679,7 @@ test("wizard: up runs without --yes; a nonzero exit gates on Continue/Stop, and 
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, seen } = wizardUi({
-    select: ["Guided setup", "Stop"],
+    select: ["Guided setup", "Stop"], // intent, then the up-failure gate
     input: [dir],
     confirm: [true], // accept up; it fails; Stop
   });
@@ -484,7 +703,7 @@ test("wizard: a failed up with 'Continue anyway' proceeds to the pointer step", 
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, seen } = wizardUi({
-    select: ["Guided setup", "Continue anyway", "Skip"],
+    select: ["Guided setup", "Continue anyway", "Skip", "Skip"], // intent, up-failure gate, worker, trigger edge
     input: [dir],
     confirm: [true, false, false], // up (fails), pointer declined, github declined
   });
@@ -500,7 +719,7 @@ test("wizard: the pointer is written only after a confirm showing the JSON verba
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, seen } = wizardUi({
-    select: ["Guided setup", "Skip"],
+    select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
     input: [dir],
     confirm: [false, true, false], // up declined, POINTER ACCEPTED, github declined
   });
@@ -520,6 +739,203 @@ test("wizard: the pointer is written only after a confirm showing the JSON verba
   assert.ok(pointerConfirm.message.includes(JSON.stringify(pointer, null, 2)), "the confirm shows the exact JSON-to-be");
   assert.ok(pointerConfirm.message.includes(dir), "including the deploymentDir");
   assert.deepEqual(order, ["write", "reapply"], "re-applied AFTER the write, so this session picks it up");
+});
+
+// ── the trigger-edge step (step 10) ──────────────────────────────────────────────────────────────
+
+const EDGE_TITLE = "How should GitHub events reach the queue?";
+const EDGE_SERVICE = "Install the webhook receiver as a service";
+const EDGE_COMPOSE = "Run the receiver with docker compose";
+const EDGE_POLL = "Show the polling command";
+const RECEIVER_PKG = "@edgehero/pi-dispatch-receiver";
+
+/** Plant an installed receiver of `version` — what the edge step's npm install would produce. */
+function plantReceiver(dir, version) {
+  const d = join(dir, "node_modules", "@edgehero", "pi-dispatch-receiver");
+  mkdirSync(d, { recursive: true });
+  writeFileSync(join(d, "package.json"), JSON.stringify({ name: RECEIVER_PKG, version }));
+  return d;
+}
+
+/**
+ * The FIFO answers that walk an already-pinned deployment to the trigger-edge step and out the other
+ * side: intent, worker Skip, the chosen `edge` answer, then Skip at the first trigger. Confirms are
+ * up/pointer/github (all declined) followed by whatever the chosen edge answer asks for -- so every
+ * assertion below is about the edge answer alone.
+ */
+function edgeAnswers(dir, edge, edgeConfirms = []) {
+  return {
+    select: ["Guided setup", "Skip", edge, "Skip"], // intent, worker, TRIGGER EDGE, first trigger
+    input: [dir],
+    confirm: [false, false, false, ...edgeConfirms], // up, pointer, github declined; then the edge's own
+  };
+}
+
+/** Did the wizard walk PAST the edge step into step 11? Every one of the four answers must. */
+function reachedFirstTrigger(seen) {
+  return seen.select.some((s) => /First trigger/.test(s.title));
+}
+
+test("wizard: the trigger-edge step offers exactly the three shapes plus Skip", async () => {
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, seen } = wizardUi(edgeAnswers(dir, "Skip"));
+  const { deps } = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(ui, mkdtempSync(join(tmpdir(), "admin-setup-repo-"))), ui.notify, deps);
+  const edge = seen.select.find((s) => s.title === EDGE_TITLE);
+  assert.deepEqual(edge.options, [EDGE_SERVICE, EDGE_COMPOSE, EDGE_POLL, "Skip"]);
+});
+
+test("wizard: the edge's service answer installs the PINNED receiver, then the --receiver unit", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, seen } = wizardUi(edgeAnswers(dir, EDGE_SERVICE, [true])); // + the receiver install confirm
+  const { deps, attached, dashboards } = wizardDeps({
+    runAttachedFn: async (_ctx, opts) => {
+      attached.push(opts);
+      if (opts.args.includes(`${RECEIVER_PKG}@${mod.RECEIVER_VERSION}`)) plantReceiver(dir, mod.RECEIVER_VERSION);
+      return { code: 0 };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+
+  assert.equal(attached.length, 2, "the npm install and the unit install — nothing else");
+  assert.equal(attached[0].argv0, "npm", "posix npm, per npmSpawnOptions");
+  assert.deepEqual(attached[0].args, mod.npmInstallArgsFor(RECEIVER_PKG, mod.RECEIVER_VERSION));
+  assert.ok(attached[0].args.includes(`${RECEIVER_PKG}@0.1.0`), "the pinned name@version token, spelled out");
+  assert.equal(attached[0].cwd, dir, "installed into the deployment dir, by cwd");
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(dir, "package.json"), "utf8")),
+    { name: "pi-dispatch-deployment", private: true },
+    "the receiver install pins npm's project to the deployment dir too — it may be the first npm run here",
+  );
+  // Commit 1's service fix is what makes THIS correct: the unit anchors on the deployment folder and
+  // resolves the receiver's own ./start export from there.
+  assert.equal(attached[1].argv0, "/usr/bin/node-under-test");
+  assert.deepEqual(attached[1].args, [cliPathOf(dir), "service", "install", "--receiver"]);
+  assert.equal(attached[1].cwd, dir);
+
+  const c = seen.confirm.find((x) => /receiver/i.test(x.title));
+  assert.match(c.message, new RegExp(`${RECEIVER_PKG.replace("/", "\\/")}@0\\.1\\.0`), "the confirm shows the exact pin");
+  assert.match(c.message, /service install --receiver/, "and the unit command it will run after");
+  assert.ok(c.message.includes(dir), "and names the cwd");
+  assert.ok(reachedFirstTrigger(seen), "the wizard continued to step 11");
+  assert.equal(dashboards.length, 1);
+});
+
+test("wizard: a receiver version mismatch skips the UNIT and the wizard CONTINUES (unlike the runtime's)", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, notes, seen } = wizardUi(edgeAnswers(dir, EDGE_SERVICE, [true]));
+  const { deps, attached, dashboards } = wizardDeps({
+    runAttachedFn: async (_ctx, opts) => {
+      attached.push(opts);
+      plantReceiver(dir, "9.9.9"); // npm "succeeded" with the wrong artifact
+      return { code: 0 };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+  assert.equal(attached.length, 1, "the npm spawn only — never a unit pointing at the wrong version");
+  assert.ok(
+    notes.some((n) => n.t === "error" && /9\.9\.9/.test(n.m) && /not the pinned/.test(n.m) && /skipping the receiver unit/.test(n.m)),
+    "the error names both versions and what it skipped",
+  );
+  assert.ok(reachedFirstTrigger(seen), "the receiver is OPTIONAL: a bad install costs this step, not the wizard");
+  assert.equal(dashboards.length, 1, "and the panel still opens");
+});
+
+test("wizard: a declined receiver confirm spawns nothing and names both commands for later", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, notes, seen } = wizardUi(edgeAnswers(dir, EDGE_SERVICE, [false]));
+  const { deps, attached } = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+  assert.equal(attached.length, 0);
+  assert.ok(notes.some((n) => /receiver skipped/.test(n.m) && /service install --receiver/.test(n.m)));
+  assert.ok(reachedFirstTrigger(seen));
+});
+
+test("wizard: the edge's compose answer copies the runtime's compose file CREATE-ONLY, then runs it", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  const runtimeDir = plantRuntime(dir, mod.RUNTIME_VERSION);
+  mkdirSync(join(runtimeDir, "deploy"), { recursive: true });
+  writeFileSync(join(runtimeDir, "deploy", "docker-compose.yml"), "# the runtime's own compose file\n");
+  const dest = join(dir, "docker-compose.yml");
+
+  const first = wizardUi(edgeAnswers(dir, EDGE_COMPOSE, [true])); // + the compose up confirm
+  const rec = wizardDeps({
+    runAttachedFn: async (_ctx, opts) => {
+      rec.attached.push(opts);
+      return { code: 0 };
+    },
+  });
+  await mod.runSetupWizard({}, tuiCtx(first.ui, repo), first.ui.notify, rec.deps);
+  assert.equal(readFileSync(dest, "utf8"), "# the runtime's own compose file\n", "copied out of the installed runtime");
+  assert.equal(rec.attached.length, 1);
+  assert.equal(rec.attached[0].argv0, "docker");
+  assert.deepEqual(rec.attached[0].args, ["compose", "-f", dest, "--profile", "receiver", "up", "-d"], "the opt-in receiver profile");
+  assert.equal(rec.attached[0].cwd, dir);
+  assert.match(first.seen.confirm.at(-1).message, /--profile receiver up -d/, "the confirm shows the exact command");
+  assert.ok(reachedFirstTrigger(first.seen));
+
+  // Second pass over the SAME dir: the operator may have edited that file, so it is never clobbered.
+  writeFileSync(dest, "# MINE — edited by the operator\n");
+  const second = wizardUi(edgeAnswers(dir, EDGE_COMPOSE, [false])); // decline the up: only the copy matters here
+  const rec2 = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(second.ui, repo), second.ui.notify, rec2.deps);
+  assert.equal(readFileSync(dest, "utf8"), "# MINE — edited by the operator\n", "create-only: an existing compose file survives");
+  assert.ok(second.notes.some((n) => /already exists/.test(n.m) && /keeping yours/.test(n.m)), "and the skip is said out loud");
+  assert.equal(rec2.attached.length, 0, "a declined up spawns nothing");
+  assert.ok(reachedFirstTrigger(second.seen));
+});
+
+test("wizard: the edge's compose answer degrades when the runtime ships no compose file", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION); // no deploy/ inside it: the install was declined earlier
+  const { ui, notes, seen } = wizardUi(edgeAnswers(dir, EDGE_COMPOSE, [true]));
+  const { deps, attached, dashboards } = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+  assert.equal(attached.length, 0, "no compose spawn without a compose file");
+  assert.ok(notes.some((n) => n.t === "error" && /could not copy/.test(n.m)), "the failure is named, not swallowed");
+  assert.ok(reachedFirstTrigger(seen), "and it is still only this step that is skipped");
+  assert.equal(dashboards.length, 1);
+});
+
+test("wizard: the edge's polling answer PRINTS both commands and spawns nothing", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, notes, seen } = wizardUi(edgeAnswers(dir, EDGE_POLL));
+  const { deps, attached } = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+  assert.equal(attached.length, 0, "a long-running poller is never started from the wizard's overlay");
+  const note = notes.find((n) => /pi-dispatch-receiver poll/.test(n.m));
+  assert.ok(note, "the producer command is named");
+  assert.match(note.m, /setup github --no-webhook/, "and the hook-inactive App mint that goes with it");
+  assert.ok(note.m.includes(dir), "both from the deployment folder");
+  assert.equal(seen.confirm.length, 3, "print-only: no consent gate of its own (up/pointer/github only)");
+  assert.ok(reachedFirstTrigger(seen));
+});
+
+test("wizard: the edge's Skip says one line naming all three options, and spawns nothing", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "admin-setup-repo-"));
+  const dir = emptyDir();
+  plantRuntime(dir, mod.RUNTIME_VERSION);
+  const { ui, notes, seen } = wizardUi(edgeAnswers(dir, "Skip"));
+  const { deps, attached } = wizardDeps();
+  await mod.runSetupWizard({}, tuiCtx(ui, repo), ui.notify, deps);
+  assert.equal(attached.length, 0);
+  const note = notes.find((n) => /trigger edge left for later/.test(n.m));
+  assert.ok(note, "the deferral is said once");
+  for (const needle of ["service install --receiver", "--profile receiver up -d", "pi-dispatch-receiver poll"]) {
+    assert.ok(note.m.includes(needle), `the deferral names ${needle}`);
+  }
+  assert.ok(reachedFirstTrigger(seen));
 });
 
 // ── the first-trigger step ───────────────────────────────────────────────────────────────────────
@@ -561,9 +977,9 @@ test("wizard: the first trigger targets ctx.cwd, lists real repo skills, and wri
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, notes, seen } = wizardUi({
-    select: ["Guided setup", "Skip", "A cron trigger for this repo", "nightly-tidy"],
+    select: ["Guided setup", "Skip", "Skip", "A cron trigger for this repo", "nightly-tidy"], // intent, worker, trigger edge, first trigger, flow
     input: [dir, "", "", ""], // dir, id blank→nightly, pattern blank→0 3 * * *, task blank→run the flow
-    confirm: [false, false, false],
+    confirm: [false, false, false], // up, pointer, github — all declined
   });
   const rec = recordingFs();
   const triggerWrites = [];
@@ -601,10 +1017,10 @@ test("wizard: an invalid cron id refuses at the dialog and skips the trigger", a
   const dir = emptyDir();
   plantRuntime(dir, mod.RUNTIME_VERSION);
   const { ui, notes } = wizardUi({
-    select: ["Guided setup", "Skip", "A cron trigger for this repo"],
+    select: ["Guided setup", "Skip", "Skip", "A cron trigger for this repo"], // intent, worker, trigger edge, first trigger
     // No .pi/skills in this repo, so flow is a free input: dir, flow, then the bad id.
     input: [dir, "tidy", "night:ly"],
-    confirm: [false, false, false],
+    confirm: [false, false, false], // up, pointer, github — all declined
   });
   const triggerWrites = [];
   const { deps } = wizardDeps({
@@ -623,9 +1039,9 @@ test("wizard: no first-trigger offer when ctx.cwd is unset or missing on disk", 
   plantRuntime(dir, mod.RUNTIME_VERSION);
   for (const cwd of [undefined, join(emptyDir(), "absent-subdir")]) {
     const { ui, seen } = wizardUi({
-      select: ["Guided setup", "Skip"],
+      select: ["Guided setup", "Skip", "Skip"], // intent, worker, trigger edge
       input: [dir],
-      confirm: [false, false, false],
+      confirm: [false, false, false], // up, pointer, github — all declined
     });
     const triggerWrites = [];
     const { deps } = wizardDeps({

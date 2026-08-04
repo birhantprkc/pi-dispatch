@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +25,9 @@ const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-a
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url);
 const indexPath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+// The wizard module through the SAME loader, for its exported pins (the skew notice compares against
+// RUNTIME_VERSION, and a test restating the literal would drift from it).
+const wizard = await jiti.import(fileURLToPath(new URL("../src/setup-wizard.ts", import.meta.url)));
 
 /**
  * A recording `pi` whose get-trap throws on any function member NOT in USED_API, so a handler that reached
@@ -129,34 +132,118 @@ test("setup with a ctx lacking dialogs degrades to a notice, never the model cha
  * The bare command on a host with NOTHING configured (issue #92): no pointer (agent dir is a pinned
  * empty tmpdir), none of the path env vars, no cwd scaffold (the test runs from admin/), and a queue
  * probe pinned to a dead port -- port 1 refuses immediately on every host, so the probe can never find
- * a REAL dev Valkey on 6379 and go green under the test's feet. That state must surface the setup
- * offer; a decline spawns nothing and degrades to the usage line. recordingPi still enforces USED_API
- * throughout, so the detection/offer path cannot quietly grow a new pi member.
+ * a REAL dev Valkey on 6379 and go green under the test's feet.
+ *
+ * That state now lands the operator IN the wizard, not in front of a confirm asking whether they want
+ * one: the wizard's own first select IS the consent, and it offers the panel as a real third answer.
+ * The load-bearing part is what a "Cancel" costs -- nothing: no spawn, no write, no overlay. recordingPi
+ * still enforces USED_API throughout, so the direct-entry path cannot quietly grow a new pi member.
  */
-test("bare /dispatch with nothing configured offers setup; a decline spawns nothing", async () => {
+test("bare /dispatch with nothing configured lands in the wizard select; Cancel spawns nothing", async () => {
   const keys = ["PI_LOGS_DIR", "PI_SETTINGS_FILE", "PI_TRIGGERS_FILE", "PI_PAUSE_WINDOWS_FILE", "PI_SUBSCRIPTIONS_FILE", "VALKEY_URL"];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   process.env.VALKEY_URL = "redis://127.0.0.1:1";
+  const agentDirBefore = readdirSync(process.env.PI_CODING_AGENT_DIR);
   try {
     const { calls, def } = await loadRegistered();
     const view = fakeCtx({ withCustom: true });
+    const selects = [];
     const confirms = [];
+    const inputs = [];
+    view.ctx.ui.select = async (title, options) => {
+      selects.push([title, options]);
+      return "Cancel";
+    };
     view.ctx.ui.confirm = async (title, message) => {
       confirms.push([title, message]);
       return false;
     };
+    view.ctx.ui.input = async (title, placeholder) => {
+      inputs.push([title, placeholder]);
+      return undefined;
+    };
     await def.handler("", view.ctx);
-    assert.equal(confirms.length, 1, "the offer confirm was shown exactly once");
-    assert.match(confirms[0][1], /No deployment found/);
-    assert.equal(view.customCalls.length, 0, "declined: no dashboard overlay, no wizard, nothing spawned");
-    assert.ok(view.notes.some(([m]) => /setup/.test(m)), "the decline degrades to the usage line naming setup");
-    assert.equal(calls.sendMessage.length, 0, "the offer path never touches the model channel");
+    assert.equal(selects.length, 1, "exactly one dialog: the wizard's own intent select");
+    assert.match(selects[0][0], /pi-dispatch setup/, "and it is the wizard's, not an offer confirm");
+    assert.deepEqual(selects[0][1], ["Guided setup", "Open the panel anyway", "Cancel"], "three answers, the panel among them");
+    assert.equal(confirms.length, 0, "no confirm asks permission to ask");
+    assert.equal(inputs.length, 0, "Cancel stops before the deployment-dir input");
+    assert.equal(view.customCalls.length, 0, "Cancel: no dashboard overlay, no attached spawn");
+    assert.equal(calls.sendMessage.length, 0, "the direct-entry path never touches the model channel");
+    assert.deepEqual(readdirSync(process.env.PI_CODING_AGENT_DIR), agentDirBefore, "and wrote nothing (no pointer, no marker)");
+
+    // Same state, a pi build with no dialog primitives: the degrade is the WIZARD's own capability gate,
+    // said exactly once. The bare branch deliberately adds no second notice -- two notices for one
+    // degrade reads like two separate failures.
+    const noDialogs = fakeCtx({ withCustom: true }); // notify + custom only
+    await def.handler("", noDialogs.ctx);
+    assert.equal(noDialogs.notes.length, 1, "exactly one notice, not two");
+    assert.match(noDialogs.notes[0][0], /dialogs|newer pi/);
+    assert.equal(noDialogs.customCalls.length, 0, "and no overlay for a wizard that cannot ask anything");
+    assert.equal(calls.sendMessage.length, 0);
   } finally {
     for (const k of keys) {
       if (saved[k] === undefined) delete process.env[k];
       else process.env[k] = saved[k];
     }
+  }
+});
+
+/**
+ * A bare `/dispatch` against a POINTED-AT deployment whose installed runtime is not the version this
+ * console pins: worth exactly one line, once per process, naming setup as the fix (its install step is a
+ * no-op when the pin already matches, so the advice converges). The pointer file is written into a temp
+ * PI_DISPATCH_DEPLOYMENT_FILE rather than the shared agent dir so no later test inherits a pointer.
+ *
+ * The two silences are the interesting half: a MATCHING version says nothing, and an ABSENT/unreadable
+ * one says nothing either -- an operator running the worker from a clone has no installed package to
+ * read and must not be nagged for it every session.
+ */
+test("bare /dispatch on a pointed-at deployment: version skew notifies once, silence otherwise", async () => {
+  const { def } = await loadRegistered();
+  const pinned = wizard.RUNTIME_VERSION;
+  const prev = process.env.PI_DISPATCH_DEPLOYMENT_FILE;
+  const home = mkdtempSync(join(tmpdir(), "admin-skew-"));
+  const pointerFile = join(home, "pointer.json");
+  const deploymentDir = join(home, "deploy");
+  const runtimeDir = join(deploymentDir, "node_modules", "@edgehero", "pi-dispatch");
+  // An empty pointer `env` on purpose: this test is about the version read, and layering paths into
+  // process.env would change what the OTHER tests in this file resolve.
+  writeFileSync(pointerFile, JSON.stringify({ version: 1, deploymentDir, env: {} }));
+  process.env.PI_DISPATCH_DEPLOYMENT_FILE = pointerFile;
+  const skews = (notes) => notes.filter(([m]) => /run \/dispatch setup to upgrade/.test(m));
+  try {
+    // 1. No installed runtime at all: silence (a clone-run worker is a deliberate choice, not a defect).
+    mkdirSync(deploymentDir, { recursive: true });
+    const absent = fakeCtx({ withCustom: true });
+    await def.handler("", absent.ctx);
+    assert.equal(skews(absent.notes).length, 0, "an absent version is silent");
+
+    // 2. The pinned version: nothing to say.
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, "package.json"), JSON.stringify({ version: pinned }));
+    const same = fakeCtx({ withCustom: true });
+    await def.handler("", same.ctx);
+    assert.equal(skews(same.notes).length, 0, "a matching version is silent");
+
+    // 3. An older deployment: one warning naming both versions and the fix.
+    writeFileSync(join(runtimeDir, "package.json"), JSON.stringify({ version: "0.0.1" }));
+    const older = fakeCtx({ withCustom: true });
+    await def.handler("", older.ctx);
+    const [[message, type]] = skews(older.notes);
+    assert.equal(skews(older.notes).length, 1, "exactly one line");
+    assert.match(message, /deployment runtime 0\.0\.1/, "names the deployment's version");
+    assert.match(message, new RegExp(`this console pins ${pinned.replace(/\./g, "\\.")}`), "and the pinned one");
+    assert.equal(type, "warning");
+
+    // 4. Once per PROCESS: the latch keeps the second /dispatch quiet (the advisory latch's twin).
+    const second = fakeCtx({ withCustom: true });
+    await def.handler("", second.ctx);
+    assert.equal(skews(second.notes).length, 0, "the latch holds for the rest of the process");
+  } finally {
+    if (prev === undefined) delete process.env.PI_DISPATCH_DEPLOYMENT_FILE;
+    else process.env.PI_DISPATCH_DEPLOYMENT_FILE = prev;
   }
 });
 

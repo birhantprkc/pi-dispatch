@@ -5,19 +5,23 @@
  * Division of labor, deliberately: the WORKER's CLI (`up`, `service`, `setup github`) stays the one
  * place host mutations happen -- the wizard only sequences those commands, attached to the operator's
  * terminal, with a confirm in front of each spawn showing the exact command. The wizard's OWN writes
- * are three files, each tame: the deployment dir's private `package.json` (never clobbered), the
- * deployment pointer (via `writePointer`'s validating normalizer), and one appended trigger entry (via
- * the validated, atomic `writeTriggers`). Secrets are never touched: the provider-key step is a notice
- * naming the file, nothing more.
+ * are four files, each tame: the deployment dir's private `package.json` (never clobbered), the
+ * deployment pointer (via `writePointer`'s validating normalizer), one appended trigger entry (via the
+ * validated, atomic `writeTriggers`), and -- only on the compose answer to the trigger-edge step -- a
+ * `docker-compose.yml` COPIED create-only out of the installed runtime's own `deploy/`. Secrets are
+ * never touched: the provider-key step is a notice naming the file, nothing more.
  *
  * Every step is declinable and a decline CONTINUES to the next step (converge-style, like `up` itself):
- * an operator who already ran half the quickstart by hand skips the steps that are done. The only hard
- * stop is the post-install version assertion -- a wrong runtime version poisons every later step, so
- * that failure is loud and final (worker/src/import-pi.mjs:334-341 idiom).
+ * an operator who already ran half the quickstart by hand skips the steps that are done. Two exceptions,
+ * both deliberate: the RUNTIME's post-install version assertion is a hard stop -- a wrong runtime
+ * version poisons every later step, so that failure is loud and final (worker/src/import-pi.mjs:334-341
+ * idiom) -- and the docker pre-check's "Stop" is an operator-chosen early exit taken before anything has
+ * been downloaded. The receiver's own version assertion is NOT a stop: the receiver is optional, so a
+ * bad receiver install skips its unit and the wizard carries on.
  */
 
 import * as nodeFs from "node:fs";
-import { spawn as nodeSpawn } from "node:child_process";
+import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 // The single source of truth for skill-directory names -- the same regex the worker's flow gate applies
@@ -49,6 +53,20 @@ type Notify = ((message: string, type?: string) => void) | undefined;
  * follows in the same change.
  */
 export const RUNTIME_VERSION = "0.1.1";
+
+/**
+ * The `@edgehero/pi-dispatch-receiver` version the trigger-edge step installs -- pinned for exactly the
+ * reasons RUNTIME_VERSION is, and with the same anti-drift test (this literal against the in-repo
+ * `receiver/package.json`), so a receiver release bump cannot land without this line following it in the
+ * same change. Its own literal rather than a reuse of RUNTIME_VERSION: the two packages version
+ * independently (the receiver's dependency range on the runtime is `^`), and pretending otherwise would
+ * install a version that does not exist the first time they diverge.
+ */
+export const RECEIVER_VERSION = "0.1.0";
+
+/** The two npm package names, spelled once. Literals of this module -- see npmInstallArgsFor's argument. */
+const RUNTIME_PKG = "@edgehero/pi-dispatch";
+const RECEIVER_PKG = "@edgehero/pi-dispatch-receiver";
 
 /** The pointer marker file suffix and the four-file cwd scaffold signature, shared by detect + nudge. */
 const NUDGE_MARKER_BASENAME = "pi-dispatch-setup.nudged";
@@ -194,22 +212,25 @@ export async function runAttached(
 }
 
 /**
- * The exact npm argv for installing the pinned runtime. Pure, and NO filesystem path in argv: the
+ * The exact npm argv for installing ONE pinned package. Pure, and NO filesystem path in argv: the
  * install target is the spawn's `cwd`, never a `--prefix <dir>` pair. That absence is what makes
  * `shell: true` safe on win32 (npmSpawnOptions below): argv holds only literal flags spelled out here
- * plus one `name@version` token whose both halves are literals of this module -- no operator-supplied
+ * plus one `name@version` token -- and BOTH halves of that token are literals of this module at every
+ * call site (RUNTIME_PKG/RUNTIME_VERSION, RECEIVER_PKG/RECEIVER_VERSION), so no operator-supplied
  * string can reach the command line as shell syntax (worker/src/import-pi.mjs:400-419 carries the full
- * argument; re-introducing a path here breaks it and must be revisited together with that comment).
+ * argument; passing a caller-shaped name or re-introducing a path here breaks it and must be revisited
+ * together with that comment). The parameters exist so the two packages share one reviewed argv, not so
+ * arbitrary names can be installed.
  *
  * `--ignore-scripts` is load-bearing exactly as in import-pi: without it, lifecycle scripts of the
  * package and every transitive dependency run as the operator at install time. No `--omit=peer` /
  * `--install-strategy=nested` here, deliberately: this is a normal application install resolved by
  * node's own algorithm at run time, not a staged self-contained overlay.
  */
-export function npmInstallArgs(): string[] {
+export function npmInstallArgsFor(pkgName: string, version: string): string[] {
   return [
     "install",
-    `@edgehero/pi-dispatch@${RUNTIME_VERSION}`,
+    `${pkgName}@${version}`,
     "--omit=dev",
     "--omit=optional",
     "--ignore-scripts",
@@ -219,10 +240,119 @@ export function npmInstallArgs(): string[] {
   ];
 }
 
+/** The runtime's own install argv -- the pinned pair applied to the shared shape above. */
+export function npmInstallArgs(): string[] {
+  return npmInstallArgsFor(RUNTIME_PKG, RUNTIME_VERSION);
+}
+
+/** The receiver's install argv, same shape, its own pin (the trigger-edge step's service answer). */
+export function receiverInstallArgs(): string[] {
+  return npmInstallArgsFor(RECEIVER_PKG, RECEIVER_VERSION);
+}
+
+/** How many probes one wizard run will ever make -- the "Re-check" loop's bound (see ensureDocker). */
+const DOCKER_PROBE_ROUNDS = 5;
+
+/** Long enough for a cold Docker Desktop VM to answer, short enough that a wedged socket is not a freeze. */
+const DOCKER_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Is docker usable RIGHT NOW? `docker version` is the cheapest question that reaches the daemon: the
+ * client prints its own version without one, so a zero exit means the CLI exists AND something answered.
+ * DELIBERATELY the same command `up` itself gates on (worker/src/up.mjs:88), so this step and the child
+ * it precedes can never disagree about what "docker is ready" means.
+ * Output is discarded (`stdio: "ignore"`) -- this is a yes/no, and the wizard must not paint docker's
+ * banner over pi's TUI. `exec` is injectable exactly as read-model.mjs:145's revParseHead does it, so
+ * every test drives this without a docker on the box.
+ *
+ * Three outcomes, because they have three different remedies:
+ *   `{ ok: true }`            -- CLI present, daemon answering
+ *   `{ missing: true }`       -- no `docker` binary on PATH at all (spawn ENOENT)
+ *   `{ daemonDown: reason }`  -- the CLI ran and refused: installed, but the daemon/VM is not up
+ * Never throws: an unusable docker is a state to report, not an exception to raise.
+ *
+ * The `timeout` is the one thing this does that revParseHead does not, and it is not decoration: this is
+ * a SYNCHRONOUS exec on the path of a TUI dialog, so a docker CLI wedged on an unresponsive VM socket
+ * would freeze pi's render loop for as long as it hung. A timeout kill lands in the daemonDown branch,
+ * which is exactly the right verdict for it.
+ */
+export function probeDocker(
+  execFn: any = execFileSync,
+): { ok: true } | { missing: true } | { daemonDown: string } {
+  try {
+    execFn("docker", ["version"], { stdio: "ignore", timeout: DOCKER_PROBE_TIMEOUT_MS });
+    return { ok: true };
+  } catch (err: any) {
+    // ENOENT is the spawn failing to find the binary -- which is also exactly what "not on PATH" looks
+    // like, on every platform. A numeric `status` means the binary DID run and exited nonzero.
+    if (err?.code === "ENOENT" || err?.errno === "ENOENT") return { missing: true };
+    if (typeof err?.status === "number") return { daemonDown: `\`docker version\` exited ${err.status}` };
+    return { daemonDown: err?.message ?? String(err) };
+  }
+}
+
+/**
+ * Per-OS pointer text for getting docker running. Vendor instructions ONLY, deliberately never a command
+ * to run and NEVER a piped installer (a download-into-shell one-liner on the operator's own host,
+ * printed by a wizard, is exactly the habit this project refuses to teach): the operator fetches and
+ * verifies their own engine, the same division of labor as the provider-key step.
+ */
+export function dockerHint(platform: string): string {
+  if (platform === "darwin") {
+    return "macOS: install and START Docker Desktop (docs.docker.com/desktop/install/mac-install) or OrbStack (orbstack.dev) — either one provides the `docker` CLI and a running daemon.";
+  }
+  if (platform === "win32") {
+    return "Windows: install and START Docker Desktop (docs.docker.com/desktop/install/windows-install) — it provides the `docker` CLI and a running daemon.";
+  }
+  return "Linux: install the docker engine from your distribution's own packages, following docs.docker.com/engine/install, then start and enable its daemon.";
+}
+
+/**
+ * Step 3's body: docker is the one host prerequisite every later step leans on, so it is asked about
+ * BEFORE anything is downloaded. `up` already refuses on its own when docker is missing (up.mjs:85-95,
+ * the same `docker version` gate) -- this step adds no enforcement, it moves the SAME verdict earlier and
+ * into the wizard's own voice, where it costs the operator no npm install and no child-process output to
+ * read.
+ *
+ * Returns whether to continue. "Re-check" re-probes (bounded: at most DOCKER_PROBE_ROUNDS probes per
+ * run, so a wizard driven by a stuck answer source cannot spin), "Continue anyway" continues, "Stop"
+ * (and a cancelled dialog, and the exhausted bound) returns false having spawned nothing at all.
+ */
+async function ensureDocker(ui: any, notify: Notify, { platform, probeDockerFn }: any): Promise<boolean> {
+  for (let round = 1; ; round++) {
+    const probe = probeDockerFn();
+    if (probe.ok) return true;
+    const why = probe.missing
+      ? "no `docker` on PATH"
+      : `docker is installed but not answering (${probe.daemonDown})`;
+    // The pointer text goes out FIRST, at warning: whatever the operator answers next, the remedy is
+    // already on screen -- and a select's own title is too small a place for an install instruction.
+    notify?.(`docker check: ${why}. ${dockerHint(platform)}`, "warning");
+    if (round >= DOCKER_PROBE_ROUNDS) {
+      notify?.(
+        `docker still not ready after ${DOCKER_PROBE_ROUNDS} checks — stopping setup before anything was installed. Re-run /dispatch setup once \`docker version\` answers.`,
+        "error",
+      );
+      return false;
+    }
+    const choice = await ui.select("Docker is not ready", ["Re-check", "Continue anyway", "Stop"]);
+    if (choice === "Re-check") continue;
+    if (choice === "Continue anyway") {
+      // Deliberately permitted: `up` runs its own docker checks and refuses on its own, so this step is
+      // a BETTER MESSAGE EARLIER, never the enforcement. An operator installing docker in the next
+      // window over -- or driving a daemon this probe cannot see -- must not be locked out by our probe.
+      notify?.("continuing without a docker answer — `up` runs its own docker checks and refuses there if it is still missing", "info");
+      return true;
+    }
+    notify?.("setup stopped before anything was installed — re-run /dispatch setup when docker is ready", "info");
+    return false;
+  }
+}
+
 /**
  * The npm binary + spawn options for one platform. win32 needs BOTH `npm.cmd` and `shell: true`
  * (CVE-2024-27980: Node refuses to spawn a `.cmd` without a shell -- worker/src/import-pi.mjs:400-419),
- * and that is safe here ONLY because npmInstallArgs keeps every path out of argv; everywhere else it is
+ * and that is safe here ONLY because npmInstallArgsFor keeps every path out of argv; everywhere else it is
  * plain `npm` with the target dir as cwd.
  */
 export function npmSpawnOptions(platform: string, dir: string): { bin: string; options: { cwd: string; shell?: true } } {
@@ -247,13 +377,40 @@ export function listRepoSkills(cwd: string, fs: any = nodeFs): string[] {
   }
 }
 
-/** The installed runtime's version inside `dir`, or undefined when absent/unreadable/shapeless. */
-function readInstalledVersion(fs: any, runtimeDir: string): string | undefined {
+/**
+ * Where npm puts one of our packages inside a deployment dir. One spelling for both packages and for
+ * both readers (this module's install assertions and index.ts's skew notice), so "the deployment's
+ * runtime lives HERE" is a fact stated once. Not a path the wizard writes -- npm owns that tree.
+ */
+export function runtimeDirFor(dir: string, pkg: string = "pi-dispatch"): string {
+  return join(dir, "node_modules", "@edgehero", pkg);
+}
+
+/**
+ * The installed version of the package at `runtimeDir`, or undefined when absent/unreadable/shapeless.
+ * Exported because index.ts asks the same question of a POINTED-AT deployment (the skew notice) that the
+ * install steps ask of the one they just built -- and an absent answer must mean the same silence there.
+ */
+export function readInstalledVersion(fs: any, runtimeDir: string): string | undefined {
   try {
     const pkg = JSON.parse(fs.readFileSync(join(runtimeDir, "package.json"), "utf8"));
     return typeof pkg?.version === "string" ? pkg.version : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * A private root `package.json` pins npm's idea of "the project" to the deployment dir, so an install run
+ * there cannot walk up into (or read config from) whatever happens to be above it. IF ABSENT only -- the
+ * import-pi.mjs:294 idiom: a file the operator may have edited is never clobbered. BOTH install steps
+ * call it (runtime, receiver), because either one can be the first npm run in a fresh dir -- a receiver
+ * install after a declined runtime install must not be the one that escapes.
+ */
+function ensureDeploymentPackageJson(fs: any, dir: string): void {
+  const rootPkg = join(dir, "package.json");
+  if (!fs.existsSync(rootPkg)) {
+    fs.writeFileSync(rootPkg, `${JSON.stringify({ name: "pi-dispatch-deployment", private: true }, null, 2)}\n`);
   }
 }
 
@@ -265,9 +422,10 @@ const CRON_ID_RE = /^[A-Za-z0-9._-]+$/;
  * sequence offline with recording fakes; production passes only `openDashboardFn` (index.ts's own
  * dashboard opener -- handed in rather than imported to keep the module cycle call-time-only).
  *
- * Steps (each declinable; a decline continues): (1) detect + intent, (2) deployment dir, (3) pinned
- * npm install with post-install version assertion, (4) `up`, (5) deployment pointer, (6) provider-key
- * notice, (7) worker service, (8) github credentials, (9) first cron trigger for ctx.cwd, (10)
+ * Steps (each declinable; a decline continues): (1) detect + intent, (2) deployment dir, (3) docker
+ * pre-check, (4) pinned npm install with post-install version assertion, (5) `up`, (6) deployment
+ * pointer, (7) provider-key notice, (8) worker service, (9) github credentials, (10) the trigger edge
+ * (receiver unit / receiver container / polling command), (11) first cron trigger for ctx.cwd, (12)
  * re-detect + open the panel.
  */
 export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps: any = {}): Promise<void> {
@@ -286,6 +444,8 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     resolvePathsFn = resolvePaths,
     listRepoSkillsFn = listRepoSkills,
     existsSyncFn = (p: string) => fs.existsSync(p),
+    probeDockerFn = probeDocker,
+    initialDetection,
   } = deps;
   const ui = ctx?.ui;
 
@@ -297,7 +457,12 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
   }
 
   // ── (1) detection + intent ─────────────────────────────────────────────────────────────────────
-  const det = await detectFn({ env, cwd: ctx?.cwd, fs });
+  // `initialDetection` is the caller's ALREADY-COMPUTED verdict, reused rather than recomputed: a bare
+  // `/dispatch` detects to decide that this host has nothing configured and then enters the wizard
+  // directly, and one keypress must not cost two detections -- the second would repeat the queue probe
+  // (a network round-trip) to re-derive an answer the caller is handing over. Absent it (the `/dispatch
+  // setup` path, and every test that wants the seam), the wizard detects for itself as before.
+  const det = initialDetection ?? (await detectFn({ env, cwd: ctx?.cwd, fs }));
   notify?.(`pi-dispatch setup — detected: ${det.detail}`, "info");
   const intent = await ui.select("pi-dispatch setup", ["Guided setup", "Open the panel anyway", "Cancel"]);
   if (intent === "Open the panel anyway") {
@@ -320,10 +485,16 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     notify?.(`could not create ${dir}: ${err?.message ?? err} — setup cannot continue`, "error");
     return;
   }
-  const runtimeDir = join(dir, "node_modules", "@edgehero", "pi-dispatch");
+  const runtimeDir = runtimeDirFor(dir);
   const cliPath = join(runtimeDir, "src", "cli.mjs");
 
-  // ── (3) install the pinned runtime ─────────────────────────────────────────────────────────────
+  // ── (3) docker: the one host prerequisite, asked about before anything is downloaded ───────────
+  // Placed AFTER the dir step (so a Stop here still leaves the operator's chosen dir created and named,
+  // which is harmless and idempotent) and BEFORE the install: the point is to spend nobody's bandwidth
+  // on a host where `up` cannot work anyway.
+  if (!(await ensureDocker(ui, notify, { platform, probeDockerFn }))) return;
+
+  // ── (4) install the pinned runtime ─────────────────────────────────────────────────────────────
   if (readInstalledVersion(fs, runtimeDir) === RUNTIME_VERSION) {
     // Convergence, said out loud: a re-run of the wizard must not re-download a runtime that is
     // already the pinned version -- and must SAY it skipped, so the operator is not left wondering.
@@ -338,13 +509,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     if (!okInstall) {
       notify?.(`install skipped — later steps assume the runtime at ${runtimeDir}`, "info");
     } else {
-      // A private root package.json pins npm's idea of "the project" to the deployment dir, so the
-      // install cannot walk up into (or read config from) whatever happens to be above it. IF ABSENT
-      // only -- the import-pi.mjs:294 idiom: a file the operator may have edited is never clobbered.
-      const rootPkg = join(dir, "package.json");
-      if (!fs.existsSync(rootPkg)) {
-        fs.writeFileSync(rootPkg, `${JSON.stringify({ name: "pi-dispatch-deployment", private: true }, null, 2)}\n`);
-      }
+      ensureDeploymentPackageJson(fs, dir);
       const res = await runAttachedFn(ctx, {
         title: `npm install @edgehero/pi-dispatch@${RUNTIME_VERSION} — in ${dir}`,
         argv0: bin,
@@ -370,7 +535,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     }
   }
 
-  // ── (4) up: image, Valkey, init, doctor — the worker's own consented pass ──────────────────────
+  // ── (5) up: image, Valkey, init, doctor — the worker's own consented pass ──────────────────────
   // NEVER `--yes`: up's per-mutation y/N prompts ARE the host-mutation consents (docker pull, docker
   // run). The wizard's confirm approves STARTING the pass; auto-accepting the child's gates would
   // collapse per-action consent into one blanket yes the operator never gave.
@@ -397,7 +562,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     }
   }
 
-  // ── (5) the deployment pointer ─────────────────────────────────────────────────────────────────
+  // ── (6) the deployment pointer ─────────────────────────────────────────────────────────────────
   // Only the three cwd-default files need pointing: resolvePaths defaults them to "./" (right only
   // when pi runs FROM the deployment dir), while logsDir/settingsFile default to absolute OS-temp
   // locations and VALKEY_URL's default already matches the container up starts. Absolute paths by
@@ -429,7 +594,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     }
   }
 
-  // ── (6) provider key: notice only, never-tier ──────────────────────────────────────────────────
+  // ── (7) provider key: notice only, never-tier ──────────────────────────────────────────────────
   // Deliberately NO dialog and NO write: a secret must never transit a wizard dialog (dialog text is
   // not a credential channel) nor a wizard-written file. The operator edits the named file themselves,
   // or leans on the already-logged-into-pi fallback the worker honours.
@@ -438,7 +603,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     "info",
   );
 
-  // ── (7) the worker ─────────────────────────────────────────────────────────────────────────────
+  // ── (8) the worker ─────────────────────────────────────────────────────────────────────────────
   const workerChoice = await ui.select("Run the worker", [
     "Install as an OS service (user-level)",
     "I'll run it myself",
@@ -457,7 +622,7 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     notify?.(`run: node ${cliPath} worker  (in ${dir}; keep it running — its own terminal, tmux, …)`, "info");
   }
 
-  // ── (8) github credentials (optional) ──────────────────────────────────────────────────────────
+  // ── (9) github credentials (optional) ──────────────────────────────────────────────────────────
   // Phrased so declining is obviously fine: local cron triggers -- the first-trigger step right below
   // -- need none of this, and the command is named for later.
   const okGithub = await ui.confirm(
@@ -476,14 +641,20 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
     notify?.(`later: node ${cliPath} setup github  (in ${dir})`, "info");
   }
 
-  // ── (9) a first trigger for the repo pi is sitting in ──────────────────────────────────────────
+  // ── (10) the trigger edge: how a forge event actually reaches the queue ─────────────────────────
+  // Credentials (step 9) mint the App; they do not make a delivery arrive. This step closes that gap,
+  // which was previously left to the README: a receiver UNIT, a receiver CONTAINER, or polling (no
+  // public URL at all). Every answer -- including Skip -- continues to the next step.
+  await offerTriggerEdge(dir, ctx, ui, notify, { fs, platform, env, execPath, cliPath, runAttachedFn });
+
+  // ── (11) a first trigger for the repo pi is sitting in ──────────────────────────────────────────
   // Offered only when ctx.cwd names an existing directory: the trigger's folder is the one hard
   // precondition (the worker refuses a missing run.folder at load), so no folder, no offer.
   if (typeof ctx?.cwd === "string" && ctx.cwd !== "" && existsSyncFn(ctx.cwd)) {
     await offerFirstTrigger(ctx.cwd, dir, ui, notify, { fs, listRepoSkillsFn, writeTriggersFn });
   }
 
-  // ── (10) re-detect + open the panel ────────────────────────────────────────────────────────────
+  // ── (12) re-detect + open the panel ────────────────────────────────────────────────────────────
   const finalDet = await detectFn({ env, cwd: ctx?.cwd, fs });
   notify?.(`setup finished — ${finalDet.detail}`, "info");
   if (typeof openDashboardFn === "function") {
@@ -493,10 +664,150 @@ export async function runSetupWizard(paths: any, ctx: any, notify: Notify, deps:
   }
 }
 
+/** The four trigger-edge answers, spelled once so the flow below and its tests read the same strings. */
+const EDGE_SERVICE = "Install the webhook receiver as a service";
+const EDGE_COMPOSE = "Run the receiver with docker compose";
+const EDGE_POLL = "Show the polling command";
+
 /**
- * Step 9's body: pick a flow (the repo's own skills first, free text as the escape), then id/pattern/
+ * Step 10's body: the trigger EDGE. A GitHub App with credentials still delivers nowhere until something
+ * is listening (or asking), and until now the wizard stopped one step short of that -- so an operator who
+ * accepted every offer still had a deployment no label could reach. The three real shapes, in the order
+ * they cost:
+ *
+ *   - a receiver SERVICE on this host: the pinned receiver package plus `service install --receiver`.
+ *     Correct only since the unit renderer started anchoring on the deployment folder and resolving the
+ *     receiver's own `./start` export from there (the `service` fix that ships alongside this step);
+ *     before it, a unit installed here would have pointed at a guessed repo root.
+ *   - a receiver CONTAINER via the runtime's own shipped compose file and its opt-in `receiver` profile.
+ *   - POLLING: no inbound delivery at all, so no public URL, DNS or tunnel -- printed, never started,
+ *     because a poller belongs in a supervisor the operator chose, not in a wizard's child process.
+ *
+ * Declining or skipping is fine and says so: local cron triggers need none of this.
+ */
+async function offerTriggerEdge(
+  dir: string,
+  ctx: any,
+  ui: any,
+  notify: Notify,
+  { fs, platform, env, execPath, cliPath, runAttachedFn }: any,
+): Promise<void> {
+  const choice = await ui.select("How should GitHub events reach the queue?", [
+    EDGE_SERVICE,
+    EDGE_COMPOSE,
+    EDGE_POLL,
+    "Skip",
+  ]);
+
+  if (choice === EDGE_SERVICE) {
+    const args = receiverInstallArgs();
+    const { bin, options } = npmSpawnOptions(platform, dir);
+    const unitHint = `node ${cliPath} service install --receiver  (in ${dir})`;
+    const ok = await ui.confirm(
+      "Install the webhook receiver",
+      `Run in ${dir}:\n  ${bin} ${args.join(" ")}\n\nthen, in the same folder:\n  ${execPath} ${cliPath} service install --receiver\n\n(scripts disabled; installs the pinned ${RECEIVER_PKG}@${RECEIVER_VERSION}, then renders a user-level receiver unit for this host)`,
+    );
+    if (!ok) {
+      notify?.(`receiver skipped — later: ${bin} ${args.join(" ")}  (in ${dir}), then ${unitHint}`, "info");
+      return;
+    }
+    // Same project pin as the runtime install: this may be the FIRST npm run in this dir (the operator
+    // could have declined step 4 and installed the runtime by hand).
+    ensureDeploymentPackageJson(fs, dir);
+    const res = await runAttachedFn(ctx, {
+      title: `npm install ${RECEIVER_PKG}@${RECEIVER_VERSION} — in ${dir}`,
+      argv0: bin,
+      args,
+      cwd: options.cwd,
+      shell: options.shell,
+      env,
+    });
+    // The same artifact-not-exit-code assertion the runtime install makes -- but NOT a hard stop. The
+    // receiver is optional: a deployment whose cron triggers work is still a working deployment, so a
+    // bad receiver install costs the operator this step and nothing else. What it must never do is
+    // install a UNIT pointing at a package that is absent or the wrong version -- `service install`
+    // would either refuse (commit 1's loud hint) or pin a boot-time failure into launchd/systemd.
+    const installed = readInstalledVersion(fs, runtimeDirFor(dir, "pi-dispatch-receiver"));
+    if (installed !== RECEIVER_VERSION) {
+      const how = res?.error ? `npm could not run: ${res.error.message}` : `npm exited ${res?.code}`;
+      notify?.(
+        `${how}; installed receiver version is ${installed ?? "(absent)"}, not the pinned ${RECEIVER_VERSION} — skipping the receiver unit (the rest of the deployment is unaffected). Fix the install, then run: ${unitHint}`,
+        "error",
+      );
+      return;
+    }
+    await runAttachedFn(ctx, {
+      title: `pi-dispatch service install --receiver — in ${dir}`,
+      argv0: execPath,
+      args: [cliPath, "service", "install", "--receiver"],
+      cwd: dir,
+      env,
+    });
+    return;
+  }
+
+  if (choice === EDGE_COMPOSE) {
+    // The compose file the RUNTIME ships (worker/deploy/docker-compose.yml, published in its `files`),
+    // copied beside the deployment's own config so `-f` names a stable path the operator can edit and
+    // keep. CREATE-ONLY, the import-pi.mjs:294 idiom the root package.json already follows: an operator
+    // who tuned their compose file must never lose it to a re-run of the wizard.
+    const src = join(runtimeDirFor(dir), "deploy", "docker-compose.yml");
+    const dest = join(dir, "docker-compose.yml");
+    if (fs.existsSync(dest)) {
+      notify?.(`${dest} already exists — keeping yours as it is (setup never overwrites a compose file you may have edited)`, "info");
+    } else {
+      try {
+        fs.copyFileSync(src, dest);
+        notify?.(`copied the runtime's compose file to ${dest}`, "info");
+      } catch (err: any) {
+        notify?.(
+          `could not copy ${src}: ${err?.message ?? err} — the receiver profile needs that file; skipping this step (install the runtime first, or copy it by hand)`,
+          "error",
+        );
+        return;
+      }
+    }
+    // `--profile receiver` is what makes the receiver container OPT-IN: the same compose file's plain
+    // `up` is Valkey-only, which is what a worker-on-host deployment wants.
+    const args = ["compose", "-f", dest, "--profile", "receiver", "up", "-d"];
+    const ok = await ui.confirm(
+      "Start the receiver container",
+      `Run in ${dir}:\n  docker ${args.join(" ")}\n\nthe receiver profile reads ${join(dir, ".env")} — WEBHOOK_SECRET and the forge credentials must be in there, or the container refuses to boot.`,
+    );
+    if (!ok) {
+      notify?.(`later: docker ${args.join(" ")}  (in ${dir})`, "info");
+      return;
+    }
+    await runAttachedFn(ctx, {
+      title: `docker compose --profile receiver up -d — in ${dir}`,
+      argv0: "docker",
+      args,
+      cwd: dir,
+      env,
+    });
+    return;
+  }
+
+  if (choice === EDGE_POLL) {
+    // Print-only by design: `poll` is a long-running producer, and starting it inside the wizard's
+    // attached overlay would tie the operator's whole session to it. Both commands, in order.
+    notify?.(
+      `polling needs no public URL, no DNS and no tunnel — two commands, in ${dir}:\n  1) node ${cliPath} setup github --no-webhook   (mints the App with its webhook INACTIVE — the polling-ready shape)\n  2) npx pi-dispatch-receiver poll   (the producer; run it from the deployment folder, under whatever keeps it alive)`,
+      "info",
+    );
+    return;
+  }
+
+  notify?.(
+    `trigger edge left for later — all three ways stay open from ${dir}: \`service install --receiver\` (a receiver unit on this host), \`docker compose --profile receiver up -d\` (a receiver container), or \`pi-dispatch-receiver poll\` (no public URL at all). Local cron triggers need none of them.`,
+    "info",
+  );
+}
+
+/**
+ * Step 11's body: pick a flow (the repo's own skills first, free text as the escape), then id/pattern/
  * task with the same defaults the add-trigger dialog uses, then write ONE cron entry -- into the
- * DEPLOYMENT dir's triggers.json, deliberately not `paths.triggersPath`: the pointer written in step 5
+ * DEPLOYMENT dir's triggers.json, deliberately not `paths.triggersPath`: the pointer written in step 6
  * aims the panel (and the worker's init scaffold) at the deployment dir, and a trigger written to
  * wherever the pre-wizard env happened to point would land in a file the new deployment never reads.
  * Any cancel or invalid answer skips the step; the wizard continues.
