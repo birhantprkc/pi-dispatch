@@ -632,6 +632,47 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `DES-GH-APP-MANIFEST-SETUP` (`--no-webhook` mints the hook-inactive App this mode
   pairs with), `INT-WEBHOOK-PAYLOAD-SUBSET`, `REQ-DEDUP-BY-DELIVERY-GUID`, `DES-TRIGGER-OUTSIDE-PI`
 
+## DES-FIRST-RUN-SETUP-WIZARD
+
+- **Decision**: `/dispatch setup` (and, when bare `/dispatch` detects no deployment anywhere, an
+  offered confirm into the same flow) walks an operator from a console-only install to a working
+  deployment: choose a deployment dir (default `~/pi-dispatch`, never the repo) → consented
+  `npm install @edgehero/pi-dispatch@<RUNTIME_VERSION>` into it → hand the terminal to
+  `npx pi-dispatch up` → optional `service install` → write the deployment pointer
+  (`INT-DEPLOYMENT-POINTER-CONTRACT`, JSON shown verbatim) → provider key **printed, never
+  written** → optional `setup github` hand-off → optional first trigger for the repo the session
+  sits in (cron pre-filled with the folder, flow picked from its `.pi/skills/` via the shared
+  `SKILL_NAME_RE`, the in-place-edit warning printed, the `ai-trigger: allow` line **printed, never
+  written** — repo files stay the operator's, and the gate reads committed HEAD anyway) → the panel.
+  A once-ever `session_start` nudge (`reason: "startup"`, notify-only, marker-file latch) points at
+  the command. Every step is individually declinable and declines continue converge-style.
+- **Mechanics, chosen for pi's real constraints**: dialogs-first, **overlay-per-handoff** — the
+  wizard is a plain `ui.select/input/confirm` chain, and each terminal-needing child runs inside a
+  short-lived `ctx.ui.custom` overlay that exists only to hold the `tui` handle for the
+  suspend bracket (`tui.stop()` → `stdio:"inherit"` spawn → `finally` restore), because the handle
+  exists nowhere else, dialogs cannot run while an overlay captures focus, and stdin is unreadable
+  while suspended — the child's own prompts (up's y/N gates) own the terminal, which is exactly
+  right: **the child's consent gates are the host-mutation consents, and the wizard never forwards
+  `--yes` to anything**. The npm step follows import-pi's spawn doctrine (bare `npm`, win32
+  `npm.cmd`+`shell:true` only there, no filesystem path in argv — the dir rides in `cwd:`,
+  `--ignore-scripts`, post-install version assertion). `--ignore-scripts` on our *own* runtime is
+  safe by inspection: bullmq/ioredis are pure JS and msgpackr's native accelerator is an optional
+  dep (`--omit=optional`) with a JS fallback.
+- **Gate-ladder fit** (`DES-CLI-SURFACE`): the wizard adds **no new tier and no new powers** — it
+  sequences existing consented commands through their own gates, writes deployment config through
+  the same validated atomic writers the panel uses, and its only novel artifact is the pointer file,
+  which resolves paths and grants nothing. Operator-typed only: there is deliberately no
+  model-callable setup tool — the bundled skill tells the model to ask the operator to type it.
+- **Rejected**: a long-lived wizard overlay with hand-rolled input (reimplements dialogs, fights the
+  focus model); reusing a clone as the runtime (the persona has none; two code-delivery paths double
+  the matrix); a detached background worker (an unsupervised long-lived process nobody consented to
+  manage — the service step or a printed command instead); credential-entry dialogs (secrets never
+  transit the extension); auto-writing `ai-trigger: allow` into the operator's repo (the two-key
+  property — repo consent and operator trigger — must stay two keys).
+- **Traces to**: `INT-DEPLOYMENT-POINTER-CONTRACT`, `REQ-DEPLOYMENT-BOOTSTRAP`, `DES-CLI-SURFACE`,
+  `DES-GH-APP-MANIFEST-SETUP`, `DES-TRIGGER-OUTSIDE-PI` (the wizard bootstraps host processes; it
+  never hosts them)
+
 ## DES-WORKER-ON-HOST
 
 - **Decision**: The worker runs **on the host** (a Node process, `pi-dispatch worker` / `npm start`), not
@@ -1608,6 +1649,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | The console becomes the front door (issue #92). Added **DES-FIRST-RUN-SETUP-WIZARD**: `/dispatch setup` + the bare-`/dispatch` no-deployment offer + a once-ever startup nudge, built as dialogs-first with **overlay-per-handoff** (the `tui` suspend handle exists only inside a `ctx.ui.custom` factory; dialogs cannot run under a capturing overlay; stdin is unreadable while suspended — so each attached child gets its own short-lived overlay, and the child's OWN consent gates are the host-mutation consents: the wizard forwards `--yes` to nothing). npm step under import-pi's spawn doctrine, with the recorded reasoning for `--ignore-scripts` on our own runtime (pure-JS deps; msgpackr's native accel is optional with a JS fallback). No new tier, no new powers, no model-callable tool; the only novel artifact is the pointer file (INT-DEPLOYMENT-POINTER-CONTRACT). Rejected on the record: long-lived wizard overlay, clone reuse, detached worker, credential dialogs, auto-writing `ai-trigger: allow` (two keys stay two keys). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the wizard bootstraps host processes, never hosts them. **DES-CLI-SURFACE UNCHANGED, checked**: every tier the wizard drives is entered through that entry's own gates. |
 | 2026-08-02 | The public URL becomes optional (issue #81, second half). Added **DES-GH-POLLING-TRANSPORT**: `pi-dispatch-receiver poll` synthesizes INT-WEBHOOK-PAYLOAD-SUBSET shapes from REST responses (issue events / comments / open PRs; ETag 304s are rate-limit-free; first boot never replays history; per-repo failures never kill the loop) and feeds the unchanged pure `filter()` + shared enqueue with `poll-*` delivery ids — the receiver stays the default and the low-latency path. Trust framing recorded: TLS with the operator's own credential replaces HMAC because authentication points the other way; `WEBHOOK_SECRET` is not required in poll mode, still hard-required for `serve`. The Actions-runner transport is rejected on the record (merge-gated workflow code executing on the worker host = merge-to-default becomes host code execution outside the container boundary). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the poller is the same always-on process class, just a different transport. **CONST-ISSUE-TEXT-IS-DATA UNCHANGED, checked**: the poller never interprets bodies. |
 | 2026-08-02 | The App path becomes the easy path (issue #81). Added **DES-GH-APP-MANIFEST-SETUP**: `pi-dispatch setup github` runs GitHub's App Manifest flow against a throwaway loopback listener — one browser click returns app id + PEM + webhook secret via the unauthenticated single-use conversion endpoint; every `.env` line is shown before one explicit consent, the PEM lands 0600 and never clobbers, an existing `WEBHOOK_SECRET` is kept (replacing it would invalidate working deliveries), installation-id discovery uses a deliberately hand-rolled ~15-line `node:crypto` RS256 JWT (auditable, once-at-setup; job-time minting stays `@octokit/auth-app`, unchanged), and `--no-webhook` creates the hook-inactive shape the polling transport will consume. No `--yes` on this wizard — these writes carry credentials. Rejected on the record: a maintainer-registered device-flow client (maintainer dependency in a self-hosted trust chain) and auto-installing the App (automating a consent screen defeats it). **CONST-TOKEN-SCOPED-PER-JOB UNCHANGED, checked**: the wizard changes how credentials are *acquired*, not how job tokens are minted or scoped. **CONST-HMAC-OVER-RAW-BODY UNCHANGED, checked**: the webhook secret the flow mints feeds the same verify path. |
 | 2026-08-02 | The receiver gets a container story (issue #82). Repo-layout `deploy/` line updated: `docker compose --profile receiver up` runs the receiver beside Valkey from a prebuilt `ghcr.io/edgehero/pi-dispatch-receiver` image (multi-arch, GITHUB_TOKEN-published like pi-job); the default `docker compose up` stays Valkey-only. The receiver was the natural candidate — `grep docker receiver/src` is empty, it is the only internet-facing process, and containerising it costs nothing the trust model cares about. **DES-WORKER-ON-HOST UNCHANGED, checked**: the worker remains a host process — no service in the compose file mounts docker.sock, and the profile's existence changes nothing about why the worker cannot be containerised (client-side path translation, local-folder bind mounts). SECURITY.md's trusted-components row holds verbatim: a containerised receiver still never executes agent-authored content, and HMAC-before-parse is unchanged. |

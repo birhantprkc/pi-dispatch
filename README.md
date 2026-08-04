@@ -279,12 +279,25 @@ then open the panel:
 pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
 ```
 
+**No deployment yet? The console builds one.** When `/dispatch` finds nothing — no pointer, no env, no
+config in the folder, queue unreachable — it offers **`/dispatch setup`**: pick a deployment folder
+(default `~/pi-dispatch`), consent to an `npm install` of the pinned runtime, watch `pi-dispatch up` run
+its own per-action prompts in your terminal, optionally install the worker as a user-level service, and
+land in the panel — with an optional first trigger for the repo you're sitting in, its flow picked from
+that repo's own `.pi/skills/`. Every step shows what it will do and asks first; every step can be
+declined; nothing is ever written into your repo (the `ai-trigger: allow` opt-in line is printed for
+*you* to commit), and no credential ever passes through a dialog. It's the same consented CLI underneath
+— the wizard just types it for you.
+
 Two other ways to load it: from a clone, the in-repo `.pi/extensions` shim auto-loads once you've trusted
 the project; or point pi at the source with `pi -e admin/src/index.ts` (add that path to the `"extensions"`
-array in `~/.pi/agent/settings.json` to make it permanent). To operate a **live** deployment, give the pi
-session the same `VALKEY_URL`, `PI_SETTINGS_FILE`, `PI_TRIGGERS_FILE`, `PI_PAUSE_WINDOWS_FILE`, and
-`PI_LOGS_DIR` the worker uses — the panel reads and writes those same files and queue, so both act on one
-deployment.
+array in `~/.pi/agent/settings.json` to make it permanent). Pointing the panel at a **live** deployment is
+automatic when `/dispatch setup` built it: the wizard writes a small **deployment pointer**
+(`~/.pi/agent/pi-dispatch-deployment.json`, override `PI_DISPATCH_DEPLOYMENT_FILE` — absolute paths only,
+never credentials), and the panel finds the deployment from any directory. Your own env always wins, key
+by key — exporting the same `VALKEY_URL` / `PI_SETTINGS_FILE` / `PI_TRIGGERS_FILE` /
+`PI_PAUSE_WINDOWS_FILE` / `PI_LOGS_DIR` the worker uses still works exactly as before, and is still the
+way to aim one pi session at a *different* deployment.
 
 Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
 queue in place, `↑`/`↓` to move across the triggers and runs, `Enter` to drill into either. **Triggers are
