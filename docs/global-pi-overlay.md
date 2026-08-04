@@ -112,6 +112,23 @@ present but dormant is a deployment missing the setup its flows were written aga
    reports it, the runner refuses the job — because the damaging misreading is now "I thought I had turned
    these off", where before a typo merely left them dormant.
 
+**Three sources of extension code reach a job, and only one of them is this overlay.** Worth stating in one
+place, because two of them are easy to forget and #58 originally called the third a non-goal:
+
+| Source | Where it comes from | How to withhold it |
+|---|---|---|
+| the overlay's `extensions/` | your own host setup, staged here by `import-pi` | `PI_GLOBAL_ALLOW_EXTENSIONS=0` |
+| a staged package's extensions | pinned third-party code under `packages/` | `"packages": false` on the trigger |
+| the serviced repo's `.pi/extensions` | the repo being worked on, discovered natively by pi | nothing here: it is the repo's own tree |
+
+The third one surprises people, and it is deliberate. pi's normal discovery posture is on
+(`noExtensions: false`), and `/workspace` holds the **base repo's default-branch sha**, so what loads is
+merge-gated content and never a fork's branch on a pull-request job — which is why this does not reopen the
+fork-adversarial hole #58 closed. Precedence runs repo mount, then overlay, then staged packages, then
+whatever discovery finds under `/workspace`, first path wins, so a discovered repo extension is last of all
+and shadows nothing you staged. The recursion guard drops any extension named like the admin console or
+registering a `dispatch_*` tool, wherever it came from.
+
 The rule of thumb inverted with the default: what you would not want running in a job container should not
 be in the overlay. Never place the admin extension there (it can enqueue paid jobs — a recursion vector;
 `import-pi` blocks it, but treat it as a rule).

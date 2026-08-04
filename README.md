@@ -4,9 +4,10 @@
 
 # pi-dispatch
 
-**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service: triggered on demand, on a
-cron schedule, or by a GitHub or GitLab issue, comment or pull request. Every job runs in a container you
-control, behind a durable queue, a spend cap, and a live admin panel.**
+**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service. It lives in the background
+and, on a schedule or on an issue, comment or pull request from GitHub, GitLab, Forgejo or Azure DevOps,
+opens a container, runs your flow against the repo, and shuts the container down. Every job runs behind a
+durable queue, a spend cap, and a live admin panel you can turn the whole thing off from.**
 
 ![The /dispatch dashboard overlay, theme-colored: live queue state, day/week/month spend meters plus a daily token counter, the unified triggers pane (cron, label, comment, pull_request; selectable and editable), scheduled pause windows, and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.5.0)
 
@@ -466,10 +467,18 @@ a frontend, screenshot it, and iterate until it renders right.
 
 ## Status
 
-The local path, the GitHub path, the GitLab path, cron scheduling, the service installer, and the admin
-extension are built and work. The design is specified in [`specs/`](specs/): start with
-[`specs/constitution.md`](specs/constitution.md) for the non-negotiables and
-[`specs/design.md`](specs/design.md) for the decisions and what was rejected.
+Everything this README describes is built and running: four forges (GitHub, GitLab, Forgejo and Gitea,
+Azure DevOps), cron and CLI jobs, the durable queue with spend caps in four windows, resumable sessions,
+replica runs, per trigger job images, quiet hours, cost analytics, resurrectable sandboxes, the service
+installer for all three platforms, and the admin console with guided first run setup.
+
+The design is specified in [`specs/`](specs/), and the specs are the source of truth rather than a summary
+of the code: start with [`specs/constitution.md`](specs/constitution.md) for the non-negotiables,
+[`specs/design.md`](specs/design.md) for the decisions and what was rejected, and
+[`specs/interfaces.md`](specs/interfaces.md) for the file and container contracts. Every spec file ends with
+a revision history that records what changed and why, including the corrections.
+
+Working on this repo with an AI agent? [`CLAUDE.md`](CLAUDE.md) is the short version of what matters here.
 
 ## Contributing
 
