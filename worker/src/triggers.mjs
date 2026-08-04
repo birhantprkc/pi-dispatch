@@ -183,6 +183,10 @@ function normalizeCron(on, run, index, path, state) {
 
 	const packages = validatePackagesFlag(run, `cron trigger "${id}"`, path);
 	const image = validateImageRef(run, `cron trigger "${id}"`, path);
+	// RETURNED, not discarded like validateReplicas below, because `resume` still has a legal value on a
+	// cron entry: only `true` is refused (the local path has nothing to resume with), so what survives is
+	// `false` or absent. Both must keep reaching the job payload unchanged -- an operator who wrote down
+	// today's default must not get a `data` that disagrees with the file they reviewed.
 	const resume = validateResumeFlag(run, `cron trigger "${id}"`, path);
 	// Called and DISCARDED: on a cron trigger this can only refuse, and the refusal is the point. The
 	// returned `run` below deliberately grows no `replicas` key -- a cron entry can never carry one.
@@ -230,9 +234,25 @@ function validatePackagesFlag(run, at, path) {
  * to host disk and replayed into a later job on the same key. Disclosures default off. Absent and `false`
  * both mean today's behaviour, with not one byte written to disk and no /session mount in the argv.
  *
- * Carried on all four kinds for `run.image`'s reason rather than cron-only like `run.github`: continuing a
- * conversation is a property of the FLOW, and a cron trigger's flow is a flow. A cron job keys on its own
- * scheduler id (session-key.mjs), which is the one key in this feature chosen by nobody untrusted.
+ * REFUSED on a CRON trigger, and the refusal is the honest half of this validator rather than a limit of
+ * the feature. `resolveSession` is handed to the FORGE preparers only (prepare.mjs); the local branch
+ * returns before it is ever in scope, and prepare-local.mjs contains no session code at all -- so an armed
+ * cron trigger stages no transcript, mounts no /session, promotes nothing, and then exits 0 as though it
+ * had. `validateReplicas` states the argument in one line and it applies verbatim here: a field accepted
+ * where it does nothing is how an operator comes to trust one that does nothing.
+ *
+ * "NOT YET COVERED", not impossible -- validateReplicas' own distinction, kept because the two are
+ * different facts and an operator planning work needs the right one. The local key already exists and is
+ * the strongest key in this feature: session-key.mjs keys a cron job on its scheduler id, which is
+ * operator-authored, unique across the file, stable across fires, and chosen by nobody untrusted. Nothing
+ * reaches it. Wiring `resolveSession` into the local path is a feature, and this line is what stops the
+ * flag from pretending that feature landed in the meantime.
+ *
+ * Only `true` is refused, and the asymmetry with validateReplicas -- which refuses ANY value on cron -- is
+ * deliberate. `run.replicas: 1` is refused because a one-member replica set is a flag that does nothing,
+ * so the field has no legal no-op value; `run.resume: false` IS the documented default, so refusing it
+ * would refuse an operator for writing down the behaviour they already have, and would change a normalized
+ * shape that has to stay byte-identical.
  *
  * Strictly boolean and fail-loud, the house rule -- and here the damaging misreading is a truthy `"false"`
  * string, which reads to an operator as an opt-out and would arm the disclosure instead. That is the exact
@@ -240,7 +260,9 @@ function validatePackagesFlag(run, at, path) {
  *
  * Type here, reality at job start, exactly as `run.image` splits it: this cannot know whether
  * PI_SESSIONS_DIR is set, whether a key resolves, or whether a transcript exists. Those are the worker's
- * to answer, and all but the first degrade to a cold start rather than refusing.
+ * to answer, and all but the first degrade to a cold start rather than refusing -- the first is the one
+ * pre-spend policy refusal, `sessions-dir-unset` in processor.mjs (REQ-RESUMABLE-SESSION fails CLOSED
+ * there and only there).
  *
  * `at` is the caller's message prefix. Returns the flag, undefined when absent, so an unflagged trigger
  * normalizes byte-identically to today's.
@@ -248,6 +270,14 @@ function validatePackagesFlag(run, at, path) {
 function validateResumeFlag(run, at, path) {
 	if (run.resume !== undefined && typeof run.resume !== "boolean") {
 		throw configError(`${at}: run.resume must be true or false when present: ${path}`);
+	}
+	// `run.kind === "local"` IS "this is a cron trigger": normalizeTrigger has already refused every other
+	// pairing of on.type and run.kind, so the matrix makes the two synonyms. The same test validateReplicas
+	// keys its first refusal on, for the same reason -- neither wants to be re-taught the matrix.
+	if (run.resume === true && run.kind === "local") {
+		throw configError(
+			`${at}: run.resume is not yet covered for cron triggers (forge triggers only in this version) -- resolveSession is handed to the forge preparers only, so a local job would stage no transcript, mount no /session and promote nothing, then exit 0 as though it had; the local session key exists in session-key.mjs and nothing reaches it, so this is a gap to close, not a limit: ${path}`,
+		);
 	}
 	return run.resume;
 }

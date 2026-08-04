@@ -352,6 +352,11 @@ export async function startWorker(
 			// Completed-only, so a policy or infra exit leaves the canonical transcript byte-identical and a
 			// retry starts from what the first attempt did (CONST-RETRY-INFRA-ONLY).
 			promoteSession: sessionStore.promoteSession,
+			// The same value the store above was built from, passed explicitly so the processor's fail-closed
+			// `run.resume` gate answers from THIS config rather than from its own env default. Identical on the
+			// real path; the difference shows under an injected env, where the store would be built from the
+			// synthetic value while the gate read the process one.
+			sessionsDir: config.sessionsDir,
 			runContainer: makeRunContainerFn({
 				image: config.jobImage,
 				hostEnv: env,

@@ -819,11 +819,18 @@ function promptRecorder(answer = false) {
 	return { fn, calls };
 }
 
-/** A validating triggers file whose one cron trigger sets run.resume (REQ-RESUMABLE-SESSION). */
+/**
+ * A validating triggers file whose one trigger sets run.resume (REQ-RESUMABLE-SESSION).
+ *
+ * A FORGE trigger, not a cron one: `run.resume: true` is refused on a local/cron entry (triggers.mjs --
+ * resolveSession is handed to the forge preparers only, so an armed cron job would stage nothing and still
+ * exit 0). The fixture has to be a file the SHARED parseTriggers really accepts, or readTriggerFacts
+ * swallows the refusal to zeroes and every resume assertion here passes for the wrong reason.
+ */
 function resumeTriggersFile() {
 	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-resume-")), "triggers.json");
-	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", resume: true };
-	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run }] }));
+	const run = { kind: "github", flow: "review", resume: true };
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:review"] }, run }] }));
 	return path;
 }
 
@@ -1157,9 +1164,12 @@ const collectSeams = (plan, extra = {}) => ({
 function fullyBrokenTriggersFile() {
 	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-broken-")), "triggers.json");
 	const triggers = [
-		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/repo", flow: "review", task: "t", image: "custom-img:1", resume: true } },
+		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/repo", flow: "review", task: "t", image: "custom-img:1" } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", replicas: 2 } },
-		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "gitlab", flow: "fix" } },
+		// `resume` rides a FORGE trigger, and not the replicating one: triggers.mjs refuses run.resume on a
+		// local entry AND refuses it beside run.replicas, so this is the only entry that can carry it. A
+		// fixture parseTriggers rejects would zero every count this pin depends on.
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "gitlab", flow: "fix", resume: true } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "forgejo", flow: "fix" } },
 		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "azure", flow: "fix", repository: "webapp" } },
 	];

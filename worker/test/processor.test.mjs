@@ -585,6 +585,87 @@ test("a job with no session records session:null and never calls the store", asy
 	assert.equal(promoted, 0);
 });
 
+// ---- REQ-RESUMABLE-SESSION's ONE fail-CLOSED case. Every other outcome in that feature degrades to a
+// ---- named cold start; an armed trigger with no store to persist into is a pre-spend policy refusal,
+// ---- because the alternative is a green run that persisted nothing and looked like it worked.
+
+const armedJob = { ...ghJob, resume: true };
+
+test("an armed run.resume with PI_SESSIONS_DIR unset refuses BEFORE the mint, the clone and the budget", async () => {
+	const redis = fakeRedis();
+	const { deps: d, calls } = deps({ redis, sessionsDir: null });
+	const r = await runJob(armedJob, d);
+	assert.equal(r.outcome, "policy");
+	assert.equal(r.reason, "sessions-dir-unset");
+	assert.equal(r.budgetReserved, false, "refused pre-reserve, so no daily slot was consumed");
+	assert.equal(redis.incrCalls, 0, "reserveBudget never reached -- the gate is free by construction");
+	assert.equal(redis.decrCalls, 0, "and with nothing reserved there is nothing to give back");
+	// The refusal comment is the ONLY side effect: no mint (no credential created to be discarded), no
+	// branch-check API call, no clone, no container -- and no cleanup, because nothing was prepared.
+	assert.deepEqual(calls, ["comment:Refused: thi"]);
+	// Attribution rides even a pre-container refusal (INT-RUN-HISTORY-FILE-CONTRACT); no ledger exists.
+	assert.equal(r.provider, "anthropic");
+	assert.equal(r.model, "m");
+	assert.equal(r.exitCode, null);
+	assert.equal(r.turns, null);
+	assert.equal(r.tokens, null);
+	assert.equal("usage" in r, false, "nothing ran, so there is no ledger key");
+	// RETURNED, never thrown: this await resolving IS the not-retried assertion. An unset environment
+	// variable is determinate, and BullMQ retrying it would refuse identically N times (CONST-RETRY-INFRA-ONLY).
+});
+
+test("the same armed job proceeds untouched once a session store is configured", async () => {
+	const { deps: d, calls } = deps({ sessionsDir: "/srv/pi-sessions" });
+	const r = await runJob(armedJob, d);
+	assert.equal(r.outcome, "completed");
+	assert.deepEqual(
+		calls,
+		["mint:org/repo", "branch-check", "prepare", "run-container", "collect-chain", "cleanup"],
+		"the gate is the only thing run.resume changes in this file -- same order as the unarmed happy path",
+	);
+});
+
+test("resume:false and an absent resume never reach the gate, store or no store", async () => {
+	// Strict `=== true`, the same test prepare-github.mjs uses to decide whether to resolve a session at
+	// all. Absent and false are today's behaviour exactly, and refusing either would refuse a job that
+	// asked for nothing.
+	for (const job of [{ ...ghJob, resume: false }, ghJob]) {
+		const { deps: d, calls } = deps({ sessionsDir: null });
+		const r = await runJob(job, d);
+		assert.equal(r.outcome, "completed", `resume=${JSON.stringify(job.resume)} must not be refused`);
+		assert.ok(calls.includes("run-container"));
+	}
+});
+
+test("the gate is kind-agnostic: an armed LOCAL job refuses on the same terms", async () => {
+	// No local job can arm the flag today -- triggers.mjs refuses run.resume on a cron trigger, and a CLI
+	// or chained job has no trigger entry that could set it. The gate covers the kind anyway, because a
+	// gate written as an enumeration of kinds is a gate the next kind skips silently.
+	const { deps: d, calls } = deps({ sessionsDir: null });
+	const r = await runJob({ kind: "local", folder: "/home/rob/proj", resume: true, provider: "anthropic", model: "m" }, d);
+	assert.equal(r.reason, "sessions-dir-unset");
+	assert.equal(r.budgetReserved, false);
+	assert.ok(!calls.includes("run-container"));
+});
+
+test("the sessionsDir default is the PI_SESSIONS_DIR read, so an unpassed dep cannot false-refuse", async () => {
+	// Load-bearing choice: a bare `null` default would refuse EVERY armed job under a wiring that omits the
+	// key, and that false refusal is indistinguishable from the true one. config.mjs derives its own
+	// `sessionsDir` from this same variable (`env.PI_SESSIONS_DIR || null`), so the two cannot disagree.
+	const saved = process.env.PI_SESSIONS_DIR;
+	try {
+		process.env.PI_SESSIONS_DIR = "/srv/pi-sessions";
+		const { deps: withStore } = deps(); // deliberately no sessionsDir key
+		assert.equal((await runJob(armedJob, withStore)).outcome, "completed", "a configured store must admit the job with no wiring change");
+		delete process.env.PI_SESSIONS_DIR;
+		const { deps: noStore } = deps();
+		assert.equal((await runJob(armedJob, noStore)).reason, "sessions-dir-unset", "and an unset variable is the real refusal");
+	} finally {
+		if (saved === undefined) delete process.env.PI_SESSIONS_DIR;
+		else process.env.PI_SESSIONS_DIR = saved;
+	}
+});
+
 // ---- per-(provider,model) usage ledger (INT-RUN-HISTORY-FILE-CONTRACT): the exit line's rebuilt
 // ---- `usage` block and the host-effective provider/model thread through results AND throws.
 
