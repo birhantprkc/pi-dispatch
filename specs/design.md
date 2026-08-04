@@ -598,6 +598,40 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `DES-CLI-SURFACE`, `REQ-DEPLOYMENT-BOOTSTRAP`, `CONST-TOKEN-SCOPED-PER-JOB`,
   `SECURITY.md` (auth-source ladder)
 
+## DES-GH-POLLING-TRANSPORT
+
+- **Decision**: `pi-dispatch-receiver poll` is an **alternative producer** for GitHub triggers that
+  needs no public URL: it polls issue events, issue comments, and open PRs per serviced repo (ETag
+  conditional requests, ~60s cadence honoring `x-poll-interval`), synthesizes the exact
+  `INT-WEBHOOK-PAYLOAD-SUBSET` shapes, and feeds the **unchanged** pure `filter()` and the shared
+  enqueue path with `poll-*` delivery ids. **The webhook receiver stays the default and the
+  documented low-latency path** — polling is for hosts that cannot (or should not) expose a port.
+  Repos come from an explicit `POLL_REPOS` allowlist or, under App auth, the installation's repo
+  list. A fresh poller initializes cursors to *now* and never replays history — a label applied
+  months ago was an approval for a different moment. One repo's API failure skips that repo for the
+  cycle, never the loop. `WEBHOOK_SECRET` is not required in poll mode (there is no inbound delivery
+  to verify); `serve` still hard-requires it.
+- **Why**: The public HTTPS endpoint was the single hardest setup mile for home deployments (tunnel
+  or DNS, both punted to the operator), and it defends a surface polling simply does not have: TLS
+  with the operator's own credential against api.github.com replaces HMAC-over-raw-body because the
+  authentication points the other way. Every author/label/bot-loop/dedup/spend gate evaluates
+  identically — parity is pinned by tests running webhook-shaped and REST-synthesized subsets through
+  the same gate. The accepted cost is ~60s trigger latency, cheap against jobs that run for minutes.
+  Conditional 304s are rate-limit-free, so a handful of repos polls within a fraction of the 5000/hr
+  budget.
+  **The polling credential is not a job token.** Under App auth the poller mints an *unscoped*
+  installation token for itself — it must call `GET /installation/repositories` and read every
+  serviced repo, which a per-repo-scoped mint cannot. That token never reaches a job:
+  `CONST-TOKEN-SCOPED-PER-JOB` governs what jobs receive, and the worker's per-repo mint is untouched.
+- **Rejected**: **a GitHub Actions self-hosted runner as the transport** — outbound-only networking,
+  yes, but it executes merge-gated workflow code on the worker's host, converting merge-to-default
+  into host-level code execution *outside the container boundary*; the one transport that removes the
+  same friction while making the trust model strictly worse. Also rejected: polling as the default
+  (latency and rate-limit budgets are real; the receiver remains first), and any body interpretation
+  in the poller (`CONST-ISSUE-TEXT-IS-DATA` — text stays data all the way through).
+- **Traces to**: `DES-GH-APP-MANIFEST-SETUP` (`--no-webhook` mints the hook-inactive App this mode
+  pairs with), `INT-WEBHOOK-PAYLOAD-SUBSET`, `REQ-DEDUP-BY-DELIVERY-GUID`, `DES-TRIGGER-OUTSIDE-PI`
+
 ## DES-WORKER-ON-HOST
 
 - **Decision**: The worker runs **on the host** (a Node process, `pi-dispatch worker` / `npm start`), not
@@ -1574,6 +1608,7 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-02 | The public URL becomes optional (issue #81, second half). Added **DES-GH-POLLING-TRANSPORT**: `pi-dispatch-receiver poll` synthesizes INT-WEBHOOK-PAYLOAD-SUBSET shapes from REST responses (issue events / comments / open PRs; ETag 304s are rate-limit-free; first boot never replays history; per-repo failures never kill the loop) and feeds the unchanged pure `filter()` + shared enqueue with `poll-*` delivery ids — the receiver stays the default and the low-latency path. Trust framing recorded: TLS with the operator's own credential replaces HMAC because authentication points the other way; `WEBHOOK_SECRET` is not required in poll mode, still hard-required for `serve`. The Actions-runner transport is rejected on the record (merge-gated workflow code executing on the worker host = merge-to-default becomes host code execution outside the container boundary). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the poller is the same always-on process class, just a different transport. **CONST-ISSUE-TEXT-IS-DATA UNCHANGED, checked**: the poller never interprets bodies. |
 | 2026-08-02 | The App path becomes the easy path (issue #81). Added **DES-GH-APP-MANIFEST-SETUP**: `pi-dispatch setup github` runs GitHub's App Manifest flow against a throwaway loopback listener — one browser click returns app id + PEM + webhook secret via the unauthenticated single-use conversion endpoint; every `.env` line is shown before one explicit consent, the PEM lands 0600 and never clobbers, an existing `WEBHOOK_SECRET` is kept (replacing it would invalidate working deliveries), installation-id discovery uses a deliberately hand-rolled ~15-line `node:crypto` RS256 JWT (auditable, once-at-setup; job-time minting stays `@octokit/auth-app`, unchanged), and `--no-webhook` creates the hook-inactive shape the polling transport will consume. No `--yes` on this wizard — these writes carry credentials. Rejected on the record: a maintainer-registered device-flow client (maintainer dependency in a self-hosted trust chain) and auto-installing the App (automating a consent screen defeats it). **CONST-TOKEN-SCOPED-PER-JOB UNCHANGED, checked**: the wizard changes how credentials are *acquired*, not how job tokens are minted or scoped. **CONST-HMAC-OVER-RAW-BODY UNCHANGED, checked**: the webhook secret the flow mints feeds the same verify path. |
 | 2026-08-02 | The receiver gets a container story (issue #82). Repo-layout `deploy/` line updated: `docker compose --profile receiver up` runs the receiver beside Valkey from a prebuilt `ghcr.io/edgehero/pi-dispatch-receiver` image (multi-arch, GITHUB_TOKEN-published like pi-job); the default `docker compose up` stays Valkey-only. The receiver was the natural candidate — `grep docker receiver/src` is empty, it is the only internet-facing process, and containerising it costs nothing the trust model cares about. **DES-WORKER-ON-HOST UNCHANGED, checked**: the worker remains a host process — no service in the compose file mounts docker.sock, and the profile's existence changes nothing about why the worker cannot be containerised (client-side path translation, local-folder bind mounts). SECURITY.md's trusted-components row holds verbatim: a containerised receiver still never executes agent-authored content, and HMAC-before-parse is unchanged. |
 | 2026-08-02 | The clone stops being the only distribution (issue #80). **DES-NAME-KEEP-PI-DISPATCH amended, on its own terms**: its change trigger ("wanting to publish *any* npm artifact under this name — a management CLI") fired, and the resolution is scoped publishing (`@edgehero/pi-dispatch` = worker + CLI, `@edgehero/pi-dispatch-receiver`), not the rename — the collision only ever bound the bare name. The amendment also retro-records `@edgehero/pi-dispatch-admin`, which shipped 2026-07 without a row here: practice had diverged from the entry's unqualified "Do not publish to npm" line, and a constitution that quietly diverges from what ships is worse than none. The two checkout-relative runtime escapes are closed package-relative (worker/.env.example, worker/deploy/ mirrors with byte-equality sync tests against the root copies — the root files stay the documented, edited source). Bare `npx pi-dispatch` outside a checkout resolves to the squatter's package; docs use scoped forms everywhere. **DES-WORKER-ON-HOST UNCHANGED, checked**: npm-on-host is the architecturally correct distribution for a worker that must drive the host docker CLI. **CONST-PI-VERSION-PINNED UNCHANGED, checked**: the pins travel into the published packages byte-identical. |
