@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runDoctor } from "../src/doctor.mjs";
+import { githubProtectionPreflight, runDoctor } from "../src/doctor.mjs";
 
 // A fake `spawn`: plan keys are command-line prefixes ("docker info", "docker image", "docker run",
 // "gh auth status", "gh auth token") mapped to a canned exit code, a `{code, output}` pair (output is
@@ -528,4 +528,200 @@ test("doctor: a deployment with no run.replicas anywhere prints no replica line 
 	const { out, text } = capture();
 	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: replicaTriggersFile() }), imgDeps(out, green));
 	assert.doesNotMatch(text(), /run\.replicas/, "a deployment that does not use the feature is not told about it");
+});
+
+// -- receiver preflight (issue #80): what receiver boot will refuse, said at doctor time --------------
+
+/** A triggers file with one forge label trigger of `kind`. Azure carries the `run.repository` its label
+ *  triggers require. Validates through the shared parseTriggers for triggersFile's reason above. */
+function forgeTriggersFile(kind) {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-forge-")), "triggers.json");
+	const run = { kind, flow: "fix", ...(kind === "azure" ? { repository: "webapp" } : {}) };
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "label", any: ["pi:fix"] }, run }] }));
+	return path;
+}
+
+test("doctor: forge triggers without WEBHOOK_SECRET warn that the receiver will refuse to start", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github") }), imgDeps(out, green));
+	assert.equal(code, 0, "mid-setup is legitimate -- warn, never fail");
+	assert.match(text(), /⚠ triggers\.json has github triggers but WEBHOOK_SECRET is unset -- the receiver will refuse to start/);
+	assert.match(text(), /openssl rand -hex 32/, "the fix shows how to mint one");
+	assert.match(text(), /pi-dispatch-receiver/, "the fix names the bin that starts the receiver");
+});
+
+test("doctor: WEBHOOK_SECRET presence is reported, its value never echoed", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github"), WEBHOOK_SECRET: "wh_secret_val_9" }), imgDeps(out, green));
+	assert.match(text(), /✓ WEBHOOK_SECRET set/);
+	assert.doesNotMatch(text(), /wh_secret_val_9/, "presence only -- the secret never reaches output");
+});
+
+test("doctor: a deployment with no forge triggers prints no receiver line at all", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: triggersFile() }), imgDeps(out, green));
+	assert.doesNotMatch(text(), /WEBHOOK_SECRET|RECEIVER_PORT/, "no receiver noise for a cron/local-only deployment");
+});
+
+test("doctor: a malformed RECEIVER_PORT is echoed by value and warned about; a sane one prints nothing", async () => {
+	// The port is not a secret, so echoing the malformed shape is what makes the warn actionable.
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github"), RECEIVER_PORT: "http" }), imgDeps(out, green));
+	assert.match(text(), /⚠ RECEIVER_PORT is "http", which is not a positive integer -- the receiver will refuse to start/);
+
+	const { out: o2, text: t2 } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github"), RECEIVER_PORT: "0" }), imgDeps(o2, green));
+	assert.match(t2(), /⚠ RECEIVER_PORT is "0"/, "zero is not a bindable choice either");
+
+	const { out: o3, text: t3 } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github"), RECEIVER_PORT: "3000" }), imgDeps(o3, green));
+	assert.doesNotMatch(t3(), /RECEIVER_PORT/, "a valid port needs no line");
+});
+
+test("doctor: forgejo triggers with nothing set warn with the exact vars receiver boot requires", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("forgejo") }), imgDeps(out, green));
+	assert.equal(code, 0, "warn, never fail");
+	assert.match(text(), /⚠ triggers\.json has forgejo triggers but FORGEJO_URL, FORGEJO_WEBHOOK_SECRET, FORGEJO_TOKEN are unset/);
+	assert.match(text(), /docs\/forgejo\.md/, "the fix says where the setup is documented");
+	assert.match(text(), /FORGEJO_BOT_ID/, "the repository-scoped-token caveat is named");
+});
+
+test("doctor: a half-set forgejo block names only the vars actually missing", async () => {
+	const { out, text } = capture();
+	await runDoctor(
+		imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("forgejo"), FORGEJO_URL: "https://code.example.org", FORGEJO_TOKEN: "fj_token_val" }),
+		imgDeps(out, green),
+	);
+	assert.match(text(), /⚠ triggers\.json has forgejo triggers but FORGEJO_WEBHOOK_SECRET is unset/);
+	assert.doesNotMatch(text(), /FORGEJO_URL,|FORGEJO_TOKEN,/, "set vars are not reported missing");
+	assert.doesNotMatch(text(), /fj_token_val/, "the token value never reaches output");
+});
+
+test("doctor: a fully-configured forgejo block reports ✓ with the instance URL, secrets unechoed", async () => {
+	const { out, text } = capture();
+	await runDoctor(
+		imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("forgejo"), FORGEJO_URL: "https://code.example.org", FORGEJO_WEBHOOK_SECRET: "fj_hook_secret", FORGEJO_TOKEN: "fj_token_val" }),
+		imgDeps(out, green),
+	);
+	assert.match(text(), /✓ forgejo triggers configured \(https:\/\/code\.example\.org\)/);
+	assert.doesNotMatch(text(), /fj_hook_secret|fj_token_val/, "presence only");
+});
+
+test("doctor: azure triggers with nothing set warn for the undefaulted mode AND the required vars", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("azure") }), imgDeps(out, green));
+	assert.equal(code, 0, "warn, never fail");
+	assert.match(text(), /⚠ triggers\.json has azure triggers but AZURE_WEBHOOK_MODE is unset -- the receiver will refuse to start/);
+	assert.match(text(), /"basic" \(HTTP Basic on the service hook\) or "header"/, "the fix names both legal modes");
+	assert.match(text(), /⚠ triggers\.json has azure triggers but AZURE_WEBHOOK_SECRET, AZURE_TOKEN, AZURE_ORG_URL are unset/);
+	assert.match(text(), /docs\/azure-devops\.md/);
+});
+
+test("doctor: AZURE_WEBHOOK_MODE=header pulls AZURE_WEBHOOK_HEADER into the required set", async () => {
+	const { out, text } = capture();
+	await runDoctor(
+		imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("azure"), AZURE_WEBHOOK_MODE: "header", AZURE_WEBHOOK_SECRET: "az_hook_secret", AZURE_TOKEN: "az_token_val", AZURE_ORG_URL: "https://dev.azure.com/acme" }),
+		imgDeps(out, green),
+	);
+	assert.match(text(), /⚠ triggers\.json has azure triggers but AZURE_WEBHOOK_HEADER is unset/);
+	assert.doesNotMatch(text(), /az_hook_secret|az_token_val/, "presence only");
+});
+
+test("doctor: a fully-configured azure block reports ✓ with the org URL; a bogus mode is echoed", async () => {
+	const base = { PI_TRIGGERS_FILE: forgeTriggersFile("azure"), AZURE_WEBHOOK_SECRET: "az_hook_secret", AZURE_TOKEN: "az_token_val", AZURE_ORG_URL: "https://dev.azure.com/acme" };
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ ...base, AZURE_WEBHOOK_MODE: "basic" }), imgDeps(out, green));
+	assert.match(text(), /✓ azure triggers configured \(https:\/\/dev\.azure\.com\/acme\)/);
+	assert.doesNotMatch(text(), /az_hook_secret|az_token_val/, "presence only");
+
+	// A value boot refuses is echoed by name -- a mode is a choice, not a secret.
+	const { out: o2, text: t2 } = capture();
+	await runDoctor(imgEnv({ ...base, AZURE_WEBHOOK_MODE: "hmac" }), imgDeps(o2, green));
+	assert.match(t2(), /⚠ triggers\.json has azure triggers but AZURE_WEBHOOK_MODE is "hmac"/);
+	assert.doesNotMatch(t2(), /✓ azure triggers configured/, "an unbootable mode is not reported configured");
+});
+
+test("doctor: gitlab triggers also preflight the receiver-boot vars (undefaulted mode, secret presence)", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("gitlab"), GITLAB_TOKEN: "glpat_secret_val" }), imgDeps(out, green));
+	assert.match(text(), /✓ gitlab triggers configured \(https:\/\/gitlab\.com\)/, "the worker-side token line is unchanged");
+	assert.match(text(), /⚠ triggers\.json has gitlab triggers but GITLAB_WEBHOOK_MODE is unset/);
+	assert.match(text(), /⚠ triggers\.json has gitlab triggers but GITLAB_WEBHOOK_SECRET is unset/);
+	assert.doesNotMatch(text(), /glpat_secret_val/, "the token value never reaches output");
+
+	const { out: o2, text: t2 } = capture();
+	await runDoctor(
+		imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("gitlab"), GITLAB_TOKEN: "glpat_secret_val", GITLAB_WEBHOOK_MODE: "signature", GITLAB_WEBHOOK_SECRET: "gl_hook_secret" }),
+		imgDeps(o2, green),
+	);
+	assert.doesNotMatch(t2(), /GITLAB_WEBHOOK_MODE is/, "a chosen mode prints no line");
+	assert.doesNotMatch(t2(), /GITLAB_WEBHOOK_SECRET is unset/);
+	assert.doesNotMatch(t2(), /gl_hook_secret/, "presence only");
+});
+
+test("doctor: each forge block appears only when the triggers file names that forge", async () => {
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github") }), imgDeps(out, green));
+	assert.doesNotMatch(text(), /FORGEJO|AZURE|gitlab triggers/, "github triggers summon no other forge's block");
+});
+
+// -- branch-protection preflight (issue #80, REQ-BRANCH-PROTECTION-PRECONDITION) ----------------------
+
+test("doctor: github triggers get ONE informational protection line, and no gh api calls", async () => {
+	// No valid github trigger can name a run.repository today (the shared schema admits the field on azure
+	// only), so runDoctor's live path is the single "enforced per job" line -- and NO network is touched.
+	const calls = [];
+	const { out, text } = capture();
+	await runDoctor(imgEnv({ PI_TRIGGERS_FILE: forgeTriggersFile("github") }), imgDeps(out, green, calls));
+	assert.match(text(), /✓ github triggers take their repository from each delivery/);
+	assert.match(text(), /REQ-BRANCH-PROTECTION-PRECONDITION/);
+	assert.ok(!calls.some((c) => c.cmd === "gh" && c.args[0] === "api"), "nothing named a repo, so nothing is asked of GitHub");
+});
+
+// The per-repo loop, exercised directly: no valid triggers file reaches it through runDoctor yet (see
+// doctor.mjs), so these pin the wiring for the day the schema grows run.repository for github.
+const protectionPlan = (protectionCode) => ({
+	"gh auth status": { code: 0, output: ghStatusOutput },
+	"gh api repos/octo/webapp --jq": { code: 0, output: "main\n" },
+	"gh api repos/octo/webapp/branches/main/protection": protectionCode,
+});
+
+test("githubProtectionPreflight: a protected default branch is one ✓ check", async () => {
+	const checks = await githubProtectionPreflight(fakeSpawn(protectionPlan(0)), ["octo/webapp"]);
+	assert.equal(checks.length, 1);
+	assert.equal(checks[0].ok, true);
+	assert.match(checks[0].label, /default branch of octo\/webapp is protected \(main\)/);
+});
+
+test("githubProtectionPreflight: an unprotected branch warns with the REQ id; the fix is shown, never run", async () => {
+	const checks = await githubProtectionPreflight(fakeSpawn(protectionPlan(1)), ["octo/webapp"]);
+	assert.equal(checks.length, 1);
+	assert.equal(checks[0].ok, false);
+	assert.equal(checks[0].warn, true, "warn, never fail -- the worker's own gate is the enforcement");
+	assert.match(checks[0].label, /default branch of octo\/webapp is not protected/);
+	assert.match(checks[0].label, /REQ-BRANCH-PROTECTION-PRECONDITION/);
+	assert.match(checks[0].fix, /https:\/\/github\.com\/octo\/webapp\/settings\/branches/, "the settings URL is shown");
+});
+
+test("githubProtectionPreflight: gh missing is ONE warn and no api calls", async () => {
+	const calls = [];
+	const checks = await githubProtectionPreflight(fakeSpawn({ "gh auth status": "enoent" }, calls), ["octo/webapp", "octo/api"]);
+	assert.equal(checks.length, 1, "one warn covers every repo");
+	assert.equal(checks[0].ok, false);
+	assert.equal(checks[0].warn, true);
+	assert.match(checks[0].label, /branch-protection preflight skipped/);
+	assert.ok(!calls.some((c) => c.args?.[0] === "api"), "the loop is skipped, not failed per-repo");
+});
+
+test("githubProtectionPreflight: an unresolvable repo warns per repo, and the loop caps at 5", async () => {
+	const calls = [];
+	const repos = ["octo/r1", "octo/r2", "octo/r3", "octo/r4", "octo/r5", "octo/r6"];
+	const plan = { "gh auth status": { code: 0, output: ghStatusOutput }, "gh api": 1 }; // every api call fails
+	const checks = await githubProtectionPreflight(fakeSpawn(plan, calls), repos);
+	assert.equal(checks[0].ok, true, "the cap is information, not a fault");
+	assert.match(checks[0].label, /capped at 5 of 6 repos/);
+	assert.equal(checks.length, 6, "the cap line plus one warn per checked repo");
+	assert.ok(checks.slice(1).every((c) => !c.ok && c.warn && /could not resolve the default branch/.test(c.label)));
+	assert.ok(!calls.some((c) => c.args?.join(" ").includes("octo/r6")), "the sixth repo is never queried");
 });

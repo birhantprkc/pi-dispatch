@@ -48,9 +48,13 @@ export function resolvePaths(env = process.env) {
     valkeyUrl: env.VALKEY_URL ?? "redis://127.0.0.1:6379",
     logsDir: env.PI_LOGS_DIR || defaultLogsDir(),
     settingsFile: settingsFilePath(env),
-    triggersPath: env.PI_TRIGGERS_FILE ?? "deploy/triggers.json",
-    pauseWindowsPath: env.PI_PAUSE_WINDOWS_FILE ?? "deploy/pause-windows.json",
-    subscriptionsPath: env.PI_SUBSCRIPTIONS_FILE ?? "deploy/subscriptions.json",
+    // Cwd defaults match what `pi-dispatch init` scaffolds (and, since issue #80, what the receiver
+    // reads), so a deployment folder works without env wiring when pi is launched from it. The old
+    // `deploy/…` defaults pointed at the repo's committed EXAMPLE files — right only from a checkout
+    // root, and silently wrong (demo triggers) everywhere else.
+    triggersPath: env.PI_TRIGGERS_FILE ?? "./triggers.json",
+    pauseWindowsPath: env.PI_PAUSE_WINDOWS_FILE ?? "./pause-windows.json",
+    subscriptionsPath: env.PI_SUBSCRIPTIONS_FILE ?? "./subscriptions.json",
     // The operator's global pi overlay dir (REQ-GLOBAL-PI-OVERLAY), where the staged third-party pi
     // packages live under `packages/`. `|| null` so unset AND empty both read as "no overlay" -- the
     // normal deployment, in which no trigger can arm any package.

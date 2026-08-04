@@ -1,4 +1,5 @@
 {
+  "_note": "Example triggers kept for the deploy templates/docs -- no component reads this file by default: the receiver reads ./triggers.json in its working directory (what `pi-dispatch init` scaffolds), and PI_TRIGGERS_FILE points either service elsewhere.",
   "triggers": [
     { "on": { "type": "label", "any": ["pi:frontend"] }, "run": { "kind": "github", "flow": "frontend-fix" } },
     { "on": { "type": "label", "any": ["pi:backend"] }, "run": { "kind": "github", "flow": "backend-fix" } }

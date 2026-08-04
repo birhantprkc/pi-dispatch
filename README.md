@@ -51,7 +51,8 @@ docker compose -f deploy/docker-compose.yml up -d
 
 # 3. Install, scaffold, and check your setup
 npm ci
-npx pi-dispatch init         # writes .env + triggers.json + pause-windows.json (never clobbers)
+npx pi-dispatch init         # writes five files (never clobbers): .env, triggers.json,
+                             #    pause-windows.json, pi-packages.json, subscriptions.json
 #    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
 #    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
 npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the images your triggers name, and your provider key
@@ -386,8 +387,9 @@ an AI tool — run that flow at all (default **deny**).
 
 Every standing trigger — cron schedules and webhook triggers alike — lives in one unified
 **`triggers.json`**, a list of `{ on, run }` pairs read by both the worker (cron) and the receiver
-(GitHub, GitLab). Point both services at it with `PI_TRIGGERS_FILE`; the worker treats it as optional (unset =
-cron off), the receiver requires it.
+(GitHub, GitLab). `PI_TRIGGERS_FILE` points both services at it; the worker treats it as optional (unset =
+cron off), the receiver falls back to `./triggers.json` in the folder it starts from (what `pi-dispatch init`
+scaffolds) and refuses to start when neither exists.
 
 ```jsonc
 { "triggers": [
@@ -525,7 +527,9 @@ authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a 
 for multi-tenant. The `gh` source hands your full login scopes to every token-carrying job — `doctor`
 warns and names them; use a fine-grained PAT or an App for per-job scoping. Which labels, comment
 phrases, and pull_request actions fire which flow is configured in the same unified **`triggers.json`**
-above; the receiver **requires** `PI_TRIGGERS_FILE`.
+above. Start the receiver with `npx pi-dispatch-receiver` (or the explicit form, `node receiver/src/cli.mjs`,
+if a shell can't find the local bin) from the folder you ran `pi-dispatch init` in: it reads
+`./triggers.json` there, `PI_TRIGGERS_FILE` overrides, and it **refuses to start** when neither exists.
 
 ```mermaid
 flowchart LR

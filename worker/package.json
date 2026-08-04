@@ -12,6 +12,7 @@
   "exports": {
     ".": "./src/index.mjs",
     "./config": "./src/config.mjs",
+    "./exit-code": "./src/exit-code.mjs",
     "./flow-gate": "./src/flow-gate.mjs",
     "./git-dirty": "./src/git-dirty.mjs",
     "./queue": "./src/queue.mjs",

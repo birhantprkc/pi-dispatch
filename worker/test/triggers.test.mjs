@@ -26,6 +26,15 @@ test("empty triggers array is valid -> []", () => {
 	assert.deepEqual(parse([]), []);
 });
 
+test("unknown top-level keys are ignored (deploy/triggers.json carries a _note marker)", () => {
+	// The parser reads only `parsed.triggers` -- pinned here because the shipped example file relies
+	// on it: deploy/triggers.json opens with a "_note" key marking it as an example (issue #80), and
+	// a stricter future parser silently breaking that file should fail THIS test, not an operator.
+	const parsed = parseTriggers(JSON.stringify({ _note: "example file", triggers: [CRON] }), PATH);
+	assert.equal(parsed.length, 1);
+	assert.equal(parsed[0].on.id, "nightly-tidy");
+});
+
 // --- diagonal: on x run trust boundary ---
 
 test('cron -> github is rejected (a cron has no webhook payload)', () => {

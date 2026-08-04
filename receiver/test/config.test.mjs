@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { loadReceiverConfig, reloadTriggers } from "../src/config.mjs";
+import { loadReceiverConfig, reloadTriggers, triggersFilePath } from "../src/config.mjs";
 import { FORGE_KINDS } from "@pi-dispatch/worker/triggers";
 
 // A valid unified triggers file, injected: exists and parses to one of each webhook type. The exhaustive
@@ -184,12 +184,57 @@ test("a malformed RECEIVER_PORT is a config error, not a silent NaN", () => {
 	assert.throws(() => loadReceiverConfig({ WEBHOOK_SECRET: "shh", RECEIVER_PORT: "nope" }, validTriggers), (e) => e.piDispatchConfig === true);
 });
 
+// -- the triggers path default: ./triggers.json in the cwd, unified with `pi-dispatch init` (issue #80)
+
+test("the default triggers path is ./triggers.json -- the file init scaffolds, not the committed demo", () => {
+	// The old default (deploy/triggers.json) silently diverged from what `pi-dispatch init` writes, so a
+	// by-the-book setup read the repo's demo triggers instead of the operator's file. The recording fake
+	// pins which path the loader actually asks the filesystem about.
+	const seen = [];
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: (p) => { seen.push(p); return true; }, readFile: () => TRIGGERS_JSON });
+	assert.ok(seen.includes("./triggers.json"), `the loader must look for ./triggers.json; it asked for: ${seen.join(", ")}`);
+	assert.ok(!seen.includes("deploy/triggers.json"), "the committed demo file must no longer be a silent default");
+	assert.equal(c.triggers.github.label.length, 1, "the default path loads and groups like any other");
+});
+
+test("PI_TRIGGERS_FILE overrides the cwd default", () => {
+	const seen = [];
+	loadReceiverConfig({ WEBHOOK_SECRET: "shh", PI_TRIGGERS_FILE: "/etc/pi/triggers.json" }, { fileExists: (p) => { seen.push(p); return true; }, readFile: () => TRIGGERS_JSON });
+	assert.ok(seen.includes("/etc/pi/triggers.json"));
+	assert.ok(!seen.includes("./triggers.json"), "an explicit override must fully replace the default, not sit beside it");
+});
+
+test("triggersFilePath (what the live-reload watcher watches) reports the same default and override", () => {
+	// The watcher and the loader must agree on the path, or a reload would watch one file and read another.
+	assert.equal(triggersFilePath({}), "./triggers.json");
+	assert.equal(triggersFilePath({ PI_TRIGGERS_FILE: "/etc/pi/triggers.json" }), "/etc/pi/triggers.json");
+});
+
+test("unknown top-level keys in a triggers file are ignored -- deploy/triggers.json carries a _note", () => {
+	// deploy/triggers.json ships a top-level "_note" saying nothing reads it by default. The shared
+	// parseTriggers reads only `parsed.triggers`, so an annotated file must load unchanged; this pin is
+	// what keeps that note (or any future annotation) from ever becoming a boot failure.
+	const json = JSON.stringify({ _note: "an example file", triggers: [{ on: { type: "label", any: ["pi:x"] }, run: { kind: "github", flow: "fix" } }] });
+	const c = loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => true, readFile: () => json });
+	assert.equal(c.triggers.github.label.length, 1);
+	assert.equal(c.triggers.github.label[0].flow, "fix");
+});
+
 // -- the receiver surfaces the shared validator's errors fail-loud -------------------------------
 
 test("a missing triggers file is a config error -- no silent empty allowlist", () => {
 	assert.throws(
 		() => loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => false, readFile: () => "" }),
 		(e) => e.piDispatchConfig === true,
+	);
+});
+
+test("the missing-file error says what to DO: init here, or point PI_TRIGGERS_FILE at yours", () => {
+	// A fresh operator hits this exact error first (empty folder, no scaffold yet), so the message is
+	// the onboarding: it must name the path it tried and both ways out.
+	assert.throws(
+		() => loadReceiverConfig({ WEBHOOK_SECRET: "shh" }, { fileExists: () => false, readFile: () => "" }),
+		(e) => e.piDispatchConfig === true && e.message.includes("./triggers.json") && /pi-dispatch init/.test(e.message) && /PI_TRIGGERS_FILE/.test(e.message),
 	);
 });
 

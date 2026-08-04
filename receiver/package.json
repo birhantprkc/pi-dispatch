@@ -4,6 +4,15 @@
   "private": true,
   "type": "module",
   "main": "src/start.mjs",
+  "bin": {
+    "pi-dispatch-receiver": "src/cli.mjs"
+  },
+  "exports": {
+    "./start": "./src/start.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\""
   },
