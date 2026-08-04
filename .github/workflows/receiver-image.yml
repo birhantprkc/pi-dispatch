@@ -10,6 +10,9 @@
 # No secret required: GHCR auth uses the built-in GITHUB_TOKEN (packages: write). One-time after the first
 # successful run: make the ghcr.io/edgehero/pi-dispatch-receiver package Public in the org's package
 # settings, otherwise `docker pull` needs auth.
+#
+# Tags: `latest`, the git `sha`, and the PRODUCT version from the root package.json (so a release cuts a
+# tag that never moves, and a deployment can pin `ghcr.io/edgehero/pi-dispatch-receiver:<version>` instead of tracking latest).
 
 name: receiver-image
 
@@ -21,6 +24,7 @@ on:
       - "worker/src/**"
       - "worker/package.json"
       - "package-lock.json"
+      - "package.json" # the ROOT one: a product version bump republishes under its own tag
       - ".github/workflows/receiver-image.yml"
   # Manual re-run (available once this file is on the default branch).
   workflow_dispatch: {}
@@ -51,6 +55,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve the product version (the tag operators can pin)
+        id: v
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Tags + labels
         id: meta
         uses: docker/metadata-action@v5
@@ -58,6 +66,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
+            type=raw,value=${{ steps.v.outputs.version }}
             type=sha
 
       - name: Build + push (amd64 + arm64)

@@ -118,7 +118,9 @@ be in the overlay. Never place the admin extension there (it can enqueue paid jo
 
 ## Packages (pinned, per-trigger)
 
-A **pi package** is third-party code from npm that contributes extensions, skills, prompts and themes. Every
+A **pi package** is third-party code from npm that contributes extensions, skills, prompts and themes. This
+is also the road a **workflow extension** takes into a job, and what a workflow can and cannot keep across
+jobs is its own reference: [`workflows.md`](workflows.md). Every
 job runs with `PI_OFFLINE=1`, which makes pi's resolver **refuse to shell out to npm**, so a package cannot
 be installed at job time: you stage it on **your host**, into the overlay, and a trigger opts in. Note what
 is doing the work here. The container's network is **not** cut off (egress is open, as above, and

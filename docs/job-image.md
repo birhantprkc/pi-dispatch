@@ -36,6 +36,12 @@ a second thing to forget to bump. Re-declare only a label whose truth your layer
 single re-declared `dev.pi-dispatch.forges` with `azure` appended (see
 [azure-devops.md](azure-devops.md), which also names the `--build-arg BASE=…` you need).
 
+**Pin the base if you would rather not track `latest`.** Every published build also carries the **product
+version** as a tag (`ghcr.io/edgehero/pi-job:0.8.0`) and the git `sha`, and neither ever moves, while
+`latest` follows `main`. The receiver image is tagged the same way. A pinned base is the honest choice for a
+derived image whose layer assumes something about the base; the cost is that a pin does not pick up a
+security rebuild, so bump it deliberately.
+
 **Copy `image/Dockerfile` and add to it.** You inherit every property in the checklist below for free, and
 the only thing you own is your own `RUN apt-get install …` layer. Prefer this over the layer above only when
 you need to change something *inside* the base build (a different base distro, a different pi pin).
