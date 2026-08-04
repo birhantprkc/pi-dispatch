@@ -1871,6 +1871,50 @@ worker reads.
   file — the only reader is the admin extension. Given a duplicate `id` or an out-of-charset glob, when
   written through `writeSubscriptions`, then the write is rejected and the file is unchanged.
 
+## INT-DEPLOYMENT-POINTER-CONTRACT
+
+**setup wizard → admin extension.** The one file that lets `/dispatch` find a deployment built
+somewhere else. The worker and the receiver **never read it** — their truth is their own env (the
+deploy dir's `.env`, loaded by the service units/wrappers); the pointer only aims the *admin* at the
+same files. On drift the failure mode is the panel editing files the services do not read, and the
+recorded repair is re-running `/dispatch setup` (or editing the pointer by hand).
+
+- **Location**: `PI_DISPATCH_DEPLOYMENT_FILE`, defaulting to
+  `<PI_CODING_AGENT_DIR or ~/.pi/agent>/pi-dispatch-deployment.json` — pi's own agent dir, the
+  repo's one established home-dir pattern; a bespoke `~/.pi-dispatch/` tree is exactly the layout
+  invention this spec warns against elsewhere. Absent = `{ absent }`, the normal pre-wizard state.
+- **Shape**: `{ "version": 1, "deploymentDir": "<abs>", "env": { … } }`. `version` (required):
+  integer ≥ 1 — the one field that cannot be retrofitted. `env` is an **allowlisted map**:
+  `VALKEY_URL`, `PI_LOGS_DIR`, `PI_SETTINGS_FILE`, `PI_TRIGGERS_FILE`, `PI_PAUSE_WINDOWS_FILE`,
+  `PI_SUBSCRIPTIONS_FILE`; every path value must be **absolute** (a relative value would resolve
+  against whichever session happens to read it, i.e. silently wrong — dropped).
+- **What it may never carry, enforced by the read-side allowlist**: credentials of any kind, and
+  capability grants — `PI_DISPATCH_RUN_ROOTS` in this file has **no effect**, because a pointer that
+  could widen the AI-run allowlist would be a second, unreviewed door to a capability the panel
+  deliberately gates. The pointer resolves paths, full stop.
+- **Validation**: unknown top-level fields and unknown/disallowed env keys are silently dropped
+  (the operator-file policy); an unparseable file, a non-object, a missing/invalid `version`, or
+  `version` **higher** than the build's ⇒ the whole file is **ignored** and a one-line notice is
+  surfaced on the next `/dispatch` (naming both versions in the newer-file case). This is
+  deliberately weaker than `INT-SUBSCRIPTIONS-FILE-CONTRACT`'s loud refusal, and the reconciliation
+  is recorded here: the admin's read-model doctrine is *never throw, always degrade* — a broken
+  pointer must leave `/dispatch` exactly as functional as before the pointer existed (env → cwd
+  defaults), so fail-loud-on-newer becomes a **surfaced notice, never a throw**.
+- **Application**: layered into the process env once at extension load — **the operator's own env
+  always wins**, key by key; a later in-process re-apply (after the wizard rewrites the file) may
+  update only keys the pointer itself set, never one the operator exported. `resolvePaths` itself
+  stays env-only and untouched.
+- **Write protocol**: the wizard writes it behind a confirm showing the JSON verbatim; validated
+  through the same normalizer (a rejected pointer is never written), atomic tmp + rename;
+  hand-editable thereafter.
+- **Enforcement**: none at job time — no service reads it, no job input derives from it.
+- **Acceptance**: Given a pointer naming `PI_TRIGGERS_FILE` while the operator's env also sets it,
+  the env value is used. Given `version: 2`, `/dispatch` behaves as if no pointer existed and
+  surfaces one notice naming versions 2 and 1. Given `PI_DISPATCH_RUN_ROOTS` or a provider key in
+  `env`, the key is dropped and `dispatch_run`'s allowlist is unchanged. Given a relative
+  `PI_LOGS_DIR` value, the key is dropped. Given a deleted pointer, the next pi session resolves
+  exactly as today.
+
 ## INT-PRICING-EXPORT-CONTRACT
 
 **worker → admin extension.**
@@ -1915,6 +1959,7 @@ worker reads.
 
 | Date | Change |
 |---|---|
+| 2026-08-04 | The panel learns to find a deployment built elsewhere (issue #92). Added **INT-DEPLOYMENT-POINTER-CONTRACT**: `<agent dir>/pi-dispatch-deployment.json` (override `PI_DISPATCH_DEPLOYMENT_FILE`), an allowlisted absolute-paths-only env map layered UNDER the operator's env once at extension load — env wins key by key, the worker/receiver never read it, and `PI_DISPATCH_RUN_ROOTS`/credentials in the file have no effect by construction (a pointer that widened the AI-run allowlist would be a second unreviewed door to a gated capability). Deliberate divergence from INT-SUBSCRIPTIONS' loud version refusal, recorded in the entry: a broken/newer pointer degrades to exactly the pre-pointer behavior with a one-line surfaced notice, never a throw — the read-model's never-throw doctrine outranks fail-loud here because the pointer is an availability aid, not a data file. **INT-SUBSCRIPTIONS-FILE-CONTRACT / INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: the pointer changes how their Locations are *found*, not what the files contain. |
 | 2026-08-02 | Polling producer (issue #81). **INT-WEBHOOK-PAYLOAD-SUBSET** amended: the subset may be synthesized from REST objects by `pi-dispatch-receiver poll` (`DES-GH-POLLING-TRANSPORT`), feeding the same pure `filter()` — parity pinned by dual-form tests; `poll-*` delivery ids share the `gh-` dedup space disjointly; the headers/HMAC row explicitly does not apply to synthesized subsets (no inbound delivery exists — TLS + the operator's credential is the transport trust). **REQ-DEDUP-BY-DELIVERY-GUID UNCHANGED, checked**: poll ids are stable across poller restarts by construction (event id / comment id / PR+head-sha), which is the retry-stability property the REQ demands of any id source. **INT-GITLAB/FORGEJO/AZURE-PAYLOAD-SUBSET UNCHANGED, checked**: polling is GitHub-only in this slice. |
 | 2026-08-02 | Receiver start path + triggers-default unification (issue #80). **INT-TRIGGERS-FILE-CONTRACT** amended: the receiver no longer *requires* `PI_TRIGGERS_FILE` — it falls back to `./triggers.json` in its working directory, the exact file `pi-dispatch init` scaffolds, and refuses to start when neither exists. The old default was the committed `deploy/triggers.json` (live demo triggers): an operator who edited the init scaffold and started the receiver without the env var silently ran the demo rules — a cwd default makes the reviewed file the operator just edited the one that fires. The admin extension's `resolvePaths` moves to the same cwd defaults for triggers/pause-windows/subscriptions (**INT-SUBSCRIPTIONS-FILE-CONTRACT** Location updated; **INT-PAUSE-WINDOWS-FILE-CONTRACT** UNCHANGED, checked — its Location is env-or-off for the *worker*, and the admin default is not part of that contract's shape). The receiver also gains its own bin, `pi-dispatch-receiver` (`receiver/src/cli.mjs`, `serve` by default): a `receiver` case in the worker CLI would invert the receiver→worker workspace dependency, and until now the only start command on record was inside `deploy/receiver.service`. **INT-WEBHOOK-PAYLOAD-SUBSET UNCHANGED, checked**: the bin changes how the process starts, not what it accepts or enqueues. |
 | 2026-08-01 | Pricing façade (issue #53, gaps 4/5 groundwork). Added **INT-PRICING-EXPORT-CONTRACT**: the worker's `./pricing` export is the admin's ONLY road to pi-ai's rate tables — `listPricedModels`/`getPricedModel`/`isZeroRated`/`piAiVersion`/`reprice`. Stream-time cost on the record stays the metered truth; the façade prices COUNTERFACTUALS only. `reprice` builds a fresh `Usage` with a zeroed cost skeleton every call (pi-ai's `calculateCost` mutates in place and TypeErrors without one — both pinned by test), inherits pi-ai's tier selection and 1h premium, and makes exactly one judgment: `cacheWrite1h` forwards only to `anthropic` targets, folded short for everyone else, because the premium is an Anthropic billing rule and applying it elsewhere would invent cost. The admin deliberately does NOT grow its own pi-ai pin (a fourth pin, a second drift axis); enumeration goes through the side-effect-free `providers/all`, never `./compat`. Enforcement is the pinned-artifact guard in `worker/test/pricing.test.mjs` — a pin bump that reshapes pricing fails the BUILD, not the screen. |

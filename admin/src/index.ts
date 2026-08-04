@@ -61,6 +61,11 @@ import {
   readSubscriptions,
   KNOWN_KEYS,
 } from "./read-model.mjs";
+// The deployment pointer (INT-DEPLOYMENT-POINTER-CONTRACT): the wizard-written file that aims this
+// extension at a deployment built in another directory. Layered into process.env once at factory load
+// (the operator's env always wins), so resolvePaths stays env-only by contract while every one of its
+// call sites below is covered without a signature change.
+import { applyDeploymentPointer, takePointerNotice } from "./deployment-pointer.mjs";
 import { foldCosts, whatIfFlow } from "./costs.mjs";
 // The REAL pricing façade. costs.mjs may not hold a module-scope worker/pricing import by contract (the
 // fold is pure; tests inject a canned fake) -- index.ts is where the fs-adjacent assembly lives, so the
@@ -111,6 +116,21 @@ export default function admin(pi: ExtensionAPI): void {
       );
       return;
     }
+  }
+
+  // Layer the setup wizard's deployment pointer into process.env exactly once, before anything can call
+  // resolvePaths(process.env). Placement matters twice over: AFTER the capability probe, so a refused
+  // load stays a complete no-op (an extension that registers nothing must not mutate the env either);
+  // and at the FACTORY top rather than inside the /dispatch handler, because resolvePaths runs
+  // per-command AND per LLM tool call -- an operator who never types /dispatch but lets the model call
+  // dispatch_status still needs the pointer's paths in place before the first resolve. The try/catch is
+  // the never-throw doctrine: an extension factory must never fail to load over a bad pointer file; the
+  // retained notice (surfaced on the next /dispatch) is the error channel, not an exception.
+  try {
+    applyDeploymentPointer();
+  } catch {
+    // Deliberately swallowed: applyDeploymentPointer degrades internally ({ ignored } + notice), so
+    // anything reaching here is unexpected -- and still must not take the whole extension down.
   }
 
   pi.registerCommand("dispatch", {
@@ -716,6 +736,12 @@ async function dispatch(pi: ExtensionAPI, args: string, ctx: any): Promise<void>
   // draws through panel.mjs' active table, and this is the one funnel all subcommands pass through. The
   // dashboard's own styler keeps its default for now -- its `ascii` opt-in lands when the view PR settles.
   setGlyphs(paths.asciiGlyphs);
+
+  // Drain the deployment pointer's retained one-line notice (a broken or newer pointer file) into the
+  // operator's face exactly once -- the REBUILT_NOTICE idiom: a surfaced warning, never a throw, and
+  // never into model context.
+  const pnote = takePointerNotice();
+  if (pnote) notify?.(pnote, "warning");
 
   if (sub === "") {
     await openDashboard(paths, ctx, notify);
