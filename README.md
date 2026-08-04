@@ -27,8 +27,8 @@ system. pi-dispatch is exactly that missing operational layer, and nothing else:
   it ships Playwright and Chromium, so a flow can build a frontend, screenshot it, and iterate on the
   rendered result. Any trigger can name its own image with `run.image`
   ([`docs/job-image.md`](docs/job-image.md)).
-- **Three triggers, one job.** A CLI command, a cron schedule, or a forge event: same queue, same box,
-  same panel.
+- **Three ways in, one job.** A CLI command, a cron schedule, or a forge event: same queue, same box,
+  same panel. The full trigger reference is the [next section](#triggers).
 - **Your project steers it** through pi's native `.pi/skills` and persona, from your committed files,
   over a small immutable safety floor the agent cannot remove.
 
@@ -79,6 +79,163 @@ you run; a name the host does not have is refused before the job costs anything.
 > bare npm name `pi-dispatch` belongs to an unrelated package (see [License](#license)), so outside a
 > checkout always use the scoped form.
 
+## Triggers
+
+**This is what starts a job.** Everything further down is the box those jobs run in and the panel you watch
+them from. All standing triggers live in one `triggers.json`, read live by the worker (cron) and the
+receiver (forges), and editable from the panel:
+
+```jsonc
+{ "triggers": [
+  { "on": { "type": "cron", "id": "nightly", "pattern": "0 3 * * *" },
+    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy" } },
+  { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
+  { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
+  { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } },
+  { "on": { "type": "label", "any": ["pi:fix"] },                   "run": { "kind": "gitlab", "flow": "fix" } }
+] }
+```
+
+### The four trigger types: what fires each one, and what it runs
+
+pi-dispatch is the trigger layer. Every entry is one `{ on, run }` pair: **`on` is what fires it**, and
+**`run` is the skill it runs** (`flow` names a `.pi/skills/<flow>` in the target repo: see
+[Flows](#flows-the-custom-prompt-a-trigger-runs) for what that file is, and
+[Multi-stage workflows](#multi-stage-workflows-and-third-party-pi-extensions) for chaining skills or
+staging a workflow extension).
+
+| `on.type` | Fires on | Required in `on` | What narrows it | What the agent gets as its task |
+|---|---|---|---|---|
+| `cron` | your schedule | `id` (unique, no `:`) · `pattern` (5 or 6 cron fields) | nothing: a schedule is its own condition | `run.task`, written in the file |
+| `label` | a label on an **issue** (or an Azure work item), never a pull request | at least one positive selector, `any` or `all` | the label **predicate**: `any` (any of these) · `all` (all of them) · `none` (suppress-only, it can prevent a fire but never cause one) | the issue title and body |
+| `comment` | a comment containing your phrase | `phrase`, for example `@pi` | the phrase, and **one comment trigger per forge** | the comment body plus the issue title and body |
+| `pull_request` | a PR or MR event | `action`, a non-empty array in your forge's own words | `action`, plus the same label predicate; where the forge has a label action and you name it, a positive selector becomes **required** | the PR title and body |
+
+Every type also needs `run.kind` (`local` for cron, else the forge) and `run.flow`. Cron additionally
+needs `folder` (a host path the worker checks exists when it loads the file; make it absolute, since a
+relative path resolves against the worker's own directory) and `task`. Azure `label` and `comment`
+triggers need `run.repository`, because a work item belongs to a project and names no repository.
+
+Two matching behaviours worth knowing before you arm a paid trigger:
+
+- **A comment can choose the flow.** `<phrase> <flow>` in the comment body overrides the trigger's
+  `run.flow` whenever that word matches another trigger's flow in the same file, so `run.flow` is a
+  default rather than a fixed pairing.
+- **Label triggers match differently per forge.** GitHub and Forgejo match the issue's **whole current
+  label set**, so reopening an already-labelled issue, or adding an unrelated label to one, fires
+  again. GitLab and Azure match only the labels **that event added**, which is exactly why they do not
+  re-fire that way.
+
+`action` words are each forge's own vocabulary, validated at load so a word from the wrong forge is
+refused rather than silently never matching:
+
+| `run.kind` | `pull_request` actions | Its label action | Notes |
+|---|---|---|---|
+| `github` | `labeled` `opened` `synchronize` `reopened` | `labeled` | |
+| `gitlab` | `open` `update` `reopen` `approved` | none | a label add arrives as `update` carrying a label diff; a predicate here matches the labels that update added |
+| `forgejo` | `label_updated` `opened` `synchronized` `reopened` | `label_updated` | `label_cleared` fires nothing, ever: removing a label must never start a paid run |
+| `azure` | `created` `updated` | none | a label predicate on an Azure PR is refused at load: Azure tags work items, never pull requests |
+
+**Who may fire a trigger is not ours to grant.** Your forge decides that, differently per forge, and
+[`SECURITY.md`](SECURITY.md) states each one plainly (short version: on GitHub only collaborators can
+apply a label, which is why the label *is* the approval there; GitLab, Forgejo and Azure resolve the
+actor's permission through their APIs because a label proves less on those). The always-on gates that
+every delivery passes, none of them per-trigger, are the signature check, the bot-loop guard, that
+permission check, dedup, quiet hours, the image preflight, branch protection, and the spend caps.
+
+### Optional `run` fields
+
+Each is a deliberate file-only edit (no panel key, no AI tool, because each one changes what code runs
+or what it costs):
+
+- `"image"` names the container image for that trigger's jobs; absent means `PI_JOB_IMAGE`. The image
+  decides what is in the box, never what the box can do: the isolation flags are the worker's, always
+  ([`docs/job-image.md`](docs/job-image.md)).
+- `"packages": false` opts one trigger out of the staged third-party pi packages, which is also how a
+  workflow extension is withheld from one flow ([`docs/workflows.md`](docs/workflows.md)).
+- `"replicas": 2` (GitHub only) races independent sandboxes on the same event and opens one PR per
+  replica. Each replica spends its own budget slot ([`docs/replicas.md`](docs/replicas.md)).
+- `"resume": true` continues the session that opened the PR ([`docs/sessions.md`](docs/sessions.md)).
+- `"github": true` on a cron trigger mints the same per-job GitHub token the webhook path gets, so a
+  scheduled flow can use `gh`.
+
+Everything else is editable from the panel (`a` adds kind-first, `e` edits the flow, `x` deletes) or via
+the confirm-gated AI tools; every write is validated and both services reload it live. Every local job
+also receives a read-only `/job/event.json` (source, folder, HEAD sha; cron adds its id, pattern and
+schedule instants), so a scheduled flow can triage only what changed since its last run.
+
+### Quiet hours
+
+Pause a specific repo or folder between certain times (recurring, weekday- or date-bounded,
+timezone-aware) and resume automatically. A paused job is deferred, never dropped, and spends nothing:
+
+```json
+{ "windows": [
+  { "scope": "acme/web", "from": "22:00", "to": "06:00", "tz": "Europe/Amsterdam", "days": ["mon","tue","wed","thu","fri"] }
+] }
+```
+
+Manage them with `w` in the panel or `PI_PAUSE_WINDOWS_FILE` by hand
+([`docs/pause-windows.md`](docs/pause-windows.md)).
+
+## Flows: the custom prompt a trigger runs
+
+A **flow** is a pi skill committed to the target repo at `.pi/skills/<flow>/SKILL.md`. That file is the
+custom prompt; a trigger only names which flow to run, so different repos define the same flow name their
+own way:
+
+```markdown
+<!-- .pi/skills/tidy/SKILL.md -->
+---
+name: tidy
+description: Format, fix lint, and tighten types across the repo.
+ai-trigger: allow        # opt-in for AI-INITIATED runs only (the dispatch_run tool, job chaining). Default deny.
+---
+
+Run the formatter and linter and fix what they report; tighten obvious type holes.
+Keep the diff minimal and open a PR titled "tidy: <what changed>". Do not change behavior.
+```
+
+The flow is the standing instructions; the **task** is the one-off ask (your `--task`, a trigger's
+`task`, or the issue/comment text itself). Flows are read from the **default branch**, so commit and
+merge a flow before a trigger can use it. That merge is the repo's consent.
+
+**`ai-trigger` gates a different axis, and it is worth being precise about which.** It answers *which
+flows a model may fire*, not *who may fire a job*. Only two paths read it: the model-callable
+`dispatch_run` tool and job chaining (a finished job requesting a follow-up). A cron entry or a forge
+trigger in your reviewed `triggers.json` runs its named flow whether or not the frontmatter carries the
+line, because a human already approved that pairing by writing the file. Omitting the line does **not**
+stop a label or comment trigger from firing. Who may fire a forge trigger is a separate gate entirely,
+described under [Triggers](#triggers) above.
+
+### Multi-stage workflows, and third-party pi extensions
+
+A flow is one skill, and a skill may call other skills, so the simplest workflow here is just that chain
+running inside one job. For something more structured, **pi extensions stage into the deployment and load
+in every job container.** Declare an exact version, stage it once on the host, and it is present offline:
+
+```jsonc
+// pi-packages.json
+{ "packages": [ { "name": "@juicesharp/rpiv-workflow", "version": "2.4.0" } ] }
+```
+
+```bash
+pi-dispatch import-pi --with-packages   # installs on the host, always --ignore-scripts, into ./pi-global/packages/
+```
+
+That example is a real pi extension: it chains skills into typed multi-stage workflows with per-stage
+output validation and append-only JSONL state. pi-dispatch does not integrate it specially, and that is
+the point. **Any package whose `package.json` carries a `pi` manifest stages the same way**, and one
+staged directory can contribute extensions, skills, prompts and themes at once.
+
+What the deployment provides is the plumbing and the limits: no network at job time (so nothing installs
+inside a job, which is why staging exists), exact versions only, package code loaded **last** so it can
+never shadow your repo's own skills, any extension that tries to register a `dispatch_*` tool dropped,
+and `"packages": false` on any trigger that must not load it.
+
+Where a workflow's own state lives is the part worth reading before you build on it, because it differs
+between a cron job and a forge job: [`docs/workflows.md`](docs/workflows.md).
+
 ## What runs, and what protects you
 
 ```mermaid
@@ -115,7 +272,8 @@ Three properties worth knowing, each with a full reference:
   ([`docs/global-pi-overlay.md`](docs/global-pi-overlay.md)).
 - **Third-party pi packages are pinned once, declinable per trigger.** Declare exact versions in
   `pi-packages.json`, stage with `import-pi --with-packages` (always `--ignore-scripts`), opt any
-  trigger out with `"packages": false`.
+  trigger out with `"packages": false`. This is also how a workflow extension reaches a job
+  ([`docs/workflows.md`](docs/workflows.md)).
 - **Sessions can continue instead of restarting.** `"resume": true` on a trigger makes follow-up jobs
   continue the session that opened the pull request. It persists the full transcript to disk, which is
   a real disclosure: read [`docs/sessions.md`](docs/sessions.md) before enabling it.
@@ -185,130 +343,6 @@ trigger. One tool is deliberately not money-safe: `dispatch_run` enqueues a paid
 bounded instead by six independent limits (folder allowlist, the committed `ai-trigger: allow` opt-in,
 the dirty-tree refusal, no spend knobs, a rate limit, and the daily cap). Raw job logs render in the
 overlay only and never enter model context.
-
-## Flows: the custom prompt a trigger runs
-
-A **flow** is a pi skill committed to the target repo at `.pi/skills/<flow>/SKILL.md`. That file is the
-custom prompt; a trigger only names which flow to run, so different repos define the same flow name their
-own way:
-
-```markdown
-<!-- .pi/skills/tidy/SKILL.md -->
----
-name: tidy
-description: Format, fix lint, and tighten types across the repo.
-ai-trigger: allow        # opt-in for AI-INITIATED runs only (the dispatch_run tool, job chaining). Default deny.
----
-
-Run the formatter and linter and fix what they report; tighten obvious type holes.
-Keep the diff minimal and open a PR titled "tidy: <what changed>". Do not change behavior.
-```
-
-The flow is the standing instructions; the **task** is the one-off ask (your `--task`, a trigger's
-`task`, or the issue/comment text itself). Flows are read from the **default branch**, so commit and
-merge a flow before a trigger can use it. That merge is the repo's consent.
-
-**`ai-trigger` gates a different axis, and it is worth being precise about which.** It answers *which
-flows a model may fire*, not *who may fire a job*. Only two paths read it: the model-callable
-`dispatch_run` tool and job chaining (a finished job requesting a follow-up). A cron entry or a forge
-trigger in your reviewed `triggers.json` runs its named flow whether or not the frontmatter carries the
-line, because a human already approved that pairing by writing the file. Omitting the line does **not**
-stop a label or comment trigger from firing. Who may fire a forge trigger is a separate gate entirely,
-described under Triggers below.
-
-## Triggers
-
-All standing triggers live in one `triggers.json`, read by the worker (cron) and the receiver (forges):
-
-```jsonc
-{ "triggers": [
-  { "on": { "type": "cron", "id": "nightly", "pattern": "0 3 * * *" },
-    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy" } },
-  { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
-  { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
-  { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } },
-  { "on": { "type": "label", "any": ["pi:fix"] },                   "run": { "kind": "gitlab", "flow": "fix" } }
-] }
-```
-
-### The four trigger types: what fires each one, and what it runs
-
-pi-dispatch is the trigger layer. Every entry is one `{ on, run }` pair: **`on` is what fires it**, and
-**`run` is the skill it runs** (`flow` names a `.pi/skills/<flow>` in the target repo, so a workflow is
-whatever that skill, and the skills it calls, do).
-
-| `on.type` | Fires on | Required in `on` | What narrows it | What the agent gets as its task |
-|---|---|---|---|---|
-| `cron` | your schedule | `id` (unique, no `:`) · `pattern` (5 or 6 cron fields) | nothing: a schedule is its own condition | `run.task`, written in the file |
-| `label` | a label on an **issue** (or an Azure work item), never a pull request | at least one positive selector, `any` or `all` | the label **predicate**: `any` (any of these) · `all` (all of them) · `none` (suppress-only, it can prevent a fire but never cause one) | the issue title and body |
-| `comment` | a comment containing your phrase | `phrase`, for example `@pi` | the phrase, and **one comment trigger per forge** | the comment body plus the issue title and body |
-| `pull_request` | a PR or MR event | `action`, a non-empty array in your forge's own words | `action`, plus the same label predicate; where the forge has a label action and you name it, a positive selector becomes **required** | the PR title and body |
-
-Every type also needs `run.kind` (`local` for cron, else the forge) and `run.flow`. Cron additionally
-needs `folder` (a host path the worker checks exists when it loads the file; make it absolute, since a
-relative path resolves against the worker's own directory) and `task`. Azure `label` and `comment`
-triggers need `run.repository`, because a work item belongs to a project and names no repository.
-
-Two matching behaviours worth knowing before you arm a paid trigger:
-
-- **A comment can choose the flow.** `<phrase> <flow>` in the comment body overrides the trigger's
-  `run.flow` whenever that word matches another trigger's flow in the same file, so `run.flow` is a
-  default rather than a fixed pairing.
-- **Label triggers match differently per forge.** GitHub and Forgejo match the issue's **whole current
-  label set**, so reopening an already-labelled issue, or adding an unrelated label to one, fires
-  again. GitLab and Azure match only the labels **that event added**, which is exactly why they do not
-  re-fire that way.
-
-`action` words are each forge's own vocabulary, validated at load so a word from the wrong forge is
-refused rather than silently never matching:
-
-| `run.kind` | `pull_request` actions | Its label action | Notes |
-|---|---|---|---|
-| `github` | `labeled` `opened` `synchronize` `reopened` | `labeled` | |
-| `gitlab` | `open` `update` `reopen` `approved` | none | a label add arrives as `update` carrying a label diff; a predicate here matches the labels that update added |
-| `forgejo` | `label_updated` `opened` `synchronized` `reopened` | `label_updated` | `label_cleared` fires nothing, ever: removing a label must never start a paid run |
-| `azure` | `created` `updated` | none | a label predicate on an Azure PR is refused at load: Azure tags work items, never pull requests |
-
-**Who may fire a trigger is not ours to grant.** Your forge decides that, differently per forge, and
-[`SECURITY.md`](SECURITY.md) states each one plainly (short version: on GitHub only collaborators can
-apply a label, which is why the label *is* the approval there; GitLab, Forgejo and Azure resolve the
-actor's permission through their APIs because a label proves less on those). The always-on gates that
-every delivery passes, none of them per-trigger, are the signature check, the bot-loop guard, that
-permission check, dedup, quiet hours, the image preflight, branch protection, and the spend caps.
-
-### Optional `run` fields
-
-Each is a deliberate file-only edit (no panel key, no AI tool, because each one changes what code runs
-or what it costs):
-
-- `"image"` names the container image for that trigger's jobs; absent means `PI_JOB_IMAGE`. The image
-  decides what is in the box, never what the box can do: the isolation flags are the worker's, always
-  ([`docs/job-image.md`](docs/job-image.md)).
-- `"packages": false` opts one trigger out of the staged third-party pi packages.
-- `"replicas": 2` (GitHub only) races independent sandboxes on the same event and opens one PR per
-  replica. Each replica spends its own budget slot ([`docs/replicas.md`](docs/replicas.md)).
-- `"resume": true` continues the session that opened the PR ([`docs/sessions.md`](docs/sessions.md)).
-- `"github": true` on a cron trigger mints the same per-job GitHub token the webhook path gets, so a
-  scheduled flow can use `gh`.
-
-Everything else is editable from the panel (`a` adds kind-first, `e` edits the flow, `x` deletes) or via
-the confirm-gated AI tools; every write is validated and both services reload it live. Every local job
-also receives a read-only `/job/event.json` (source, folder, HEAD sha; cron adds its id, pattern and
-schedule instants), so a scheduled flow can triage only what changed since its last run.
-
-### Quiet hours
-
-Pause a specific repo or folder between certain times (recurring, weekday- or date-bounded,
-timezone-aware) and resume automatically. A paused job is deferred, never dropped, and spends nothing:
-
-```json
-{ "windows": [
-  { "scope": "acme/web", "from": "22:00", "to": "06:00", "tz": "Europe/Amsterdam", "days": ["mon","tue","wed","thu","fri"] }
-] }
-```
-
-Manage them with `w` in the panel or `PI_PAUSE_WINDOWS_FILE` by hand
-([`docs/pause-windows.md`](docs/pause-windows.md)).
 
 ## GitHub automation
 

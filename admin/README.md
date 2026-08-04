@@ -33,6 +33,21 @@ Every trigger produces the same job, through the same path: one queue, one conta
 
 The container is the boundary (pi's missing permission system, enforced by Docker). Those isolation flags are built by the worker's own `docker run` argv, so nothing an image contains can weaken them; the non-root user is a property of the **image**, which is why an image has to meet the conformance checklist in [`docs/job-image.md`](https://github.com/edgehero/pi-dispatch/blob/main/docs/job-image.md). Spend is checked before a container starts, so a runaway or a junk trigger costs a refusal, not a surprise bill. The job image is yours to shape, per deployment or per trigger, and it ships Playwright and Chromium so a flow can build a frontend, screenshot it, and iterate on the render.
 
+## Triggers: what starts a job
+
+Every trigger is one `{ on, run }` entry in a single `triggers.json`, read live by the worker (cron) and the receiver (forge webhooks), and editable from the console. **`on` is what fires it; `run` is the skill it runs.**
+
+| `on.type` | Fires on | What narrows it | What the agent gets as its task |
+|---|---|---|---|
+| `cron` | your schedule | nothing: a schedule is its own condition | the `task` written in the file |
+| `label` | a label on an **issue** (or an Azure work item), never a pull request | a label predicate: `any`, `all`, or `none` (which can suppress a fire, never cause one) | the issue title and body |
+| `comment` | a comment containing your phrase, for example `@pi` | the phrase, and one comment trigger per forge | the comment body, plus the issue title and body |
+| `pull_request` | a PR or MR event | `action`, in your forge's own words, plus the same label predicate | the PR title and body |
+
+Four forges: GitHub, GitLab, Forgejo (and Gitea), Azure DevOps. **Who may fire a trigger is your forge's decision, not this service's**: on GitHub the label *is* the approval, because only collaborators can apply one, while GitLab, Forgejo and Azure resolve the actor's permission through their APIs. Each forge's action vocabulary is validated when the file loads, so a word from the wrong forge is refused instead of silently never matching.
+
+**Flows, and workflows.** `run.flow` names a skill committed to the target repo at `.pi/skills/<flow>/SKILL.md`, read from the **default branch**, so the repo owns the prompt and merging it is the repo's consent. A skill may call other skills, which is already a workflow. For typed multi-stage ones, a pi extension such as `@juicesharp/rpiv-workflow` can be staged into the deployment: pinned to an exact version, installed on your host (never at job time, since jobs run offline), loaded in every container, and declinable per trigger. See [`docs/workflows.md`](https://github.com/edgehero/pi-dispatch/blob/main/docs/workflows.md).
+
 ## The console: `/dispatch`
 
 One command puts a live TUI over the whole deployment:
