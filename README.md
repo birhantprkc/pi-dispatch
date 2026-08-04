@@ -212,7 +212,32 @@ described under [Triggers](#triggers) above.
 
 A flow is one skill, and a skill may call other skills, so the simplest workflow here is just that chain
 running inside one job. For something more structured, **pi extensions stage into the deployment and load
-in every job container.** Declare an exact version, stage it once on the host, and it is present offline:
+in every job container**, pinned to an exact version and present offline.
+
+**How a workflow gets triggered: nothing new fires it.** The chain is always the same, and every stage
+runs inside the one job the trigger produced:
+
+```text
+label / comment / PR / cron  ->  one job, one container  ->  run.flow (a skill)  ->  the skills it calls,
+                                                                                     or a workflow extension
+```
+
+Four basics follow from that shape:
+
+- **`run.flow` is the only entry point.** A trigger names a flow, never a workflow. Which stages run, and
+  in what order, is decided inside the job by that skill.
+- **A job is not an interactive session.** The container hands pi one assembled prompt and reads the exit
+  line, so a workflow extension's slash command (`/wf`, in the example below) has nobody to type it. In a
+  job a workflow starts because the flow's instructions drive it, or because you also staged a small
+  extension that calls the workflow API from a lifecycle hook.
+- **One trigger is one job, one budget slot, one turn budget.** Ten stages share the same `PI_MAX_TURNS`
+  and the same per-job token budget; exhausting either aborts the job as a policy refusal that is never
+  retried. Budget for the whole chain, not per stage.
+- **Whether state survives depends on the trigger kind.** A cron or CLI job has your folder mounted
+  read-write, so a workflow's own state persists between runs. A forge job gets a fresh clone, so it does
+  not.
+
+Staging is the setup, and it happens once on the host:
 
 ```jsonc
 // pi-packages.json

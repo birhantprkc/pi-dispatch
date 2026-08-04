@@ -16,6 +16,57 @@ skills, or a pi extension that orchestrates them.
 | **workflow extension** | a pi extension that chains skills into stages, with its own state and routing | a third party, staged by you |
 | **staged package** | the pinned directory a workflow extension lives in, inside the global overlay | `import-pi --with-packages` |
 
+## How a workflow gets triggered
+
+Nothing in a workflow fires itself. A pi-dispatch trigger is the only thing that starts work, and it always
+produces the same shape:
+
+```text
+label / comment / PR / cron        one delivery, one dedup key
+        |
+        v
+one job, one container            one budget slot, one turn budget, one transcript
+        |
+        v
+run.flow                          the skill the trigger names, read from the default branch
+        |
+        v
+the skills it calls, or a staged workflow extension
+```
+
+Four properties of that chain decide what is possible inside it.
+
+**`run.flow` is the only entry point.** There is no `run.workflow` and there is not going to be one. Which
+stages run is a property of the repo's own skill, which the repo changes by merging; the trigger stays a
+reviewed pairing of an event with a flow name. That split is the same one the whole trigger schema rests
+on: this service decides *when* and *in what box*, the repo decides *what*.
+
+**A job is not an interactive session.** The runner assembles one prompt, calls pi once, and reads the exit
+line. So an extension that registers a **slash command** has nobody to type it inside a job.
+`@juicesharp/rpiv-workflow` names that distinction in its own trigger taxonomy: `command` for a typed
+`/wf`, `programmatic` for an embedder that calls the API, `external` for a webhook or cron source. **A
+pi-dispatch job is the programmatic case**, and it is reached one of two ways:
+
+- the flow's `SKILL.md` tells the agent to use the workflow's skills, which needs nothing but prose, and
+  leaves the decision to start a workflow with the model; or
+- you stage a second small extension of your own that imports the package and starts a run from a lifecycle
+  hook. That is the embedding route the package documents, and it is the only way to start a workflow
+  *without* the model choosing to.
+
+**One trigger is one job, one budget slot, and one turn budget.** Every stage runs inside the container that
+one delivery produced, so ten stages share the `PI_MAX_TURNS` ceiling and the per-job token budget, and
+exhausting either aborts the job as a **policy** refusal that is never retried. A many-stage workflow is
+therefore a turn-budget question before it is anything else: raise `PI_MAX_TURNS` for the deployment, or keep
+stages coarse. Nothing about a workflow multiplies the daily cap either, which is the one thing an operator
+usually wants to hear: a workflow costs one container start, however many stages it has.
+
+**Concurrency is yours to gate, on local jobs only.** Each job is its own container, so two jobs never share
+a pi session. What they can share is a **directory**: a `cron` or CLI job bind-mounts your folder, and
+`PI_CONCURRENCY` defaults to 3, so two triggers pointing at the same folder can run at the same time and
+write the same workflow state. `@juicesharp/rpiv-workflow` says as much about its own run-name claim, which
+is atomic per write but holds no cross-process lock. One trigger per folder is the simple answer; quiet
+hours on that scope is the other. Forge jobs are immune by construction, since each one gets its own clone.
+
 ## The simple case: a flow that calls skills
 
 Nothing to configure. A flow is a skill, and a skill may call other skills, so a two-stage or five-stage
