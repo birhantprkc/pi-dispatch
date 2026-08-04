@@ -197,7 +197,7 @@ own way:
 ---
 name: tidy
 description: Format, fix lint, and tighten types across the repo.
-ai-trigger: allow        # opt-in required for GitHub/AI triggers; omit for CLI/cron-only flows (default deny)
+ai-trigger: allow        # opt-in for AI-INITIATED runs only (the dispatch_run tool, job chaining). Default deny.
 ---
 
 Run the formatter and linter and fix what they report; tighten obvious type holes.
@@ -206,8 +206,15 @@ Keep the diff minimal and open a PR titled "tidy: <what changed>". Do not change
 
 The flow is the standing instructions; the **task** is the one-off ask (your `--task`, a trigger's
 `task`, or the issue/comment text itself). Flows are read from the **default branch**, so commit and
-merge a flow before a trigger can use it. That merge is the repo's consent: `ai-trigger: allow` is what
-lets a forge event or an AI tool run the flow at all.
+merge a flow before a trigger can use it. That merge is the repo's consent.
+
+**`ai-trigger` gates a different axis, and it is worth being precise about which.** It answers *which
+flows a model may fire*, not *who may fire a job*. Only two paths read it: the model-callable
+`dispatch_run` tool and job chaining (a finished job requesting a follow-up). A cron entry or a forge
+trigger in your reviewed `triggers.json` runs its named flow whether or not the frontmatter carries the
+line, because a human already approved that pairing by writing the file. Omitting the line does **not**
+stop a label or comment trigger from firing. Who may fire a forge trigger is a separate gate entirely,
+described under Triggers below.
 
 ## Triggers
 
@@ -224,10 +231,55 @@ All standing triggers live in one `triggers.json`, read by the worker (cron) and
 ] }
 ```
 
-The shape is enforced fail-loud at load: cron triggers run local folders, webhook triggers run on a
-forge, and each forge's `pull_request` action words are validated against that forge's own vocabulary.
-Optional `run` fields, each a deliberate file-only edit (no panel key, no AI tool, because each one
-changes what code runs or what it costs):
+### The four trigger types: what fires each one, and what it runs
+
+pi-dispatch is the trigger layer. Every entry is one `{ on, run }` pair: **`on` is what fires it**, and
+**`run` is the skill it runs** (`flow` names a `.pi/skills/<flow>` in the target repo, so a workflow is
+whatever that skill, and the skills it calls, do).
+
+| `on.type` | Fires on | Required in `on` | What narrows it | What the agent gets as its task |
+|---|---|---|---|---|
+| `cron` | your schedule | `id` (unique, no `:`) · `pattern` (5 or 6 cron fields) | nothing: a schedule is its own condition | `run.task`, written in the file |
+| `label` | a label on an **issue** (or an Azure work item), never a pull request | at least one positive selector, `any` or `all` | the label **predicate**: `any` (any of these) · `all` (all of them) · `none` (suppress-only, it can prevent a fire but never cause one) | the issue title and body |
+| `comment` | a comment containing your phrase | `phrase`, for example `@pi` | the phrase, and **one comment trigger per forge** | the comment body plus the issue title and body |
+| `pull_request` | a PR or MR event | `action`, a non-empty array in your forge's own words | `action`, plus the same label predicate; where the forge has a label action and you name it, a positive selector becomes **required** | the PR title and body |
+
+Every type also needs `run.kind` (`local` for cron, else the forge) and `run.flow`. Cron additionally
+needs `folder` (a host path the worker checks exists when it loads the file; make it absolute, since a
+relative path resolves against the worker's own directory) and `task`. Azure `label` and `comment`
+triggers need `run.repository`, because a work item belongs to a project and names no repository.
+
+Two matching behaviours worth knowing before you arm a paid trigger:
+
+- **A comment can choose the flow.** `<phrase> <flow>` in the comment body overrides the trigger's
+  `run.flow` whenever that word matches another trigger's flow in the same file, so `run.flow` is a
+  default rather than a fixed pairing.
+- **Label triggers match differently per forge.** GitHub and Forgejo match the issue's **whole current
+  label set**, so reopening an already-labelled issue, or adding an unrelated label to one, fires
+  again. GitLab and Azure match only the labels **that event added**, which is exactly why they do not
+  re-fire that way.
+
+`action` words are each forge's own vocabulary, validated at load so a word from the wrong forge is
+refused rather than silently never matching:
+
+| `run.kind` | `pull_request` actions | Its label action | Notes |
+|---|---|---|---|
+| `github` | `labeled` `opened` `synchronize` `reopened` | `labeled` | |
+| `gitlab` | `open` `update` `reopen` `approved` | none | a label add arrives as `update` carrying a label diff; a predicate here matches the labels that update added |
+| `forgejo` | `label_updated` `opened` `synchronized` `reopened` | `label_updated` | `label_cleared` fires nothing, ever: removing a label must never start a paid run |
+| `azure` | `created` `updated` | none | a label predicate on an Azure PR is refused at load: Azure tags work items, never pull requests |
+
+**Who may fire a trigger is not ours to grant.** Your forge decides that, differently per forge, and
+[`SECURITY.md`](SECURITY.md) states each one plainly (short version: on GitHub only collaborators can
+apply a label, which is why the label *is* the approval there; GitLab, Forgejo and Azure resolve the
+actor's permission through their APIs because a label proves less on those). The always-on gates that
+every delivery passes, none of them per-trigger, are the signature check, the bot-loop guard, that
+permission check, dedup, quiet hours, the image preflight, branch protection, and the spend caps.
+
+### Optional `run` fields
+
+Each is a deliberate file-only edit (no panel key, no AI tool, because each one changes what code runs
+or what it costs):
 
 - `"image"` names the container image for that trigger's jobs; absent means `PI_JOB_IMAGE`. The image
   decides what is in the box, never what the box can do: the isolation flags are the worker's, always
