@@ -13,8 +13,9 @@ never write bare `npx pi-dispatch` in launch copy; always the scoped form, and l
 
 ## The one-liner
 
-> Run the [pi](https://github.com/earendil-works/pi) coding agent as a service — on demand, on a cron, or on
-> a GitHub issue/PR — in a container you control, with a durable queue and a spend cap.
+> Run the [pi](https://github.com/earendil-works/pi) coding agent as a service: on demand, on a cron, or on a
+> label, comment or PR in GitHub, GitLab, Forgejo or Azure DevOps, in a container you control, with a durable
+> queue and a spend cap.
 
 ## The elevator pitch (3 sentences)
 
@@ -22,9 +23,10 @@ pi is a minimal coding agent with no queue, no concurrency control, no spend lim
 no permission system. pi-dispatch is exactly that missing operational layer: every job runs in an ephemeral
 `--cap-drop=ALL` non-root container (pi's missing permissions, enforced by Docker), spend is bounded *before*
 a container starts (per-job turn budget + a daily cap), and the same job runs whether you trigger it from the
-CLI, a cron schedule, or a GitHub issue. You bake your own toolchain into the image (it ships Playwright +
-Chromium, so a flow can build a frontend, screenshot it, and iterate on the render), and a live `/dispatch`
-admin panel shows the queue, spend meters, run history, and triggers.
+CLI, a cron schedule, or a label, `@pi` comment or PR event on GitHub, GitLab, Forgejo or Azure DevOps. You
+bake your own toolchain into the image (it ships Playwright + Chromium, so a flow can build a frontend,
+screenshot it, and iterate on the render), and a live `/dispatch` admin panel shows the queue, spend meters,
+run history, and triggers.
 
 **The install line** (use this everywhere; the scoped form only, per the naming rule above):
 
@@ -33,7 +35,9 @@ pi install npm:@edgehero/pi-dispatch-admin      # then, in pi:  /dispatch
 ```
 
 With nothing configured, `/dispatch` walks the whole setup with a consent per step. For servers and
-headless hosts the same setup is `npx @edgehero/pi-dispatch up` in a fresh folder.
+headless hosts, `npx @edgehero/pi-dispatch up` in a fresh folder does the host half of it (pull and tag the
+job image, start Valkey, scaffold config, run doctor); the worker service, the trigger edge and your first
+trigger stay separate commands.
 
 ---
 
@@ -56,8 +60,10 @@ pi-dispatch is the operational layer that closes them, and nothing else:
   missing permission system, enforced by Docker.
 - Spend is bounded BEFORE a container starts — a per-job turn budget and a daily cap (plus
   week/month ceilings and a soft-hold band) checked before a single token is spent.
-- Three triggers, one job: a CLI command, a cron schedule, or a GitHub issue/PR — same queue,
-  same box, same budget. Cron is the unattended one.
+- One job, many ways in: a CLI command, a cron schedule, or a label, @pi comment or PR event on
+  GitHub, GitLab, Forgejo or Azure DevOps. Same queue, same box, same budget. Cron is the
+  unattended one. A confirm-free tool in the operator's own pi session and a finished job's
+  outbox can each enqueue one more, both behind their own gates.
 - Your image, your tools. Bake a project's toolchain into the Dockerfile; it ships Playwright +
   Chromium so a flow can build a frontend, screenshot it, and iterate on the rendered result.
 - A live admin panel (a pi extension): queue state, day/week/month spend meters, run history
@@ -66,8 +72,9 @@ pi-dispatch is the operational layer that closes them, and nothing else:
 
 Setup is the panel's job too. `pi install npm:@edgehero/pi-dispatch-admin`, then `/dispatch`:
 with nothing configured it walks the whole deployment with a consent per step, and lands you in
-the panel. Servers and headless hosts get the same thing as plain commands
-(`npx @edgehero/pi-dispatch up`).
+the panel. Servers and headless hosts do the host half as plain commands
+(`npx @edgehero/pi-dispatch up`: image, Valkey, config, doctor), with the worker service, the
+trigger edge and the first trigger as their own commands.
 
 I've tried to be honest about the threat model rather than hand-wave it: the whole thing runs
 untrusted, adversarial input through an unrestricted agent on purpose, so SECURITY.md states
@@ -87,19 +94,28 @@ https://github.com/edgehero/pi-dispatch
 
 ## pi community (Discord / GitHub Discussions) + showcase submission
 
-pi has a Discord, GitHub Discussions on earendil-works/pi, and a package/showcase directory at pi.dev. This
-is the warmest, highest-intent audience — start here, before the cold channels.
+<!--
+POSTING LOGISTICS, UNVERIFIED. The channels named in this section (a pi Discord, GitHub Discussions on
+earendil-works/pi, a package/showcase directory at pi.dev) trace to nothing in this repository, unlike every
+product claim below them. Confirm each channel exists, and that it welcomes a post like this, before using
+any of it. The message body itself is traceable copy and can be reused as is.
+-->
+
+If those channels exist, they are the warmest, highest-intent audience: start there, before the cold channels.
 
 **Discord / Discussions post:**
 ```
 Built a thing on top of pi some of you might want: pi-dispatch — a harness to run pi as a
-*service* (on-demand / cron / GitHub issue) with the operational bits pi deliberately leaves
-out: a durable Valkey+BullMQ queue, a container-per-job boundary (--cap-drop=ALL, non-root),
-and a spend cap checked before any container starts.
+*service* (on-demand / cron / a label, comment or PR on GitHub, GitLab, Forgejo or Azure
+DevOps) with the operational bits pi deliberately leaves out: a durable Valkey+BullMQ queue,
+a container-per-job boundary (--cap-drop=ALL, non-root), and a spend cap checked before any
+container starts.
 
 The admin side is itself a pi extension: a /dispatch command + overlay (queue, spend meters,
 run history, editable triggers) and confirm-gated tools so an agent can operate the deployment
-with a human approving each change. Newest bit: per-repo scheduled pause windows ("quiet hours")
+with a human approving each *config* change. Two tools skip that dialog on purpose: pause and
+resume (reversible, spend nothing), and the paid dispatch_run (bounded by six limits instead,
+spelled out in SECURITY.md). Newest bit: per-repo scheduled pause windows ("quiet hours")
 that defer runs between certain times via BullMQ moveToDelayed and auto-resume.
 
 Repo: https://github.com/edgehero/pi-dispatch — feedback and pokes at the security model welcome.
@@ -120,7 +136,7 @@ Repo: https://github.com/edgehero/pi-dispatch — feedback and pokes at the secu
 system — so you can't really run it *unattended*.
 
 pi-dispatch is the missing operational layer. Run pi as a service: on-demand, on a cron, or on a
-GitHub issue. 🧵
+label, comment or PR in GitHub, GitLab, Forgejo or Azure DevOps. 🧵
 
 2/ The container is the boundary.
 Every job → an ephemeral --cap-drop=ALL, non-root container, instructions mounted read-only.
@@ -155,7 +171,9 @@ with my shell's permissions or (b) waking up to a surprise API bill. pi-dispatch
 that makes that safe-ish and boring:
 
 - One ephemeral container per job (--cap-drop=ALL, non-root); the agent can't reach the host
-  outside two declared mounts.
+  outside its declared mounts (/job read-only and /workspace always, plus /outbox on local
+  jobs, /session when you arm resumable sessions, and a read-only global pi overlay if you
+  configure one).
 - Spend capped before a container even starts (per-job + daily/weekly/monthly).
 - Durable queue (Valkey + BullMQ) so a burst or a reboot doesn't drop jobs.
 - Bring your own Docker image (Playwright/Chromium included for frontend work).
@@ -185,14 +203,25 @@ Working title: **"Giving a coding agent an off-switch: containers, spend caps, a
 4. **Quiet hours without dropping work.** The scoped pause-window design: defer a repo's runs with BullMQ's
    `moveToDelayed` *before* the budget reservation, so a paused job costs nothing and auto-resumes — vs.
    dropping it (which loses a GitHub job that has no re-trigger). Timezone-correct via built-in `Intl`.
-5. **An agent that can operate itself, safely.** Confirm-gated tools: the model proposes a change (raise a cap,
-   add a trigger), a human approves a dialog it can't answer. Why "operator-approved" beats "no tool at all"
-   here, and why it's fail-closed without a human.
+5. **An agent that can operate itself, safely.** Confirm-gated tools: the model proposes a *config* change
+   (raise a cap, add a trigger), a human approves a dialog it can't answer, and it's fail-closed without a
+   human. Why "operator-approved" beats "no tool at all" here, and then the honest half: where that gate
+   deliberately stops. Pause and resume carry no confirm (reversible, spend nothing), and the paid
+   `dispatch_run` carries none either, bounded by six independent limits instead of a dialog.
 6. **What I got wrong / what's not defended.** Link SECURITY.md's honest list. Invite scrutiny.
 
 ---
 
-## GitHub Release notes (draft — for `gh release create vX.Y.Z`)
+## GitHub Release notes (TEMPLATE — for `gh release create vX.Y.Z`)
+
+<!--
+TEMPLATE, NOT the current release. This block is v0.2.0-era copy and its feature list predates the GitLab,
+Forgejo and Azure DevOps arms, the resurrectable sandbox, run.replicas, resumable sessions, the COSTS view,
+the setup wizard, polling mode and `setup github`. Re-cut it per release against that release's own changes,
+keeping the shape (Admin / AI-operable / feature area / Docs & safety / the maturity footer) and nothing
+else. Versions at the time of writing: root 0.7.0, @edgehero/pi-dispatch 0.1.1,
+@edgehero/pi-dispatch-admin 0.4.0, @edgehero/pi-dispatch-receiver 0.1.0.
+-->
 
 **Title:** `v0.2.0 — admin panel, AI-operable controls, scoped pause windows`
 
@@ -205,8 +234,9 @@ Admin
 - Trigger CRUD (cron / label / comment / pull_request) from the overlay, applied live (no restart).
 
 AI-operable, safely
-- Confirm-gated model tools: an agent can change limits and manage triggers/pause windows, but every
-  write pops an operator confirmation dialog it can't answer — fail-closed without a human.
+- Confirm-gated model tools: an agent can change limits and manage triggers/pause windows, and every
+  *config* write pops an operator confirmation dialog it can't answer — fail-closed without a human.
+  Pause and resume are reversible and spend nothing, so they carry no confirm.
 - Bundled `operate-pi-dispatch` skill documenting the human-in-the-loop gates.
 
 Scheduled pause windows (quiet hours)

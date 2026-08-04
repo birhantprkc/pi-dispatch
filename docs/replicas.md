@@ -26,16 +26,24 @@ Each is handed the replica index, and nothing else moves.
 | Semantic dedup key | `repo#7:fix-issue` | `repo#7:fix-issue:r1`, `…:r2` |
 | Branch | `pi/issue-7` | `pi/issue-7-r1`, `pi/issue-7-r2` |
 | Container name | `pi-job-gh-<guid>` | `pi-job-gh-<guid>-r1`, `-r2` |
-| PR title | whatever the flow chose | `[r1/2] …`, `[r2/2] …` |
+| PR title (agent-honored, issue path only) | whatever the flow chose | `[r1/2] …`, `[r2/2] …` |
 | Run record | `replica: null` | `replica: 1` / `2`, `replicas: 2` |
+
+Every row but the PR title is host-enforced. The `[r1/2]` marker is prompt text the agent is asked to
+carry into the title it writes, and it is emitted on the **issue** path only: the host mints the branch,
+which is the only replica identity it actually enforces. A `pull_request` target has no branch and no
+title to mint, so its prompt asks each replica to say "replica *i* of *n*" in whatever it posts instead.
 
 The **branch suffix is symmetric** — there is no unsuffixed "original" and no "copy". A scheme where
 replica 1 kept `pi/issue-7` would make the pair read as an original and a duplicate, which is the framing
 that makes people stop comparing them.
 
-**Redelivery still dedups.** The `:r<i>` on the semantic key is added *only* when a replica is set, so
-GitHub redelivering the same webhook inside the 10-minute window enqueues nothing new — each replica
-coalesces against **itself**, never against its sibling.
+**Redelivery still dedups**, by the same two mechanisms an unreplicated job uses. An *exact* redelivery
+(the same webhook guid) is stopped by the job id: `gh-<guid>-r<i>` is already in the queue's history,
+which is retained for 31 days. The 10-minute semantic window does a different job: it coalesces
+*distinct* guids landing on the same `repo#7:fix-issue`, which is what absorbs re-label bursts. The
+`:r<i>` suffix is added to that semantic key *only* when a replica is set, so each replica coalesces
+against **itself**, never against its sibling.
 
 ## The budget arithmetic
 
@@ -88,14 +96,17 @@ actually name the prompt's branch, so the label cannot lie.
 
 ## Where it is refused, and why
 
-Each refusal is at config load, fail-loud, in both services, naming the field and the reason.
+Each refusal is at config load, fail-loud, naming the field and the reason. Which service refuses depends
+on which one reads the file: the receiver always loads it, so a webhook deployment refuses on every start;
+the worker loads it only when `PI_TRIGGERS_FILE` is set (unset means cron is simply disabled there). A
+worker without that variable will therefore start happily on a file its receiver rejects.
 
 | Refused | Why |
 |---|---|
 | `kind: "local"` (a cron trigger) | A local job's `/workspace` **is** your folder, bind-mounted read-write and edited in place. Two replicas would edit one working tree with no gate and no undo. A GitHub job gets its own `mkdtemp`'d clone — that is the whole reason it is safe there. |
 | `gitlab` / `forgejo` / `azure` | **Not yet covered**, not impossible. Every forge mints its branch through the same function, so extending this is mechanical. |
 | `replicas: 1` | A one-member replica set is a field that does nothing — and a field that does nothing is one you set and then trust. |
-| `replicas: 4` or more | Above `PI_CONCURRENCY`'s default they queue instead of racing. |
+| `replicas: 4` or more | `REPLICAS_MAX` is the literal `3`, chosen because `PI_CONCURRENCY` defaults to 3 and a fourth replica would queue instead of racing. It is not a read of the concurrency setting: raising `PI_CONCURRENCY` does not raise the cap, so the literal is the line to edit (see above). |
 | alongside `"resume": true` | A resumed run continues **one** lineage; replicas exist to fork it. Without this refusal every replica of an issue would resolve the same session key, share one transcript, and contend for the store's one-writer lock. |
 
 ## The pull-request hazard

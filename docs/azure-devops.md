@@ -58,6 +58,17 @@ Then create Service Hook subscriptions (Project Settings → Service hooks → W
 | Pull request created / updated | the pull_request trigger |
 | Pull request commented on | the comment trigger, on a PR |
 
+Two things the receiver needs regardless of forge: `WEBHOOK_SECRET`, which its config requires with no
+default, and a GitHub identity that resolves at boot, because that resolution is not conditional on your
+triggers naming GitHub the way the Azure, GitLab and Forgejo arms are. With `GITHUB_AUTH_SOURCE` unset (the
+default is `gh`) that means a logged-in `gh` CLI on the host. An Azure-only deployment still needs both,
+which is a wart rather than intended design (issue #99).
+
+Then start it: `pi-dispatch-receiver` from your deployment folder, where `serve` is the default command, or
+the container profile instead (`docker compose -f deploy/docker-compose.yml --profile receiver up -d`); the
+README lays out the choice. The third way the README offers, `pi-dispatch-receiver poll`, cannot serve this
+forge: the poller reads api.github.com and has no Azure path at all.
+
 ## Tags are the label analogue, and the DIFF is the trigger
 
 Azure has no `labeled` event. A tag change arrives as `workitem.updated` carrying a before/after pair, and
@@ -79,14 +90,32 @@ Practical consequences:
 
 Azure work items belong to a **project**, and a project may hold many repositories — so nothing in the
 delivery says where the agent should work. `run.repository` supplies it, and is **required** on azure
-`label` and `comment` triggers and **refused** on every other forge's. A pull request names its own
-repository and needs none.
+`label` and `comment` triggers: exactly the two a work item can fire. It is **refused** everywhere else,
+which means on every other forge's triggers *and* on an azure `pull_request` trigger, because a pull request
+names its own repository. Refused rather than accepted and ignored: a field that quietly does nothing is one
+an operator sets once and then trusts.
+
+## Pull-request actions are Azure's own words
+
+An azure `pull_request` trigger takes exactly two action words, `created` and `updated`:
+
+```jsonc
+{ "on": { "type": "pull_request", "action": ["created", "updated"] },
+  "run": { "kind": "azure", "flow": "review" } }
+```
+
+GitHub's `opened` or GitLab's `open` on an azure rule is **refused when the file loads**, rather than left to
+load clean and never match an event. `git.pullrequest.merged` is deliberately not offered: a job started by a
+merge has nothing left to act on, the same call GitLab's `merge` and `close` get. A label predicate is
+refused here too, for the reason in the unsupported list below.
 
 ## Who can trigger a job
 
-The actor's **project membership** is resolved from the Graph API. Two calls, not one: the actor is
-resolved to a subject descriptor, then that descriptor's memberships are checked against the project's
-group. Either can go indeterminate, and either does **503**, never 204.
+The actor's **project membership** is resolved from the Graph API. Two lookups (three requests), not one: the
+actor is resolved to a subject descriptor, then the project's own descriptor is fetched and the actor's
+memberships are checked against it, transitively, so a member of a team inside the project counts. A lookup
+that **cannot be completed** (a 5xx, a dead socket, a token that cannot read the Graph, a 200 in a shape the
+harness does not recognise) answers **503** and Azure can redeliver.
 
 The actor arrives in two different shapes depending on the event, and this is the sharpest edge on this
 forge:
@@ -94,9 +123,20 @@ forge:
 - a **pull request** names them by GUID;
 - a **work item** names them only as `"Display Name <email>"`, with no id anywhere.
 
-So the address is matched **anchored** to the trailing `<...>`, never as a substring. The display half is
+So the address is matched **anchored**, never as a substring: the address inside a trailing `<...>`, or the
+whole trimmed string when that string is itself nothing but an address. The display half is
 attacker-settable: someone who names themselves `pi-bot@example.com is not me` must not read as the
 harness, or as anyone else.
+
+**A current limitation, and it is the one to know about.** Azure's Graph has no lookup-by-email endpoint, so
+the work-item path fetches the organization's user list and filters it locally. That fetch is a **single
+page**, and the continuation token is not followed. In an organization large enough for that list to
+paginate, an actor who falls outside the first page resolves to nobody, which is **determinate**: the gate
+refuses, the receiver answers **204**, and the run never happens. The symptom is work-item triggers that
+simply never fire for some people while working for others, behind a 204 that looks exactly like a stranger
+being correctly refused. Pull requests are unaffected, because a PR names its actor by GUID and that is a
+direct descriptor lookup. If work-item triggers are silent for a subset of your members, suspect this before
+your triggers file.
 
 Your `AZURE_TOKEN` needs to be able to read the Graph (`vso.graph`). If it cannot, every delivery answers
 503 rather than silently admitting or refusing anyone.
@@ -135,6 +175,12 @@ majority pay for the minority, so it lives in a variant:
 docker build -f image/Dockerfile.azure -t pi-job:azure \
   --build-arg BASE=ghcr.io/edgehero/pi-job:latest .
 ```
+
+`--build-arg BASE=...` is **required**, not decoration, until the Dockerfile's default is fixed:
+`image/Dockerfile.azure` still declares `ARG BASE=ghcr.io/edgehero/pi-dispatch-job:latest`, which is not a
+published image (the published one is `ghcr.io/edgehero/pi-job`), so a build that omits the arg fails
+pulling its own base. Point it at the published image as above, or at whatever you tagged the default image
+locally (`pi-job:latest`).
 
 Name it on the trigger with `run.image`. If you forget, the job is **refused before it costs anything**:
 the image declares which forges it can serve (`dev.pi-dispatch.forges`) and the pre-spend preflight reads

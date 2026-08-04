@@ -18,6 +18,12 @@ flags** — and no credentials at all. The agent is not running. You are.
 You can also open one from the admin panel: `/dispatch`, Enter on a finished run, then `b`. The panel
 suspends itself, hands the terminal to the shell, and comes back when you exit.
 
+Two refusals land before anything else runs, and they are the two an operator meets first. The command
+**needs a terminal**: it opens an interactive shell, so from a pipe, a TTY-less script or CI it refuses by
+name rather than letting docker fail with "the input device is not a TTY". And if a sandbox for that id is
+**already running**, it refuses and points at it: `docker attach pi-sandbox-<jobId>`, or exit that one
+first.
+
 ## What is preserved, and what is not
 
 | | |
@@ -72,7 +78,8 @@ pull request on your own machine — and the container still applies every isola
 ## No credentials, and why
 
 A sandbox carries no `GITHUB_TOKEN`, no `GH_TOKEN`, no GitLab/Forgejo/Azure token, and no provider API
-key. The env is two variables: `TERM` and `TMOUT`.
+key. The env is at most two variables: `TERM` and `TMOUT`. Both are dropped when they have nothing to say,
+so an unset host `TERM` or `PI_SANDBOX_IDLE_MINUTES=0` emits nothing rather than an empty string.
 
 This is not a precaution that could be relaxed with a flag. A job's credential is minted for that job,
 scoped to that repository, and short-lived (`CONST-TOKEN-SCOPED-PER-JOB`); a shell you can type into is
@@ -124,8 +131,13 @@ session that ends in a closed laptop still keeps the workspace.
   1001) against files owned by your host account, so writes may fail with `EACCES` on Linux. This is not
   new to sandboxes — local *jobs* have the same shape — and it does not arise on Docker Desktop, which
   maps ownership for you.
-- **Sandboxes are not reaped by the worker.** They are named `pi-sandbox-*`, outside the `pi-job-*`
-  filter the boot reaper uses, precisely so a worker restart cannot kill a shell you are sitting in. The
-  cost is that stopping a forgotten one is yours: `docker stop pi-sandbox-<jobId>`.
+- **Sandbox *containers* are not reaped by the worker.** They are named `pi-sandbox-*`, outside the
+  `pi-job-*` filter the boot reaper uses, precisely so a worker restart cannot kill a shell you are
+  sitting in. The cost is that stopping a forgotten one is yours: `docker stop pi-sandbox-<jobId>`. The
+  retained **directories** are swept, and by a separate reaper: every worker boot deletes the ones past
+  their window, skipping any id whose container is live so a mount is never pulled out from under a shell.
+  That boot sweep is what actually enforces the 24-hour window, which is worth knowing in both
+  directions: a worker that never restarts never sweeps, and a restart after you lower the retention
+  setting sweeps what the old one kept.
 - **The retention window is bounded but not quota'd.** At the default daily cap that is roughly 25
   directories at a time. There is no byte ceiling; `doctor` reports the count.

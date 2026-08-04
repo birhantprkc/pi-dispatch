@@ -792,14 +792,14 @@ async function offerTriggerEdge(
     // Print-only by design: `poll` is a long-running producer, and starting it inside the wizard's
     // attached overlay would tie the operator's whole session to it. Both commands, in order.
     notify?.(
-      `polling needs no public URL, no DNS and no tunnel — two commands, in ${dir}:\n  1) node ${cliPath} setup github --no-webhook   (mints the App with its webhook INACTIVE — the polling-ready shape)\n  2) npx pi-dispatch-receiver poll   (the producer; run it from the deployment folder, under whatever keeps it alive)`,
+      `polling needs no public URL, no DNS and no tunnel — two commands, in ${dir}:\n  1) node ${cliPath} setup github --no-webhook   (mints the App with its webhook INACTIVE — the polling-ready shape)\n  2) npx @edgehero/pi-dispatch-receiver poll   (the producer; run it from the deployment folder, under whatever keeps it alive)`,
       "info",
     );
     return;
   }
 
   notify?.(
-    `trigger edge left for later — all three ways stay open from ${dir}: \`service install --receiver\` (a receiver unit on this host), \`docker compose --profile receiver up -d\` (a receiver container), or \`pi-dispatch-receiver poll\` (no public URL at all). Local cron triggers need none of them.`,
+    `trigger edge left for later — all three ways stay open from ${dir}: \`service install --receiver\` (a receiver unit on this host), \`docker compose --profile receiver up -d\` (a receiver container), or \`npx @edgehero/pi-dispatch-receiver poll\` (no public URL at all). Local cron triggers need none of them.`,
     "info",
   );
 }

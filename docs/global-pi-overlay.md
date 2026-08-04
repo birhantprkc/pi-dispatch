@@ -19,7 +19,9 @@ pi-dispatch doctor             # verifies the overlay is credential-free
 `import-pi` reads your host agent dir (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`) and copies a **curated,
 credential-free** subset into the overlay dir. Re-run it whenever you change your host setup. Flags:
 `--no-extensions` (see below), `--with-packages` / `--packages-file <path>` (see below),
-`--from <agentDir>`, `--to <overlayDir>`.
+`--from <agentDir>`, `--to <overlayDir>`. `--with-extensions` is still accepted as a documented no-op
+(extensions come along by default now), so an older setup script keeps working and keeps meaning what it
+always meant.
 
 ## What layers, and who wins
 
@@ -36,30 +38,41 @@ Four tiers, most-trusted first; each refines but never removes the one above:
 
 - **Skills**: repo skills are listed **first**, so a repo skill **overrides** a global one of the same name
   (pi is first-path-wins); names that don't collide all load.
-- **Persona**: the assembled prompt is `guardrails → global persona → repo persona`. The floor is always
-  first and cannot be removed; global is your baseline; the repo's `.pi/APPEND_SYSTEM.md` is most specific.
+- **Persona**: the assembled prompt is `guardrails → outbox protocol → global persona → repo persona`. The
+  floor is always first and cannot be removed; global is your baseline; the repo's `.pi/APPEND_SYSTEM.md` is
+  most specific. The outbox tier is **local jobs only**: it is read only when the `/outbox` mount exists, so
+  a forge job's prompt never carries it.
 - **Models**: the overlay's `models.json` makes a **custom provider/model** resolvable. Definitions only —
   the credential still comes from the environment, never the overlay.
 - **The repo's own files load too** (tier 3b). A job's checkout is always the base repo at its
   **default-branch SHA** — never a PR branch — so its `AGENTS.md` becomes part of the agent's context and
-  its `.pi/extensions` are **executed**, which is pi's normal behaviour. Repo *skills*, though, still
-  arrive by the `/job/pi` route above rather than by discovery: same files, read from the pinned SHA onto
-  a read-only mount the agent cannot rewrite mid-run. See [`SECURITY.md`](../SECURITY.md) for what that
-  posture costs and how to turn it off if you service repos you do not control.
+  its `.pi/extensions` are **executed**, which is pi's normal behaviour with one subtraction: the loader's
+  recursion guard silently drops any extension whose name looks like the dispatch admin **or** that registers
+  a `dispatch_*` tool, logging `extension_dropped`, so a serviced repo's own `dispatch_*` tool is lost inside
+  job containers (rename it). Repo *skills*, though, still arrive by the `/job/pi` route above rather than by
+  discovery: same files, read from the pinned SHA onto a read-only mount the agent cannot rewrite mid-run. See
+  [`SECURITY.md`](../SECURITY.md) for what that posture costs and how to turn it off if you service repos you
+  do not control.
 
 ## What is copied — and what never is
 
 | Copied into the overlay | Never copied |
 |---|---|
 | `models.json` (definitions; **refused if it embeds a literal key**) | `auth.json` — your credential stays in env/auth.json |
-| `skills/<name>/` | `settings.json`, `sessions/`, `themes/`, `prompts/` |
+| `skills/<name>/` | `settings.json`, `sessions/`, `themes/`, `prompts/`, `tools/` |
 | `APPEND_SYSTEM.md` (global persona) | anything holding a secret |
 | `extensions/` — by default; skip with `--no-extensions`, each one printed by name | the admin extension (hard-blocked) |
 | `packages/<dir>/` — only with `--with-packages`, exact-pinned, staged from npm on **your host** | any package whose name looks like the dispatch admin (hard-blocked) |
 
 The overlay is mounted **read-only** into a container that runs adversarial input, so it must hold **no
-secret**. `import-pi` refuses a `models.json` with a literal `apiKey` (move it to `auth.json`, or reference
-the environment as `"$MY_KEY"`), and `doctor` re-checks the overlay for `auth.json` and literal keys.
+secret**. `import-pi` refuses a `models.json` with a literal `apiKey`, and equally with a literal value
+under an auth-ish provider **header** (a header name carrying `auth`, `api-key`, `token`, `secret` or
+`bearer`); move it to `auth.json`, or reference the environment as `"$MY_KEY"`. `doctor` re-checks the
+overlay for `auth.json` and literal keys.
+
+A `models.json` that is not valid **JSON** is a different case, and a quieter one: it is **skipped**, with a
+`models.json  SKIPPED — not valid JSON` row in the import's output, and the import still **succeeds**. The
+overlay then carries no custom model definitions, so read that row.
 
 ### Custom providers
 
@@ -105,9 +118,12 @@ be in the overlay. Never place the admin extension there (it can enqueue paid jo
 
 ## Packages (pinned, per-trigger)
 
-A **pi package** is third-party code from npm that contributes extensions, skills, prompts and themes. Jobs
-run with **no network**, so a package cannot be installed at job time — you stage it on **your host**, into
-the overlay, and a trigger opts in.
+A **pi package** is third-party code from npm that contributes extensions, skills, prompts and themes. Every
+job runs with `PI_OFFLINE=1`, which makes pi's resolver **refuse to shell out to npm**, so a package cannot
+be installed at job time: you stage it on **your host**, into the overlay, and a trigger opts in. Note what
+is doing the work here. The container's network is **not** cut off (egress is open, as above, and
+[`SECURITY.md`](../SECURITY.md) says so plainly); offline mode is the thing that closes the job-time
+install, and the worker sets it on every job while the runner re-asserts it before the loader is built.
 
 ```jsonc
 // pi-packages.json — scaffolded empty by `pi-dispatch init`; also honours PI_PACKAGES_FILE / --packages-file.
@@ -117,7 +133,7 @@ the overlay, and a trigger opts in.
 
 ```bash
 pi-dispatch import-pi --with-packages     # installs each pin into <overlay>/packages/<dir>/
-pi-dispatch doctor                        # shows what is staged, and which triggers have opted out
+pi-dispatch doctor                        # shows what is staged, and how many triggers have opted out
 ```
 
 That is all it takes: once staged, packages load for **every** job. If one flow must run without them,
@@ -137,13 +153,14 @@ A package is *someone else's*, so it passes four checks, and each stops a differ
 | 1 | An **exact** version in `pi-packages.json` (no `^`, `~`, `*`, `latest`) | refuses | a silent upstream minor turning every queued job into a no-op that still reports success |
 | 2 | `import-pi --with-packages` stages it on your host | refuses | a live `npm install` of third-party code inside a job container, every run |
 | 3 | `"packages"` on a trigger | **loads** | one flow that must not see the staged set — `"packages": false` withdraws it for that trigger alone |
-| 4 | The runner validates paths and enforces skill precedence | refuses | a package that did not mount (refused before any spend), and a package skill taking a repo or overlay skill's name (the repo's stays in force) |
+| 4 | The runner validates paths and enforces skill precedence | refuses | a package that did not mount (refused by the runner at container start, before any model call; the daily-cap slot is still taken), and a package skill taking a repo or overlay skill's name (the repo's stays in force) |
 
 Gate 3 is the reason there is no `PI_GLOBAL_ALLOW_PACKAGES` env flag: the decision is **per trigger**, so
 one flow can run without a package while every other flow has it — a granularity no env flag can express.
 It defaults open for the same reason gates 1 and 2 exist at all: you pinned the version and staged it
-deliberately, so the staged set is the set your jobs get. `doctor` shows you what is staged and which
-triggers have opted out.
+deliberately, so the staged set is the set your jobs get. `doctor` shows you what is staged and **how many**
+triggers have opted out: a count, never their names, so which flow it was is a question for the triggers
+file.
 
 **`--ignore-scripts` is on, and it cuts both ways.** Staging never runs a package's lifecycle scripts —
 without that flag, the `install`/`postinstall` of the package **and of every transitive dependency** would

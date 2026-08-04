@@ -13,7 +13,7 @@
 Every trigger produces the same job, through the same path: one queue, one container, one budget.
 
 ```
-   CLI  ·  cron  ·  GitHub issue / PR
+   CLI · cron · label / comment / PR on GitHub, GitLab, Forgejo or Azure DevOps
                 │  enqueue
                 ▼
         Valkey + BullMQ            durable queue: survives reboots, absorbs bursts
@@ -23,14 +23,15 @@ Every trigger produces the same job, through the same path: one queue, one conta
        per-job turn budget?
                 │  yes
                 ▼
-        docker run --rm            one ephemeral container per job:
-   --cap-drop=ALL · non-root       --no-new-privileges · /job mounted read-only
+        docker run --rm            one ephemeral container per job: --cap-drop=ALL,
+                                   --security-opt no-new-privileges, memory/CPU/pids
+                                   limits, /job mounted read-only
                 │
                 ▼
-     pi + your .pi/skills          edits your code in place, opens a PR, comments back
+     pi + your .pi/skills          edits your code in place, opens a PR or MR, comments back
 ```
 
-The container is the boundary (pi's missing permission system, enforced by Docker). Spend is checked before a container starts, so a runaway or a junk trigger costs a refusal, not a surprise bill. The job image is yours to shape, per deployment or per trigger, and it ships Playwright and Chromium so a flow can build a frontend, screenshot it, and iterate on the render.
+The container is the boundary (pi's missing permission system, enforced by Docker). Those isolation flags are built by the worker's own `docker run` argv, so nothing an image contains can weaken them; the non-root user is a property of the **image**, which is why an image has to meet the conformance checklist in [`docs/job-image.md`](https://github.com/edgehero/pi-dispatch/blob/main/docs/job-image.md). Spend is checked before a container starts, so a runaway or a junk trigger costs a refusal, not a surprise bill. The job image is yours to shape, per deployment or per trigger, and it ships Playwright and Chromium so a flow can build a frontend, screenshot it, and iterate on the render.
 
 ## The console: `/dispatch`
 
@@ -49,7 +50,7 @@ One command puts a live TUI over the whole deployment:
 
 - **Triggers, editable live.** cron, label, comment and pull_request triggers with colored drill-ins showing what fires each one, what it runs, and its trust model. Added, edited and deleted without a restart. Triggers that run third-party code or a custom image are badged; opting in or out of either stays an edit to the reviewed `triggers.json`, which neither the console nor a model-callable tool will make for you.
 - **Quiet hours.** Scheduled pause windows per folder or repo: defer runs between certain times, timezone-aware, and resume automatically. Deferred, never dropped, at zero budget cost.
-- **AI-operable, with a human gate.** Model-callable tools let an agent change limits and manage triggers and pause windows, but every write pops an operator confirmation the model cannot answer, and refuses when no operator is present. The bundled `operate-pi-dispatch` skill teaches the agent those gates.
+- **AI-operable, with a human gate.** Model-callable tools let an agent change limits and manage triggers and pause windows, and every **config** write pops an operator confirmation the model cannot answer, refusing outright when no operator is present. Two tools sit outside that gate on purpose: `dispatch_pause` and `dispatch_resume` write durable queue state but are reversible and spend nothing, so they carry no confirm. One more sits outside it and is **not** money-safe: `dispatch_run` enqueues a **paid** run that edits a local folder in place with no undo, bounded instead by six independent limits (the `PI_DISPATCH_RUN_ROOTS` folder allowlist, a committed per-flow `ai-trigger: allow` opt-in read at a pre-agent SHA, a dirty-tree refusal with no force option, no spend knobs on the tool, a per-hour rate limit, and the worker's daily cap). Read [`SECURITY.md`](https://github.com/edgehero/pi-dispatch/blob/main/SECURITY.md) on that one before you enable it. The bundled `operate-pi-dispatch` skill teaches the agent those gates.
 - **Logs stay put.** Raw container output renders only in the overlay viewer, never into model context.
 
 ## Install
@@ -58,9 +59,11 @@ One command puts a live TUI over the whole deployment:
 pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
 ```
 
-**This is the default way to set up pi-dispatch.** With nothing configured, `/dispatch` takes you straight into guided setup: an opening choice, a deployment folder, a consented npm install of the pinned runtime, a Docker check with per-OS pointers if it is missing, `pi-dispatch up` running its own prompts in your terminal, an optional worker service, an optional trigger edge (receiver service, docker compose profile, or the polling command), and an optional first trigger for the repo you are sitting in. Every step shows what it will do, asks first, and can be declined; nothing is written into your repo and no credential passes through a dialog. A deployment whose queue is merely down keeps the unreachable banner instead: setup appears when there is nothing, never over an outage.
+**This is the default way to set up pi-dispatch.** With nothing configured, `/dispatch` takes you straight into guided setup, in this order: an opening choice, a deployment folder, a Docker check with per-OS pointers if it is missing, a consented npm install of the pinned runtime (Docker is checked **first** on purpose, so no bandwidth is spent on a host where `up` cannot work anyway), `pi-dispatch up` running its own prompts in your terminal, the deployment pointer that lets `/dispatch` find this deployment from any directory, a notice naming the file your provider key belongs in, an optional worker service, optional GitHub App credentials (`setup github`, the one step that mints a private key), an optional trigger edge (receiver service, docker compose profile, or the polling command), and an optional first **cron** trigger for the repo you are sitting in. Every step shows what it will do, asks first, and can be declined; nothing is written into your repo and no credential passes through a dialog. A deployment whose queue is merely down keeps the unreachable banner instead: setup appears when there is nothing, never over an outage.
 
 Already have a deployment? The panel finds it through the deployment pointer setup writes, or through the same env vars your worker uses (`VALKEY_URL`, `PI_LOGS_DIR`, `PI_SETTINGS_FILE`, `PI_TRIGGERS_FILE`, `PI_PAUSE_WINDOWS_FILE`, `PI_SUBSCRIPTIONS_FILE`). Your env always wins.
+
+`dispatch_run` is inert until you set one more variable yourself: `PI_DISPATCH_RUN_ROOTS` defaults to empty, and an empty allowlist refuses every folder. The deployment pointer deliberately cannot set it (the pointer carries paths, never capability grants), so widening that allowlist is always your own env edit.
 
 ## Get the whole thing
 
