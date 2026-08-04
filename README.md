@@ -1,101 +1,66 @@
 <p align="center">
-  <img src="docs/images/banner.png?v=0.5.0" alt="pi-dispatch — run the pi coding agent as a self-hosted service" width="880">
+  <img src="docs/images/banner.png?v=0.5.0" alt="pi-dispatch: run the pi coding agent as a self-hosted service" width="880">
 </p>
 
 # pi-dispatch
 
-**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service — triggered on demand, on a
-cron schedule, or by a GitHub or GitLab issue, comment or pull/merge request — in a container you control, with a durable queue, a
-spend cap, and a live admin panel.**
+**Run the [pi](https://github.com/earendil-works/pi) coding agent as a service: triggered on demand, on a
+cron schedule, or by a GitHub or GitLab issue, comment or pull request. Every job runs in a container you
+control, behind a durable queue, a spend cap, and a live admin panel.**
 
-![The /dispatch dashboard overlay — theme-colored: live queue state, day/week/month spend meters + a daily token counter, the unified triggers pane (cron, label, comment, pull_request — selectable and editable), scheduled pause windows, and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.5.0)
+![The /dispatch dashboard overlay, theme-colored: live queue state, day/week/month spend meters plus a daily token counter, the unified triggers pane (cron, label, comment, pull_request; selectable and editable), scheduled pause windows, and the interactive runs list, in one framed TUI](docs/images/dispatch-dashboard.svg?v=0.5.0)
 
-![The COSTS view — verdict-first cost analytics: per-plan SAVING/LOSING verdicts against API rates, a daily spend sparkline, per-flow spend with API-equivalents, subscription amortization with peak-window facts, and a what-if that re-prices a flow under another model — every estimate visibly marked](docs/images/costs-view.svg?v=0.5.0)
+![The COSTS view, verdict-first cost analytics: per-plan SAVING/LOSING verdicts against API rates, a daily spend sparkline, per-flow spend with API equivalents, subscription amortization with peak-window facts, and a what-if that re-prices a flow under another model, every estimate visibly marked](docs/images/costs-view.svg?v=0.5.0)
 
-![Transcript of /dispatch status, runs, and triggers — queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg?v=0.5.0)
+![Transcript of /dispatch status, runs, and triggers: queue counts, the run-history table with per-job token and cost accounting, and the unified {on,run} triggers list](docs/images/dispatch-commands.svg?v=0.5.0)
 
-pi has no job queue, no concurrency control, no spend limit, and — by its own README — no permission
-system. **pi-dispatch is exactly that missing operational layer, and nothing else.**
+pi has no job queue, no concurrency control, no spend limit, and, by its own README, no permission
+system. pi-dispatch is exactly that missing operational layer, and nothing else:
 
-- **The container is the boundary.** Every job runs `--cap-drop=ALL`, non-root, ephemeral, instructions
-  mounted read-only — pi's missing permission system, enforced by Docker.
-- **Spend is bounded before a container starts** — a per-job turn budget and a daily cap, checked before
-  a single token is spent.
-- **And analyzed after.** Every run records which models spent what, and the dashboard's **COSTS view**
-  turns that into verdicts: spend per flow/model/day, what a declared subscription actually saves
-  against API rates, and what a flow *would* cost on another model — with every estimate visibly marked
-  as one ([`docs/costs.md`](docs/costs.md)).
-- **The image is yours to shape — per deployment, or per trigger.** Bake a project's toolchain into
-  [`image/Dockerfile`](image/Dockerfile); it ships **Playwright + Chromium**, so a flow can build a frontend,
-  screenshot it, and iterate on the rendered result — the edge over a fixed hosted routine or `/loop`. A
-  trigger can name its own image with `run.image` when one flow needs Python and another needs Node
+- **The container is the boundary.** Every job runs `--cap-drop=ALL`, non-root, ephemeral, with its
+  instructions mounted read-only. That is pi's missing permission system, enforced by Docker.
+- **Spend is bounded before a container starts**: a per-job turn budget plus daily, weekly and monthly
+  caps, checked before a single token is spent. And analyzed after: the panel's COSTS view shows spend
+  per flow, model and day, what a subscription actually saves, and what a flow would cost on another
+  model ([`docs/costs.md`](docs/costs.md)).
+- **The image is yours to shape.** Bake a project's toolchain into [`image/Dockerfile`](image/Dockerfile);
+  it ships Playwright and Chromium, so a flow can build a frontend, screenshot it, and iterate on the
+  rendered result. Any trigger can name its own image with `run.image`
   ([`docs/job-image.md`](docs/job-image.md)).
-- **Three triggers, one job.** A CLI command, a cron schedule, or a GitHub/GitLab issue, comment or
-  PR/MR — same job, same box, same panel. Cron is the unattended one: recurring work on your own hardware, in an image you control —
-  one per deployment, or one per trigger.
-- **Your project steers it** — pi's native `.pi/skills` and persona, from your committed files, over a
-  small immutable safety floor the agent can't remove.
+- **Three triggers, one job.** A CLI command, a cron schedule, or a forge event: same queue, same box,
+  same panel.
+- **Your project steers it** through pi's native `.pi/skills` and persona, from your committed files,
+  over a small immutable safety floor the agent cannot remove.
 
-## Quickstart (local folders)
+## Quickstart
 
-You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic). No clone needed:
+You need **Docker**, **Node 22.19 or newer**, and a provider API key (Anthropic, OpenAI, and about 30
+others). No clone needed:
 
 ```bash
-# 1. A folder for your deployment's config, then one consented pass over the whole setup
 mkdir my-dispatch && cd my-dispatch
-npx @edgehero/pi-dispatch up   # checks Docker → offers to pull+tag the job image → offers to start
-                               #    Valkey (AOF, localhost) → scaffolds five config files (never
-                               #    clobbers) → generates WEBHOOK_SECRET → runs the doctor preflight.
-                               #    Every docker action shows its exact command and asks first.
-#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
-#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
+npx @edgehero/pi-dispatch up   # one consented pass: pulls the job image, starts Valkey,
+                               #   scaffolds the config files, runs the doctor preflight.
+                               #   Every docker action shows its command and asks first.
+#  edit .env and set your provider key. Already logged into pi with an API key? Leave it blank.
 
-# 2. Run the worker in one terminal
-npx @edgehero/pi-dispatch worker
-
-# 3. Queue a job from another
-npx @edgehero/pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
+npx @edgehero/pi-dispatch worker                                          # terminal 1: drain the queue
+npx @edgehero/pi-dispatch run ./my-project --task "add type hints" --flow tidy   # terminal 2: first job
 ```
 
-Prefer the steps typed out, or working from a clone (required for a **custom job image** — the
-Dockerfile needs this repo as build context)? Same commands, unbundled:
+The worker mounts your folder into a container and pi edits it **in place**. It refuses a dirty git tree
+unless you pass `--force`, because there is no undo. Commit first.
 
-```bash
-git clone https://github.com/edgehero/pi-dispatch && cd pi-dispatch && npm ci
-# 1. The job image — pull the prebuilt one (fast)...
-docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest
-#    ...or bake your own toolchain in (slower, fully yours) — same tag, or a new one you point triggers at:
-#    docker build -f image/Dockerfile -t pi-job:latest .
-# 2. Valkey (the durable job queue)
-docker compose -f deploy/docker-compose.yml up -d
-# 3. Scaffold + preflight (same five files; doctor checks Docker, Valkey, images, provider key)
-npx pi-dispatch init && npx pi-dispatch doctor
-# 4-5. worker in one terminal, run from another — as above (the local bin is `npx pi-dispatch`)
-```
+Prefer a clone? Same commands, unbundled (`git clone` + `npm ci`, then `npx pi-dispatch init`, `doctor`,
+`worker`). A clone is required for one thing only: **building a custom job image**, since the Dockerfile
+needs this repo as build context. Jobs launch with `--pull=never`, so pull or build every image before
+you run; a name the host does not have is refused before the job costs anything.
 
-> **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
-> toolchain in (the edge cron/visual flows rely on), build `image/Dockerfile` yourself — step 1's second form.
-> And you can run **more than one**: `PI_JOB_IMAGE` is the deployment default, and any trigger may name its
-> own with `run.image`. See [`docs/job-image.md`](docs/job-image.md).
->
-> Either way, **pull or build it before you run**: jobs launch with `--pull=never`, so the worker never
-> fetches an image at job time. A name it cannot find is refused *before* the job costs anything, rather than
-> becoming a silent pull of whatever answers to that name in a registry. `pi-dispatch doctor` checks presence.
-
-> **Heads-up on the CLI name.** The published package is **scoped**: `@edgehero/pi-dispatch` (its bin is
-> `pi-dispatch`). The **bare** npm name `pi-dispatch` belongs to an unrelated package (see
-> [License](#license)) — so outside a checkout, always `npx @edgehero/pi-dispatch <cmd>`; bare
-> `npx pi-dispatch` would ask the registry for the wrong project. Inside a clone after `npm ci`, bare
-> `npx pi-dispatch` resolves to the local workspace bin and is fine; if a shell can't find it, use the
-> explicit form: `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
-
-The worker picks up the job, mounts your folder into a container, and pi edits it **in place**. It
-refuses a dirty git working tree unless you pass `--force`, because there is no undo — point it at
-folders you can restore, and commit first.
+> **Naming heads-up.** The published package is scoped: `@edgehero/pi-dispatch` (bin `pi-dispatch`). The
+> bare npm name `pi-dispatch` belongs to an unrelated package (see [License](#license)), so outside a
+> checkout always use the scoped form.
 
 ## What runs, and what protects you
-
-The local path, end to end — the same queue, container, and budget every trigger flows through:
 
 ```mermaid
 flowchart LR
@@ -107,304 +72,101 @@ flowchart LR
   PI -->|"edits in place"| F[("your folder")]
 ```
 
-A container boundary, spend bounded *before* a container starts, nothing dropped — that is what this path
-enforces. Read [`SECURITY.md`](SECURITY.md) before you rely on it: it states plainly what is and is not
-defended.
-
-**What the spend numbers cover.** Recorded tokens and cost are **process-wide**: they include every session
-running inside the job's container, not just the top-level one — so a flow whose extension fans out into
-subagent sessions is accounted in full, and the per-job token budget (`PI_MAX_TOKENS`) is enforced against
-that same total. Two honest limits. `PI_MAX_TURNS` bounds only the **root** session's turns, because a
-subagent session runs its own loop that the root's turn counter never sees. And a package that spawns a
-**`pi` subprocess** is outside the container's Node process entirely and is **not metered** — its tokens are
-spent and will not appear in the run record; the 30-minute container timeout is the backstop there, along
-with the provider-side spend limit you should set anyway.
+Every trigger flows through this same path: a container boundary, spend checked before the container
+starts, nothing dropped. Read [`SECURITY.md`](SECURITY.md) before you rely on it; it states plainly what
+is and is not defended. Recorded tokens and cost are process-wide (subagent sessions included), and the
+per-job token budget is enforced against that same total.
 
 ## Reuse your existing pi setup
 
-Already run `pi`? Give every job your host setup — custom models, global skills, a global persona — **layered
-under each repo's own `.pi/`** (the repo still wins). Works with the pulled image; it's a read-only mount, not
-a rebuild — and it works the same in a per-trigger image, because a mount is a mount. What the overlay
-**cannot** deliver is a **toolchain** (apt packages, a language runtime, system libraries); that is what
-`run.image` and [`docs/job-image.md`](docs/job-image.md) are for.
-
-**Continuing a conversation instead of starting one.** A follow-up job on a pull request is a cold start
-by default: the agent re-explores the repo and re-derives what it decided an hour ago before it can act on
-a two-line comment. `"resume": true` on a trigger makes its jobs continue the session that opened the pull
-request instead. Off by default, on any trigger type, both forges — and it persists the agent's full
-working history to disk, which is a real disclosure rather than a free win. Read
-[`docs/sessions.md`](docs/sessions.md) before enabling it; it says who can be handed a transcript and what
-it costs.
+Give every job your host pi setup (custom models, global skills, a persona), layered under each repo's
+own `.pi/`. The repo always wins on conflict:
 
 ```bash
-pi-dispatch import-pi          # stage a credential-free copy of ~/.pi/agent into ./pi-global
-# then set PI_GLOBAL_PI_DIR=/abs/path/to/pi-global in .env, and:
-pi-dispatch doctor             # verifies the overlay carries no credential
+pi-dispatch import-pi   # stage a credential-free copy of ~/.pi/agent into ./pi-global
+                        # then set PI_GLOBAL_PI_DIR in .env; doctor verifies it carries no credential
 ```
 
-The overlay is mounted `/opt/pi-global:ro` into every container. Skills merge with the repo's (a repo skill
-of the same name overrides the global one); the prompt layers `guardrails → global persona → repo persona`,
-the safety floor always first and unremovable. `import-pi` **refuses** a `models.json` with a literal key and
-**never** copies `auth.json` — your credential stays in the environment. Extensions come across **by
-default** and `import-pi` prints each one it staged, since staging is the vetting step; pass
-`--no-extensions` to skip them, or `PI_GLOBAL_ALLOW_EXTENSIONS=0` to keep them staged but dormant. The
-admin extension is hard-blocked either way. Full reference:
-[`docs/global-pi-overlay.md`](docs/global-pi-overlay.md).
+Three properties worth knowing, each with a full reference:
 
-**Third-party pi packages, pinned once and declinable per trigger.** Jobs run with no network, so a package
-can't be installed at job time — declare it at an **exact** version in `pi-packages.json` and stage it into
-the overlay on your host with `pi-dispatch import-pi --with-packages`. From then on every job gets it; set
-`"packages": false` on any trigger that must run without it. Staging uses `--ignore-scripts` (a package's
-lifecycle scripts would otherwise run **as you, on your host**), refuses a floating version or an
-admin-shaped package name, and is all-or-nothing — a half-staged set would silently skip what didn't make
-it. `pi-dispatch doctor` shows what is staged and which triggers have opted out.
-
-**Already logged into pi? The key just works — by default.** When the provider key is absent from the
-worker's environment, the worker reads it **host-side** from `~/.pi/agent/auth.json` and env-injects it into
-the job — a host-side read of a host-held secret, never a file mounted into the container. Nothing to set;
-`PI_AUTH_FROM_PI=0` forces env-only if you'd rather fail loudly on a missing env key. **API-key logins only**:
-an OAuth/subscription login (`pi login`) is refused — those tokens expire and can't be refreshed in the
-container, and a subscription isn't the credential for an unattended service; use an API key with a spend limit.
+- **Credentials never enter the overlay.** `import-pi` refuses a `models.json` with a literal key and
+  never copies `auth.json`. When the worker's env has no provider key, it reads your API key host-side
+  from `~/.pi/agent/auth.json` and injects it per job. OAuth and subscription logins are refused; an
+  unattended service needs an API key with a spend limit
+  ([`docs/global-pi-overlay.md`](docs/global-pi-overlay.md)).
+- **Third-party pi packages are pinned once, declinable per trigger.** Declare exact versions in
+  `pi-packages.json`, stage with `import-pi --with-packages` (always `--ignore-scripts`), opt any
+  trigger out with `"packages": false`.
+- **Sessions can continue instead of restarting.** `"resume": true` on a trigger makes follow-up jobs
+  continue the session that opened the pull request. It persists the full transcript to disk, which is
+  a real disclosure: read [`docs/sessions.md`](docs/sessions.md) before enabling it.
 
 ## Run as a service
 
-`pi-dispatch worker` is a long-running process — run it in a terminal, or hand it to your OS's service
-manager so it starts on boot and restarts on a crash. Since issue #80 the hand-editing is optional:
-
 ```bash
-pi-dispatch service render     # show the unit it would install — real node path, real repo root
-pi-dispatch service install    # user-level: LaunchAgent (macOS) / systemctl --user (Linux) / nssm (Windows)
-pi-dispatch service status     # which unit exists, in which scope, and whether it is running
+pi-dispatch service render    # show the unit it would install: real node path, real repo root
+pi-dispatch service install   # user-level: LaunchAgent (macOS) / systemctl --user (Linux) / nssm (Windows)
+pi-dispatch service status    # which unit exists, in which scope, and whether it is running
+pi-dispatch service restart --drain   # pause, wait until nothing is in flight, restart, resume
 ```
 
-`install` renders the [`deploy/`](deploy/) templates with **computed absolutes** — the node that is
-actually running (`process.execPath`, so an nvm install works where the template's `/usr/bin/node`
-would not) and the real repo root — and installs **user-level, without sudo**. `--system` on Linux
-prints the exact `sudo` commands instead of running them; `--receiver` installs the receiver unit;
-`--force` replaces an existing same-scope unit. It **refuses** to install a second worker unit in the
-other scope: one worker per docker daemon is a boot-reaper invariant — a second worker would treat the
-first's in-flight container as a stray to kill. Two honesty notes: on macOS and Windows the service is
-**login-scoped**, because Docker Desktop itself only runs while you're logged in (Linux with a system
-`dockerd` gets true boot persistence — add `sudo loginctl enable-linger $(whoami)` for user units on a
-headless box); and a **policy refusal never relaunches** — exit 2 (a determinate budget/config refusal)
-is excluded from restart on systemd and nssm, and the launchd wrapper converts it to a clean exit, so no
-supervisor loops against a paid provider.
+`install` renders the [`deploy/`](deploy/) templates with computed paths and installs without sudo
+(`--system` on Linux prints the sudo commands instead of running them; `--receiver` installs the
+receiver unit). It refuses a second worker unit in another scope: one worker per docker daemon, because
+the boot reaper would treat the other's containers as strays. Honesty notes: on macOS and Windows the
+service is login-scoped, because Docker Desktop is; and a policy refusal (exit 2) never relaunches, on
+any OS, so no supervisor loops against a paid provider. The templates remain hand-editable examples if
+you prefer to adapt them directly.
 
-The templates in `deploy/` remain hand-editable **per-host examples** for anyone who wants to adapt them
-directly; `service render` is those templates with the placeholders filled in. All three OSes run the
-worker on the **host** — it drives the `docker` CLI and is not itself containerised — so they need the
-AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running alongside,
-which is what makes the queue **and the pause state** survive a reboot.
+Steer the running worker without stopping it, from any terminal:
 
-**Steer the running worker** without stopping it — these commands talk to Valkey, so they work whether the
-worker runs in a terminal or under a service manager:
+- `pi-dispatch pause` stops taking new jobs. Durable: it lives in the queue and survives restarts.
+  Jobs still enqueue; they wait.
+- `pi-dispatch resume` takes jobs again. `pi-dispatch status` prints the counts.
 
-- `pi-dispatch pause` — stop taking new jobs. **Durable**: the pause lives in the queue and survives a
-  worker restart, so a paused worker comes back paused after a reboot. Jobs still enqueue; they just wait.
-- `pi-dispatch resume` — start taking jobs again.
-- `pi-dispatch status` — prints `{ pausedState, waiting, active, paused, delayed, failed }`. `pausedState`
-  is the switch; `paused` is the backlog **count** of jobs that piled up while paused (they land in the
-  `paused` list, not `waiting`).
+## The admin panel
 
-### Linux (systemd)
-
-Edit [`deploy/worker.service`](deploy/worker.service): set `WorkingDirectory`, `EnvironmentFile`, `User`,
-and the `node` path to your clone. Then install and start it:
-
-```bash
-sudo cp deploy/worker.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now worker
-```
-
-`systemctl stop worker` sends **SIGTERM** — the worker stops accepting jobs and lets the in-flight
-container drain before it exits.
-
-### macOS (launchd)
-
-Edit [`deploy/com.pi-dispatch.worker.plist`](deploy/com.pi-dispatch.worker.plist) and its wrapper
-[`deploy/worker-env-wrapper.sh`](deploy/worker-env-wrapper.sh): set the repo-root and log paths (launchd
-has no `EnvironmentFile`, so the wrapper loads `.env` at runtime). Then bootstrap it:
-
-```bash
-launchctl bootstrap gui/$(id -u) deploy/com.pi-dispatch.worker.plist
-```
-
-`launchctl bootout gui/$(id -u)/com.pi-dispatch.worker` sends **SIGTERM** for the same graceful drain.
-
-### Windows (nssm)
-
-Put `nssm.exe` on PATH ([nssm.cc](https://nssm.cc)), set `SERVICE` / `REPO` / `LOGDIR` in
-[`deploy/nssm-install.cmd`](deploy/nssm-install.cmd), then run it and start the service:
-
-```
-deploy\nssm-install.cmd
-nssm start pi-dispatch-worker
-```
-
-The wrapper [`deploy/worker-env-wrapper.cmd`](deploy/worker-env-wrapper.cmd) loads `.env` at runtime. A
-console-stop (`nssm stop pi-dispatch-worker`) sends the worker a signal it handles, so it drains
-gracefully.
-
-### Drain before a planned restart
-
-A planned restart should abort no in-flight job:
-
-```bash
-pi-dispatch service restart --drain   # pause → wait until "active": 0 → restart the unit → resume
-```
-
-That composes the durable-pause ritual (`pause` / poll `status` / restart / `resume`) into one command.
-If the queue is still busy at `--drain-timeout` (default 600s) it stops **without restarting and without
-resuming** — a timed-out drain must not un-pause a queue that still has a job in flight. The manual
-sequence still works, and because the pause is durable, the worker comes back paused even if a restart
-outruns your `resume`, so nothing slips through in the gap.
-
-**Windows caveat**: stop the service with nssm's **console-stop** (`nssm stop`), which delivers a signal
-the worker handles and drains gracefully. Task Scheduler is a weaker fallback — it stops a task with a
-hard kill, giving the worker no chance to drain; a job killed mid-flight leaves a stray container that the
-worker's **boot reaper** clears on the next start, rather than draining cleanly.
-
-## Admin (pi extension)
-
-The admin surface — the dashboard and command transcript shown at the top of this README — is a **pi
-extension** in [`admin/`](admin/) that loads into *your own* interactive pi session — no daemon, no web
-app, **no network port at all**.
-
-**Install it through pi** — the published package (the extension **and** the `operate-pi-dispatch` skill, so
-your AI can drive the deployment too — see [Operating pi-dispatch from your AI](#operating-pi-dispatch-from-your-ai)),
-then open the panel:
+The dashboard shown at the top of this README is a **pi extension**: it loads into your own interactive
+pi session. No daemon, no web app, no network port.
 
 ```bash
 pi install npm:@edgehero/pi-dispatch-admin   # then, in pi:  /dispatch
 ```
 
-**No deployment yet? The console builds one.** When `/dispatch` finds nothing — no pointer, no env, no
-config in the folder, queue unreachable — it offers **`/dispatch setup`**: pick a deployment folder
-(default `~/pi-dispatch`), consent to an `npm install` of the pinned runtime, watch `pi-dispatch up` run
-its own per-action prompts in your terminal, optionally install the worker as a user-level service, and
-land in the panel — with an optional first trigger for the repo you're sitting in, its flow picked from
-that repo's own `.pi/skills/`. Every step shows what it will do and asks first; every step can be
-declined; nothing is ever written into your repo (the `ai-trigger: allow` opt-in line is printed for
-*you* to commit), and no credential ever passes through a dialog. It's the same consented CLI underneath
-— the wizard just types it for you.
+**No deployment yet? The console builds one.** When `/dispatch` finds nothing (no config, no env, queue
+unreachable) it offers **`/dispatch setup`**: pick a deployment folder, consent to an npm install of the
+pinned runtime, watch `pi-dispatch up` run its own prompts in your terminal, optionally install the
+worker as a service, and land in the panel, with an optional first trigger for the repo you are sitting
+in. Every step shows what it will do and asks first; every step can be declined; nothing is ever written
+into your repo, and no credential passes through a dialog. Setup writes a small **deployment pointer**
+(`~/.pi/agent/pi-dispatch-deployment.json`, paths only, never credentials) so the panel finds the
+deployment from any directory afterwards. Your own env vars always win over it, key by key.
 
-Two other ways to load it: from a clone, the in-repo `.pi/extensions` shim auto-loads once you've trusted
-the project; or point pi at the source with `pi -e admin/src/index.ts` (add that path to the `"extensions"`
-array in `~/.pi/agent/settings.json` to make it permanent). Pointing the panel at a **live** deployment is
-automatic when `/dispatch setup` built it: the wizard writes a small **deployment pointer**
-(`~/.pi/agent/pi-dispatch-deployment.json`, override `PI_DISPATCH_DEPLOYMENT_FILE` — absolute paths only,
-never credentials), and the panel finds the deployment from any directory. Your own env always wins, key
-by key — exporting the same `VALKEY_URL` / `PI_SETTINGS_FILE` / `PI_TRIGGERS_FILE` /
-`PI_PAUSE_WINDOWS_FILE` / `PI_LOGS_DIR` the worker uses still works exactly as before, and is still the
-way to aim one pi session at a *different* deployment.
+Inside the panel: `p`/`r` pause and resume the queue, arrows and `Enter` drill into triggers and runs,
+`a`/`e`/`x` add, edit and delete triggers (validated, atomic, reloaded live by both services), `s` edits
+a limit, `w` manages quiet hours, `c` opens the COSTS view. `Enter` on a run opens its full record:
 
-Bare `/dispatch` opens the live dashboard overlay — one snapshot per second, `p`/`r` to pause/resume the
-queue in place, `↑`/`↓` to move across the triggers and runs, `Enter` to drill into either. **Triggers are
-editable in place**: `Enter` on a trigger shows its trust model, `e` edits its flow, `x` deletes it, `a`
-adds one (guided, kind-first), `s` edits a limit, and `w` manages scheduled pause windows — every write is
-operator-typed, validated, atomic, and **reloaded live** by the worker/receiver (no restart). `Enter` on a
-run opens its full PII-free record:
+![The RUN_DETAIL drill-in, a colored post-mortem of one run's PII-free record: outcome, target, timing with duration, turns/exit/budget slot, tokens and cost, and a chain line naming spawned children](docs/images/dispatch-run-detail.svg)
 
-![The RUN_DETAIL drill-in — a colored post-mortem of one run's PII-free record: outcome, target, timing with duration, turns/exit/budget slot, tokens and cost, and a chain line naming spawned children](docs/images/dispatch-run-detail.svg)
-
-It adds `/dispatch` commands that run **locally, with no model involvement**:
-
-- `status` — queue counts, paused state, budget; `budget` — today's spend against the daily cap
-- `pause` / `resume` — the queue on/off switch
-- `runs` / `logs` — recent run records, and one run's raw log
-- `triggers` — the configured triggers (also editable from the overlay: `a`/`e`/`x`, applied live)
-- `run <folder> <flow> [task]` — enqueue a flow against a local folder (operator-typed; the dirty-tree guard still applies)
-- `settings` / `set <key> <value>` / `unset <key>` — the runtime overlay
-
-`/dispatch pause|resume|status` are a second interface over the **same durable switch** as
-`pi-dispatch pause|resume|status` (see **Steer the running worker** above), not a new mechanism; `runs`
-and `logs` read the **same** `logs/<jobId>.json` / `.log` files as **Run history** below. The extension
-reads only queue counts, run records, and the settings overlay — none of which carry credentials.
+The same surface exists as plain commands (`/dispatch status | runs | logs | budget | triggers | costs |
+run | pause | resume | set | unset`), all local, no model involvement.
 
 ### Operating pi-dispatch from your AI
 
-Installing `@edgehero/pi-dispatch-admin` gives your AI more than the panel: the package **also ships the
-`operate-pi-dispatch` skill** (via its `pi.skills` manifest), so once it's installed your assistant knows this
-deployment's tools and how to use their gates — **you can just ask, in plain language**: *"raise the daily cap
-to 30", "add a nightly `tidy` trigger for `/srv/site`", "quiet-hours for `acme/web` 22:00–06:00 Amsterdam"*.
-Everything the panel does is model-callable, so **setting it up can be driven entirely by the AI** — with your
-confirmation on every change that costs money or config:
-
-- **Read** (no confirm): `dispatch_status`, `dispatch_runs`, `dispatch_triggers`, `dispatch_pauses`.
-- **Turn on/off** (no confirm — reversible, money-safe): `dispatch_pause` / `dispatch_resume`.
-- **Change config — each behind a confirm you approve**: `dispatch_set` (a limit/setting), the triggers
-  `dispatch_trigger_add` / `_edit` / `_delete`, and the quiet-hours `dispatch_pause_add` / `_edit` / `_delete`.
-- **Start a paid run**: `dispatch_run` (gated — see below).
-
-A confirm-gated write applies its change **only after you approve a dialog showing the exact before→after**,
-and **refuses — writing nothing — when no interactive operator is present** (so a prompt-injected session
-can't raise your cap or add a paid trigger; the model emits the call, only your keypress approves it). The
-`operate-pi-dispatch` skill tells the model how to use those gates: state the change plainly, and accept a
-decline. `CONST-BUDGET-BEFORE-TOKENS` and `CONST-TRIGGER-AUTHOR-GATE` are unchanged — the confirm is the human approval.
-
-`dispatch_run` is the one model-callable tool that is **not money-safe**: unlike the others, it enqueues a
-**PAID** agent run that edits a folder in place with **no undo** — and unlike the confirm-gated writes, it
-has no operator confirm. It is bounded in blast-radius, not prevented, by **six** independent limits: the
-folder allowlist `PI_DISPATCH_RUN_ROOTS` (realpath + containment); the committed per-flow
-`ai-trigger: allow` opt-in read at HEAD (default **deny**); the dirty-tree refusal (no force option); no
-spend-knob parameters on the tool; a per-hour rate limit; and the daily cap. Do not read it as money-safe
-or reversible — it is neither. A raw `.log` is untrusted container output that renders in the overlay
-viewer only, never into model context. Settings land in the `settings.json` overlay
-(`PI_SETTINGS_FILE`; keys `model`, `provider`, `maxTurns`, `dailyCap`, `concurrency`) and take effect per
-job — `concurrency` at the next pickup. The supported pi version is the pinned `0.80.7`; the load-time
-capability probe is all-or-nothing and refuses loudly on any other version.
-
-A flow becomes AI-triggerable only when its `.pi/skills/<flow>/SKILL.md` frontmatter sets
-`ai-trigger: allow` (default **deny**); an AI trigger naming no such opted-in flow is refused.
-
-A completed job can request follow-up flows by writing to a `/outbox` mount. The worker validates each
-request host-side and enqueues **same-folder, local-parent only** (GitHub jobs never chain), gated by the
-same `ai-trigger: allow` opt-in and bounded by `PI_CHAIN_DEPTH_MAX` and `PI_CHAIN_MAX_PER_JOB` — both
-host-enforced, so the in-container agent controls nothing.
-
-## Run history
-
-The worker keeps a durable, per-job record under `PI_LOGS_DIR` (default: your OS temp dir,
-`.../pi-dispatch/logs`). Every job writes an id-only status record `logs/<jobId>.json` — stable ids only
-(the delivery GUID, `repo#number`), never issue or comment text. Set `PI_CAPTURE_JOB_LOGS=1` to **also**
-capture the container's raw stdout/stderr to `logs/<jobId>.log`; this is **opt-in and off by default**,
-because that raw stream can contain issue and comment text (PII). Both files stay host-side, are never
-mounted into the job container, and are gitignored. A boot-time sweep prunes anything older than
-`PI_LOG_RETENTION_DAYS` (default 30; `0` keeps them forever).
-
-Each record also carries a per-(provider, model) **usage ledger** — which models spent what, cache split
-included — which is what the dashboard's COSTS view (`c`), `/dispatch costs`, and the what-if re-pricing
-fold over. Declare what your subscriptions cost in `subscriptions.json` (see
-`subscriptions.example.json`) and the screen shows whether they are actually saving money; leave it out
-and zero-rate runs honestly show `$0 (unrated)`, never "free". The whole story is in
-[`docs/costs.md`](docs/costs.md).
-
-## Re-open a finished run
-
-The container is gone the moment a job exits, and stays gone. But the run's workspace is kept for a
-short window, so you can start a **fresh** container on it and see what the agent actually built:
-
-```bash
-pi-dispatch sandbox --list                    # what is still re-openable, and for how long
-pi-dispatch sandbox gh-12345 --publish 3000   # a shell in that run's workspace, app on 127.0.0.1:3000
-```
-
-Same image, same workspace, same isolation flags — and **no credentials**: no minted forge token, no
-provider key. The agent is not running; you are. Bring your own auth if you need to push. From the admin
-panel, press `b` on a run's detail screen.
-
-Retention is on by default for 24 hours (`PI_SANDBOX_RETENTION_HOURS`; `0` turns it off) and swept at
-worker boot. `--pin` keeps one run for `PI_SANDBOX_PIN_DAYS` (default 7) — bounded, never forever.
-A retained directory holds the run's clone **plus its issue text**, so read `docs/sandbox.md` before
-leaving it on.
+The package also ships the `operate-pi-dispatch` **skill**, so your assistant knows the deployment's
+tools: ask in plain language ("raise the daily cap to 30", "add a nightly tidy trigger for /srv/site").
+Reads need no confirmation. Every config write pops **an operator confirmation the model cannot answer**,
+and refuses when no operator is present, so a prompt-injected session cannot raise your cap or add a paid
+trigger. One tool is deliberately not money-safe: `dispatch_run` enqueues a paid run without a confirm,
+bounded instead by six independent limits (folder allowlist, the committed `ai-trigger: allow` opt-in,
+the dirty-tree refusal, no spend knobs, a rate limit, and the daily cap). Raw job logs render in the
+overlay only and never enter model context.
 
 ## Flows: the custom prompt a trigger runs
 
-A **flow** is the recipe the agent follows — a pi **skill** committed to the target repo/folder at
-`.pi/skills/<flow>/SKILL.md`. **That file *is* the custom prompt**: the frontmatter names the flow, the body is
-the standing instructions the agent runs. A trigger (or `pi-dispatch run --flow <name>`) only *names* which
-flow to run; the flow lives with the project, so different repos can define the same flow name their own way.
+A **flow** is a pi skill committed to the target repo at `.pi/skills/<flow>/SKILL.md`. That file is the
+custom prompt; a trigger only names which flow to run, so different repos define the same flow name their
+own way:
 
 ```markdown
 <!-- .pi/skills/tidy/SKILL.md -->
@@ -418,196 +180,72 @@ Run the formatter and linter and fix what they report; tighten obvious type hole
 Keep the diff minimal and open a PR titled "tidy: <what changed>". Do not change behavior.
 ```
 
-Two things reach the agent: the **flow** (this SKILL.md — the standing instructions) and the **task** (the
-one-off ask for a single run). You set the task explicitly for a CLI/cron run (`--task "…"`, or the trigger's
-`task`); for a GitHub trigger the issue/comment/PR text *is* the task. Flows are read from your
-**default-branch** commit, read-only — so **commit and merge a flow before a trigger can use it**; a PR branch
-can neither add one nor alter it. `ai-trigger: allow` in the frontmatter is what lets a label/comment/PR — or
-an AI tool — run that flow at all (default **deny**).
+The flow is the standing instructions; the **task** is the one-off ask (your `--task`, a trigger's
+`task`, or the issue/comment text itself). Flows are read from the **default branch**, so commit and
+merge a flow before a trigger can use it. That merge is the repo's consent: `ai-trigger: allow` is what
+lets a forge event or an AI tool run the flow at all.
 
-## Triggers: cron, labels, comments, pull requests
+## Triggers
 
-Every standing trigger — cron schedules and webhook triggers alike — lives in one unified
-**`triggers.json`**, a list of `{ on, run }` pairs read by both the worker (cron) and the receiver
-(GitHub, GitLab). `PI_TRIGGERS_FILE` points both services at it; the worker treats it as optional (unset =
-cron off), the receiver falls back to `./triggers.json` in the folder it starts from (what `pi-dispatch init`
-scaffolds) and refuses to start when neither exists.
+All standing triggers live in one `triggers.json`, read by the worker (cron) and the receiver (forges):
 
 ```jsonc
 { "triggers": [
   { "on": { "type": "cron", "id": "nightly", "pattern": "0 3 * * *" },
-    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy",
-             "image": "pi-job:latest" } },
+    "run": { "kind": "local", "folder": "/srv/site", "flow": "tidy", "task": "run the nightly tidy" } },
   { "on": { "type": "label", "any": ["pi:frontend"] },              "run": { "kind": "github", "flow": "frontend-fix" } },
   { "on": { "type": "comment", "phrase": "@pi" },                   "run": { "kind": "github", "flow": "fix" } },
   { "on": { "type": "pull_request", "action": ["labeled"], "any": ["pi:review"] }, "run": { "kind": "github", "flow": "review" } },
-
-  { "on": { "type": "label", "any": ["pi:fix"] },                   "run": { "kind": "gitlab", "flow": "fix" } },
-  { "on": { "type": "pull_request", "action": ["open", "update"] }, "run": { "kind": "gitlab", "flow": "review" } }
+  { "on": { "type": "label", "any": ["pi:fix"] },                   "run": { "kind": "gitlab", "flow": "fix" } }
 ] }
 ```
 
-The `on × run` matrix is the trust boundary, enforced fail-loud at load: a `cron` trigger must run
-`local` (it has no webhook delivery, issue/PR number, or body), and every webhook trigger runs on a forge
-— `github` or `gitlab`. `run.kind` picks the forge; the trigger types and label predicates are shared, but
-the `pull_request` **actions** are each forge's own words (`labeled|opened|synchronize|reopened` vs
-`open|update|reopen|approved`), and a word from the wrong forge is refused at load rather than left to
-silently never match. See [`docs/gitlab.md`](docs/gitlab.md).
+The shape is enforced fail-loud at load: cron triggers run local folders, webhook triggers run on a
+forge, and each forge's `pull_request` action words are validated against that forge's own vocabulary.
+Optional `run` fields, each a deliberate file-only edit (no panel key, no AI tool, because each one
+changes what code runs or what it costs):
 
-`"packages"` on any trigger's `run` (all four kinds) decides whether that trigger loads the third-party pi
-packages you staged into the global overlay. It is an **opt-out**: staged packages load for every job, and
-`"packages": false` is how one flow declines them. A non-boolean value is refused at load, and with nothing
-staged the flag loads nothing either way; `pi-dispatch doctor` reports both cases.
+- `"image"` names the container image for that trigger's jobs; absent means `PI_JOB_IMAGE`. The image
+  decides what is in the box, never what the box can do: the isolation flags are the worker's, always
+  ([`docs/job-image.md`](docs/job-image.md)).
+- `"packages": false` opts one trigger out of the staged third-party pi packages.
+- `"replicas": 2` (GitHub only) races independent sandboxes on the same event and opens one PR per
+  replica. Each replica spends its own budget slot ([`docs/replicas.md`](docs/replicas.md)).
+- `"resume": true` continues the session that opened the PR ([`docs/sessions.md`](docs/sessions.md)).
+- `"github": true` on a cron trigger mints the same per-job GitHub token the webhook path gets, so a
+  scheduled flow can use `gh`.
 
-`"image"` on any trigger's `run` (all four kinds) names the **container image** that trigger's jobs run in;
-absent means the deployment default `PI_JOB_IMAGE`. It is how one flow gets a Python toolchain and another
-gets Node + Playwright without one image carrying the union of both. **The image decides what is in the box,
-never what the box can do**: whichever tag runs, it runs under the same `--cap-drop=ALL`, the same non-root
-user, the same read-only `/job`, and the same closed env allowlist — all built by the worker, none of it
-influenced by the image. Jobs launch with `--pull=never`, so **build or pull every image you name**; a name
-this host does not have is refused before the job costs anything, and `pi-dispatch doctor` lists them all.
-Like `packages`, it is deliberately **not** settable from the panel or by an AI tool — naming an image is an
-edit to the reviewed `triggers.json`. See [`docs/job-image.md`](docs/job-image.md).
+Everything else is editable from the panel (`a` adds kind-first, `e` edits the flow, `x` deletes) or via
+the confirm-gated AI tools; every write is validated and both services reload it live. Every local job
+also receives a read-only `/job/event.json` (source, folder, HEAD sha; cron adds its id, pattern and
+schedule instants), so a scheduled flow can triage only what changed since its last run.
 
-`"replicas"` on a **GitHub** `label`/`comment`/`pull_request` trigger's `run` (an integer `2` or `3`) races
-that many sandboxes on the same event, independently, and lets you pick the better result. One labelled issue
-becomes two containers, two branches (`pi/issue-7-r1`, `pi/issue-7-r2`) and **two pull requests**, each titled
-`[r1/2]` / `[r2/2]`. Neither replica knows what the other did; that is the point. It is for the task that is
-urgent enough that token cost has stopped mattering — **each replica reserves its own budget slot and spends
-its own tokens**, so a `replicas: 2` trigger burns your daily cap twice as fast. Absent means what it always
-meant: one delivery, one run. It is refused at load on cron/local triggers (a local job's workspace *is* your
-folder — two replicas would edit one working tree), on GitLab/Forgejo/Azure for now, and alongside
-`"resume": true`. Rebuild your job image before using it: an image that does not declare
-`dev.pi-dispatch.capabilities=replicas` refuses replica jobs before they cost anything. Like `image` and
-`packages`, it is a file edit only — no panel key, no AI tool. See [`docs/replicas.md`](docs/replicas.md).
+### Quiet hours
 
-### Add a trigger from the panel
-
-You can edit `triggers.json` by hand, or add one from `/dispatch` without touching the file: press **`a`** and
-answer the **kind-first** prompts. The panel writes a validated entry and both services reload it live:
-
-- **cron** → `id` · `pattern` (5–6 field cron) · `folder` (absolute host path) · `flow` · `task`, then the
-  optional `model` / `provider` / `maxTurns` (blank = the deployment default). Neither the panel nor
-  `dispatch_trigger_*` can set `image`, `packages` or `replicas` — all three stay file edits; the panel shows
-  them and edits the flow only. `replicas` is the sharpest case: a spend multiplier is exactly the kind of
-  capability an AI assistant should not be able to grant itself.
-- **label** → `labels` (space-separated, any-of) · `flow`. The issue text is the task.
-- **comment** → trigger `phrase` (e.g. `@pi`) · `flow`. The comment/issue text is the task.
-- **pull_request** → `action`s (`labeled opened synchronize reopened`) · `labels` (for `labeled`) · `flow`.
-
-To change an existing trigger, `Enter` on it → **`e`** edits which flow it runs, **`x`** deletes it (with a
-confirm). An AI assistant can propose the same edits via `dispatch_trigger_add`/`_edit`/`_delete`, but each
-write waits on your confirmation.
-
-### Scheduling recurring jobs
-
-A cron trigger runs a local folder through a flow on a cron pattern — `pattern` is a 5- or 6-field cron
-expression; `provider`, `model`, `maxTurns` and `image` are optional on `run` and fall back to the worker's
-defaults. `"github": true` on `run` is also optional — it mints the same per-job GitHub token the webhook
-path gets (injected as `GITHUB_TOKEN`/`GH_TOKEN`), so the flow can use `gh`; off by default. It names
-GitHub explicitly — there is no cron opt-in for a GitLab token. A cron
-`folder` is a **host path** — the worker runs on the host
-([`DES-WORKER-ON-HOST`](specs/design.md)) and mounts that folder into the job container, so it must be
-readable by the worker's user.
-
-Every local job — cron, manual, or chained — also gets a read-only `/job/event.json` (`source:
-cron|manual|chain`, the folder's basename, its HEAD sha; cron jobs additionally the trigger's id and
-pattern, the scheduled-for instant, and the previous run's timestamp), so a scheduled flow can e.g. triage
-only what changed since its last run. Comment-triggered GitHub jobs likewise now receive the invoking
-comment in `event.json` and the prompt.
-
-```bash
-cp triggers.example.json triggers.json   # then edit the cron entry's "folder" to a REAL absolute path
-# In .env:  PI_TRIGGERS_FILE=/absolute/path/to/triggers.json
-npx pi-dispatch worker
-```
-
-Copying `triggers.example.json` verbatim makes the worker **refuse to start** with
-`configError: folder does not exist` until a cron trigger's `folder` names a real path — fail-loud on
-purpose, so a broken trigger never silently fails to fire.
-
-## Quiet hours — scoped pause windows
-
-Pause a **specific folder or repo's** runs *between certain times* — recurring daily, optionally restricted to
-certain weekdays or a date range, in a timezone of your choice — and resume automatically. Unlike
-`pi-dispatch pause` (which stops the **whole** queue, untimed), a pause window is per-scope and scheduled, and
-a paused job is **deferred, not dropped**: it waits in the queue and runs once the window ends. The check
-happens **before** the budget reservation, so a deferred job spends nothing and counts nothing against the cap.
-
-Copy `pause-windows.example.json` and point `PI_PAUSE_WINDOWS_FILE` at it (unset = off); the worker validates
-it at boot and live-reloads edits:
+Pause a specific repo or folder between certain times (recurring, weekday- or date-bounded,
+timezone-aware) and resume automatically. A paused job is deferred, never dropped, and spends nothing:
 
 ```json
 { "windows": [
-  { "scope": "acme/web",  "from": "22:00", "to": "06:00", "tz": "Europe/Amsterdam",
-    "days": ["mon","tue","wed","thu","fri"] },
-  { "scope": "/srv/site", "from": "09:00", "to": "17:00", "dateFrom": "2026-08-10", "dateTo": "2026-08-14" }
+  { "scope": "acme/web", "from": "22:00", "to": "06:00", "tz": "Europe/Amsterdam", "days": ["mon","tue","wed","thu","fri"] }
 ] }
 ```
 
-`scope` is a repo path (`"owner/name"`, or a nested GitLab `"group/sub/project"`), a local folder path, or `"*"` for all; `from > to` is an overnight window;
-`days`/`dateFrom`/`dateTo` gate the day the window starts.
-
-**Manage windows from the panel:** in `/dispatch`, press **`w`** and choose *Add*, *Edit*, or *Delete* —
-validated and live, no restart.
-
-- **Add** prompts `scope → from → to → tz → days → dateFrom → dateTo`; leave an optional field blank to omit it
-  (blank `tz` = UTC, blank `days` = every day).
-- **Edit** lets you pick a window and re-type only what changes — a blank answer keeps the current value.
-- **Delete** picks a window and confirms.
-
-The **PAUSES** pane shows each window as ● paused (with a resume countdown) or ○ open. Editing the file
-directly and the confirm-gated `dispatch_pause_add`/`_edit`/`_delete` tools do the same thing. Full field
-reference and more examples: **[`docs/pause-windows.md`](docs/pause-windows.md)**.
+Manage them with `w` in the panel or `PI_PAUSE_WINDOWS_FILE` by hand
+([`docs/pause-windows.md`](docs/pause-windows.md)).
 
 ## GitHub automation
 
-pi-dispatch can also be triggered by GitHub — label an issue, and a container works it on a fresh clone,
-opens a PR, and comments back. A repo **webhook** drives it (set a `WEBHOOK_SECRET`), and the worker
-authenticates to GitHub via `GITHUB_AUTH_SOURCE`: `gh` (a `gh auth token`) or a repo-scoped fine-grained
-**PAT** by default. A GitHub **App is optional** — it buys stronger token scoping and is what you need
-for multi-tenant. The `gh` source hands your full login scopes to every token-carrying job — `doctor`
-warns and names them; use a fine-grained PAT or an App for per-job scoping. Which labels, comment
-phrases, and pull_request actions fire which flow is configured in the same unified **`triggers.json`**
-above. Start the receiver with `npx pi-dispatch-receiver` (or the explicit form, `node receiver/src/cli.mjs`,
-if a shell can't find the local bin) from the folder you ran `pi-dispatch init` in: it reads
-`./triggers.json` there, `PI_TRIGGERS_FILE` overrides, and it **refuses to start** when neither exists.
-
-Or run it as a **container** — the receiver is the one piece with zero docker dependency, so it
-containerises for free (the worker never does — it drives the host `docker` CLI):
-
-```bash
-docker compose -f deploy/docker-compose.yml --profile receiver up -d
-```
-
-That adds the prebuilt [`ghcr.io/edgehero/pi-dispatch-receiver`](https://github.com/edgehero/pi-dispatch/pkgs/container/pi-dispatch-receiver)
-beside Valkey — `restart: unless-stopped` durability for one flag, your `triggers.json` mounted
-read-only, published on `127.0.0.1:3000` (your reverse proxy or tunnel does the public exposure, exactly
-as with the host receiver). No service in the compose file mounts the docker socket; the trust model is
-unchanged — the receiver still never executes agent-authored content.
-
-**No public URL at all?** Run the **polling** producer instead of the webhook edge:
-
-```bash
-pi-dispatch-receiver poll     # fetches issue events / comments / PRs over TLS with your own credential
-```
-
-Same triggers, same author/label/bot-loop gates, same queue — GitHub events are *fetched* (~60s cadence,
-conditional requests, nearly free against the rate limit) rather than delivered, so there is no port, no
-tunnel, no DNS, and no webhook secret to manage. Pair it with `pi-dispatch setup github --no-webhook`,
-which mints the App hook-inactive. The webhook receiver stays the low-latency default; polling trades
-~60s of trigger latency for zero public surface. Repos come from `POLL_REPOS` or, under App auth, the
-App installation's repo list. A fresh poller starts from *now* — it never replays a repo's history of
-old labels.
+Label an issue, and a container works it on a fresh clone, opens a PR, and comments back:
 
 ```mermaid
 flowchart LR
   GH["GitHub repo<br/>issue labeled, @pi comment, or PR"] -->|"webhook, HMAC-signed"| R
-  subgraph EDGE["receiver/ — public edge, binds 0.0.0.0"]
+  subgraph EDGE["receiver/ (public edge, binds 0.0.0.0)"]
     R["verify raw-body HMAC (401 on mismatch)<br/>filter: label allowlist, author gate, bot-loop"]
   end
   R -->|"enqueueGitHubJob (jobId = gh-&lt;delivery&gt;)"| Q[("Valkey + BullMQ<br/>pi-jobs, AOF, 31d+ retention")]
-  subgraph HOST["worker/ — host process"]
+  subgraph HOST["worker/ (host process)"]
     W["mint scoped token, refuse an unprotected branch,<br/>hardened clone at the default-branch SHA, run container"]
   end
   Q --> W
@@ -615,143 +253,90 @@ flowchart LR
   C -->|"GITHUB_TOKEN via env only, never merges"| GH
 ```
 
-- Only a collaborator's label or `@pi` comment starts a job (the label *is* the approval step).
-- Beyond labeled issues, pi-dispatch also handles **pull requests**: label a PR, comment on a PR, or fire
-  automatically when a PR is opened or updated — the auto (`opened`/`synchronize`/`reopened`) path is
-  gated on the PR author being a collaborator, so a fork PR from a stranger never auto-fires. A PR trigger
-  just runs the configured flow; the flow (a repo skill) reviews, comments, or pushes to the PR via `gh`.
-- The agent gets a **repo-scoped, short-lived token** — and, honestly: that token *can* merge, because
-  GitHub gates push and merge behind the same `contents: write` scope. **Branch protection on your
-  default branch is the real control**, so the worker **refuses** an unprotected repo. `SECURITY.md` has
-  the detail.
-- The checkout is always the base repo at its **default-branch SHA** — never a PR branch, even for a PR
-  trigger. Because of that the repo's own `AGENTS.md` and `.pi/extensions` are loaded, as they would be in
-  any `pi` run, which means **landing a commit on your default branch is enough to run code in a job
-  container**. Issue and comment text is *not* in that category and never has been: it stays data in the
-  user prompt. If you service repos you don't control, read the discovery section of `SECURITY.md` first.
+- Only a collaborator's label or `@pi` comment starts a job; the label is the approval step. PR triggers
+  (label, comment, or auto on open/update) gate the auto path on the PR author being a collaborator, so
+  a fork PR from a stranger never auto-fires.
+- The per-job token is repo-scoped and short-lived, and honestly: it *can* merge, because GitHub gates
+  push and merge behind the same scope. **Branch protection on your default branch is the real
+  control**, and the worker refuses an unprotected repo before any spend.
+- The checkout is always the base repo at its default-branch SHA, never a PR branch. Landing a commit on
+  your default branch is enough to run code in a job container; issue and comment text never is. It
+  stays data.
 
-Every delivery runs the same gate before anything is queued — the signature is checked over the raw bytes
-*before* the body is parsed, and the `sender.id` bot-loop guard fires before the author check (so the
-receiver's own comments, and the agent's own push to a PR head, can never re-trigger a job):
+**Credentials in one click**: `pi-dispatch setup github` runs GitHub's App Manifest flow against your own
+loopback. One browser click mints the App id, private key and webhook secret; every `.env` line is shown
+before one consent, the key lands with mode 0600, and no secret is ever printed. The App is the
+strongest auth source (per-repo one-hour tokens); `gh` and fine-grained PATs also work
+(`GITHUB_AUTH_SOURCE`).
 
-```mermaid
-flowchart TD
-  D["POST delivery"] --> V{"HMAC over the<br/>raw body valid?"}
-  V -->|no| E401["401 — reject, enqueue nothing"]
-  V -->|yes| S{"sender.id ==<br/>our own id?"}
-  S -->|"yes"| D204a["204 — drop (bot-loop guard)"]
-  S -->|no| A{"allowlisted label, collaborator @pi,<br/>or collaborator-authored PR?"}
-  A -->|no| D204b["204 — drop"]
-  A -->|yes| EN{"enqueue to Valkey"}
-  EN -->|ok| A202["202 — queued<br/>(duplicate delivery = no-op, deduped by GUID)"]
-  EN -->|"Valkey down"| E503["503 — GitHub redelivers,<br/>deduped by GUID"]
-```
+**Three ways to run the trigger edge**, pick one:
 
-## GitLab automation
+1. **Webhook receiver on the host** (lowest latency): `npx pi-dispatch-receiver` from your deployment
+   folder. Your reverse proxy or tunnel does the public exposure.
+2. **Webhook receiver in a container**: `docker compose -f deploy/docker-compose.yml --profile receiver
+   up -d` runs the prebuilt
+   [`ghcr.io/edgehero/pi-dispatch-receiver`](https://github.com/edgehero/pi-dispatch/pkgs/container/pi-dispatch-receiver)
+   beside Valkey, triggers mounted read-only, no docker socket anywhere.
+3. **No public URL at all**: `pi-dispatch-receiver poll` fetches issue events, comments and PRs over TLS
+   with your own credential (conditional requests, nearly free against the rate limit). Same gates, same
+   queue, about 60 seconds of latency, zero public surface. Pair with `setup github --no-webhook`. A
+   fresh poller starts from now and never replays old labels.
 
-Same machinery, one new field. Point a GitLab webhook at **`/gitlab`** (`/` is the GitHub endpoint), set
-`GITLAB_TOKEN` plus a verification mode, and write `"kind": "gitlab"` on your triggers.
+## Other forges
+
+Same machinery, per-forge correctness differences, each with a full setup doc:
+
+- **GitLab** ([`docs/gitlab.md`](docs/gitlab.md)): webhook at `/gitlab`, project token with `api` scope.
+  A GitLab label is not an approval, so every trigger is gated on the actor's resolved access level
+  (Developer or above). Labels fire on the diff, not the state. Needs GitLab 17.4+ for retry-stable
+  dedup. Self-hosted works via `GITLAB_URL`.
+- **Forgejo / Gitea** ([`docs/forgejo.md`](docs/forgejo.md)): webhook at `/forgejo`. Transport is
+  byte-compatible with GitHub's; actions are Forgejo's own words (`label_updated`, `synchronized`);
+  every trigger is gated on the actor's resolved repository permission.
+- **Azure DevOps** ([`docs/azure-devops.md`](docs/azure-devops.md)): Service Hook at `/azure`. The
+  weakest transport of the four (no HMAC, no signed timestamp), and the doc says exactly how. Needs a
+  dedicated identity, `run.repository` on triggers, and its own job image (`image/Dockerfile.azure`).
+
+## Run history, costs, and re-opening a run
+
+Every job writes a durable, id-only record under `PI_LOGS_DIR` (never issue or comment text; raw logs
+are opt-in via `PI_CAPTURE_JOB_LOGS=1` and stay host-side). Each record carries a per-model **usage
+ledger**, which is what the COSTS view, `/dispatch costs`, and the what-if re-pricing fold over. Declare
+what your subscriptions cost in `subscriptions.json` and the screen shows whether they actually save
+money; without it, zero-rate runs show `$0 (unrated)`, never "free" ([`docs/costs.md`](docs/costs.md)).
+
+A finished run's workspace is kept for a bounded window (24h by default), so you can re-open it:
 
 ```bash
-GITLAB_TOKEN=glpat-xxxxxxxxxxxx        # a PROJECT access token, `api` scope, Developer or above
-GITLAB_URL=https://gitlab.com          # your instance, if self-hosted
-GITLAB_WEBHOOK_MODE=signature          # or `token` below GitLab 19.0
-GITLAB_WEBHOOK_SECRET=whsec_...
+pi-dispatch sandbox gh-12345 --publish 3000   # a fresh container on that run's workspace, no credentials
 ```
 
-Three things differ from the GitHub arm, and each is a correctness matter rather than a rename:
-
-- **A GitLab label is not an approval.** A Guest can label an issue they are creating, and the minimum
-  role for labelling varies by version and edition — so every GitLab trigger is gated on the actor's
-  API-resolved project `access_level >= 30` (Developer), labels included.
-- **Labels fire on the diff.** GitLab has no `labeled` event; a label add arrives as `update` with a
-  before/after pair. Adding your label fires once; editing the issue afterwards fires nothing.
-- **GitLab 17.4 or later.** Dedup uses GitLab's own retry-stable delivery id. An older instance is refused
-  with a clear 400 rather than run on a key that would only half-dedup.
-
-**Self-hosted works** — set `GITLAB_URL` and everything follows it, including `GITLAB_HOST` inside the job
-container. A private CA needs `NODE_EXTRA_CA_CERTS` on the host and the cert in your job image; a
-certificate failure names itself in the log rather than reporting a bare "fetch failed".
-
-Full setup, the `api`-scope trade-off, and what is not supported: [`docs/gitlab.md`](docs/gitlab.md).
+Same image, same isolation, no minted token, no provider key. The agent is not running; you are. From
+the panel, press `b` on a run. A retained directory holds the run's clone plus its issue text, so read
+[`docs/sandbox.md`](docs/sandbox.md) before extending retention.
 
 ## How it compares
 
-**vs the Claude Code GitHub Action.** For GitHub automation, often reach for the action —
-[`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action) (MIT, ~8.4k stars) is
-GA and does label-triggered issue automation for 10% of the effort. pi-dispatch is for a narrower case:
-**you run pi, on your own hardware, and you want a real queue, a container boundary, and — the part the
-action can't do — to run flows against local folders**, not just GitHub repos, without hosted-runner
-minutes.
+**vs the Claude Code GitHub Action**: for pure GitHub automation the
+[action](https://github.com/anthropics/claude-code-action) does label-triggered issues for a tenth of
+the effort. pi-dispatch is for the narrower case where you run pi on your own hardware and want a real
+queue, a container boundary, and flows against **local folders**, not just GitHub repos.
 
-**vs Claude Code routines and `/loop`.** A routine runs a recurring agent task on a cron schedule (managed,
-in the cloud); `/loop` repeats a prompt on an interval inside your session. For generic recurring work
-they're simpler — nothing to host — and often the right call. pi-dispatch's cron trigger is the same idea
-with a different centre of gravity: the run happens in **container images you build** — a different one per
-flow, if that is what the work needs — on **your**
-hardware, under **your** queue and spend caps. That is the edge when the task needs an environment a hosted
-routine cannot give it — a project's exact toolchain and system libraries, or the baked-in **Playwright +
-Chromium** that lets a scheduled flow build a frontend, screenshot it, and iterate until it renders right,
-then attach the before/after to a PR. Rule of thumb: if the recurring task is *"run a prompt,"* use a
-routine; if it is *"run this project's real build / test / visual loop on a schedule, in images I
-control,"* that is this.
-
-## Forgejo / Gitea automation
-
-```bash
-FORGEJO_URL=https://forgejo.example.com
-FORGEJO_TOKEN=...            # repo-scoped: write:repository + write:issue
-FORGEJO_BOT_ID=42            # required when the token is repo-scoped -- it cannot call GET /user
-FORGEJO_WEBHOOK_SECRET=...
-```
-
-Point the webhook at **`/forgejo`**. Three things differ from the GitHub arm, and each is a correctness
-matter rather than a rename:
-
-- **Forgejo's transport is byte-compatible with GitHub's**, so `verify.mjs` is unmodified and delivery
-  dedup transfers unchanged. This is the only forge of which that is true.
-- **Actions are Forgejo's own words** — `label_updated`, `synchronized`. Against GitHub's vocabulary they
-  fall out silently as an unhandled event, so the loader refuses the wrong forge's words at load.
-  `label_cleared` fires nothing, ever.
-- **Every trigger is gated on the actor's resolved repository permission** (`admin`/`write`), labels
-  included — not because a Forgejo label is untrustworthy, but because we have not verified that it is.
-
-Full setup, including the token scope trade-off: [`docs/forgejo.md`](docs/forgejo.md).
-
-## Azure DevOps automation
-
-```bash
-AZURE_ORG_URL=https://dev.azure.com/your-org
-AZURE_TOKEN=...              # a dedicated identity; needs vso.graph as well as code/work scopes
-AZURE_WEBHOOK_MODE=basic     # required, deliberately not defaulted
-AZURE_WEBHOOK_SECRET=...
-```
-
-Point the Service Hook at **`/azure`**, and read [`docs/azure-devops.md`](docs/azure-devops.md) before you
-enable it — this is the weakest transport of the four, and the doc says exactly how:
-
-- **No HMAC exists.** The credential proves the sender knew a secret and covers no bytes; there is no
-  delivery-id header (the dedup key comes from the body) and no signed timestamp (so no replay window).
-  `OQ-015` records the residual.
-- **Tags are the label analogue, and the DIFF is the trigger.** Matching the current tag set would start a
-  paid run on every later edit of a tagged work item.
-- **A work item names no repository**, so an azure label/comment trigger must set `run.repository`.
-- **Azure's CLI needs its own image.** Build `image/Dockerfile.azure` and name it with `run.image`; a
-  trigger that forgets is refused *before* it costs anything.
+**vs hosted routines and `/loop`**: for "run a prompt on a schedule" they are simpler; nothing to host.
+pi-dispatch's cron trigger is for recurring work that needs an environment a hosted routine cannot give
+it: a project's exact toolchain, or the baked-in Playwright + Chromium that lets a scheduled flow build
+a frontend, screenshot it, and iterate until it renders right.
 
 ## Status
 
-The local-folder path (image, worker, `pi-dispatch run` / `worker`), the GitLab path (the same, for
-issues, notes and merge requests), the GitHub path (receiver → queue →
-clone → PR for both issues and pull requests), and scheduled (cron) triggers for local folders are built
-and work; the worker runs in a terminal or as an OS service on Linux, macOS or Windows (see **Run as a
-service**). The admin surface ships as a pi extension (see **Admin (pi extension)**). The design is
-specified in [`specs/`](specs/) — start with [`specs/constitution.md`](specs/constitution.md) for the
-non-negotiables and [`specs/design.md`](specs/design.md) for the decisions and what was rejected.
+The local path, the GitHub path, the GitLab path, cron scheduling, the service installer, and the admin
+extension are built and work. The design is specified in [`specs/`](specs/): start with
+[`specs/constitution.md`](specs/constitution.md) for the non-negotiables and
+[`specs/design.md`](specs/design.md) for the decisions and what was rejected.
 
 ## Contributing
 
-PRs welcome. Sign off your commits (`git commit -s`) — this project uses the
+PRs welcome. Sign off your commits (`git commit -s`); this project uses the
 [DCO](https://developercertificate.org/), not a CLA. If you change behaviour, the spec changes with it:
 `specs/` is the source of truth, and a PR that violates a `CONST-*` entry will be asked to justify the
 constraint first, not the code.
@@ -762,7 +347,7 @@ MIT. See [LICENSE](LICENSE). Built on [pi](https://github.com/earendil-works/pi)
 does the actual hard part.
 
 > **Not affiliated with** the unrelated npm package `pi-dispatch`, a pi extension for rotating ChatGPT
-> Codex OAuth accounts. Same name, different thing — this project publishes **scoped** packages only:
+> Codex OAuth accounts. Same name, different thing. This project publishes scoped packages only:
 > [`@edgehero/pi-dispatch`](https://www.npmjs.com/package/@edgehero/pi-dispatch) (worker + CLI),
 > [`@edgehero/pi-dispatch-receiver`](https://www.npmjs.com/package/@edgehero/pi-dispatch-receiver), and
 > [`@edgehero/pi-dispatch-admin`](https://www.npmjs.com/package/@edgehero/pi-dispatch-admin) (the
