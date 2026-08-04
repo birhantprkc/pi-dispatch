@@ -1,0 +1,66 @@
+# pi-dispatch's worker runs on the HOST, not in a container: it drives the `docker` CLI to launch
+# job containers, and the CLI is what translates bind-mount paths cross-platform (Windows/macOS/
+# Linux) -- see DES-WORKER-ON-HOST. That is settled doctrine, and it is why no service here mounts
+# docker.sock: a socket mount is root-equivalent access to the host, and nothing in this stack needs it.
+#
+# The RECEIVER may run either way. It is the one internet-facing process and needs no Docker access at
+# all, so a container suits it -- but the host mode (`pi-dispatch-receiver`, deploy/receiver.service)
+# stays first-class. The `receiver` profile keeps the container OPT-IN: a plain `up` stays Valkey-only,
+# so worker-on-host deployments that already run the receiver on the host gain no second copy.
+#
+#   docker compose -f deploy/docker-compose.yml up -d                     # start Valkey (default)
+#   docker compose -f deploy/docker-compose.yml --profile receiver up -d  # Valkey + receiver container
+#   pi-dispatch worker                                                    # drain the queue (host)
+
+services:
+  valkey:
+    image: valkey/valkey:8
+    # AOF on: the wait-list must survive a reboot (REQ-QUEUE-BURST-NO-DROP).
+    command: valkey-server --appendonly yes
+    # Bound to localhost only -- the queue is not a public surface.
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - valkey-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # The containerized receiver (issue #82): the always-on webhook edge, prebuilt for amd64+arm64.
+  # Build locally instead with:  docker build -f receiver/Dockerfile -t pi-dispatch-receiver .
+  #
+  # Relative paths below resolve against THIS FILE's directory (deploy/), not the caller's cwd --
+  # that is the Compose spec for both env_file and bind mounts -- so `../` reaches the repo root
+  # regardless of where `docker compose -f deploy/docker-compose.yml ...` is run from.
+  receiver:
+    profiles: ["receiver"]
+    image: ghcr.io/edgehero/pi-dispatch-receiver:latest
+    # The operator's .env at the repo root, same file the host services read (WEBHOOK_SECRET, github
+    # auth, forge blocks). Compose refuses to start the profile when it is missing -- correctly: a
+    # receiver without WEBHOOK_SECRET refuses to boot anyway, so fail at the clearer message.
+    env_file: ../.env
+    # `environment` OVERRIDES env_file, deliberately: a host .env says redis://127.0.0.1:6379, which
+    # inside a container is the container itself. Service DNS is the container-side truth.
+    environment:
+      VALKEY_URL: redis://valkey:6379
+      PI_TRIGGERS_FILE: /config/triggers.json
+    # The repo-root triggers.json (`pi-dispatch init` scaffolds it -- run that first: mounting a path
+    # that does not exist makes Docker create it as a DIRECTORY and the boot fails confusingly).
+    # Read-only: the receiver live-reloads this file on change; it never writes it.
+    volumes:
+      - ../triggers.json:/config/triggers.json:ro
+    # Loopback only, like Valkey's port above: the operator's reverse proxy or tunnel (TLS, public
+    # hostname) is what faces the internet -- never this port raw. Assumes the in-container default
+    # RECEIVER_PORT=3000; if your .env overrides it, adjust the right-hand side to match.
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  valkey-data:

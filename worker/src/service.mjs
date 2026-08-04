@@ -3,11 +3,26 @@
  *
  * Durable running used to mean hand-editing the per-OS examples in deploy/. This module reads those
  * SAME files from the package and substitutes a documented table of their known literals —
- * `/usr/bin/node` → `process.execPath`, `/opt/pi-dispatch` → the real repo root — rather than
+ * `/usr/bin/node` → `process.execPath`, `/opt/pi-dispatch` → the deployment folder — rather than
  * introducing a `{{placeholder}}` dialect. That keeps the deploy/ files byte-usable examples (and
  * deploy-lint keeps parsing exactly what ships); TEMPLATE_PINS below is the table's enforcement — the
  * test suite asserts every literal is still present in every template, so template drift breaks the
  * build loudly instead of breaking the render silently.
+ *
+ * Path doctrine (issue #96): this module used to derive a REPO_ROOT from its own location ("../..").
+ * Right in a checkout; WRONG under `npm install`, where src/ lives at
+ * node_modules/@edgehero/pi-dispatch/src and "../.." is the @edgehero SCOPE directory — every rendered
+ * unit pointed at files that do not exist. Three anchors replace it, each correct in BOTH layouts:
+ *   - deployDir     the deployment folder = the cwd `service` is invoked from. Owns everything
+ *                   host-side: WorkingDirectory, EnvironmentFile (<deployDir>/.env) and the daemon
+ *                   logs (<deployDir>/logs/, created at install time) — never the package dir, which
+ *                   npm may replace wholesale on update.
+ *   - cliPath       join(moduleDir, "cli.mjs"): cli.mjs sits beside this module in src/ in both
+ *                   layouts, so the worker ExecStart needs no repo root at all.
+ *   - receiverStart import.meta.resolve("@edgehero/pi-dispatch-receiver/start"): the receiver
+ *                   package's own exported entry, wherever npm (or the workspace symlink) put it.
+ *                   null when the package is not installed — receiver renders refuse loudly instead
+ *                   of writing a unit that would crash-loop at boot.
  *
  * Scope doctrine:
  *   - User-level by default, everywhere. macOS REFUSES root outright (a LaunchAgent is per-user, and a
@@ -32,12 +47,26 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-// Deploy templates resolved relative to this module (the init.mjs pattern): worker/deploy is SHIPPED
-// in the npm tarball and kept byte-identical to the repo-root deploy/ (the documented source) by
-// worker/test/publish.test.mjs — so `service` renders the same templates from a checkout and from an
-// npm install, no matter where the CLI is invoked from.
-const DEPLOY_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "deploy");
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+// src/ is where this module lives in BOTH layouts (worker/src in a checkout,
+// node_modules/@edgehero/pi-dispatch/src under npm). Deploy templates resolve one level up from it
+// (the init.mjs pattern): worker/deploy is SHIPPED in the npm tarball and kept byte-identical to the
+// repo-root deploy/ (the documented source) by worker/test/publish.test.mjs — so `service` renders
+// the same templates from a checkout and from an npm install, no matter where the CLI is invoked from.
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The receiver's entry point comes from the receiver PACKAGE (its ./start export), wherever module
+ * resolution finds it from here — the workspace symlink in a checkout, the sibling install under the
+ * deployment folder's node_modules in production. Never a path guessed off this module: that guess is
+ * exactly what issue #96 is about. null = not installed, and the receiver renders refuse on it.
+ */
+function resolveReceiverStart() {
+	try {
+		return fileURLToPath(import.meta.resolve("@edgehero/pi-dispatch-receiver/start"));
+	} catch {
+		return null;
+	}
+}
 
 /**
  * The whole substitution surface, template by template. The render replaces ONLY these literals (plus
@@ -47,9 +76,9 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
  */
 export const TEMPLATE_PINS = {
 	"worker.service": [
-		"ExecStart=/usr/bin/node worker/src/cli.mjs worker", // /usr/bin/node → process.execPath
-		"WorkingDirectory=/opt/pi-dispatch", // /opt/pi-dispatch → the real repo root
-		"EnvironmentFile=/opt/pi-dispatch/.env",
+		"ExecStart=/usr/bin/node worker/src/cli.mjs worker", // the WHOLE line → `<execPath> <cliPath> worker` (cli.mjs sits beside this module in src/ in both layouts)
+		"WorkingDirectory=/opt/pi-dispatch", // /opt/pi-dispatch → the deployment folder (the cwd `service` runs from)
+		"EnvironmentFile=/opt/pi-dispatch/.env", // → <deployDir>/.env — the operator's .env lives beside the units, never inside the package
 		"\nUser=pi\n", // the DIRECTIVE line (the header comment also says User=pi mid-line, hence the \n anchors): stripped for --user scope; rewritten to the invoking user for --system
 		"WantedBy=multi-user.target", // → default.target in user scope (multi-user.target never runs there)
 		// Byte-for-byte survivors — semantics the render must not lose:
@@ -60,7 +89,7 @@ export const TEMPLATE_PINS = {
 		"TimeoutStopSec=30",
 	],
 	"receiver.service": [
-		"ExecStart=/usr/bin/node receiver/src/start.mjs",
+		"ExecStart=/usr/bin/node receiver/src/start.mjs", // the WHOLE line → `<execPath> <receiverStart>` (the receiver package's resolved ./start export)
 		"WorkingDirectory=/opt/pi-dispatch",
 		"EnvironmentFile=/opt/pi-dispatch/.env",
 		"\nUser=pi\n",
@@ -70,9 +99,9 @@ export const TEMPLATE_PINS = {
 	],
 	"com.pi-dispatch.worker.plist": [
 		"<string>com.pi-dispatch.worker</string>", // → com.pi-dispatch.receiver for --receiver
-		"<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>", // gains a `receiver` argument for --receiver
-		"<key>WorkingDirectory</key>\n\t<string>/opt/pi-dispatch</string>", // anchor for the PATH injection below
-		"<string>/opt/pi-dispatch/logs/worker.out.log</string>",
+		"<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>", // → the PACKAGE's wrapper copy, followed by the exec argv (<node> <script> …) the wrapper now runs verbatim
+		"<key>WorkingDirectory</key>\n\t<string>/opt/pi-dispatch</string>", // → the deployment folder (load-bearing: the wrapper sources ./.env there); also the anchor for the PATH injection below
+		"<string>/opt/pi-dispatch/logs/worker.out.log</string>", // → <deployDir>/logs/… (install creates the dir; launchd will not)
 		"<string>/opt/pi-dispatch/logs/worker.err.log</string>",
 		"<key>SuccessfulExit</key>", // the KeepAlive shape the wrapper's exit-2 conversion pairs with
 		"<integer>30</integer>", // ExitTimeOut — room for the SIGTERM drain
@@ -82,8 +111,8 @@ export const TEMPLATE_PINS = {
 	// the two cannot drift apart — especially the AppExit pair, which is the EXIT_POLICY never-retry.
 	"nssm-install.cmd": [
 		"pi-dispatch-worker",
-		"C:\\pi-dispatch", // the REPO placeholder → the real repo root
-		"deploy\\worker-env-wrapper.cmd",
+		"C:\\pi-dispatch", // the REPO placeholder → the deployment folder (cwd)
+		"deploy\\worker-env-wrapper.cmd", // the sequence points at the PACKAGE's wrapper copy and passes the exec argv behind it
 		"AppStopMethodConsole 15000",
 		"AppThrottle 5000",
 		"AppExit Default Restart",
@@ -116,7 +145,11 @@ export async function runService(argv = [], deps = {}) {
 		platform = process.platform,
 		euid = typeof process.geteuid === "function" ? process.geteuid() : null,
 		execPath = process.execPath,
-		repoRoot = REPO_ROOT,
+		// The deployment folder: where the operator ran `service`, where .env lives, where logs/ goes.
+		cwd = process.cwd(),
+		// Injectable so tests can render as if from an npm install without installing anything.
+		moduleDir = MODULE_DIR,
+		resolveReceiver = resolveReceiverStart,
 		home = homedir(),
 		user = env.USER || userInfo().username,
 		tmp = tmpdir(),
@@ -162,12 +195,22 @@ export async function runService(argv = [], deps = {}) {
 	}
 	if (!["darwin", "linux", "win32"].includes(platform)) return fail(err, `unsupported platform: ${platform}`);
 
+	// The templates dir is module-relative like moduleDir itself: worker/deploy in a checkout,
+	// <pkg>/deploy under npm — the SHIPPED copies, correct in both layouts (unlike the old repo root).
+	const templatesDir = resolve(moduleDir, "..", "deploy");
 	const ctx = {
 		env,
 		platform,
 		euid,
 		execPath,
-		repoRoot,
+		deployDir: cwd,
+		cliPath: join(moduleDir, "cli.mjs"),
+		templatesDir,
+		wrapperSh: join(templatesDir, "worker-env-wrapper.sh"),
+		wrapperCmd: join(templatesDir, "worker-env-wrapper.cmd"),
+		// Resolved only when asked for: worker-only invocations must not care whether the receiver
+		// package exists here at all.
+		receiverStart: values.receiver ? resolveReceiver() : null,
 		home,
 		user,
 		tmp,
@@ -240,7 +283,20 @@ function unitPaths(ctx) {
 }
 
 function readTemplate(ctx, name) {
-	return ctx.fs.readFileSync(join(DEPLOY_DIR, name), "utf8");
+	return ctx.fs.readFileSync(join(ctx.templatesDir, name), "utf8");
+}
+
+/**
+ * The receiver refusal, shared by render and install: a null receiverStart means the receiver package
+ * is not resolvable from this worker install. Refusing beats rendering — a unit pointing at a
+ * nonexistent start.mjs would install cleanly and then crash-loop at boot, which is exactly the failure
+ * mode issue #96 shipped for every path.
+ */
+function refuseMissingReceiver(ctx) {
+	return fail(
+		ctx.err,
+		"the receiver package is not installed here — run: npm install @edgehero/pi-dispatch-receiver (from the deployment folder)",
+	);
 }
 
 /**
@@ -250,12 +306,23 @@ function readTemplate(ctx, name) {
  */
 function renderLinuxUnit(ctx) {
 	const template = ctx.which === "receiver" ? "receiver.service" : "worker.service";
+	// The ExecStart line is replaced WHOLE, not path-by-path: the template's script path is relative
+	// to a repo-root WorkingDirectory that only a checkout has. The rendered unit points at absolute
+	// entries that exist in both layouts — cliPath beside this module; the receiver package's ./start
+	// export — so ExecStart works no matter what WorkingDirectory is.
+	const execStart =
+		ctx.which === "receiver"
+			? ["ExecStart=/usr/bin/node receiver/src/start.mjs", `ExecStart=${ctx.execPath} ${ctx.receiverStart}`]
+			: ["ExecStart=/usr/bin/node worker/src/cli.mjs worker", `ExecStart=${ctx.execPath} ${ctx.cliPath} worker`];
 	// The banner outranks the template's own "TEMPLATE/UNTESTED EXAMPLE — set the PLACEHOLDERs" header,
 	// which renders through below (the no-markers design keeps templates byte-usable, so their prose
 	// survives): a reader of the rendered unit should know the placeholders are already substituted.
 	let unit = `# rendered by \`pi-dispatch service\` — paths computed for this host from deploy/${template};\n# the template's PLACEHOLDER prose below is already substituted.\n` +
 		readTemplate(ctx, template)
-		.replaceAll("/opt/pi-dispatch", ctx.repoRoot)
+		.replace(execStart[0], execStart[1])
+		// /opt/pi-dispatch → the deployment folder (the cwd this render ran from): WorkingDirectory and
+		// EnvironmentFile stay operator territory, never the package dir npm may wipe on update.
+		.replaceAll("/opt/pi-dispatch", ctx.deployDir)
 		.replaceAll("/usr/bin/node", ctx.execPath);
 	if (ctx.scope === "user") {
 		// A systemd --user unit always runs as the invoking user, and systemd REJECTS a User= line in
@@ -279,48 +346,67 @@ function renderLinuxUnit(ctx) {
 
 /**
  * Render the launchd plist for this host. For --receiver the worker plist is DERIVED, not a second
- * template: same KeepAlive/ExitTimeOut shape, label and log names swapped, and the shared wrapper told
- * (via its one argument) to run the receiver. The wrapper's exit-2 conversion is a no-op for the
+ * template: same KeepAlive/ExitTimeOut shape, label and log names swapped, and the shared wrapper given
+ * the receiver's exec argv instead of the worker's. The wrapper's exit-2 conversion is a no-op for the
  * receiver — it has no EXIT_POLICY — and harmless.
  */
 function renderPlist(ctx) {
 	let plist = readTemplate(ctx, "com.pi-dispatch.worker.plist");
+	// One wrapper, two daemons: the exec argv IS the difference now. The wrapper sources ./.env in the
+	// unit's WorkingDirectory and runs exactly these arguments — no `receiver` selector flag, no paths
+	// guessed inside the wrapper (issue #96: the wrapper's self-relative guess broke under npm install).
+	const execArgv = ctx.which === "receiver" ? [ctx.execPath, ctx.receiverStart] : [ctx.execPath, ctx.cliPath, "worker"];
 	if (ctx.which === "receiver") {
 		plist = plist
 			.replace("<string>com.pi-dispatch.worker</string>", "<string>com.pi-dispatch.receiver</string>")
-			.replace(
-				"<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>",
-				"<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>\n\t\t<!-- the argument that makes the shared .env wrapper run the receiver instead of the worker -->\n\t\t<string>receiver</string>",
-			)
 			.replaceAll("worker.out.log", "receiver.out.log")
 			.replaceAll("worker.err.log", "receiver.err.log");
 	}
-	// launchd's default PATH is /usr/bin:/bin — an nvm or Homebrew node is invisible to it, and the
-	// wrapper invokes bare `node`. Prepend the directory of the node that ran this render so the
-	// service runs the SAME binary, no guessing. PATH is configuration, not a secret: the template's
-	// deliberate no-EnvironmentVariables stance is about credentials, which still live only in .env.
+	// The template's two-element ProgramArguments (sh + wrapper) becomes sh + the PACKAGE's wrapper +
+	// the command: absolute node, absolute script. The wrapper path is module-relative (templatesDir),
+	// so it exists in a checkout AND under node_modules — unlike the old repo-root guess.
+	plist = plist.replace(
+		"<string>/opt/pi-dispatch/deploy/worker-env-wrapper.sh</string>",
+		[
+			`<string>${ctx.wrapperSh}</string>`,
+			"<!-- the command the wrapper execs after sourcing ./.env in WorkingDirectory - absolute paths, nothing guessed -->",
+			...execArgv.map((a) => `<string>${a}</string>`),
+		].join("\n\t\t"),
+	);
+	// launchd's default PATH is /usr/bin:/bin — an nvm or Homebrew node is invisible to it. The exec
+	// argv above pins THIS node absolutely, but the worker's own children (npx-style hooks, tooling
+	// that spawns bare `node`) still resolve via PATH; prepending the render node's directory keeps
+	// them on the SAME binary. PATH is configuration, not a secret: the template's deliberate
+	// no-EnvironmentVariables stance is about credentials, which still live only in .env.
 	plist = plist.replace(
 		"<key>WorkingDirectory</key>\n\t<string>/opt/pi-dispatch</string>",
-		"<key>WorkingDirectory</key>\n\t<string>/opt/pi-dispatch</string>\n\n\t<!-- Injected by `pi-dispatch service`: launchd's default PATH cannot see an nvm/Homebrew node,\n\t     and the wrapper calls bare `node`. Not a secrets dict - credentials still live only in .env\n\t     (see the header comment). -->\n\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>" +
+		"<key>WorkingDirectory</key>\n\t<string>/opt/pi-dispatch</string>\n\n\t<!-- Injected by `pi-dispatch service`: launchd's default PATH cannot see an nvm/Homebrew node,\n\t     and child processes may call bare `node`. Not a secrets dict - credentials still live only\n\t     in .env (see the header comment). -->\n\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>" +
 			`${dirname(ctx.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\t</dict>`,
 	);
-	return plist.replaceAll("/opt/pi-dispatch", ctx.repoRoot);
+	// Everything left standing on /opt/pi-dispatch — WorkingDirectory, the log paths, comment prose —
+	// belongs to the deployment folder.
+	return plist.replaceAll("/opt/pi-dispatch", ctx.deployDir);
 }
 
 /**
- * The nssm command sequence — deploy/nssm-install.cmd's exact steps with computed paths. Values that
- * carry semantics (AppStopMethodConsole 15000, AppThrottle 5000, AppExit Default Restart, AppExit 2
- * Exit) mirror the template byte-for-byte and are pinned. Backslashes on purpose: this argv reaches
- * nssm on a real Windows host, where repoRoot is already a Windows path.
+ * The nssm command sequence — deploy/nssm-install.cmd's exact steps with computed paths: the service
+ * Application is the PACKAGE's .cmd wrapper, its AppParameters are the exec argv (<node> <script> …)
+ * the wrapper now runs verbatim, and AppDirectory is the deployment folder so the wrapper finds ./.env
+ * there (the same WorkingDirectory contract as launchd). Values that carry semantics
+ * (AppStopMethodConsole 15000, AppThrottle 5000, AppExit Default Restart, AppExit 2 Exit) mirror the
+ * template byte-for-byte and are pinned. Backslashes on purpose where paths are BUILT here: this argv
+ * reaches nssm on a real Windows host, where deployDir is already a Windows path (wrapperCmd and
+ * cliPath come from win32 path.join and need no help).
  */
 function nssmSequence(ctx) {
 	const service = `pi-dispatch-${ctx.which}`;
-	const logDir = `${ctx.repoRoot}\\logs`;
+	const logDir = `${ctx.deployDir}\\logs`;
+	const execArgv = ctx.which === "receiver" ? [ctx.execPath, ctx.receiverStart] : [ctx.execPath, ctx.cliPath, "worker"];
 	return {
 		service,
 		commands: [
-			["install", service, `${ctx.repoRoot}\\deploy\\worker-env-wrapper.cmd`, ...(ctx.which === "receiver" ? ["receiver"] : [])],
-			["set", service, "AppDirectory", ctx.repoRoot],
+			["install", service, ctx.wrapperCmd, ...execArgv],
+			["set", service, "AppDirectory", ctx.deployDir],
 			["set", service, "AppStdout", `${logDir}\\${ctx.which}.out.log`],
 			["set", service, "AppStderr", `${logDir}\\${ctx.which}.err.log`],
 			["set", service, "AppStopMethodConsole", "15000"],
@@ -332,12 +418,13 @@ function nssmSequence(ctx) {
 }
 
 function doRender(ctx) {
+	if (ctx.which === "receiver" && !ctx.receiverStart) return refuseMissingReceiver(ctx);
 	const paths = unitPaths(ctx);
 	if (ctx.platform === "darwin") {
 		ctx.out(`# → ${paths.installPath}\n`);
 		ctx.out(renderPlist(ctx));
 		ctx.out(
-			"\n# note: ProgramArguments runs deploy/worker-env-wrapper.sh — launchd has no EnvironmentFile,\n# so the wrapper loads .env at runtime. The wrapper also converts a policy refusal (exit 2,\n# EXIT_POLICY) into a clean exit, so KeepAlive never relaunch-loops a refusal into a provider bill.\n",
+			"\n# note: ProgramArguments runs the package's worker-env-wrapper.sh, which sources ./.env in the\n# WorkingDirectory above and then runs the argv that follows it — launchd has no EnvironmentFile.\n# The wrapper also converts a policy refusal (exit 2, EXIT_POLICY) into a clean exit, so KeepAlive\n# never relaunch-loops a refusal into a provider bill.\n",
 		);
 		return 0;
 	}
@@ -354,6 +441,7 @@ function doRender(ctx) {
 }
 
 async function doInstall(ctx) {
+	if (ctx.which === "receiver" && !ctx.receiverStart) return refuseMissingReceiver(ctx);
 	const paths = unitPaths(ctx);
 
 	// THE refusal, worker only: one worker per docker daemon (DES-CONCURRENCY-3). The worker's boot
@@ -396,6 +484,9 @@ async function installDarwin(ctx, paths) {
 		await run(ctx, "launchctl", ["bootout", `gui/${ctx.euid}/${paths.name}`]);
 	}
 	ctx.fs.mkdirSync(dirname(paths.installPath), { recursive: true });
+	// launchd creates the StandardOutPath FILES but not their parent directory: without this the job
+	// spawns and dies with its error unwritable. Done at install, not render — render stays read-only.
+	ctx.fs.mkdirSync(join(ctx.deployDir, "logs"), { recursive: true });
 	ctx.fs.writeFileSync(paths.installPath, renderPlist(ctx));
 	const bootstrap = await run(ctx, "launchctl", ["bootstrap", `gui/${ctx.euid}`, paths.installPath]);
 	if (bootstrap !== 0) {
@@ -459,6 +550,10 @@ async function installWindows(ctx) {
 		const removed = await run(ctx, "nssm", ["remove", service, "confirm"]);
 		if (removed !== 0) return fail(ctx.err, `nssm remove ${service} confirm failed (exit ${removed})`);
 	}
+	// nssm, like launchd, does not create the AppStdout/AppStderr directory. join(), not the
+	// sequence's literal backslashes: this branch runs on the actual Windows host, where join is
+	// win32-flavoured anyway.
+	ctx.fs.mkdirSync(join(ctx.deployDir, "logs"), { recursive: true });
 	for (const args of commands) {
 		const code = await run(ctx, "nssm", args);
 		if (code !== 0) return fail(ctx.err, `nssm ${args.join(" ")} failed (exit ${code})`);

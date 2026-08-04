@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,6 +11,17 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // The deploy/ copy the render actually reads: worker/deploy, shipped in the npm tarball and kept
 // byte-identical to the repo-root deploy/ by the sync test in publish.test.mjs.
 const DEPLOY_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "deploy");
+
+// The checkout-layout anchors (issue #96): moduleDir is worker/src, so cliPath and the wrapper paths
+// land on REAL files here — the npm-layout tests below build the other shape under a tmpdir.
+const WORKER_SRC = join(REPO_ROOT, "worker", "src");
+const CLI_PATH = join(WORKER_SRC, "cli.mjs");
+const RECEIVER_START = join(REPO_ROOT, "receiver", "src", "start.mjs");
+const WRAPPER_SH = join(DEPLOY_DIR, "worker-env-wrapper.sh");
+const WRAPPER_CMD = join(DEPLOY_DIR, "worker-env-wrapper.cmd");
+// The injected deployment folder (cwd): deliberately NOT the repo root, so any assertion that still
+// expected repo-root-derived paths would fail loudly instead of passing by coincidence.
+const DEPLOY_AT = "/srv/pi-deploy";
 
 // ---------------------------------------------------------------------------------------------------
 // The pin test: render is a targeted substitution of the templates' KNOWN literals, so a template
@@ -32,7 +43,9 @@ test("pin: every literal the render substitutes or preserves is present in its r
 
 // ---------------------------------------------------------------------------------------------------
 // Harness: everything injected, everything recorded. The fake fs serves writes from a Map but lets
-// reads FALL THROUGH to the real filesystem, so renders exercise the actual deploy/ templates.
+// reads FALL THROUGH to the real filesystem, so renders exercise the actual deploy/ templates. The
+// three path seams (cwd = the deployment folder, moduleDir = where service.mjs lives, resolveReceiver)
+// replace the old injected repoRoot: they are what makes checkout AND npm layouts testable.
 // ---------------------------------------------------------------------------------------------------
 
 // The up.test.mjs fake spawn: plan keys are command-line prefixes mapped to an exit code, a
@@ -75,10 +88,22 @@ function fakeSpawn(plan, calls, events) {
 	};
 }
 
-function harness({ platform = "linux", argv = [], files = {}, euid = 501, plan = {}, queue = null, events = null } = {}) {
+function harness({
+	platform = "linux",
+	argv = [],
+	files = {},
+	euid = 501,
+	plan = {},
+	queue = null,
+	events = null,
+	cwd = DEPLOY_AT,
+	moduleDir = WORKER_SRC,
+	resolveReceiver = () => RECEIVER_START,
+} = {}) {
 	const calls = [];
 	const buf = [];
 	const errBuf = [];
+	const mkdirs = [];
 	const store = new Map(Object.entries(files));
 	let clock = 0;
 	const deps = {
@@ -86,7 +111,9 @@ function harness({ platform = "linux", argv = [], files = {}, euid = 501, plan =
 		platform,
 		euid,
 		execPath: "/fake/node/bin/node",
-		repoRoot: REPO_ROOT,
+		cwd,
+		moduleDir,
+		resolveReceiver,
 		home: "/home/tester",
 		user: "tester",
 		tmp: "/faketmp",
@@ -104,27 +131,35 @@ function harness({ platform = "linux", argv = [], files = {}, euid = 501, plan =
 			existsSync: (p) => store.has(p),
 			readFileSync: (p, encoding) => (store.has(p) ? store.get(p) : readFileSync(p, encoding)),
 			writeFileSync: (p, data) => store.set(p, data),
-			mkdirSync: () => {},
+			mkdirSync: (p) => mkdirs.push(p),
 			unlinkSync: (p) => store.delete(p),
 		},
 	};
-	return { run: () => runService(argv, deps), calls, store, text: () => buf.join(""), errText: () => errBuf.join("") };
+	return { run: () => runService(argv, deps), calls, store, mkdirs, text: () => buf.join(""), errText: () => errBuf.join("") };
 }
 
 const USER_UNIT = "/home/tester/.config/systemd/user/pi-dispatch-worker.service";
 const AGENT_PLIST = "/home/tester/Library/LaunchAgents/com.pi-dispatch.worker.plist";
 
+/** The <string> values of the rendered plist's ProgramArguments ARRAY — not the comment prose. */
+function programArguments(plist) {
+	const block = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
+	assert.ok(block, "the plist has a ProgramArguments array");
+	return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => m[1]);
+}
+
 // ---------------------------------------------------------------------------------------------------
-// render
+// render — checkout layout (moduleDir = worker/src, so every substituted path must EXIST here)
 // ---------------------------------------------------------------------------------------------------
 
-test("render linux --user: execPath and repo root land; the exit-2 and crash-loop semantics survive; User= is stripped", async () => {
+test("render linux --user: ExecStart is the absolute module-relative cli, the deployment folder owns WorkingDirectory and .env; the exit-2 and crash-loop semantics survive; User= is stripped", async () => {
 	const h = harness({ platform: "linux", argv: ["render"] });
 	assert.equal(await h.run(), 0);
 	const text = h.text();
-	assert.match(text, new RegExp(`ExecStart=/fake/node/bin/node worker/src/cli\\.mjs worker`));
-	assert.ok(text.includes(`WorkingDirectory=${REPO_ROOT}`), "repo root landed in WorkingDirectory");
-	assert.ok(text.includes(`EnvironmentFile=${REPO_ROOT}/.env`), "repo root landed in EnvironmentFile");
+	assert.ok(text.includes(`ExecStart=/fake/node/bin/node ${CLI_PATH} worker`), "ExecStart = <node> <cliPath> worker");
+	assert.ok(existsSync(CLI_PATH), "the checkout-layout cliPath must be a real file");
+	assert.ok(text.includes(`WorkingDirectory=${DEPLOY_AT}`), "the deployment folder landed in WorkingDirectory");
+	assert.ok(text.includes(`EnvironmentFile=${DEPLOY_AT}/.env`), ".env is looked up in the deployment folder, never inside the package");
 	assert.match(text, /RestartPreventExitStatus=2/, "the EXIT_POLICY never-restart must survive byte-for-byte");
 	assert.match(text, /StartLimitBurst=5/, "the crash-loop bound must survive byte-for-byte");
 	assert.match(text, /StartLimitIntervalSec=60/);
@@ -142,48 +177,145 @@ test("render linux --system: User= is rewritten to the invoking user, WantedBy s
 	assert.match(h.text(), /WantedBy=multi-user\.target/);
 });
 
-test("render linux --receiver: receiver.service rendered with the same table", async () => {
+test("render linux --receiver: ExecStart is the receiver package's resolved ./start export", async () => {
 	const h = harness({ platform: "linux", argv: ["render", "--receiver"] });
 	assert.equal(await h.run(), 0);
-	assert.ok(h.text().includes("ExecStart=/fake/node/bin/node receiver/src/start.mjs"));
-	assert.ok(h.text().includes(`WorkingDirectory=${REPO_ROOT}`));
+	assert.ok(h.text().includes(`ExecStart=/fake/node/bin/node ${RECEIVER_START}`), "ExecStart = <node> <receiverStart>");
+	assert.ok(existsSync(RECEIVER_START), "the workspace-resolved receiver start must be a real file");
+	assert.ok(h.text().includes(`WorkingDirectory=${DEPLOY_AT}`));
 	assert.doesNotMatch(h.text(), /^User=/m);
 	assert.match(h.text(), /pi-dispatch-receiver\.service/, "the receiver unit gets its own name");
 });
 
-test("render darwin: plist paths computed, node dir injected into PATH, KeepAlive shape intact, wrapper note printed", async () => {
+test("render darwin: ProgramArguments = sh + package wrapper + exec argv in order, logs under the deployment folder, node dir injected into PATH, KeepAlive shape intact, wrapper note printed", async () => {
 	const h = harness({ platform: "darwin", argv: ["render"] });
 	assert.equal(await h.run(), 0);
 	const text = h.text();
 	assert.ok(text.includes("<string>com.pi-dispatch.worker</string>"));
-	assert.ok(text.includes(`<string>${REPO_ROOT}/deploy/worker-env-wrapper.sh</string>`), "the wrapper path follows the repo root");
-	assert.ok(text.includes(`<string>${REPO_ROOT}/logs/worker.out.log</string>`));
+	assert.ok(text.includes(`<string>${WRAPPER_SH}</string>`), "the wrapper is the PACKAGE's copy (worker/deploy), not a repo-root guess");
+	assert.ok(existsSync(WRAPPER_SH), "the checkout-layout wrapper must be a real file");
+	// The exec argv contract: the wrapper runs "$@", so the plist must carry the full command after it.
+	// Scoped to the ProgramArguments ARRAY: the template's own comment block quotes example <string>s
+	// for hand-editors, which a whole-document search would trip over.
+	assert.deepEqual(
+		programArguments(text),
+		["/bin/sh", WRAPPER_SH, "/fake/node/bin/node", CLI_PATH, "worker"],
+		"sh, wrapper, node, cli, worker — in exec order",
+	);
+	assert.ok(text.includes(`<string>${DEPLOY_AT}/logs/worker.out.log</string>`), "daemon logs live under the deployment folder");
 	// launchd's default PATH cannot see an nvm/Homebrew node; the render must pin the installing node's dir.
 	assert.ok(text.includes("<string>/fake/node/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"), "node's directory is prepended to the service PATH");
 	assert.ok(text.includes("<key>SuccessfulExit</key>"), "the KeepAlive crash-only-restart shape survives");
 	assert.match(text, /converts a policy refusal \(exit 2/, "the wrapper note explains the exit-2 conversion");
 });
 
-test("render darwin --receiver: derived plist swaps label and logs and passes the receiver argument to the shared wrapper", async () => {
+test("render darwin --receiver: derived plist swaps label and logs and carries the receiver's exec argv — the old `receiver` selector argument is gone", async () => {
 	const h = harness({ platform: "darwin", argv: ["render", "--receiver"] });
 	assert.equal(await h.run(), 0);
 	const text = h.text();
 	assert.ok(text.includes("<string>com.pi-dispatch.receiver</string>"));
 	assert.ok(!text.includes("<string>com.pi-dispatch.worker</string>"), "the worker label must not survive the derivation");
-	assert.ok(text.includes("<string>receiver</string>"), "the wrapper argument that selects the receiver");
+	assert.deepEqual(
+		programArguments(text),
+		["/bin/sh", WRAPPER_SH, "/fake/node/bin/node", RECEIVER_START],
+		"the receiver argv is the whole difference — no `receiver` selector argument, no worker cli",
+	);
 	assert.ok(text.includes("receiver.out.log") && text.includes("receiver.err.log"));
 });
 
-test("render win32: the nssm sequence carries computed paths and the AppExit pair byte-for-byte", async () => {
+test("render win32: the nssm sequence carries the package wrapper + exec argv and the AppExit pair byte-for-byte", async () => {
 	const h = harness({ platform: "win32", argv: ["render"] });
 	assert.equal(await h.run(), 0);
 	const text = h.text();
-	assert.ok(text.includes(`nssm install pi-dispatch-worker "${REPO_ROOT}\\deploy\\worker-env-wrapper.cmd"`));
-	assert.ok(text.includes(`"${REPO_ROOT}\\logs\\worker.out.log"`));
+	assert.ok(text.includes(`nssm install pi-dispatch-worker ${WRAPPER_CMD} /fake/node/bin/node ${CLI_PATH} worker`), "Application = the package wrapper; AppParameters = the exec argv");
+	assert.ok(text.includes(`nssm set pi-dispatch-worker AppDirectory ${DEPLOY_AT}`), "AppDirectory = the deployment folder — the wrapper's ./.env contract");
+	assert.ok(text.includes(`"${DEPLOY_AT}\\logs\\worker.out.log"`), "logs live under the deployment folder");
 	assert.match(text, /AppExit Default Restart/);
 	assert.match(text, /AppExit 2 Exit/, "the EXIT_POLICY never-retry must survive");
 	assert.match(text, /AppStopMethodConsole 15000/, "the console-stop grace must survive");
 	assert.match(text, /AppThrottle 5000/, "the crash-loop throttle must survive");
+});
+
+// ---------------------------------------------------------------------------------------------------
+// render — npm layout (issue #96): moduleDir is <deployment>/node_modules/@edgehero/pi-dispatch/src
+// under a real tmpdir, with real files, so "the rendered path EXISTS" is a filesystem fact, not a
+// string-shape opinion. This is exactly the layout where the old repoRoot ("../..") landed on the
+// @edgehero SCOPE directory and every rendered unit pointed at nothing.
+// ---------------------------------------------------------------------------------------------------
+
+function npmLayout() {
+	const dep = mkdtempSync(join(tmpdir(), "pi-dispatch-npmdep-"));
+	const pkg = join(dep, "node_modules", "@edgehero", "pi-dispatch");
+	mkdirSync(join(pkg, "src"), { recursive: true });
+	writeFileSync(join(pkg, "src", "cli.mjs"), "// stands in for the packed cli.mjs\n");
+	mkdirSync(join(pkg, "deploy"), { recursive: true });
+	// The real shipped mirrors, copied byte-for-byte: the render must read ITS package's templates.
+	for (const name of readdirSync(DEPLOY_DIR)) {
+		writeFileSync(join(pkg, "deploy", name), readFileSync(join(DEPLOY_DIR, name)));
+	}
+	const receiverStart = join(dep, "node_modules", "@edgehero", "pi-dispatch-receiver", "src", "start.mjs");
+	mkdirSync(dirname(receiverStart), { recursive: true });
+	writeFileSync(receiverStart, "// stands in for the packed start.mjs\n");
+	return { dep, moduleDir: join(pkg, "src"), receiverStart };
+}
+
+test("npm layout: the rendered linux unit points at files that EXIST under node_modules — never the @edgehero scope dir", async () => {
+	const { dep, moduleDir } = npmLayout();
+	const h = harness({ platform: "linux", argv: ["render"], cwd: dep, moduleDir });
+	assert.equal(await h.run(), 0);
+	const text = h.text();
+	const exec = text.match(/^ExecStart=(\S+) (\S+) worker$/m);
+	assert.ok(exec, "ExecStart parses as <node> <cliPath> worker");
+	assert.equal(exec[1], "/fake/node/bin/node");
+	assert.ok(existsSync(exec[2]), `the rendered ExecStart target must exist: ${exec[2]}`);
+	assert.ok(exec[2].includes(join("node_modules", "@edgehero", "pi-dispatch", "src")), "the cli comes from the PACKAGE");
+	assert.ok(!text.includes(join("@edgehero", "worker")), "the issue #96 scope-dir path shape must never render");
+	assert.ok(text.includes(`EnvironmentFile=${dep}/.env`), ".env is the deployment folder's, beside node_modules");
+	assert.ok(text.includes(`WorkingDirectory=${dep}`));
+});
+
+test("npm layout: the plist's wrapper and exec argv exist in the package and logs land in the deployment folder", async () => {
+	const { dep, moduleDir } = npmLayout();
+	const h = harness({ platform: "darwin", argv: ["render"], cwd: dep, moduleDir });
+	assert.equal(await h.run(), 0);
+	const text = h.text();
+	const cli = join(moduleDir, "cli.mjs");
+	const wrapper = join(dep, "node_modules", "@edgehero", "pi-dispatch", "deploy", "worker-env-wrapper.sh");
+	assert.deepEqual(
+		programArguments(text),
+		["/bin/sh", wrapper, "/fake/node/bin/node", cli, "worker"],
+		"sh, the PACKAGE's shipped wrapper, then the exec argv the wrapper runs",
+	);
+	assert.ok(existsSync(wrapper), `the wrapper path must exist: ${wrapper}`);
+	assert.ok(existsSync(cli), `the cli path must exist: ${cli}`);
+	assert.ok(text.includes(`<string>${dep}/logs/worker.out.log</string>`), "logs belong to the deployment folder, not the package");
+});
+
+test("npm layout: the receiver render uses the resolved receiver package; win32 nssm uses the package wrapper and the deployment folder", async () => {
+	const { dep, moduleDir, receiverStart } = npmLayout();
+	const r = harness({ platform: "linux", argv: ["render", "--receiver"], cwd: dep, moduleDir, resolveReceiver: () => receiverStart });
+	assert.equal(await r.run(), 0);
+	assert.ok(r.text().includes(`ExecStart=/fake/node/bin/node ${receiverStart}`), "ExecStart = the sibling-installed receiver package's start");
+	assert.ok(existsSync(receiverStart));
+	const w = harness({ platform: "win32", argv: ["render"], cwd: dep, moduleDir });
+	assert.equal(await w.run(), 0);
+	const wrapperCmd = join(dep, "node_modules", "@edgehero", "pi-dispatch", "deploy", "worker-env-wrapper.cmd");
+	assert.ok(w.text().includes(`nssm install pi-dispatch-worker ${wrapperCmd} /fake/node/bin/node ${join(moduleDir, "cli.mjs")} worker`));
+	assert.ok(existsSync(wrapperCmd), "the .cmd wrapper ships in the package");
+	assert.ok(w.text().includes(`nssm set pi-dispatch-worker AppDirectory ${dep}`));
+});
+
+test("--receiver with no receiver package installed: render and install both refuse with the npm install hint, writing nothing", async () => {
+	const r = harness({ platform: "linux", argv: ["render", "--receiver"], resolveReceiver: () => null });
+	assert.equal(await r.run(), 1);
+	assert.match(r.errText(), /receiver package is not installed here/);
+	assert.match(r.errText(), /npm install @edgehero\/pi-dispatch-receiver/);
+	assert.match(r.errText(), /from the deployment folder/);
+	const i = harness({ platform: "darwin", argv: ["install", "--receiver"], resolveReceiver: () => null, plan: { launchctl: 0 } });
+	assert.equal(await i.run(), 1);
+	assert.match(i.errText(), /npm install @edgehero\/pi-dispatch-receiver/);
+	assert.equal(i.store.size, 0, "nothing written after the refusal");
+	assert.equal(i.calls.length, 0, "nothing spawned after the refusal");
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -199,12 +331,14 @@ test("install darwin: refuses euid 0 outright — no writes, no spawns", async (
 	assert.equal(h.calls.length, 0, "nothing spawned");
 });
 
-test("install darwin: writes the LaunchAgent, bootstraps and enables it, and prints the honest login-scope note", async () => {
+test("install darwin: writes the LaunchAgent with the exec argv, creates the logs dir, bootstraps and enables it, and prints the honest login-scope note", async () => {
 	const h = harness({ platform: "darwin", argv: ["install"], plan: { launchctl: 0 } });
 	assert.equal(await h.run(), 0);
 	const plist = h.store.get(AGENT_PLIST);
 	assert.ok(plist, "plist written into ~/Library/LaunchAgents");
-	assert.ok(plist.includes(`<string>${REPO_ROOT}/deploy/worker-env-wrapper.sh</string>`));
+	assert.ok(plist.includes(`<string>${WRAPPER_SH}</string>`), "the installed plist runs the package wrapper");
+	assert.ok(plist.includes(`<string>${CLI_PATH}</string>`) && plist.includes("<string>worker</string>"), "the installed plist carries the exec argv");
+	assert.ok(h.mkdirs.includes(`${DEPLOY_AT}/logs`), "launchd will not create StandardOutPath's directory — install must");
 	const argvs = h.calls.map((c) => [c.cmd, ...c.args].join(" "));
 	assert.deepEqual(argvs, [`launchctl bootstrap gui/501 ${AGENT_PLIST}`, "launchctl enable gui/501/com.pi-dispatch.worker"]);
 	assert.match(h.text(), /LOGIN-scoped/, "no pretending a LaunchAgent is a boot daemon");
@@ -230,6 +364,7 @@ test("install linux --user: unit written without User=, daemon-reload then enabl
 	const unit = h.store.get(USER_UNIT);
 	assert.ok(unit, "unit written into ~/.config/systemd/user");
 	assert.doesNotMatch(unit, /^User=/m);
+	assert.ok(unit.includes(`ExecStart=/fake/node/bin/node ${CLI_PATH} worker`), "the installed unit carries the absolute cli path");
 	assert.match(unit, /RestartPreventExitStatus=2/);
 	assert.match(unit, /WantedBy=default\.target/);
 	const argvs = h.calls.map((c) => c.args);
@@ -248,6 +383,7 @@ test("install linux --system: prints the exact sudo commands, stages the render,
 	assert.ok(staged, "the render is staged for inspection");
 	assert.match(staged, /^User=tester$/m, "system scope keeps a User= line, rewritten to the invoking user");
 	assert.match(staged, /RestartPreventExitStatus=2/);
+	assert.ok(staged.includes(`EnvironmentFile=${DEPLOY_AT}/.env`), "the staged render still points .env at the deployment folder");
 	assert.ok(h.text().includes("sudo install -m 644 /faketmp/pi-dispatch-worker.service /etc/systemd/system/pi-dispatch-worker.service"));
 	assert.ok(h.text().includes("sudo systemctl daemon-reload"));
 	assert.ok(h.text().includes("sudo systemctl enable --now pi-dispatch-worker.service"));
@@ -299,21 +435,22 @@ test("install win32: nssm absent → the download pointer, nothing else", async 
 	assert.match(h.errText(), /Task Scheduler is not a substitute/);
 });
 
-test("install win32: drives the nssm-install.cmd sequence with computed paths, AppExit 2 Exit included", async () => {
+test("install win32: drives the nssm-install.cmd sequence — package wrapper + exec argv, AppDirectory = deployment folder, AppExit 2 Exit included", async () => {
 	const h = harness({ platform: "win32", argv: ["install"], plan: { "nssm status": 3, nssm: 0 } });
 	assert.equal(await h.run(), 0);
 	const argvs = h.calls.map((c) => c.args);
 	assert.deepEqual(argvs[0], ["status", "pi-dispatch-worker"], "the probe that answers both on-PATH and already-exists");
 	assert.deepEqual(argvs.slice(1), [
-		["install", "pi-dispatch-worker", `${REPO_ROOT}\\deploy\\worker-env-wrapper.cmd`],
-		["set", "pi-dispatch-worker", "AppDirectory", REPO_ROOT],
-		["set", "pi-dispatch-worker", "AppStdout", `${REPO_ROOT}\\logs\\worker.out.log`],
-		["set", "pi-dispatch-worker", "AppStderr", `${REPO_ROOT}\\logs\\worker.err.log`],
+		["install", "pi-dispatch-worker", WRAPPER_CMD, "/fake/node/bin/node", CLI_PATH, "worker"],
+		["set", "pi-dispatch-worker", "AppDirectory", DEPLOY_AT],
+		["set", "pi-dispatch-worker", "AppStdout", `${DEPLOY_AT}\\logs\\worker.out.log`],
+		["set", "pi-dispatch-worker", "AppStderr", `${DEPLOY_AT}\\logs\\worker.err.log`],
 		["set", "pi-dispatch-worker", "AppStopMethodConsole", "15000"],
 		["set", "pi-dispatch-worker", "AppThrottle", "5000"],
 		["set", "pi-dispatch-worker", "AppExit", "Default", "Restart"],
 		["set", "pi-dispatch-worker", "AppExit", "2", "Exit"],
 	]);
+	assert.ok(h.mkdirs.includes(join(DEPLOY_AT, "logs")), "nssm will not create the AppStdout directory — install must");
 	assert.match(h.text(), /nssm start pi-dispatch-worker/);
 });
 
@@ -447,28 +584,29 @@ test("--user and --system together refuse; --system refuses on macOS", async () 
 });
 
 // ---------------------------------------------------------------------------------------------------
-// The real wrapper under a real sh: the exit-2 conversion and the SIGTERM forwarding are behaviour of
-// deploy/worker-env-wrapper.sh itself, so these tests execute the shipped file with a stub `node` on
-// PATH. POSIX-only (win32 has no sh).
+// The real wrapper under a real sh: the exit-2 conversion, the SIGTERM forwarding, the ./.env contract
+// and the argv contract are behaviour of deploy/worker-env-wrapper.sh itself, so these tests execute
+// the shipped file exactly the way a rendered unit does: cwd = the deployment folder (the unit's
+// WorkingDirectory) and the command as arguments. POSIX-only (win32 has no sh).
 // ---------------------------------------------------------------------------------------------------
 
 const POSIX = process.platform === "linux" || process.platform === "darwin";
+const REAL_WRAPPER = join(REPO_ROOT, "deploy", "worker-env-wrapper.sh");
 
-function wrapperDir(nodeStub) {
+function wrapperDir(nodeStub, { env = true } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-dispatch-wrapper-"));
-	mkdirSync(join(dir, "deploy"));
-	writeFileSync(join(dir, "deploy", "worker-env-wrapper.sh"), readFileSync(join(REPO_ROOT, "deploy", "worker-env-wrapper.sh")));
-	writeFileSync(join(dir, ".env"), "PI_WRAPPER_TEST=1\n");
+	if (env) writeFileSync(join(dir, ".env"), "PI_WRAPPER_TEST=1\n");
 	mkdirSync(join(dir, "bin"));
 	writeFileSync(join(dir, "bin", "node"), nodeStub);
 	chmodSync(join(dir, "bin", "node"), 0o755);
 	return dir;
 }
 
-function runWrapper(dir, { onSpawn } = {}) {
+function runWrapper(dir, { args, onSpawn } = {}) {
 	return new Promise((resolvePromise, reject) => {
-		const child = spawn("sh", [join(dir, "deploy", "worker-env-wrapper.sh")], {
-			env: { ...process.env, PATH: `${join(dir, "bin")}:${process.env.PATH}`, MARKER_DIR: dir },
+		const child = spawn("sh", [REAL_WRAPPER, ...(args ?? [join(dir, "bin", "node")])], {
+			cwd: dir,
+			env: { ...process.env, MARKER_DIR: dir },
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let stderr = "";
@@ -491,6 +629,30 @@ test("wrapper: every other nonzero exit passes through untouched (7 stays 7, so 
 	const dir = wrapperDir("#!/bin/sh\nexit 7\n");
 	const { code } = await runWrapper(dir);
 	assert.equal(code, 7);
+});
+
+test("wrapper: sources ./.env from its cwd and passes the trailing argv through to the command", { skip: !POSIX }, async () => {
+	// The stub proves both halves of the contract at once: the sourced variable arrived, and so did
+	// the argument after the script path (the `worker` in `<node> <cli> worker`).
+	const dir = wrapperDir('#!/bin/sh\n[ "$PI_WRAPPER_TEST" = "1" ] || exit 9\n[ "$1" = "worker" ] || exit 8\nexit 0\n');
+	const { code } = await runWrapper(dir, { args: [join(dir, "bin", "node"), "worker"] });
+	assert.equal(code, 0, "exit 9 = .env not sourced; exit 8 = argv not forwarded");
+});
+
+test("wrapper: refuses with no argv command — it no longer decides what to run", { skip: !POSIX }, async () => {
+	const dir = wrapperDir("#!/bin/sh\nexit 0\n");
+	const { code, stderr } = await runWrapper(dir, { args: [] });
+	assert.equal(code, 1);
+	assert.match(stderr, /no command given/);
+	assert.match(stderr, /pi-dispatch service render/, "points at the re-render that composes the argv");
+});
+
+test("wrapper: refuses when ./.env is absent from its cwd, naming the directory it looked in", { skip: !POSIX }, async () => {
+	const dir = wrapperDir("#!/bin/sh\nexit 0\n", { env: false });
+	const { code, stderr } = await runWrapper(dir);
+	assert.equal(code, 1);
+	assert.match(stderr, /\.env not found in \//, "the message names $PWD, an absolute directory");
+	assert.match(stderr, /deployment folder/, "the message explains the WorkingDirectory contract instead of guessing");
 });
 
 test("wrapper: SIGTERM to the wrapper reaches node (trap + kill + double wait replaces the old exec)", { skip: !POSIX }, async () => {

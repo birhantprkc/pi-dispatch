@@ -1,9 +1,20 @@
 #!/bin/sh
 # pi-dispatch launcher for daemon managers that have NO EnvironmentFile mechanism. systemd reads
 # `.env` for you via `EnvironmentFile=` (see deploy/worker.service); launchd (macOS) has no equivalent --
-# a plist's ProgramArguments cannot name a `.env`. This wrapper closes that gap: launchd execs THIS
-# script, which loads the explicit `.env` from the repo root and then runs node. Its exit-code
-# conversion and signal forwarding are exercised under `sh` by worker/test/service.test.mjs.
+# a plist's ProgramArguments cannot name a `.env`. This wrapper closes that gap: it sources `./.env`
+# from the directory it is STARTED IN, then runs the command it was handed. Its exit-code conversion
+# and signal forwarding are exercised under `sh` by worker/test/service.test.mjs.
+#
+# CONTRACT (issue #96 -- nothing here is guessed from this script's own location any more):
+#   - The current directory IS the deployment folder. The daemon manager guarantees it: launchd sets
+#     the plist's WorkingDirectory, nssm sets AppDirectory. The old `cd "$(dirname "$0")/.."` self-guess
+#     was right only in a repo checkout; under `npm install` this script lives at
+#     node_modules/@edgehero/pi-dispatch/deploy/, whose parent is the package -- no `.env` there, ever.
+#   - "$@" IS the command, e.g.:  /path/to/node /abs/path/to/src/cli.mjs worker
+#     `pi-dispatch service` composes it with absolute paths (the same node that rendered, the worker
+#     package's own cli.mjs or the receiver package's start.mjs) and puts it in the unit's
+#     ProgramArguments / AppParameters. This wrapper no longer decides WHAT to run -- only the env it
+#     runs in and what its exit code means -- so an empty argv is a configuration error, refused below.
 #
 # It sources ONLY the declared `.env` (see `.env.example`), never the host login shell: the
 # container-boundary rules require an explicit, auditable variable set, not whatever the operator's
@@ -17,19 +28,15 @@
 # One worker per host (DES-CONCURRENCY-3): parallelism is PI_CONCURRENCY inside the single process, not
 # multiple daemons. Requires the AOF-enabled Valkey from deploy/docker-compose.yml.
 
-# Resolve repo root relative to this script (deploy/ is one level down).
-cd "$(dirname "$0")/.." || exit 1
-if [ ! -f .env ]; then echo "worker-env-wrapper: .env not found in $(pwd)" >&2; exit 1; fi
-set -a; . ./.env; set +a
-
-# One wrapper serves both daemons, because the gap it closes (no EnvironmentFile under launchd/nssm)
-# is identical for both: no argument runs the worker; `receiver` (passed by the derived receiver
-# units `pi-dispatch service` renders) runs the webhook receiver.
-if [ "$1" = "receiver" ]; then
-	set -- node receiver/src/start.mjs
-else
-	set -- node worker/src/cli.mjs worker
+if [ "$#" -eq 0 ]; then
+	echo "worker-env-wrapper: no command given -- expected: worker-env-wrapper.sh /path/to/node /path/to/script [args...]; the unit's ProgramArguments/AppParameters carry these (re-render with: pi-dispatch service render)" >&2
+	exit 1
 fi
+if [ ! -f ./.env ]; then
+	echo "worker-env-wrapper: .env not found in $PWD -- this wrapper must be started in the deployment folder (the unit's WorkingDirectory / nssm AppDirectory); it no longer guesses a location from its own path" >&2
+	exit 1
+fi
+set -a; . ./.env; set +a
 
 # `exec` is deliberately GONE here (it used to hand this shell's pid straight to node): intercepting
 # the exit code needs a parent still alive after node exits. launchd's KeepAlive/SuccessfulExit=false
