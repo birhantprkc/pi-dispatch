@@ -30,10 +30,11 @@ const exec = promisify(execFile);
  */
 
 // The skill name charset: lowercase kebab/underscore, 1-64 chars, no dots (so no "..") and no
-// slashes. Mirrors materialize.mjs SKILL_NAME_RE (not exported there) — keep in sync. Validating
-// `flow` against it BEFORE building any path is the traversal choke point: a bad name is denied,
-// never interpolated into a git path.
-const SKILL_NAME_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
+// slashes. Validating `flow` against it BEFORE building any path is the traversal choke point: a
+// bad name is denied, never interpolated into a git path. Exported as the single source of truth
+// (issue #92): materialize.mjs imports it, and the admin's setup wizard lists a repo's .pi/skills
+// through it — three keep-in-sync copies would drift exactly where a traversal guard cannot.
+export const SKILL_NAME_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
 
 export async function readFlowGate({ folder, flow, sha, git = defaultGit }) {
 	// `sha` is REQUIRED and never defaulted: a missing SHA fails closed rather than resolving HEAD,

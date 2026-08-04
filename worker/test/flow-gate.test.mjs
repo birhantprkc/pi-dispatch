@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { readFlowGate } from "../src/flow-gate.mjs";
+import { SKILL_NAME_RE, readFlowGate } from "../src/flow-gate.mjs";
 
 // git is NEVER faked in this suite: readFlowGate's object-store discipline is only meaningfully
 // tested against a REAL repo with REAL tree modes (a genuine 120000 symlink, a real prior commit).
@@ -124,4 +124,11 @@ test("CRLF frontmatter with a quoted value -> allow (CRLF normalised, quote opti
 test("never throws even when the folder is not a git repo at all -> deny", async () => {
 	const notRepo = mkdtempSync(join(tmpdir(), "pi-notrepo-"));
 	assert.deepEqual(await readFlowGate({ folder: notRepo, flow: "tidy", sha: "0".repeat(40) }), { gate: "deny" });
+});
+
+test("SKILL_NAME_RE is exported as the single source of truth (issue #92) and holds its vectors", () => {
+	// materialize.mjs imports this regex and the admin's setup wizard lists .pi/skills through it, so
+	// the charset is API now: a loosening here loosens a traversal choke in three places at once.
+	for (const ok of ["tidy", "bug-fix", "a", "x_1", "a".repeat(64)]) assert.ok(SKILL_NAME_RE.test(ok), ok);
+	for (const bad of ["", "Tidy", "a..b", "a/b", "-lead", "trail-", ".hidden", "a".repeat(65)]) assert.ok(!SKILL_NAME_RE.test(bad), bad);
 });

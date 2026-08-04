@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
+import { SKILL_NAME_RE } from "./flow-gate.mjs";
 
 const exec = promisify(execFile);
 
@@ -29,9 +30,10 @@ const PI_DIR = ".pi";
 const APPEND_SYSTEM = `${PI_DIR}/APPEND_SYSTEM.md`;
 // A skill directory name: lowercase kebab/underscore, 1-64 chars, no dots (so no "..") and no
 // slashes. This is what makes a traversal name impossible at the source. Matched against the
-// CAPTURED segment only, never the whole path.
+// CAPTURED segment only, never the whole path. The name charset itself is imported from
+// flow-gate.mjs (the exported single source of truth, issue #92); the path form stays local
+// because only the materialiser walks whole tree paths.
 const SKILL_PATH_RE = /^\.pi\/skills\/([a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?)\/SKILL\.md$/;
-const SKILL_NAME_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
 
 /**
  * Classify a git tree path into the destination we will WRITE, or null to reject.
