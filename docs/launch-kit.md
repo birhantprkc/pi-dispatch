@@ -4,7 +4,9 @@ SECURITY.md / the code — keep it that way when you edit. Be honest about matur
 self-host, read SECURITY.md); overclaiming burns a launch faster than underclaiming.
 
 Repo: https://github.com/edgehero/pi-dispatch
-Not distributed via npm (the name `pi-dispatch` is an unrelated package). Link the GitHub repo everywhere.
+npm: scoped packages only — @edgehero/pi-dispatch (worker+CLI), @edgehero/pi-dispatch-receiver,
+@edgehero/pi-dispatch-admin (the console). The BARE name `pi-dispatch` is an unrelated squatted package:
+never write bare `npx pi-dispatch` in launch copy; always the scoped form, and link the GitHub repo.
 -->
 
 # pi-dispatch — launch kit

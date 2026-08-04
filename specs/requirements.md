@@ -942,6 +942,40 @@ and nothing about the box itself (`INT-CONTAINER-RUNTIME-CONTRACT`).
   spends nothing. Given a failure enqueueing replica *k*, then the receiver answers 503 with replicas
   `1..k-1` queued, and the redelivery converges on exactly *n* jobs rather than *n + k − 1*.
 
+## REQ-DEPLOYMENT-BOOTSTRAP
+
+- **Statement**: The CLI shall take a fresh machine to a preflighted deployment through **create-only
+  scaffolds and per-action consented host mutations** — `pi-dispatch init` (scaffold), `pi-dispatch
+  doctor [--fix]` (preflight; offered fixes), `pi-dispatch up [--yes]` (the consented sequence:
+  default-image pull+tag, loopback Valkey start, scaffold, preflight) — and shall never perform an
+  unshown host mutation, never touch an existing config value, and never spend a token.
+- **Scope**: Deployment setup, repair, and process supervision on the operator's own host —
+  `pi-dispatch service <render|install|uninstall|status|start|stop|restart [--drain]>` renders the
+  shipped deploy/ templates with computed absolutes (`process.execPath`, the real repo root — the
+  shipped `/usr/bin/node` literal does not exist on an nvm host) and installs **user-level** by
+  default; system-wide stays a printed sudo command, never executed. Not job execution, not
+  forge-side configuration (webhooks, branch protection, App installation), not the admin extension.
+- **Why**: The quickstart was five hand-typed infra chores whose commands were already fixed strings —
+  automation removes typing, not decisions. The decisions stay human: every mutating action is printed
+  verbatim and runs only on an explicit accept (y/N, default No, No on non-TTY), because "pulled onto
+  that host yourself" (`SECURITY.md`) is a trust property the consent keypress preserves and a silent
+  bootstrap would erase. Fix tiers are closed sets (`DES-CLI-SURFACE`): silent = init's create-only
+  scaffolds + `mkdir` of env-declared paths; prompted = the deployment's own default image, the
+  loopback Valkey, an overlay `auth.json` delete, an `import-pi` restage under its own gates; never =
+  malformed-config rewrites, triggers/pause-windows content, trigger-named images, semantic env
+  guesses. `up` may set `WEBHOOK_SECRET` in a scaffolded `.env` **only when the key is empty** — a
+  generated secret is never printed and an operator's value is never replaced.
+- **Traces to**: `DES-CLI-SURFACE`, `CONST-BUDGET-BEFORE-TOKENS`, `SECURITY.md` (pull-it-yourself),
+  `REQ-GLOBAL-PI-OVERLAY` (doctor's existing obligations)
+- **Acceptance**: Given `up` with every prompt declined, then no docker command runs, init reports its
+  usual kept/written lines, doctor renders, and the summary names each skipped action. Given `--yes`,
+  then exactly the shown commands run, in order. Given a `.env` whose `WEBHOOK_SECRET` has a value,
+  then `up` leaves the byte untouched. Given `doctor --fix` on non-TTY stdin, then every prompt-tier
+  fix is skipped as declined. Given a failing check with no fix action (malformed JSON, a missing
+  trigger-named image), then `--fix` prints today's fix line and offers nothing. Given any `up` run,
+  then no path reserves budget, enqueues a job, or reads a provider key beyond doctor's existing
+  presence checks.
+
 ## Notes (not requirements)
 
 **Capacity and cost.** ~1.5–2.5 GB RAM per job (pi + dev server + headless Chromium) and roughly
@@ -960,6 +994,8 @@ wait-list working as designed, not a failure — see `README.md`.
 
 | Date | Change |
 |---|---|
+| 2026-08-02 | Process supervision joins the bootstrap requirement (issue #80). **REQ-DEPLOYMENT-BOOTSTRAP Scope widened**: `pi-dispatch service` (render/install/uninstall/status/start/stop/restart `--drain`) — user-level by default, sudo commands printed never executed, per-OS honesty (macOS login-scoped because Docker Desktop is; Windows via operator-installed nssm, never Task Scheduler — its `TerminateProcess` hard-kill is the recorded rejection), `restart --drain` composing the durable pause → wait-idle → restart → resume ritual the README previously spelled out by hand, and a timed-out drain leaves the queue paused rather than un-pausing over a live job. **REQ-SPEND-CAPS-MULTI-WINDOW / CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: supervision changes when the worker runs, never what a run may spend. |
+| 2026-08-02 | Consented bootstrap (issue #80). Added **REQ-DEPLOYMENT-BOOTSTRAP**: `pi-dispatch up [--yes]` and `doctor --fix` take a fresh machine to a preflighted deployment through create-only scaffolds and per-action consented host mutations — every mutating command printed verbatim, y/N default No (No on non-TTY), closed fix tiers with an explicit never-set (malformed-config rewrites, triggers/pause-windows content, trigger-named `run.image`, semantic env guesses), `WEBHOOK_SECRET` set only when empty and never printed. Automation removes typing, never decisions: the consent keypress preserves SECURITY.md's "pulled onto that host yourself" property that a silent bootstrap would erase. **CONST-BUDGET-BEFORE-TOKENS UNCHANGED, checked**: no bootstrap path reserves budget, enqueues, or spends — `up` ends at doctor, not at a job. **REQ-GLOBAL-PI-OVERLAY UNCHANGED, checked**: doctor's overlay obligations are cited by the new REQ, not moved; `--fix`'s overlay actions (auth.json delete, import-pi restage) re-execute existing gates. |
 | 2026-08-02 | Doctor grows the missing receiver-side preflight (issue #80). **REQ-BRANCH-PROTECTION-PRECONDITION** amended: `doctor` now states at setup time that github branch protection cannot be preflighted statically (github triggers take their repo from each delivery — `run.repository` is azure-only) and names the actual enforcement point, per job pre-spend; a read-only capped `gh api` preflight helper ships for when repos are statically known, warn-never-fail, never offering to enable protection. Doctor also warns on the receiver-boot hard-requirements it previously ignored (WEBHOOK_SECRET; Forgejo and Azure credentials mirroring the existing GitLab block), gated on which forges the triggers file actually names, preserving warn-not-fail ("a deployment can legitimately be mid-setup") and presence-only secret checks. **REQ-TRIGGER-AUTHOR-GATE UNCHANGED, checked**: every new check reads state; none writes or gates anything. **CONST-MERGE-NEVER-AUTOMATIC UNCHANGED, checked**: the preflight surfaces the backstop's precondition earlier; the backstop itself is untouched. |
 | 2026-08-01 | Added **`REQ-COST-ANALYTICS`** (issue #53): the COSTS view, `/dispatch costs` (+`whatif`), and the `dispatch_costs` read tool over one retention-bounded fold — per-flow/per-model/per-day spend, subscription verdicts with the API-rate comparison, and what-if re-pricing through the pricing façade. The **labeling rules are requirements, not conventions**: every dollar carries its class through one shared formatter; plan-covered runs never render `$0.00` and uncovered zero-rate runs render `$0 (unrated)`, never "free"; estimates are always marked and demote any sum they enter, with coverage; floors keep their `≥`; undisclosed quota limits produce facts only, never burn-down; seeding is measured-median-first with the `OQ-002` band as the labeled last resort, always a band; the surface names its window and retention bound. The screen informs and changes nothing — no auto-switching, no new network surface, no database. **`REQ-ADMIN-VIA-PI-EXTENSION` amended**: `costs` joins the command inventory and `dispatch_costs` the read tools; the confirm-gate posture is **UNCHANGED, checked** (costs is a read; the write gates neither grew nor moved). `CONST-BUDGET-BEFORE-TOKENS` **UNCHANGED, checked**: analytics reads what enforcement recorded and touches no reservation path. |
 | 2026-08-01 | **`REQ-TOKEN-ACCOUNTING-AND-CAPS` amended** (issue #53, gap 1): obligation (a) grows the per-(provider,model) **ledger** — the meter keeps the full cache split (`cacheRead`/`cacheWrite`/`cacheWrite1h`/`reasoning`) per model that the flat totals collapse, emits it as the exit line's `usage` block (8 named rows max + an `other` row absorbing overflow and model-less calls; rows sum to `total`; stamped with the pricing pi-ai's version), and the worker persists it beside host-effective `provider`/`model` on every terminal path. The statement records the two honesty rules: a model-less call lands on `other`, **never guessed onto a model**, and the fallback meter keeps **no** ledger — `usage: null` is the reader's signal, not an error. Enforcement (`maxTokens`, `dailyTokenCap`) is **UNCHANGED, checked**: the ledger is accounting only, and the number `recordTokenSpend` charges is still the flat billed total. |

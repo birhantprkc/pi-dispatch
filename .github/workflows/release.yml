@@ -1,15 +1,24 @@
-# Publish @edgehero/pi-dispatch-admin (npm) and cut its GitHub Release when admin/package.json's version
-# changes on main. This is the EXTENSION's pipeline: it tags admin-v*. The whole TOOL's releases (v*) are cut
-# by repo-release.yml off the ROOT package.json version — the two never share a tag.
+# Publish the pi-dispatch npm packages and cut each one's GitHub Release when its workspace's version
+# changes on main: @edgehero/pi-dispatch (worker/, tagged worker-v*), @edgehero/pi-dispatch-receiver
+# (receiver/, tagged receiver-v*) and @edgehero/pi-dispatch-admin (admin/, tagged admin-v*). The whole
+# TOOL's releases (v*) are cut by repo-release.yml off the ROOT package.json version — no workflow shares
+# a tag namespace with another.
+#
+# One job, three sequenced step-groups, in publish ORDER worker → receiver → admin. The order is load-
+# bearing: receiver depends on the worker package being on the registry, and a matrix — even with
+# max-parallel: 1 — promises serialization, not order. Steps in one job run top to bottom, and a failure
+# in an earlier group stops the later ones, which is what you want when the later package depends on the
+# earlier one landing.
 #
 # main is branch-protected (PR + 1 approving review required), so a push here is an already-approved merge —
 # the human gate is the merge, not this workflow (consistent with CONST-MERGE-NEVER-AUTOMATIC: nothing here
-# merges anything). Publishing is idempotent: it fires only when admin/package.json's version is not already
-# on npm, so re-runs, reverts, and unrelated pushes are no-ops. Bump the version in your PR to ship a release.
+# merges anything). Publishing is idempotent PER PACKAGE: each group fires only when its workspace's version
+# is not already on npm, so re-runs, reverts, and pushes that touch only one workspace are no-ops for the
+# other two. Bump a workspace's version in your PR to ship that package.
 #
 # Required repo secret: NPM_TOKEN — an npm *automation* (or granular, "bypass 2FA") token that can publish to
 #   the @edgehero scope. Interactive 2FA cannot run in CI; the token is how publishing works here.
-# Optional repo secret: ANTHROPIC_API_KEY — enables AI-written release notes; without it, the release falls
+# Optional repo secret: ANTHROPIC_API_KEY — enables AI-written release notes; without it, each release falls
 #   back to a plain commit list. Optional repo variable: RELEASE_MODEL (default: claude-sonnet-5).
 
 name: release
@@ -18,6 +27,8 @@ on:
   push:
     branches: [main]
     paths:
+      - "worker/**"
+      - "receiver/**"
       - "admin/**"
       - ".github/workflows/release.yml"
       - ".github/scripts/release-notes.mjs"
@@ -38,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history for the release-notes commit range
+          fetch-depth: 0 # full history for the release-notes commit ranges
 
       - uses: actions/setup-node@v4
         with:
@@ -48,11 +59,170 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Test the package being shipped
-        run: npm run test --workspace admin
+      # The whole suite once, up front, rather than each workspace's tests just before its publish. Simpler —
+      # one step instead of three — and stricter: a worker change that breaks receiver's tests should block
+      # worker's publish too, and per-workspace gating would have let it through.
+      - name: Test everything being shipped
+        run: npm test
 
-      - name: Resolve version + decide publish/release
-        id: v
+      # ── @edgehero/pi-dispatch (worker/) ─────────────────────────────────────────────────────────────────
+      # Name and version are read from the workspace's package.json, never restated here — the package.json
+      # is the fact, this file just acts on it.
+
+      - name: "worker: resolve version + decide publish/release"
+        id: worker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(node -p "require('./worker/package.json').version")
+          NAME=$(node -p "require('./worker/package.json').name")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          # npm view exits 0 printing the version when NAME@V is on the registry, and exits non-zero with
+          # E404 both when the package has never been published (worker/receiver's first release) and when
+          # only this version is new — verified against npm ≥9; both mean "go". Any OTHER failure — auth,
+          # network, registry outage — must not be read as "unpublished": a gate that publishes on a flake
+          # is not a gate, so those fail the run instead.
+          CODE=0; VIEW=$(npm view "$NAME@$V" version 2>&1) || CODE=$?
+          if [ "$CODE" -eq 0 ]; then
+            echo "publish=no" >> "$GITHUB_OUTPUT"; echo "$NAME@$V already on npm — skip publish"
+          elif printf '%s' "$VIEW" | grep -q "E404"; then
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm view $NAME@$V failed for a reason other than 404 — refusing to guess:"
+            printf '%s\n' "$VIEW"; exit 1
+          fi
+          # This package's GitHub releases are tagged worker-v* so the tool's own releases keep the v*
+          # namespace (see repo-release.yml). npm publish is unaffected — it keys off the package version.
+          if gh release view "worker-v$V" >/dev/null 2>&1; then
+            echo "release=no" >> "$GITHUB_OUTPUT"; echo "release worker-v$V already exists — skip release"
+          else
+            echo "release=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "worker: publish to npm"
+        if: steps.worker.outputs.publish == 'yes'
+        run: npm publish --workspace worker --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: "worker: build release notes"
+        if: steps.worker.outputs.release == 'yes'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
+          # Which artifact is being described — the script reads this from its caller (see release-notes.mjs
+          # on why). The name comes from the resolve step, so a rename never leaves this stale.
+          PRODUCT: ${{ steps.worker.outputs.name }}
+          PRODUCT_DESC: the pi-dispatch worker — drains the queue and runs one isolated container per job
+        run: |
+          PREV=$(git tag --list 'worker-v*' --sort=-v:refname | head -n1)
+          RANGE=${PREV:+$PREV..HEAD}
+          COMMITS=$(git log $RANGE --no-merges --pretty=format:'- %s' -- worker/ | head -n 60)
+          if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.worker.outputs.version }}" \
+               node .github/scripts/release-notes.mjs > /tmp/notes-worker.md 2>/tmp/notes-worker.err; then
+            echo "release notes: AI-written"
+          else
+            echo "release notes: AI unavailable ($(head -n1 /tmp/notes-worker.err 2>/dev/null)) — using commit list"
+            # Capped like the AI notes are, and the remainder counted rather than dropped silently.
+            TOTAL=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
+            {
+              echo "### Changes"; echo
+              printf '%s\n' "$COMMITS" | head -n 12
+              if [ "$TOTAL" -gt 12 ]; then printf -- '- …and %s more\n' "$((TOTAL - 12))"; fi
+            } > /tmp/notes-worker.md
+          fi
+          # Appended on BOTH paths -- this link is what earns the brevity above.
+          if [ -n "$PREV" ]; then
+            printf '\n**Full changelog**: %s/%s/compare/%s...worker-v%s\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.worker.outputs.version }}" >> /tmp/notes-worker.md
+          fi
+
+      - name: "worker: create GitHub Release"
+        if: steps.worker.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "worker-v${{ steps.worker.outputs.version }}" \
+            --title "${{ steps.worker.outputs.name }} v${{ steps.worker.outputs.version }}" \
+            --notes-file /tmp/notes-worker.md
+
+      # ── @edgehero/pi-dispatch-receiver (receiver/) ──────────────────────────────────────────────────────
+      # Same shape as worker's group above (the gate's reasoning lives there). Runs after worker on purpose:
+      # receiver depends on the worker package, which must be on the registry first.
+
+      - name: "receiver: resolve version + decide publish/release"
+        id: receiver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(node -p "require('./receiver/package.json').version")
+          NAME=$(node -p "require('./receiver/package.json').name")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          CODE=0; VIEW=$(npm view "$NAME@$V" version 2>&1) || CODE=$?
+          if [ "$CODE" -eq 0 ]; then
+            echo "publish=no" >> "$GITHUB_OUTPUT"; echo "$NAME@$V already on npm — skip publish"
+          elif printf '%s' "$VIEW" | grep -q "E404"; then
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm view $NAME@$V failed for a reason other than 404 — refusing to guess:"
+            printf '%s\n' "$VIEW"; exit 1
+          fi
+          if gh release view "receiver-v$V" >/dev/null 2>&1; then
+            echo "release=no" >> "$GITHUB_OUTPUT"; echo "release receiver-v$V already exists — skip release"
+          else
+            echo "release=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "receiver: publish to npm"
+        if: steps.receiver.outputs.publish == 'yes'
+        run: npm publish --workspace receiver --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: "receiver: build release notes"
+        if: steps.receiver.outputs.release == 'yes'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
+          PRODUCT: ${{ steps.receiver.outputs.name }}
+          PRODUCT_DESC: the pi-dispatch webhook receiver — turns forge events into queued jobs
+        run: |
+          PREV=$(git tag --list 'receiver-v*' --sort=-v:refname | head -n1)
+          RANGE=${PREV:+$PREV..HEAD}
+          COMMITS=$(git log $RANGE --no-merges --pretty=format:'- %s' -- receiver/ | head -n 60)
+          if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.receiver.outputs.version }}" \
+               node .github/scripts/release-notes.mjs > /tmp/notes-receiver.md 2>/tmp/notes-receiver.err; then
+            echo "release notes: AI-written"
+          else
+            echo "release notes: AI unavailable ($(head -n1 /tmp/notes-receiver.err 2>/dev/null)) — using commit list"
+            TOTAL=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
+            {
+              echo "### Changes"; echo
+              printf '%s\n' "$COMMITS" | head -n 12
+              if [ "$TOTAL" -gt 12 ]; then printf -- '- …and %s more\n' "$((TOTAL - 12))"; fi
+            } > /tmp/notes-receiver.md
+          fi
+          if [ -n "$PREV" ]; then
+            printf '\n**Full changelog**: %s/%s/compare/%s...receiver-v%s\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.receiver.outputs.version }}" >> /tmp/notes-receiver.md
+          fi
+
+      - name: "receiver: create GitHub Release"
+        if: steps.receiver.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "receiver-v${{ steps.receiver.outputs.version }}" \
+            --title "${{ steps.receiver.outputs.name }} v${{ steps.receiver.outputs.version }}" \
+            --notes-file /tmp/notes-receiver.md
+
+      # ── @edgehero/pi-dispatch-admin (admin/) ────────────────────────────────────────────────────────────
+      # Same shape again. admin's prepublishOnly builds its bundle, so publish needs nothing extra here.
+
+      - name: "admin: resolve version + decide publish/release"
+        id: admin
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -60,61 +230,60 @@ jobs:
           NAME=$(node -p "require('./admin/package.json').name")
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          if npm view "$NAME@$V" version >/dev/null 2>&1; then
+          CODE=0; VIEW=$(npm view "$NAME@$V" version 2>&1) || CODE=$?
+          if [ "$CODE" -eq 0 ]; then
             echo "publish=no" >> "$GITHUB_OUTPUT"; echo "$NAME@$V already on npm — skip publish"
-          else
+          elif printf '%s' "$VIEW" | grep -q "E404"; then
             echo "publish=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "npm view $NAME@$V failed for a reason other than 404 — refusing to guess:"
+            printf '%s\n' "$VIEW"; exit 1
           fi
-          # The admin EXTENSION's GitHub releases are tagged admin-v* so the tool's own releases own the v*
-          # namespace (see repo-release.yml). npm publish above is unaffected — it keys off the package version.
           if gh release view "admin-v$V" >/dev/null 2>&1; then
             echo "release=no" >> "$GITHUB_OUTPUT"; echo "release admin-v$V already exists — skip release"
           else
             echo "release=yes" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish to npm
-        if: steps.v.outputs.publish == 'yes'
+      - name: "admin: publish to npm"
+        if: steps.admin.outputs.publish == 'yes'
         run: npm publish --workspace admin --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Build release notes
-        if: steps.v.outputs.release == 'yes'
+      - name: "admin: build release notes"
+        if: steps.admin.outputs.release == 'yes'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RELEASE_MODEL: ${{ vars.RELEASE_MODEL }}
-          # This pipeline ships the EXTENSION; repo-release.yml passes the tool's own name for the v* line.
-          PRODUCT: "@edgehero/pi-dispatch-admin"
+          PRODUCT: ${{ steps.admin.outputs.name }}
           PRODUCT_DESC: the operator console for pi-dispatch, shipped as a pi extension
         run: |
           PREV=$(git tag --list 'admin-v*' --sort=-v:refname | head -n1)
           RANGE=${PREV:+$PREV..HEAD}
           COMMITS=$(git log $RANGE --no-merges --pretty=format:'- %s' -- admin/ | head -n 60)
-          if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.v.outputs.version }}" \
-               node .github/scripts/release-notes.mjs > /tmp/notes.md 2>/tmp/notes.err; then
+          if [ -n "$ANTHROPIC_API_KEY" ] && COMMITS="$COMMITS" VERSION="v${{ steps.admin.outputs.version }}" \
+               node .github/scripts/release-notes.mjs > /tmp/notes-admin.md 2>/tmp/notes-admin.err; then
             echo "release notes: AI-written"
           else
-            echo "release notes: AI unavailable ($(head -n1 /tmp/notes.err 2>/dev/null)) — using commit list"
-            # Capped like the AI notes are, and the remainder counted rather than dropped silently.
+            echo "release notes: AI unavailable ($(head -n1 /tmp/notes-admin.err 2>/dev/null)) — using commit list"
             TOTAL=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
             {
               echo "### Changes"; echo
               printf '%s\n' "$COMMITS" | head -n 12
               if [ "$TOTAL" -gt 12 ]; then printf -- '- …and %s more\n' "$((TOTAL - 12))"; fi
-            } > /tmp/notes.md
+            } > /tmp/notes-admin.md
           fi
-          # Appended on BOTH paths -- this link is what earns the brevity above.
           if [ -n "$PREV" ]; then
             printf '\n**Full changelog**: %s/%s/compare/%s...admin-v%s\n' \
-              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.v.outputs.version }}" >> /tmp/notes.md
+              "${{ github.server_url }}" "${{ github.repository }}" "$PREV" "${{ steps.admin.outputs.version }}" >> /tmp/notes-admin.md
           fi
 
-      - name: Create GitHub Release
-        if: steps.v.outputs.release == 'yes'
+      - name: "admin: create GitHub Release"
+        if: steps.admin.outputs.release == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "admin-v${{ steps.v.outputs.version }}" \
-            --title "@edgehero/pi-dispatch-admin v${{ steps.v.outputs.version }}" \
-            --notes-file /tmp/notes.md
+          gh release create "admin-v${{ steps.admin.outputs.version }}" \
+            --title "${{ steps.admin.outputs.name }} v${{ steps.admin.outputs.version }}" \
+            --notes-file /tmp/notes-admin.md

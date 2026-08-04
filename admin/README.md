@@ -66,7 +66,16 @@ Then run pi and open `/dispatch`. Point it at your deployment with `VALKEY_URL` 
 
 ## Get the whole thing
 
-The queue, worker, container image, and GitHub webhook receiver — the actual service — are in the main repo. **Start there:**
+The service this console drives is a sibling install away — no clone needed:
+
+```bash
+mkdir my-dispatch && cd my-dispatch
+npx @edgehero/pi-dispatch up      # consented setup pass: job image, Valkey, config scaffold, preflight
+npx @edgehero/pi-dispatch worker  # drain the queue (its own terminal, or `service install`)
+```
+
+(`@edgehero/pi-dispatch` is the worker + CLI; `@edgehero/pi-dispatch-receiver` is the webhook edge for
+forge triggers.) The container image, docs, specs, and SECURITY.md live in the main repo. **Start there:**
 
 ### → **https://github.com/edgehero/pi-dispatch**
 

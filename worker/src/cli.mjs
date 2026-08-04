@@ -9,7 +9,11 @@ import { gitDirty } from "./git-dirty.mjs";
 const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch init         scaffold .env + triggers.json + pause-windows.json + pi-packages.json + subscriptions.json here
-  pi-dispatch doctor       preflight Docker, Valkey, the job image, and your provider key
+  pi-dispatch doctor [--fix]  preflight Docker, Valkey, the job image, and your provider key; --fix offers to run each fix (y/N per action)
+  pi-dispatch up [--yes]   one consented pass: pull+tag the job image, start Valkey, init, doctor
+  pi-dispatch setup github mint GitHub App credentials in one browser click (App Manifest flow);
+                           every write shown first and individually consented — no --yes here
+                           (--webhook-url <URL> | --no-webhook) [--org <org>] [--name <appName>]
   pi-dispatch import-pi    stage your host pi setup (models/skills/persona) into a global overlay
                            [--no-extensions] [--with-packages] [--packages-file <path>]
                            [--from <agentDir>] [--to <overlayDir>]
@@ -24,6 +28,10 @@ const USAGE = `pi-dispatch — run pi coding-agent flows on your own folders
 
   pi-dispatch worker       drain the queue (run this in another terminal, or as a service)
   pi-dispatch-receiver     webhook receiver for forge triggers — its own bin (see the GitHub section of the README)
+  pi-dispatch service <render|install|uninstall|status|start|stop|restart> [--receiver] [--user|--system] [--force]
+                           run the worker (or --receiver) as an OS service — the deploy/ templates
+                           rendered with this host's real paths, installed user-level;
+                           \`service restart --drain\` lets the in-flight job finish first
   pi-dispatch pause        stop taking new jobs (durable; survives worker restart)
   pi-dispatch resume       resume taking jobs
   pi-dispatch status       show paused state + job counts
@@ -40,7 +48,24 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 
 	if (cmd === "doctor") {
 		const { runDoctor } = await import("./doctor.mjs");
-		return runDoctor(env);
+		// `fix` rides in the deps position (runDoctor(env, depsOrOpts)) — one options bag, no third arg.
+		return runDoctor(env, { fix: argv.slice(1).includes("--fix") });
+	}
+
+	if (cmd === "up") {
+		const { runUp } = await import("./up.mjs");
+		return runUp(argv.slice(1), { env });
+	}
+
+	if (cmd === "setup") {
+		// Subcommand shape (`setup <forge>`) so future forges can land beside github without a new
+		// top-level verb; an unknown or missing target prints guidance rather than guessing.
+		if (argv[1] === "github") {
+			const { runGithubAppSetup } = await import("./github-app-setup.mjs");
+			return runGithubAppSetup(argv.slice(2), { env });
+		}
+		process.stdout.write(`pi-dispatch setup <target> — guided credential setup\n\n  targets: github\n\n  pi-dispatch setup github (--webhook-url <URL> | --no-webhook) [--org <org>] [--name <appName>]\n      mint GitHub App credentials via the App Manifest flow — one browser click returns the app id,\n      private key, and webhook secret; every write is shown first and individually consented\n`);
+		return argv[1] ? 1 : 0;
 	}
 
 	if (cmd === "import-pi") {
@@ -57,6 +82,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		const { startWorker } = await import("./start.mjs");
 		await startWorker(env);
 		return 0; // the worker keeps the process alive until SIGTERM
+	}
+
+	if (cmd === "service") {
+		const { runService } = await import("./service.mjs");
+		return runService(argv.slice(1), { env });
 	}
 
 	if (cmd === "run") {

@@ -35,10 +35,19 @@
  * a manifest naming a staged dir that is gone, and a trigger that explicitly requires packages nobody staged.
  * Both end the same way -- pi skips an absent local source with no error, and the flow exits 0 without the
  * tools it was written for.
+ *
+ * `doctor --fix` (issue #80, REQ-DEPLOYMENT-BOOTSTRAP) turns SOME fix lines into offers, per failing check.
+ * The tier ladder is deliberate: a silent tier for the two fixes whose decision the operator already made
+ * (init's create-only scaffolds; mkdir of a directory an env var already names), a prompt tier (y/N,
+ * default No, the exact command shown first) for the rest, and a never tier for everything doctor could
+ * only fix by guessing -- see the fixAction comment at its first use below. Offering fixes changes NOTHING
+ * about severity: a --fix run still exits by the same failed/ok logic, warns stay warns, and the fix pass
+ * happens at most once (check, fix, re-check -- never a loop).
  */
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn as nodeSpawn } from "node:child_process";
 import { defaultSandboxDir, globalExtensionsEnabled } from "./config.mjs";
 import { isForgeKind } from "./forges.mjs";
@@ -60,6 +69,12 @@ const PROVIDER_KEYS = {
 // gh login scopes that reach well past what a job should ever hold — called out by name in the fix line.
 const BROAD_SCOPES = ["admin:org", "delete_repo", "workflow"];
 
+// The loopback Valkey, as one docker argv. Mirrors deploy/docker-compose.yml exactly: AOF on (the
+// wait-list must survive a reboot, REQ-QUEUE-BURST-NO-DROP), bound to 127.0.0.1 only (the queue is not a
+// public surface), restart unless-stopped, data on a named volume. Container and volume names are
+// pi-dispatch-prefixed so compose's own `valkey`/`valkey-data` never collide with these.
+const VALKEY_RUN = ["run", "-d", "--name", "pi-dispatch-valkey", "--restart", "unless-stopped", "-p", "127.0.0.1:6379:6379", "-v", "pi-dispatch-valkey-data:/data", "valkey/valkey:8", "valkey-server", "--appendonly", "yes"];
+
 export async function runDoctor(env = process.env, deps = {}) {
 	const {
 		cwd = process.cwd(),
@@ -68,7 +83,120 @@ export async function runDoctor(env = process.env, deps = {}) {
 		probeValkey = defaultProbeValkey,
 		fileExists = existsSync,
 		nodeVersion = process.versions.node,
+		// --fix (REQ-DEPLOYMENT-BOOTSTRAP): offer to run the exact fixes doctor already prints. The prompt
+		// is injectable so tests drive consent hermetically; the default is a readline y/N that answers No
+		// on empty input AND on non-TTY stdin -- a piped or CI `doctor --fix` runs nothing from the prompt
+		// tier, because nobody was at the keyboard to consent.
+		fix = false,
+		promptFn = defaultPromptFn,
+		// fs seams for the fixActions, injectable for the same hermetic-test reason as fileExists.
+		mkdir = mkdirSync,
+		chmod = chmodSync,
+		rm = rmSync,
 	} = deps;
+	const seams = { cwd, out, spawn, probeValkey, fileExists, nodeVersion, mkdir, chmod, rm };
+
+	let checks = await collectChecks(env, seams);
+	let failed = render(checks, out);
+
+	if (fix) {
+		const ran = await applyFixes(checks, seams, promptFn);
+		if (ran > 0) {
+			// Converge-to-green: the probes are idempotent and cheap, so ONE full re-collect answers "did
+			// the fixes take" without bookkeeping about which probe fed which check. At most once,
+			// structurally -- the re-check never re-enters the fix pass, so a fix that did not take is
+			// reported still-failing rather than retried forever.
+			checks = await collectChecks(env, seams);
+			const passing = checks.filter((c) => c.ok).length;
+			out(`\nre-check after fixes: ${passing} of ${checks.length} checks pass\n`);
+			for (const c of checks.filter((c) => !c.ok)) {
+				out(`${c.warn ? "⚠" : "✗"} ${c.label}\n    → ${c.fix}\n`);
+			}
+			// Recomputed with the SAME failed/ok logic as the first pass (warn-not-fail): --fix changes
+			// what doctor does, never how it judges. A converged run exits 0 because the checks pass now,
+			// not because attempting fixes earns credit.
+			failed = checks.some((c) => !c.ok && !c.warn);
+		}
+	}
+
+	out(failed ? "\ndoctor: some checks failed — fix the above, then re-run.\n" : "\ndoctor: ready. Start the worker with `pi-dispatch worker`.\n");
+	return failed ? 1 : 0;
+}
+
+/** The ✓/⚠/✗ lines plus each failure's fix, exactly as doctor has always printed them. Returns whether
+ *  any HARD check failed (a ⚠ never fails doctor). */
+function render(checks, out) {
+	let failed = false;
+	for (const c of checks) {
+		out(`${c.ok ? "✓" : c.warn ? "⚠" : "✗"} ${c.label}\n`);
+		if (!c.ok) {
+			out(`    → ${c.fix}\n`);
+			if (!c.warn) failed = true;
+		}
+	}
+	return failed;
+}
+
+/**
+ * The --fix pass (REQ-DEPLOYMENT-BOOTSTRAP): walk the rendered checks IN ORDER and act on each failing one
+ * that carries a fixAction. Returns how many fixes actually RAN -- a declined offer counts for nothing, so
+ * a decline-everything run re-checks nothing and ends exactly like a fix-less one.
+ */
+async function applyFixes(checks, seams, promptFn) {
+	let ran = 0;
+	for (const c of checks) {
+		if (c.ok || !c.fixAction) continue;
+		const fa = c.fixAction;
+		if (fa.tier === "prompt") {
+			// The exact command first, then consent, default No. The same philosophy that runs jobs with
+			// --pull=never holds here: nothing is fetched or started implicitly -- the y keypress IS the
+			// operator running the command themselves, and doctor only saves the retyping after it.
+			seams.out(`\nfix available: ${c.label}\n    $ ${fa.describe}\n`);
+			if (!(await promptFn("run this? [y/N] "))) {
+				seams.out(`skipped: ${c.label}\n`);
+				continue;
+			}
+		}
+		ran++;
+		let res;
+		try {
+			res = await fa.run(seams);
+		} catch (e) {
+			res = { ok: false, note: e?.message ?? String(e) };
+		}
+		seams.out(`${res.ok ? "fixed" : "fix failed"}: ${c.label}${res.note ? ` — ${res.note}` : ""}\n`);
+	}
+	return ran;
+}
+
+/**
+ * The default --fix consent prompt: y/N over readline, No unless the operator typed y/yes. Two refusals
+ * are load-bearing: EMPTY input is No (plain enter must never consent), and NON-TTY stdin is No without
+ * reading at all -- a piped or CI `doctor --fix` has nobody at the keyboard, so the prompt tier must
+ * execute nothing there. Streams are injectable and the function exported so tests exercise both refusals
+ * without owning the process's real stdin.
+ */
+export async function defaultPromptFn(question, { input = process.stdin, output = process.stdout } = {}) {
+	if (!input.isTTY) return false;
+	const { createInterface } = await import("node:readline/promises");
+	const rl = createInterface({ input, output });
+	try {
+		const answer = (await rl.question(question)).trim().toLowerCase();
+		return answer === "y" || answer === "yes";
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * Run every probe and return the check list without rendering -- runDoctor renders it, and under --fix
+ * collects it a second time for the converge re-check. Exported for the never-tier doctrine pin in the
+ * tests (githubProtectionPreflight's precedent): the test walks the returned array and fails on any check
+ * that grows a `fixAction` outside the allowed set, so the never tier stays a tested contract rather than
+ * a comment.
+ */
+export async function collectChecks(env, seams) {
+	const { cwd, spawn, probeValkey, fileExists, nodeVersion } = seams;
 
 	const jobImage = env.PI_JOB_IMAGE ?? "pi-job:latest";
 	const valkeyUrl = env.VALKEY_URL ?? "redis://127.0.0.1:6379";
@@ -82,6 +210,28 @@ export async function runDoctor(env = process.env, deps = {}) {
 		warn: true, // advisory: env may be supplied by a service manager instead of a file
 		label: ".env present",
 		fix: "run `pi-dispatch init` to scaffold one (or supply env via your service manager)",
+		// `fixAction` -- what `doctor --fix` may offer for a failing check (REQ-DEPLOYMENT-BOOTSTRAP):
+		// { tier: "silent"|"prompt", describe: <the exact command>, run(seams) }. Silent runs unprompted
+		// and is reported after; ONLY two fixes qualify, because in both the operator already made the
+		// decision and only the mechanical remainder is left: (1) THIS one, delegating absent config files
+		// to init, which is create-only by contract (init.mjs header) and so can overwrite nothing; and
+		// (2) mkdir -p + chmod 700 of a directory an env var already names (the session store, below).
+		// Prompt shows the exact command and defaults to No. EVERY other check deliberately carries no
+		// fixAction -- the never tier: doctor never rewrites malformed JSON, never touches triggers or
+		// pause-windows CONTENT, never guesses a semantic env value (PI_GLOBAL_ALLOW_EXTENSIONS and kin),
+		// never touches branch protection, and never pulls a trigger-named run.image -- each custom image
+		// is a per-flow trust posture the operator chose, so only the deployment's OWN default image ever
+		// gains an offer. Fail loud and let the operator decide; the plain fix line still prints as before.
+		fixAction: {
+			tier: "silent",
+			describe: "pi-dispatch init",
+			run: async ({ out }) => {
+				// Lazy import: a doctor run without --fix (or without this failure) never loads init.
+				const { runInit } = await import("./init.mjs");
+				const code = runInit(cwd, { out });
+				return { ok: code === 0, note: "scaffolded by `pi-dispatch init` (create-only: existing files were kept)" };
+			},
+		},
 	});
 
 	const dockerCode = await runCmd(spawn, "docker", ["info"]);
@@ -103,6 +253,24 @@ export async function runDoctor(env = process.env, deps = {}) {
 		ok: imageCode === 0,
 		label: `Job image present (${jobImage})`,
 		fix: "docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest  (or build image/Dockerfile)",
+		// Prompt tier, and ONLY for the deployment default: a PI_JOB_IMAGE the operator overrode is a trust
+		// choice this command cannot honestly satisfy (pulling ghcr's pi-job would not make THEIR image
+		// exist), so an overridden name keeps the plain fix line -- the same never-tier reasoning as the
+		// trigger-named run.image checks below. Jobs run with --pull=never and that stays true: the y
+		// keypress IS the operator pulling the repo's own image themselves.
+		...(jobImage === "pi-job:latest"
+			? {
+					fixAction: {
+						tier: "prompt",
+						describe: "docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest",
+						run: async ({ spawn }) => {
+							if ((await runCmd(spawn, "docker", ["pull", "ghcr.io/edgehero/pi-job:latest"])) !== 0) return { ok: false, note: "docker pull failed" };
+							if ((await runCmd(spawn, "docker", ["tag", "ghcr.io/edgehero/pi-job:latest", "pi-job:latest"])) !== 0) return { ok: false, note: "docker tag failed" };
+							return { ok: true };
+						},
+					},
+				}
+			: {}),
 	});
 
 	// Issue #41: every DISTINCT image a trigger names in run.image, minus the deployment default already
@@ -318,6 +486,74 @@ export async function runDoctor(env = process.env, deps = {}) {
 		}
 	}
 
+	// GITHUB_AUTH_SOURCE=app: completeness of the credential triple loadGitHubAuth hard-requires
+	// (config.mjs), preflighted here so a half-finished App setup surfaces as doctor lines instead of a
+	// boot refusal. WARN, never fail, same doctrine as the rest of the github block: a deployment can
+	// legitimately be mid-setup. The private key gets a hygiene pass on top — presence, POSIX mode, and
+	// a first-bytes PEM sniff — but its CONTENTS never reach output: only the leading bytes are read
+	// (never the whole key into memory), and nothing from the file is ever echoed. Every fix line points
+	// at `pi-dispatch setup github`, which mints all three values and writes the PEM 0600 in one pass.
+	if (ghSource === "app") {
+		const setupFix = "run `pi-dispatch setup github` -- it mints the App, writes these .env lines, and lands the key mode 0600";
+		const numeric = (v) => typeof v === "string" && /^\d+$/.test(v.trim());
+		for (const name of ["GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID"]) {
+			checks.push({
+				ok: numeric(env[name]),
+				warn: true,
+				label: numeric(env[name])
+					? `${name} set (${env[name].trim()})`
+					: `GITHUB_AUTH_SOURCE=app but ${name} is ${env[name] ? `not numeric (${JSON.stringify(env[name])})` : "unset"} -- github jobs cannot mint tokens`,
+				fix: setupFix,
+			});
+		}
+		const keyPath = env.GITHUB_APP_PRIVATE_KEY_PATH;
+		if (!keyPath) {
+			checks.push({ ok: false, warn: true, label: "GITHUB_AUTH_SOURCE=app but GITHUB_APP_PRIVATE_KEY_PATH is unset -- the worker will refuse to boot", fix: setupFix });
+		} else if (!fileExists(keyPath)) {
+			checks.push({ ok: false, warn: true, label: `GITHUB_APP_PRIVATE_KEY_PATH does not exist (${keyPath})`, fix: setupFix });
+		} else {
+			checks.push({ ok: true, label: `GitHub App private key present (${keyPath})` });
+			// POSIX mode only -- on win32 stat modes are synthetic (0666-ish for everything), so a warn
+			// there would fire on every healthy deployment and teach operators to ignore it.
+			if (process.platform !== "win32") {
+				try {
+					const loose = statSync(keyPath).mode & 0o077;
+					if (loose !== 0) {
+						checks.push({
+							ok: false,
+							warn: true,
+							label: `the App private key at ${keyPath} is group/world-readable`,
+							fix: `chmod 600 ${keyPath} -- any local user can read the App's signing key right now (\`pi-dispatch setup github\` writes it 0600)`,
+						});
+					}
+				} catch {
+					// stat raced a deletion or an exotic fs: the presence line above already covered existence.
+				}
+			}
+			// First bytes only: enough to see "-----BEGIN", never the key material, and never echoed.
+			try {
+				const fd = openSync(keyPath, "r");
+				const head = Buffer.alloc(16);
+				let read = 0;
+				try {
+					read = readSync(fd, head, 0, head.length, 0);
+				} finally {
+					closeSync(fd);
+				}
+				if (!head.toString("utf8", 0, read).startsWith("-----BEGIN")) {
+					checks.push({
+						ok: false,
+						warn: true,
+						label: `the file at GITHUB_APP_PRIVATE_KEY_PATH does not look like a PEM (first line is not "-----BEGIN ...") -- contents not shown`,
+						fix: setupFix,
+					});
+				}
+			} catch {
+				checks.push({ ok: false, warn: true, label: `the App private key at ${keyPath} exists but is not readable by this user`, fix: setupFix });
+			}
+		}
+	}
+
 	// Preflight gh INSIDE the job image: a token that works host-side but not in-container (no egress from
 	// containers, stale image) fails jobs mid-run, not at submit. Only meaningful when docker and the image
 	// are green; otherwise it is noise on top of the failures already reported above.
@@ -360,6 +596,22 @@ export async function runDoctor(env = process.env, deps = {}) {
 		ok: await probeValkey(valkeyUrl),
 		label: `Valkey reachable (${valkeyUrl})`,
 		fix: "docker compose -f deploy/docker-compose.yml up -d",
+		// Prompt tier, and only for a LOOPBACK url (the shipped default): starting a local container cannot
+		// make a remote VALKEY_URL reachable, so a pointed-elsewhere deployment keeps the plain fix line
+		// rather than an offer that would mask the real problem. The argv mirrors the compose file's
+		// semantics exactly (VALKEY_RUN above).
+		...(/^redis:\/\/(127\.0\.0\.1|localhost)(:6379)?\/?$/.test(valkeyUrl)
+			? {
+					fixAction: {
+						tier: "prompt",
+						describe: `docker ${VALKEY_RUN.join(" ")}`,
+						run: async ({ spawn }) =>
+							(await runCmd(spawn, "docker", VALKEY_RUN)) === 0
+								? { ok: true }
+								: { ok: false, note: "docker run failed (is a container named pi-dispatch-valkey already present? `docker start pi-dispatch-valkey`)" },
+					},
+				}
+			: {}),
 	});
 
 	const keys = PROVIDER_KEYS[provider] ?? [`${provider.toUpperCase()}_API_KEY`];
@@ -411,10 +663,22 @@ export async function runDoctor(env = process.env, deps = {}) {
 		const dirOk = fileExists(overlay);
 		checks.push({ ok: dirOk, label: `Global overlay dir exists (${overlay})`, fix: "run `pi-dispatch import-pi`, or fix PI_GLOBAL_PI_DIR" });
 		if (dirOk) {
+			const overlayAuth = join(overlay, "auth.json");
 			checks.push({
-				ok: !fileExists(join(overlay, "auth.json")),
+				ok: !fileExists(overlayAuth),
 				label: "Overlay is credential-free (no auth.json)",
 				fix: "delete auth.json from the overlay — the provider key belongs in env, never a mounted file",
+				// Prompt, not silent, even though deleting it is always right for the OVERLAY: the file may
+				// be the operator's only copy of a credential they meant to keep elsewhere, and doctor
+				// deleting an operator's file unasked is a line not worth crossing for one saved keypress.
+				fixAction: {
+					tier: "prompt",
+					describe: `rm ${overlayAuth}`,
+					run: async ({ rm }) => {
+						rm(overlayAuth);
+						return { ok: true };
+					},
+				},
 			});
 			const modelsPath = join(overlay, "models.json");
 			let modelsOk = true;
@@ -457,12 +721,29 @@ export async function runDoctor(env = process.env, deps = {}) {
 			// prints nothing here.
 			const packagesDir = join(overlay, PACKAGES_SUBDIR);
 			if (fileExists(packagesDir)) {
+				// The restage offer shared by the two staleness checks below (prompt tier: it fetches and
+				// runs npm on this host). A child process through the injected spawn rather than an
+				// in-process call, so import-pi's own gates run unmodified -- the literal-secret abort, the
+				// admin-extension block, the printed-names vetting -- and its output is forwarded so the
+				// operator still reads the names of exactly what will load into their job containers.
+				const restageFixAction = {
+					tier: "prompt",
+					describe: `pi-dispatch import-pi --with-packages --to ${overlay}`,
+					run: async ({ spawn, out }) => {
+						const cli = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+						// npm staging can be slow, so 10 minutes rather than runCmdCapture's default 30s.
+						const res = await runCmdCapture(spawn, process.execPath, [cli, "import-pi", "--with-packages", "--to", overlay], { env, cwd, timeoutMs: 600000 });
+						if (res.output) out(res.output);
+						return { ok: res.code === 0 };
+					},
+				};
 				const manifest = readStageManifest({ globalPiDir: overlay, readFile: (p) => readFileSync(p, "utf8"), fileExists });
 				if (!manifest) {
 					checks.push({
 						ok: false,
 						label: `Staged packages manifest readable (${PACKAGES_SUBDIR}/packages.json)`,
 						fix: "re-run `pi-dispatch import-pi --with-packages` -- without the manifest nothing knows what is staged, so no package is ever loaded",
+						fixAction: restageFixAction,
 					});
 				} else {
 					// A manifest entry whose dir is gone loads nothing, and pi reports no error for a package
@@ -472,6 +753,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 						ok: missing.length === 0,
 						label: `Staged packages present (${manifest.packages.map((p) => `${p.name}@${p.version}`).join(", ")})`,
 						fix: `staged dir missing for ${missing.join(", ")} -- re-run \`pi-dispatch import-pi --with-packages\` to restage`,
+						fixAction: restageFixAction,
 					});
 					// The admin extension's twin, and blocked for the same reason import-pi blocks that one.
 					const admin = manifest.packages.filter((p) => ADMIN_RE.test(p.name) || ADMIN_RE.test(p.dir)).map((p) => p.name);
@@ -534,6 +816,18 @@ export async function runDoctor(env = process.env, deps = {}) {
 				ok: exists,
 				label: `Session store ${exists ? "exists" : "does not exist"} (${sessionsDir})`,
 				fix: `create it: mkdir -p ${sessionsDir} && chmod 700 ${sessionsDir}`,
+				// Silent tier: setting PI_SESSIONS_DIR WAS the decision, and it has already been made -- the
+				// mkdir is the mechanical remainder, creates only the path the env var names, and 0700 is
+				// the mode the fix line already prescribes (transcripts are PII-bearing, host-only).
+				fixAction: {
+					tier: "silent",
+					describe: `mkdir -p ${sessionsDir} && chmod 700 ${sessionsDir}`,
+					run: async ({ mkdir, chmod }) => {
+						mkdir(sessionsDir, { recursive: true });
+						chmod(sessionsDir, 0o700);
+						return { ok: true, note: "mode 0700" };
+					},
+				},
 			});
 			// Not a failure -- a warning, because it is a disclosure the operator may have accepted
 			// knowingly. A transcript holds tool output, file contents and the agent's own reasoning, which
@@ -585,16 +879,7 @@ export async function runDoctor(env = process.env, deps = {}) {
 		}
 	}
 
-	let failed = false;
-	for (const c of checks) {
-		out(`${c.ok ? "✓" : c.warn ? "⚠" : "✗"} ${c.label}\n`);
-		if (!c.ok) {
-			out(`    → ${c.fix}\n`);
-			if (!c.warn) failed = true;
-		}
-	}
-	out(failed ? "\ndoctor: some checks failed — fix the above, then re-run.\n" : "\ndoctor: ready. Start the worker with `pi-dispatch worker`.\n");
-	return failed ? 1 : 0;
+	return checks;
 }
 
 /**
@@ -772,14 +1057,15 @@ function runCmd(spawn, cmd, args) {
  * Like runCmd but collects stdout+stderr into one combined string — gh moves its human output between
  * the two across versions, so callers get both. Resolves `{code, output}`; `code: null` when the command
  * could not be launched or overran the timeout (default 30s, so a hung docker daemon cannot stall doctor).
- * `opts.env` is passed through to the spawn so secrets can travel via env instead of argv.
+ * `opts.env` is passed through to the spawn so secrets can travel via env instead of argv; `opts.cwd`
+ * likewise, for the child-process fixActions that must run where doctor's own cwd seam points.
  */
 function runCmdCapture(spawn, cmd, args, opts = {}) {
 	const { timeoutMs = 30000 } = opts;
 	return new Promise((resolve) => {
 		let child;
 		try {
-			child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...(opts.env ? { env: opts.env } : {}) });
+			child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...(opts.env ? { env: opts.env } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}) });
 		} catch {
 			resolve({ code: null, output: "" });
 			return;

@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { githubProtectionPreflight, runDoctor } from "../src/doctor.mjs";
+import { PassThrough } from "node:stream";
+import { collectChecks, defaultPromptFn, githubProtectionPreflight, runDoctor } from "../src/doctor.mjs";
 
 // A fake `spawn`: plan keys are command-line prefixes ("docker info", "docker image", "docker run",
 // "gh auth status", "gh auth token") mapped to a canned exit code, a `{code, output}` pair (output is
@@ -500,6 +501,86 @@ test("doctor: GITHUB_AUTH_SOURCE=app skips the in-image probe (mints per-job)", 
 	assert.doesNotMatch(text(), /forwards your full gh login/, "no scope warning for source app");
 });
 
+// -- GITHUB_AUTH_SOURCE=app completeness (issue #81): the credential triple, preflighted -----------------
+//
+// Real temp files for the key, like the overlay tests above: the mode check stats a real mode and the
+// PEM sniff reads real leading bytes. cwd points at tmpdir and fileExists stays the default, so only
+// the app-auth env drives these outcomes; everything else warns at most (and warns never fail).
+
+const KEY_BODY = "sk-app-key-body-distinctive"; // planted so no-contents-in-output is a grep, not a hope
+function appKeyFile({ content = `-----BEGIN PRIVATE KEY-----\n${KEY_BODY}\n-----END PRIVATE KEY-----\n`, mode = 0o600 } = {}) {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-app-key-")), "github-app-test.pem");
+	writeFileSync(path, content);
+	chmodSync(path, mode);
+	return path;
+}
+const appEnv = (extra = {}) => ({ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", GITHUB_AUTH_SOURCE: "app", ...extra });
+const appDeps = (out) => ({ out, cwd: tmpdir(), spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0" });
+
+test("doctor: a complete app-auth triple with a locked-down PEM is all green, contents never in output", async () => {
+	const keyPath = appKeyFile();
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /✓ GITHUB_APP_ID set \(4242\)/);
+	assert.match(text(), /✓ GITHUB_APP_INSTALLATION_ID set \(987654\)/);
+	assert.match(text(), new RegExp(`✓ GitHub App private key present \\(${keyPath.replace(/[.\\/]/g, "\\$&")}\\)`));
+	assert.doesNotMatch(text(), /group\/world-readable/);
+	assert.doesNotMatch(text(), /does not look like a PEM/);
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY), "the key's contents must never reach output");
+});
+
+test("doctor: app source with the whole triple unset warns per variable, points at setup github, exits 0", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv(), appDeps(out));
+	assert.equal(code, 0, "app-auth completeness warns, never fails — a deployment can be mid-setup");
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_ID is unset/);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_INSTALLATION_ID is unset/);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_PRIVATE_KEY_PATH is unset/);
+	assert.match(text(), /run `pi-dispatch setup github`/, "the fix is the wizard that mints all three");
+});
+
+test("doctor: a non-numeric GITHUB_APP_ID is named as such (an id is not a secret, so it IS echoed)", async () => {
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "Iv1.oops", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: appKeyFile() }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /⚠ GITHUB_AUTH_SOURCE=app but GITHUB_APP_ID is not numeric \("Iv1\.oops"\)/);
+	assert.match(text(), /✓ GITHUB_APP_INSTALLATION_ID set \(987654\)/, "the other two are judged independently");
+});
+
+test("doctor: a key path that points at nothing warns with the path", async () => {
+	const { out, text } = capture();
+	const missing = join(tmpdir(), "no-such-github-app.pem");
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: missing }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), new RegExp(`⚠ GITHUB_APP_PRIVATE_KEY_PATH does not exist \\(${missing.replace(/[.\\/]/g, "\\$&")}\\)`));
+});
+
+test("doctor: a group/world-readable PEM warns with the chmod fix", { skip: process.platform === "win32" ? "POSIX modes are synthetic on win32 (the check skips itself there)" : false }, async () => {
+	const keyPath = appKeyFile({ mode: 0o644 });
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0, "a loose mode is a warning, not a failure");
+	assert.match(text(), /⚠ the App private key at .* is group\/world-readable/);
+	assert.match(text(), new RegExp(`chmod 600 ${keyPath.replace(/[.\\/]/g, "\\$&")}`));
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY));
+});
+
+test("doctor: a file that does not start with -----BEGIN warns, and its contents are never echoed", async () => {
+	const keyPath = appKeyFile({ content: `definitely not a pem ${KEY_BODY}\n` });
+	const { out, text } = capture();
+	const code = await runDoctor(appEnv({ GITHUB_APP_ID: "4242", GITHUB_APP_INSTALLATION_ID: "987654", GITHUB_APP_PRIVATE_KEY_PATH: keyPath }), appDeps(out));
+	assert.equal(code, 0);
+	assert.match(text(), /⚠ the file at GITHUB_APP_PRIVATE_KEY_PATH does not look like a PEM \(first line is not "-----BEGIN \.\.\."\)/);
+	assert.doesNotMatch(text(), new RegExp(KEY_BODY), "not even a malformed key's contents may reach output");
+});
+
+test("doctor: the app-auth block only fires for source app", async () => {
+	const { out, text } = capture();
+	await runDoctor(ghEnv({ GITHUB_AUTH_SOURCE: "pat" }), ghDeps(out, green));
+	assert.doesNotMatch(text(), /GITHUB_APP_ID/, "pat deployments hear nothing about App credentials");
+});
+
 // -- replica runs (REQ-REPLICA-RUNS): the multiplier is worth stating, not worth failing on ------------
 
 /** A triggers file with one github label trigger, optionally carrying `run.replicas`. */
@@ -724,4 +805,443 @@ test("githubProtectionPreflight: an unresolvable repo warns per repo, and the lo
 	assert.equal(checks.length, 6, "the cap line plus one warn per checked repo");
 	assert.ok(checks.slice(1).every((c) => !c.ok && c.warn && /could not resolve the default branch/.test(c.label)));
 	assert.ok(!calls.some((c) => c.args?.join(" ").includes("octo/r6")), "the sixth repo is never queried");
+});
+
+// -- doctor --fix (issue #80, REQ-DEPLOYMENT-BOOTSTRAP): offers, tiers, and the never-tier pin --------
+
+/** A y/N prompt recorder. `answer` is the canned reply (or a fn of the call count). */
+function promptRecorder(answer = false) {
+	const calls = [];
+	const fn = async (q) => {
+		calls.push(q);
+		return typeof answer === "function" ? answer(calls.length) : answer;
+	};
+	return { fn, calls };
+}
+
+/** A validating triggers file whose one cron trigger sets run.resume (REQ-RESUMABLE-SESSION). */
+function resumeTriggersFile() {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-resume-")), "triggers.json");
+	const run = { kind: "local", folder: "/srv/repo", flow: "review", task: "nightly review", resume: true };
+	writeFileSync(path, JSON.stringify({ triggers: [{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run }] }));
+	return path;
+}
+
+test("doctor: without --fix, a fixAction-bearing failure prints exactly the old fix line and asks nothing", async () => {
+	// The non-adopter byte-identity guard for --fix: same lines, same fixes, and the injected prompt is
+	// never consulted -- offering is strictly opt-in behavior.
+	const { fn: promptFn, calls: prompts } = promptRecorder(true);
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x" },
+		{ out, cwd: tmpdir(), spawn: fakeSpawn({ "docker info": 0, "docker image": 1 }), probeValkey: async () => false, fileExists: () => true, nodeVersion: "22.19.0", promptFn },
+	);
+	assert.equal(code, 1);
+	assert.match(
+		text(),
+		/✗ Job image present \(pi-job:latest\)\n    → docker pull ghcr\.io\/edgehero\/pi-job:latest && docker tag ghcr\.io\/edgehero\/pi-job:latest pi-job:latest {2}\(or build image\/Dockerfile\)\n/,
+	);
+	assert.match(text(), /✗ Valkey reachable \(redis:\/\/127\.0\.0\.1:6379\)\n    → docker compose -f deploy\/docker-compose\.yml up -d\n/);
+	assert.equal(prompts.length, 0, "no --fix, no prompt -- even with a promptFn injected");
+	assert.doesNotMatch(text(), /fix available|run this\?|skipped:|fixed:|re-check after fixes/);
+});
+
+test("doctor --fix: declining every offer runs nothing and leaves the exit code alone", async () => {
+	const calls = [];
+	const { fn: promptFn, calls: prompts } = promptRecorder(false);
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x" },
+		{ out, cwd: tmpdir(), spawn: fakeSpawn({ "docker info": 0, "docker image": 1 }, calls), probeValkey: async () => false, fileExists: () => true, nodeVersion: "22.19.0", fix: true, promptFn },
+	);
+	assert.equal(code, 1, "warn-not-fail doctrine: offering fixes changes nothing about severity");
+	// The EXACT command is shown before each prompt -- consent is to a command, not to a vibe.
+	assert.match(text(), /fix available: Job image present \(pi-job:latest\)\n {4}\$ docker pull ghcr\.io\/edgehero\/pi-job:latest && docker tag ghcr\.io\/edgehero\/pi-job:latest pi-job:latest\n/);
+	assert.match(
+		text(),
+		/fix available: Valkey reachable \(redis:\/\/127\.0\.0\.1:6379\)\n {4}\$ docker run -d --name pi-dispatch-valkey --restart unless-stopped -p 127\.0\.0\.1:6379:6379 -v pi-dispatch-valkey-data:\/data valkey\/valkey:8 valkey-server --appendonly yes\n/,
+	);
+	assert.match(text(), /skipped: Job image present \(pi-job:latest\)/);
+	assert.match(text(), /skipped: Valkey reachable/);
+	assert.deepEqual(prompts, ["run this? [y/N] ", "run this? [y/N] "]);
+	assert.ok(!calls.some((c) => ["pull", "tag", "run"].includes(c.args[0])), "no spawn beyond the probes: a declined offer executes nothing");
+	assert.doesNotMatch(text(), /re-check after fixes/, "nothing ran, so nothing is re-checked");
+});
+
+test("doctor --fix: accepting the image offer runs exactly docker pull then docker tag", async () => {
+	const calls = [];
+	const { out, text } = capture();
+	await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x" },
+		{
+			out,
+			cwd: tmpdir(),
+			spawn: fakeSpawn({ "docker info": 0, "docker image": 1, "docker pull": 0, "docker tag": 0 }, calls),
+			probeValkey: async () => true,
+			fileExists: () => true,
+			nodeVersion: "22.19.0",
+			fix: true,
+			promptFn: async () => true,
+		},
+	);
+	const acts = calls.filter((c) => ["pull", "tag"].includes(c.args[0]));
+	assert.deepEqual(
+		acts.map((c) => [c.cmd, ...c.args]),
+		[
+			["docker", "pull", "ghcr.io/edgehero/pi-job:latest"],
+			["docker", "tag", "ghcr.io/edgehero/pi-job:latest", "pi-job:latest"],
+		],
+		"exactly the printed command, as two argv arrays, in order",
+	);
+	assert.match(text(), /fixed: Job image present \(pi-job:latest\)/);
+});
+
+test("doctor --fix: the converge re-check reruns the probes once and reports green", async () => {
+	const calls = [];
+	const plan = { "docker info": 0, "docker image": 1, "docker pull": 0, "docker tag": 0 };
+	const inner = fakeSpawn(plan, calls);
+	// Once the tag lands, the next inspect finds the image -- the probes are idempotent, so the single
+	// re-collect is what honestly turns the report green.
+	const spawn = (cmd, args, opts) => {
+		const child = inner(cmd, args, opts);
+		if (cmd === "docker" && args[0] === "tag") plan["docker image"] = 0;
+		return child;
+	};
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", GITHUB_AUTH_SOURCE: "pat" },
+		{ out, cwd: tmpdir(), spawn, probeValkey: async () => true, fileExists: () => true, nodeVersion: "22.19.0", fix: true, promptFn: async () => true },
+	);
+	assert.match(text(), /✗ Job image present \(pi-job:latest\)/, "the first pass reported the failure as always");
+	assert.match(text(), /re-check after fixes: \d+ of \d+ checks pass/);
+	assert.match(text(), /\ndoctor: ready\. Start the worker with `pi-dispatch worker`\.\n/);
+	assert.equal(code, 0, "converge-to-green: the exit code judges the re-checked list by the same failed/ok logic");
+});
+
+test("doctor --fix: accepting the valkey offer runs the exact loopback docker run argv, and converges", async () => {
+	const calls = [];
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", GITHUB_AUTH_SOURCE: "pat" },
+		{
+			out,
+			cwd: tmpdir(),
+			spawn: fakeSpawn({ "docker info": 0, "docker image": 0, "docker run": 0 }, calls),
+			// Reachable exactly once the container has been started: the converge pass flips to ✓ only
+			// because the fix actually ran, not because fixing earns credit.
+			probeValkey: async () => calls.some((c) => c.cmd === "docker" && c.args[0] === "run"),
+			fileExists: () => true,
+			nodeVersion: "22.19.0",
+			fix: true,
+			promptFn: async () => true,
+		},
+	);
+	const run = calls.find((c) => c.cmd === "docker" && c.args[0] === "run");
+	assert.deepEqual(run.args, [
+		"run",
+		"-d",
+		"--name",
+		"pi-dispatch-valkey",
+		"--restart",
+		"unless-stopped",
+		"-p",
+		"127.0.0.1:6379:6379",
+		"-v",
+		"pi-dispatch-valkey-data:/data",
+		"valkey/valkey:8",
+		"valkey-server",
+		"--appendonly",
+		"yes",
+	]);
+	assert.match(text(), /fixed: Valkey reachable \(redis:\/\/127\.0\.0\.1:6379\)/);
+	assert.match(text(), /re-check after fixes/);
+	assert.equal(code, 0);
+});
+
+test("doctor --fix: the declared-but-absent session store is created silently -- mkdir -p, chmod 700, no prompt", async () => {
+	const sessionsDir = "/srv/pi-sessions";
+	const made = [];
+	const modes = [];
+	const { fn: promptFn, calls: prompts } = promptRecorder(true);
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_SESSIONS_DIR: sessionsDir, PI_TRIGGERS_FILE: resumeTriggersFile(), GITHUB_AUTH_SOURCE: "pat" },
+		{
+			out,
+			spawn: fakeSpawn(green),
+			probeValkey: async () => true,
+			nodeVersion: "22.19.0",
+			fix: true,
+			promptFn,
+			// The store exists once mkdir ran -- everything else exists throughout.
+			fileExists: (p) => (p === sessionsDir ? made.length > 0 : true),
+			mkdir: (p, o) => made.push([p, o]),
+			chmod: (p, m) => modes.push([p, m]),
+		},
+	);
+	assert.equal(prompts.length, 0, "silent tier: setting PI_SESSIONS_DIR was the decision -- no prompt for the mechanical mkdir");
+	assert.deepEqual(made, [[sessionsDir, { recursive: true }]]);
+	assert.deepEqual(modes, [[sessionsDir, 0o700]], "0700 exactly -- transcripts are PII-bearing");
+	assert.match(text(), /fixed: Session store does not exist \(\/srv\/pi-sessions\) — mode 0700/);
+	assert.match(text(), /re-check after fixes/);
+	assert.equal(code, 0, "the converge pass re-probes the now-existing store");
+});
+
+test("doctor --fix: a missing .env is delegated to init's create-only scaffolds, silently", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-fix-init-"));
+	const { fn: promptFn, calls: prompts } = promptRecorder(true);
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", GITHUB_AUTH_SOURCE: "pat" },
+		{ out, cwd, spawn: fakeSpawn(green), probeValkey: async () => true, nodeVersion: "22.19.0", fix: true, promptFn },
+	);
+	assert.equal(prompts.length, 0, "scaffold delegation is silent -- init is create-only by contract and can overwrite nothing");
+	assert.ok(existsSync(join(cwd, ".env")), "init created the .env");
+	assert.match(text(), /created \.env {2,}from \.env\.example/, "init's own report is forwarded");
+	assert.match(text(), /fixed: \.env present — scaffolded by `pi-dispatch init` \(create-only: existing files were kept\)/);
+	assert.doesNotMatch(text().split("re-check after fixes")[1], /\.env present/, "the converge pass no longer lists it");
+	assert.equal(code, 0);
+});
+
+test("doctor --fix: accepting the overlay auth.json offer deletes the file and converges credential-free", async () => {
+	const dir = overlay({ auth: true });
+	const cwd = mkdtempSync(join(tmpdir(), "pi-fix-auth-"));
+	const { fn: promptFn, calls: prompts } = promptRecorder(true);
+	const { out, text } = capture();
+	const code = await runDoctor(overlayEnv(dir, { GITHUB_AUTH_SOURCE: "pat" }), {
+		out,
+		cwd,
+		spawn: fakeSpawn(green),
+		probeValkey: async () => true,
+		nodeVersion: "22.19.0",
+		fix: true,
+		promptFn,
+	});
+	assert.deepEqual(prompts, ["run this? [y/N] "], "prompt tier: deleting an operator's file always gets a look first");
+	assert.ok(text().includes(`    $ rm ${join(dir, "auth.json")}\n`), "the exact rm is shown before consent");
+	assert.ok(!existsSync(join(dir, "auth.json")), "the credential file is gone");
+	assert.match(text(), /fixed: Overlay is credential-free \(no auth\.json\)/);
+	assert.doesNotMatch(text().split("re-check after fixes")[1], /credential-free/, "the converge pass finds the overlay clean");
+	assert.equal(code, 0);
+});
+
+test("doctor --fix: accepting the restage offer re-runs import-pi as a child through the injected spawn", async () => {
+	const dir = overlay({ packages: [pkg(), pkg({ name: "pi-lint", version: "0.4.0", dir: "pi-lint", stage: false })] });
+	const cwd = mkdtempSync(join(tmpdir(), "pi-fix-restage-"));
+	const calls = [];
+	const env = overlayEnv(dir, { GITHUB_AUTH_SOURCE: "pat" });
+	const { fn: promptFn, calls: prompts } = promptRecorder(true);
+	const { out, text } = capture();
+	await runDoctor(env, {
+		out,
+		cwd,
+		spawn: fakeSpawn({ ...green, [process.execPath]: { code: 0, output: "restage-run-output\n" } }, calls),
+		probeValkey: async () => true,
+		nodeVersion: "22.19.0",
+		fix: true,
+		promptFn,
+	});
+	assert.deepEqual(prompts, ["run this? [y/N] "]);
+	assert.ok(text().includes(`    $ pi-dispatch import-pi --with-packages --to ${dir}\n`), "the offer names the exact command");
+	const child = calls.find((c) => c.cmd === process.execPath);
+	assert.ok(child, "import-pi runs as a child process, so its own gates and printed-names vetting run unmodified");
+	assert.ok(child.args[0].endsWith("cli.mjs"), "spawned through the real CLI entry");
+	assert.deepEqual(child.args.slice(1), ["import-pi", "--with-packages", "--to", dir]);
+	assert.equal(child.opts.env, env, "the child inherits doctor's env (PI_PACKAGES_FILE, PI_CODING_AGENT_DIR)");
+	assert.equal(child.opts.cwd, cwd, "and doctor's cwd seam, where pi-packages.json lives");
+	assert.match(text(), /restage-run-output/, "import-pi's own output is forwarded");
+	assert.match(text(), /fixed: Staged packages present \(pi-fmt@1\.2\.3, pi-lint@0\.4\.0\)/);
+	// The converge pass re-probes the real dirs; the fake spawn staged nothing, so the check honestly
+	// stays failing -- running a fix is reported, convergence is measured.
+	assert.match(text().split("re-check after fixes")[1], /✗ Staged packages present/);
+});
+
+test("doctor --fix: the default prompt answers No on non-TTY stdin and on plain enter", async () => {
+	// Non-TTY is refused without reading at all -- a piped/CI --fix run must execute nothing prompt-tier.
+	assert.equal(await defaultPromptFn("run this? [y/N] ", { input: new PassThrough(), output: new PassThrough() }), false);
+
+	// Plain enter on a TTY-shaped stream is No: consent is only ever an explicit y.
+	const emptyIn = new PassThrough();
+	emptyIn.isTTY = true;
+	const emptyAnswer = defaultPromptFn("run this? [y/N] ", { input: emptyIn, output: new PassThrough() });
+	emptyIn.write("\n");
+	assert.equal(await emptyAnswer, false);
+
+	const yesIn = new PassThrough();
+	yesIn.isTTY = true;
+	const yesAnswer = defaultPromptFn("run this? [y/N] ", { input: yesIn, output: new PassThrough() });
+	yesIn.write("y\n");
+	assert.equal(await yesAnswer, true);
+});
+
+test("doctor --fix: piped stdin executes nothing from the prompt tier, end to end", async () => {
+	const calls = [];
+	const { out, text } = capture();
+	const code = await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x" },
+		{
+			out,
+			cwd: tmpdir(),
+			spawn: fakeSpawn({ "docker info": 0, "docker image": 1 }, calls),
+			probeValkey: async () => true,
+			fileExists: () => true,
+			nodeVersion: "22.19.0",
+			fix: true,
+			promptFn: (q) => defaultPromptFn(q, { input: new PassThrough(), output: new PassThrough() }),
+		},
+	);
+	assert.equal(code, 1);
+	assert.match(text(), /skipped: Job image present/);
+	assert.ok(!calls.some((c) => c.args[0] === "pull"), "default-No: nothing was pulled");
+});
+
+test("doctor --fix: secret values still never reach output", async () => {
+	const { out, text } = capture();
+	await runDoctor(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-secret-value", WEBHOOK_SECRET: "wh_secret_val_9", PI_TRIGGERS_FILE: forgeTriggersFile("github") },
+		{
+			out,
+			cwd: tmpdir(),
+			spawn: fakeSpawn({ ...green, "gh auth status": { code: 0, output: ghStatusOutput }, "gh auth token": { code: 0, output: "gho_secret_mint\n" }, "docker run": 0 }),
+			probeValkey: async () => false,
+			fileExists: () => true,
+			nodeVersion: "22.19.0",
+			fix: true,
+			promptFn: async () => true,
+		},
+	);
+	assert.doesNotMatch(text(), /sk-secret-value|gho_secret_mint|wh_secret_val_9/, "--fix changes nothing about secrets-and-pii");
+});
+
+// -- the never-tier doctrine pin: which checks may carry a fixAction, exactly, and no more ------------
+
+// The allowed set, by label and tier. THIS list is the doctrine (REQ-DEPLOYMENT-BOOTSTRAP): a future
+// check that grows a fixAction fails assertFixActionDoctrine by default, until someone deliberately adds
+// it here and answers for the trust ladder it sits on.
+const ALLOWED_FIXACTIONS = [
+	[/^\.env present$/, "silent"],
+	[/^Session store (exists|does not exist) \(/, "silent"],
+	[/^Job image present \(pi-job:latest\)$/, "prompt"],
+	[/^Valkey reachable \(redis:\/\/(127\.0\.0\.1|localhost)(:6379)?\/?\)$/, "prompt"],
+	[/^Overlay is credential-free \(no auth\.json\)$/, "prompt"],
+	[/^Staged packages manifest readable \(/, "prompt"],
+	[/^Staged packages present \(/, "prompt"],
+];
+
+/** Walk a check list; fail on any fixAction outside the allowed set. Returns the carrying labels. */
+function assertFixActionDoctrine(checks) {
+	const carried = [];
+	for (const c of checks) {
+		if (!c.fixAction) continue;
+		carried.push(c.label);
+		const allowed = ALLOWED_FIXACTIONS.find(([re]) => re.test(c.label));
+		assert.ok(allowed, `check "${c.label}" carries a fixAction outside the allowed set -- the never tier is doctrine`);
+		assert.equal(c.fixAction.tier, allowed[1], `check "${c.label}" carries the wrong tier`);
+		assert.equal(typeof c.fixAction.describe, "string", "every offer must show an exact command");
+		assert.equal(typeof c.fixAction.run, "function");
+	}
+	return carried;
+}
+
+const collectSeams = (plan, extra = {}) => ({
+	cwd: mkdtempSync(join(tmpdir(), "pi-fix-doctrine-")),
+	out: () => {},
+	spawn: fakeSpawn(plan),
+	probeValkey: async () => false,
+	fileExists: existsSync,
+	nodeVersion: "20.10.0",
+	...extra,
+});
+
+/** One validating triggers file that names every forge, a custom image, resume, and replicas. */
+function fullyBrokenTriggersFile() {
+	const path = join(mkdtempSync(join(tmpdir(), "pi-triggers-broken-")), "triggers.json");
+	const triggers = [
+		{ on: { type: "cron", id: "nightly", pattern: "0 3 * * *" }, run: { kind: "local", folder: "/srv/repo", flow: "review", task: "t", image: "custom-img:1", resume: true } },
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "github", flow: "fix", replicas: 2 } },
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "gitlab", flow: "fix" } },
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "forgejo", flow: "fix" } },
+		{ on: { type: "label", any: ["pi:fix"] }, run: { kind: "azure", flow: "fix", repository: "webapp" } },
+	];
+	writeFileSync(path, JSON.stringify({ triggers }));
+	return path;
+}
+
+test("doctor --fix doctrine: from a fully-broken env, no check outside the allowed set carries a fixAction", async () => {
+	// Everything that can fail does: old node, no .env, absent images (default AND trigger-named), gh
+	// missing, valkey down, no provider key, a poisoned overlay (auth.json, malformed models.json, a
+	// missing staged dir, an admin-alike package), a malformed extensions knob, all four forges
+	// misconfigured, and a declared-but-absent session store.
+	const dir = overlay({
+		auth: true,
+		models: "{not json",
+		extensions: true,
+		packages: [pkg(), pkg({ name: "pi-lint", version: "0.4.0", dir: "pi-lint", stage: false }), pkg({ name: "dispatch-admin", version: "0.1.0", dir: "dispatch-admin" })],
+	});
+	const env = {
+		PI_PROVIDER: "anthropic",
+		PI_AUTH_FROM_PI: "0",
+		PI_TRIGGERS_FILE: fullyBrokenTriggersFile(),
+		PI_GLOBAL_PI_DIR: dir,
+		PI_GLOBAL_ALLOW_EXTENSIONS: "maybe",
+		PI_SESSIONS_DIR: join(mkdtempSync(join(tmpdir(), "pi-sessions-parent-")), "absent"),
+		RECEIVER_PORT: "http",
+		AZURE_WEBHOOK_MODE: "hmac",
+	};
+	const checks = await collectChecks(env, collectSeams({ "docker info": 0, "docker image": 1, "gh auth": "enoent" }));
+	const carried = assertFixActionDoctrine(checks);
+	// The fixture must actually reach every eligible check -- a triggers-parse regression swallowed to
+	// zeroes would otherwise hollow this pin out silently.
+	for (const expected of [/^\.env present$/, /^Job image present \(pi-job:latest\)$/, /^Valkey reachable/, /^Overlay is credential-free/, /^Staged packages present/, /^Session store does not exist/]) {
+		assert.ok(carried.some((l) => expected.test(l)), `fixture failed to produce a fixAction for ${expected}`);
+	}
+	assert.equal(carried.length, 6, "exactly the eligible checks carry one, no more");
+	// The nevers, by name: each of these IS failing here and still gets no offer.
+	const never = (re, why) => {
+		const c = checks.find((x) => re.test(x.label));
+		assert.ok(c, `fixture lost the check ${re}`);
+		assert.ok(!c.ok, `the pinned check ${re} is expected to be failing here`);
+		assert.equal(c.fixAction, undefined, why);
+	};
+	never(/^Trigger job image present \(custom-img:1\)$/, "a trigger-named image is a per-flow trust posture -- never pulled for the operator");
+	never(/^PI_GLOBAL_ALLOW_EXTENSIONS is/, "a semantic env value is never guessed");
+	never(/^Overlay models\.json is credential-free$/, "malformed JSON is never rewritten");
+	never(/^Staged package looks like the dispatch admin/, "removing staged code is the operator's call");
+	never(/^Node ≥/, "doctor does not upgrade the host runtime");
+	never(/but WEBHOOK_SECRET is unset/, "secrets are never minted or set");
+	never(/AZURE_WEBHOOK_MODE is/, "an undefaulted mode must stay a chosen thing");
+	never(/GITHUB_AUTH_SOURCE is gh but/, "auth posture is never changed behind the operator");
+});
+
+test("doctor --fix doctrine: a missing manifest offers restage; overridden image and remote valkey never gain offers", async () => {
+	const dir = overlay({ packagesNoManifest: true });
+	const env = {
+		PI_PROVIDER: "anthropic",
+		ANTHROPIC_API_KEY: "sk-x",
+		PI_GLOBAL_PI_DIR: dir,
+		PI_JOB_IMAGE: "acme/pi-job:2",
+		VALKEY_URL: "redis://queue.internal:6379",
+	};
+	const checks = await collectChecks(env, collectSeams({ "docker info": 0, "docker image": 1, "gh auth": "enoent" }, { nodeVersion: "22.19.0" }));
+	assertFixActionDoctrine(checks);
+	const manifest = checks.find((c) => /^Staged packages manifest readable/.test(c.label));
+	assert.ok(manifest && !manifest.ok);
+	assert.equal(manifest.fixAction.tier, "prompt");
+	assert.equal(manifest.fixAction.describe, `pi-dispatch import-pi --with-packages --to ${dir}`);
+	const img = checks.find((c) => c.label === "Job image present (acme/pi-job:2)");
+	assert.ok(img && !img.ok);
+	assert.equal(img.fixAction, undefined, "an overridden PI_JOB_IMAGE is the operator's trust choice -- pulling the default could not honor it");
+	const valkey = checks.find((c) => c.label === "Valkey reachable (redis://queue.internal:6379)");
+	assert.ok(valkey && !valkey.ok);
+	assert.equal(valkey.fixAction, undefined, "a remote VALKEY_URL cannot be fixed by starting a local container");
+
+	// A trigger demanding packages nobody staged is a declaration problem, never auto-restaged: with an
+	// empty pi-packages.json a restage would 'succeed' into the same silent package-less job.
+	const c2 = await collectChecks(
+		{ PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-x", PI_GLOBAL_PI_DIR: overlay({}), PI_TRIGGERS_FILE: triggersFile(true) },
+		collectSeams(green, { nodeVersion: "22.19.0" }),
+	);
+	const req = c2.find((c) => /require staged packages/.test(c.label));
+	assert.ok(req && !req.ok);
+	assert.equal(req.fixAction, undefined, "which packages a flow needs is a semantic decision, never guessed");
 });

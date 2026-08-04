@@ -38,30 +38,39 @@ system. **pi-dispatch is exactly that missing operational layer, and nothing els
 
 ## Quickstart (local folders)
 
-You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic).
+You need **Docker** and **Node ≥ 22.19**, and a provider API key (e.g. Anthropic). No clone needed:
 
 ```bash
-# 1. Get the job image — pull the prebuilt one (fast)...
+# 1. A folder for your deployment's config, then one consented pass over the whole setup
+mkdir my-dispatch && cd my-dispatch
+npx @edgehero/pi-dispatch up   # checks Docker → offers to pull+tag the job image → offers to start
+                               #    Valkey (AOF, localhost) → scaffolds five config files (never
+                               #    clobbers) → generates WEBHOOK_SECRET → runs the doctor preflight.
+                               #    Every docker action shows its exact command and asks first.
+#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
+#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
+
+# 2. Run the worker in one terminal
+npx @edgehero/pi-dispatch worker
+
+# 3. Queue a job from another
+npx @edgehero/pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
+```
+
+Prefer the steps typed out, or working from a clone (required for a **custom job image** — the
+Dockerfile needs this repo as build context)? Same commands, unbundled:
+
+```bash
+git clone https://github.com/edgehero/pi-dispatch && cd pi-dispatch && npm ci
+# 1. The job image — pull the prebuilt one (fast)...
 docker pull ghcr.io/edgehero/pi-job:latest && docker tag ghcr.io/edgehero/pi-job:latest pi-job:latest
 #    ...or bake your own toolchain in (slower, fully yours) — same tag, or a new one you point triggers at:
 #    docker build -f image/Dockerfile -t pi-job:latest .
-
-# 2. Start Valkey (the durable job queue)
+# 2. Valkey (the durable job queue)
 docker compose -f deploy/docker-compose.yml up -d
-
-# 3. Install, scaffold, and check your setup
-npm ci
-npx pi-dispatch init         # writes five files (never clobbers): .env, triggers.json,
-                             #    pause-windows.json, pi-packages.json, subscriptions.json
-#    edit .env — set ANTHROPIC_API_KEY (or your provider's key)
-#    already logged into pi? leave it blank — the worker reuses the key from ~/.pi/agent/auth.json by default
-npx pi-dispatch doctor       # ✓/✗ preflight: Docker, Valkey, the images your triggers name, and your provider key
-
-# 4. Run the worker in one terminal
-npx pi-dispatch worker       # (or: npm --workspace worker start)
-
-# 5. Queue a job from another
-npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
+# 3. Scaffold + preflight (same five files; doctor checks Docker, Valkey, images, provider key)
+npx pi-dispatch init && npx pi-dispatch doctor
+# 4-5. worker in one terminal, run from another — as above (the local bin is `npx pi-dispatch`)
 ```
 
 > **The prebuilt image is a snapshot** of this repo's runner + guardrails at its build. To bake a project's
@@ -73,11 +82,12 @@ npx pi-dispatch run ./my-project --task "add type hints to utils.py" --flow tidy
 > fetches an image at job time. A name it cannot find is refused *before* the job costs anything, rather than
 > becoming a silent pull of whatever answers to that name in a registry. `pi-dispatch doctor` checks presence.
 
-> **Heads-up on the CLI name.** `pi-dispatch` here is *this repo's* workspace CLI (`worker/src/cli.mjs`),
-> which `npx` resolves from the local `node_modules/.bin` after `npm ci` — run these from the repo root. It
-> is **not** the unrelated npm package `pi-dispatch` (see [License](#license)); this project isn't published
-> to npm. If a shell can't find the local bin, use the explicit form:
-> `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
+> **Heads-up on the CLI name.** The published package is **scoped**: `@edgehero/pi-dispatch` (its bin is
+> `pi-dispatch`). The **bare** npm name `pi-dispatch` belongs to an unrelated package (see
+> [License](#license)) — so outside a checkout, always `npx @edgehero/pi-dispatch <cmd>`; bare
+> `npx pi-dispatch` would ask the registry for the wrong project. Inside a clone after `npm ci`, bare
+> `npx pi-dispatch` resolves to the local workspace bin and is fine; if a shell can't find it, use the
+> explicit form: `node worker/src/cli.mjs run ./my-project --task "…" --flow tidy`.
 
 The worker picks up the job, mounts your folder into a container, and pi edits it **in place**. It
 refuses a dirty git working tree unless you pass `--force`, because there is no undo — point it at
@@ -159,12 +169,32 @@ container, and a subscription isn't the credential for an unattended service; us
 ## Run as a service
 
 `pi-dispatch worker` is a long-running process — run it in a terminal, or hand it to your OS's service
-manager so it starts on boot and restarts on a crash. The units in [`deploy/`](deploy/) are **per-host
-templates, not turnkey**: each carries `<PLACEHOLDER>` paths you fill in for your machine. The systemd
-unit's *structure* is checked by `systemd-analyze`; the launchd and nssm units are worked examples. All
-three run the worker on the **host** — it drives the `docker` CLI and is not itself containerised — so
-they need the AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running
-alongside, which is what makes the queue **and the pause state** survive a reboot.
+manager so it starts on boot and restarts on a crash. Since issue #80 the hand-editing is optional:
+
+```bash
+pi-dispatch service render     # show the unit it would install — real node path, real repo root
+pi-dispatch service install    # user-level: LaunchAgent (macOS) / systemctl --user (Linux) / nssm (Windows)
+pi-dispatch service status     # which unit exists, in which scope, and whether it is running
+```
+
+`install` renders the [`deploy/`](deploy/) templates with **computed absolutes** — the node that is
+actually running (`process.execPath`, so an nvm install works where the template's `/usr/bin/node`
+would not) and the real repo root — and installs **user-level, without sudo**. `--system` on Linux
+prints the exact `sudo` commands instead of running them; `--receiver` installs the receiver unit;
+`--force` replaces an existing same-scope unit. It **refuses** to install a second worker unit in the
+other scope: one worker per docker daemon is a boot-reaper invariant — a second worker would treat the
+first's in-flight container as a stray to kill. Two honesty notes: on macOS and Windows the service is
+**login-scoped**, because Docker Desktop itself only runs while you're logged in (Linux with a system
+`dockerd` gets true boot persistence — add `sudo loginctl enable-linger $(whoami)` for user units on a
+headless box); and a **policy refusal never relaunches** — exit 2 (a determinate budget/config refusal)
+is excluded from restart on systemd and nssm, and the launchd wrapper converts it to a clean exit, so no
+supervisor loops against a paid provider.
+
+The templates in `deploy/` remain hand-editable **per-host examples** for anyone who wants to adapt them
+directly; `service render` is those templates with the placeholders filled in. All three OSes run the
+worker on the **host** — it drives the `docker` CLI and is not itself containerised — so they need the
+AOF-enabled Valkey from [`deploy/docker-compose.yml`](deploy/docker-compose.yml) running alongside,
+which is what makes the queue **and the pause state** survive a reboot.
 
 **Steer the running worker** without stopping it — these commands talk to Valkey, so they work whether the
 worker runs in a terminal or under a service manager:
@@ -218,18 +248,17 @@ gracefully.
 
 ### Drain before a planned restart
 
-A planned restart should abort no in-flight job. Pause, wait for the queue to go idle, restart, then
-resume:
+A planned restart should abort no in-flight job:
 
 ```bash
-pi-dispatch pause                     # stop taking new jobs (durable)
-pi-dispatch status                    # repeat until "active": 0 — nothing in flight
-sudo systemctl restart worker         # (or the launchctl / nssm equivalent)
-pi-dispatch resume                    # take jobs again
+pi-dispatch service restart --drain   # pause → wait until "active": 0 → restart the unit → resume
 ```
 
-Because the pause is durable, the worker comes back paused even if the restart outruns your `resume`, so
-nothing slips through in the gap.
+That composes the durable-pause ritual (`pause` / poll `status` / restart / `resume`) into one command.
+If the queue is still busy at `--drain-timeout` (default 600s) it stops **without restarting and without
+resuming** — a timed-out drain must not un-pause a queue that still has a job in flight. The manual
+sequence still works, and because the pause is durable, the worker comes back paused even if a restart
+outruns your `resume`, so nothing slips through in the gap.
 
 **Windows caveat**: stop the service with nssm's **console-stop** (`nssm stop`), which delivers a signal
 the worker handles and drains gracefully. Task Scheduler is a weaker fallback — it stops a task with a
@@ -531,6 +560,33 @@ above. Start the receiver with `npx pi-dispatch-receiver` (or the explicit form,
 if a shell can't find the local bin) from the folder you ran `pi-dispatch init` in: it reads
 `./triggers.json` there, `PI_TRIGGERS_FILE` overrides, and it **refuses to start** when neither exists.
 
+Or run it as a **container** — the receiver is the one piece with zero docker dependency, so it
+containerises for free (the worker never does — it drives the host `docker` CLI):
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile receiver up -d
+```
+
+That adds the prebuilt [`ghcr.io/edgehero/pi-dispatch-receiver`](https://github.com/edgehero/pi-dispatch/pkgs/container/pi-dispatch-receiver)
+beside Valkey — `restart: unless-stopped` durability for one flag, your `triggers.json` mounted
+read-only, published on `127.0.0.1:3000` (your reverse proxy or tunnel does the public exposure, exactly
+as with the host receiver). No service in the compose file mounts the docker socket; the trust model is
+unchanged — the receiver still never executes agent-authored content.
+
+**No public URL at all?** Run the **polling** producer instead of the webhook edge:
+
+```bash
+pi-dispatch-receiver poll     # fetches issue events / comments / PRs over TLS with your own credential
+```
+
+Same triggers, same author/label/bot-loop gates, same queue — GitHub events are *fetched* (~60s cadence,
+conditional requests, nearly free against the rate limit) rather than delivered, so there is no port, no
+tunnel, no DNS, and no webhook secret to manage. Pair it with `pi-dispatch setup github --no-webhook`,
+which mints the App hook-inactive. The webhook receiver stays the low-latency default; polling trades
+~60s of trigger latency for zero public surface. Repos come from `POLL_REPOS` or, under App auth, the
+App installation's repo list. A fresh poller starts from *now* — it never replays a repo's history of
+old labels.
+
 ```mermaid
 flowchart LR
   GH["GitHub repo<br/>issue labeled, @pi comment, or PR"] -->|"webhook, HMAC-signed"| R
@@ -693,4 +749,8 @@ MIT. See [LICENSE](LICENSE). Built on [pi](https://github.com/earendil-works/pi)
 does the actual hard part.
 
 > **Not affiliated with** the unrelated npm package `pi-dispatch`, a pi extension for rotating ChatGPT
-> Codex OAuth accounts. Same name, different thing — this project is not distributed via npm.
+> Codex OAuth accounts. Same name, different thing — this project publishes **scoped** packages only:
+> [`@edgehero/pi-dispatch`](https://www.npmjs.com/package/@edgehero/pi-dispatch) (worker + CLI),
+> [`@edgehero/pi-dispatch-receiver`](https://www.npmjs.com/package/@edgehero/pi-dispatch-receiver), and
+> [`@edgehero/pi-dispatch-admin`](https://www.npmjs.com/package/@edgehero/pi-dispatch-admin) (the
+> console). The bare name is theirs.

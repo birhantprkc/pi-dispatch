@@ -25,7 +25,7 @@
  * The username is never sent, logged or returned; the lookup is by numeric user id.
  */
 
-import { fetchFailureReason } from "@pi-dispatch/worker/gitlab-identity";
+import { fetchFailureReason } from "@edgehero/pi-dispatch/gitlab-identity";
 
 /** GitLab's API path prefix. `apiUrl` is the instance root, e.g. `https://gitlab.com`. */
 const API_PREFIX = "/api/v4";

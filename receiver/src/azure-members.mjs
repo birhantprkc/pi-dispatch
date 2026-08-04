@@ -27,7 +27,7 @@
  * login and GitLab's username.
  */
 
-import { fetchFailureReason } from "@pi-dispatch/worker/gitlab-identity";
+import { fetchFailureReason } from "@edgehero/pi-dispatch/gitlab-identity";
 
 /**
  * Build the resolver.

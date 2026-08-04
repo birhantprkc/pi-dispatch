@@ -65,10 +65,10 @@ import { foldCosts, whatIfFlow } from "./costs.mjs";
 // The REAL pricing façade. costs.mjs may not hold a module-scope worker/pricing import by contract (the
 // fold is pure; tests inject a canned fake) -- index.ts is where the fs-adjacent assembly lives, so the
 // injection happens here.
-import { getPricedModel, isZeroRated, listPricedModels, piAiVersion, reprice } from "@pi-dispatch/worker/pricing";
+import { getPricedModel, isZeroRated, listPricedModels, piAiVersion, reprice } from "@edgehero/pi-dispatch/pricing";
 import { setGlyphs } from "./panel.mjs";
-import { buildSandboxRunArgs, launchSandbox as spawnSandbox, resolveSandbox, sandboxContainerName } from "@pi-dispatch/worker/sandbox";
-import { readManifest } from "@pi-dispatch/worker/sandbox-store";
+import { buildSandboxRunArgs, launchSandbox as spawnSandbox, resolveSandbox, sandboxContainerName } from "@edgehero/pi-dispatch/sandbox";
+import { readManifest } from "@edgehero/pi-dispatch/sandbox-store";
 import { renderStatus, renderRuns, renderBudget, renderTriggers, renderSettingsView, renderCosts, renderWhatIf } from "./render.mjs";
 import { makeDashboard, createDashboardDeps } from "./dashboard.ts";
 import { matchesKey } from "./keys.mjs";

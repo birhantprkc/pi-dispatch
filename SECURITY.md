@@ -82,6 +82,14 @@ Jobs are a **trigger × target** matrix, and the triggers do not share a threat 
   is accepted, so a sender cannot choose the weaker gate. **Token mode is genuinely weaker**: it proves
   the sender knew a secret, and nothing at all about whether the body arrived as it was sent. Prefer
   `signature` where your instance supports it.
+  The receiver may run **containerised** (`docker compose --profile receiver up`, issue #82) — that
+  changes none of the above: HMAC-before-parse is the same code, the container mounts `triggers.json`
+  read-only and **no docker socket**, and the worker stays a host process either way.
+  **Polling mode has no webhook surface at all** (`pi-dispatch-receiver poll`, issue #81): GitHub
+  events are *fetched* over TLS with your own credential rather than delivered to a public port, so
+  there is no signature to verify and nothing to forge against — the HMAC gate defends the webhook
+  path; polling removes the path. Every author/label/bot-loop/dedup gate still runs, on the same
+  fields, through the same pure filter. The cost is ~60s of trigger latency.
 - **Isolation.** One ephemeral container per job: `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   memory/CPU/pids limits, non-root, `--rm`. Per-job rather than per-session, so state cannot leak
   between mutually-untrusting issue authors.
@@ -294,6 +302,13 @@ Stated openly rather than discovered later:
   scopes it carries (calling out broad ones like `admin:org`, `delete_repo`, `workflow`). Prefer a
   fine-grained PAT — or an App — for real per-job scoping. Your `~/.config/gh` is never mounted into a
   container; the credential reaches jobs only as env values.
+  **`pi-dispatch setup github` makes the App path the easy one** (issue #81): the GitHub App Manifest
+  flow mints the app id, private key, and webhook secret in one browser click, against a throwaway
+  listener on **your own loopback** — nothing crosses a maintainer-controlled service, the conversion
+  code is single-use and expires in an hour, and the wizard shows every `.env` line before writing it,
+  never prints a secret, writes the PEM `0600`, and refuses to overwrite an existing key file or an
+  already-set `WEBHOOK_SECRET`. The credential minted is the narrowest this system supports
+  (`contents`/`pull_requests`/`issues` write + `metadata` read, per-repo 1h installation tokens).
 - **On GitLab there is no stronger option to prefer.** GitLab has no App equivalent and no short-expiry
   per-job token, so your project access token is what every GitLab job gets, for as long as you leave it
   valid. Use a **project** token rather than a group token (a group token reaches every project in the

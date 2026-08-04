@@ -15,8 +15,8 @@ test("costs.mjs is pure: no fs, no redis, no queue, no env, no console -- record
   // function is how the two sides cannot drift. Everything else -- the pricing facade above all --
   // must arrive as an injected argument, never as a module-scope worker import.
   assert.ok(
-    !/@pi-dispatch\/worker\/(?!budget\b)/.test(src),
-    "the only worker import the fold may hold is @pi-dispatch/worker/budget (dayKey)",
+    !/@edgehero\/pi-dispatch\/(?!budget\b)/.test(src),
+    "the only worker import the fold may hold is @edgehero/pi-dispatch/budget (dayKey)",
   );
 });
 

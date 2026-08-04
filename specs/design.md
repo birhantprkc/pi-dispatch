@@ -65,17 +65,31 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 ## DES-NAME-KEEP-PI-DISPATCH
 
-- **Decision**: Keep the name `pi-dispatch`. Do not publish to npm.
+- **Decision**: Keep the name `pi-dispatch`. Do not publish under the **bare npm name** — it is
+  taken. Scoped `@edgehero/*` publishing is the sanctioned channel (amended 2026-08-02, issue #80;
+  the original Decision line read "Do not publish to npm" unqualified, and practice had already
+  diverged: `@edgehero/pi-dispatch-admin` shipped 2026-07 without this entry recording it).
+  Published artifacts: `@edgehero/pi-dispatch-admin` (the console), `@edgehero/pi-dispatch` (the
+  worker + CLI — the "management CLI" this entry's change trigger named), and
+  `@edgehero/pi-dispatch-receiver`. The bin name stays `pi-dispatch`, which shadows nothing locally;
+  the README warns that **bare** `npx pi-dispatch` outside a checkout resolves to the unrelated
+  squatted package, so docs always use the scoped form.
 - **Why**: `pi-dispatch` **is** taken on npm — `pi-dispatch@1.0.3`, a pi *extension* that rotates
   ChatGPT Codex OAuth accounts to maximise quota. It does not bind us: it is functionally unrelated
   (it runs *inside* a pi session; this project runs pi inside *itself*), it was published once on
   2026-04-06 with no release since, and its GitHub repository returns 404. **We do not need the npm
-  name** — distribution is docker-compose and container images, not `pi install npm:`, because this is
-  not a pi package. GitHub namespaces by owner, so there is no conflict there either.
+  name** — the *bare* name, that is: scoped `@edgehero/*` names have no collision at all, which is
+  what made the 2026-08-02 amendment a scoping of this entry rather than a reversal. GitHub
+  namespaces by owner, so there is no conflict there either.
   Recorded because the collision is real and the question will otherwise return every time someone
   searches npm.
 - **What would change this**: wanting to publish *any* npm artifact under this name — a management CLI,
   a client library. At that point rename; `pi-foreman` and `pi-onduty` were verified available.
+  **The trigger fired** (issue #80: the worker CLI is exactly "a management CLI") and the resolution
+  chosen was **scoped publishing, not the rename**: the collision only ever bound the bare name, the
+  `@edgehero` scope was already shipping the admin console, and renaming a documented project to route
+  around a squatter's dead package is cost without benefit. A *bare-name* artifact would still require
+  the rename this entry prescribes.
 - **Evidence (upstream)**: `registry.npmjs.org/pi-dispatch` — versions 1.0.2 and 1.0.3 both published
   2026-04-06; `time.modified` 2026-07-06 is a metadata touch, not a release; `repository.url` →
   `github.com/vincenthopf/pi-dispatch` → HTTP 404
@@ -231,6 +245,10 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   launches) — a co-located second worker sharing the daemon would read the first's in-flight container as
   its own to remove and kill a live job. Per-host is the common case, but the docker daemon, not the host,
   is the true boundary.
+  Since issue #80 the invariant is *enforced* where units are minted: `pi-dispatch service install`
+  refuses to install a worker unit when one exists in the other scope (user vs system LaunchAgent/
+  LaunchDaemon, `systemctl --user` vs `/etc/systemd/system`) — before this, the paragraph above was the
+  only thing standing between an operator and two workers sharing one daemon.
 - **Traces to**: `OQ-002`, `REQ-QUEUE-BURST-NO-DROP`
 
 ## DES-CRON-VIA-BULLMQ-SCHEDULER
@@ -381,7 +399,7 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 
 - **Decision**: One `triggers.json` of `{ on, run }` entries is the single source of standing triggers for
   **both** services. A shared validator (`worker/src/triggers.mjs`, exported as
-  `@pi-dispatch/worker/triggers`) parses and validates the whole file; the worker selects `on.type:"cron"`
+  `@edgehero/pi-dispatch/triggers` — `@pi-dispatch/worker/triggers` before the issue-#80 rename) parses and validates the whole file; the worker selects `on.type:"cron"`
   and the receiver selects `on.type ∈ {label, comment, pull_request}` for whichever forge each entry's `run.kind` names. Both validate everything; each
   evaluates only its own subset. This replaces the two prior files (`PI_SCHEDULES_FILE` and
   `receiver.flows.json`) with **no compatibility shim** — a clean cutover.
@@ -391,8 +409,8 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   The `on × run` matrix pairs `cron ↔ local` and webhook ↔ a **forge** (`github`|`gitlab`), and that
   pairing **is** the trust boundary, encoded as a fail-loud validation rule (`INT-TRIGGERS-FILE-CONTRACT`). One validator, run
   by both, means a malformed file fails both services identically — the two cannot drift. The shared module
-  lives in the worker package because `receiver` and `admin` already depend on `@pi-dispatch/worker`; the
-  dependency is one-way, so no cycle.
+  lives in the worker package because `receiver` and `admin` already depend on it (today
+  `@edgehero/pi-dispatch`); the dependency is one-way, so no cycle.
 - **Rejected**: a compat union accepting both old shapes (the repo bans backwards-compat shims,
   `.claude/rules/legacy-removal.md`) · two independent validators (they drift) · a third shared package
   (unnecessary — the one-way worker dependency already exists).
@@ -527,6 +545,93 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
 - **Traces to**: `CONST-BUDGET-BEFORE-TOKENS`, `DES-ADMIN-VIA-PI-EXTENSION`, `DES-AI-TRIGGER-FLOW-GATE`,
   `DES-JOB-OUTBOX-CHAINING`, `REQ-LOCAL-JOB-VISIBILITY`
 
+## DES-CLI-SURFACE
+
+- **Decision**: The workspace CLI (`pi-dispatch`, bin of the worker package) is the deployment's
+  operator surface, and its subcommands sit on an explicit gate ladder. **Read-only / always safe**:
+  `doctor`, `status`. **Operator-typed, ungated**: `run`, `pause`, `resume`, `sandbox`, `import-pi`
+  (each is its own gate — typing it is the approval, `REQ-ADMIN-VIA-PI-EXTENSION`'s ladder top).
+  **Create-only, contractually non-destructive**: `init` (idempotent scaffolds; an existing file is
+  never touched). **Consented host mutations**: `up` and `doctor --fix` — each concrete action (a
+  docker pull of the deployment's *own default* image, a loopback Valkey start, an overlay
+  `auth.json` delete, an `import-pi` restage) is shown verbatim and runs only on an explicit y/N
+  accept, defaulting to No, including on non-TTY stdin. The receiver's `pi-dispatch-receiver` bin is
+  a sibling on the same ladder (serve = the operator typed it).
+- **Why**: `init` and `doctor` grew organically with no recorded surface; issue #80 adds subcommands
+  that *mutate the host*, and an unrecorded gate ladder is how a later "helpful" flag erodes a trust
+  property nobody wrote down. Recording which tier each subcommand sits on makes "may this be
+  automated?" a lookup instead of a debate.
+- **The never-tier is load-bearing**: no subcommand, flag, or fix path may rewrite malformed config
+  (fail-loud/keep-last-good is doctrine), write triggers/pause-windows *content*, pull a
+  trigger-named `run.image` (each image is a separate per-flow trust posture — only the deployment's
+  default is ever offered, and the consent keypress is the "pulled it onto this host yourself" act
+  `SECURITY.md` requires), guess a semantic env value, or touch branch protection on a forge.
+- **Traces to**: `REQ-DEPLOYMENT-BOOTSTRAP`, `DES-CLI-TRIGGER-FOR-LOCAL`, `CONST-BUDGET-BEFORE-TOKENS`
+
+## DES-GH-APP-MANIFEST-SETUP
+
+- **Decision**: `pi-dispatch setup github` mints GitHub App credentials via the **App Manifest flow**:
+  a throwaway loopback HTTP listener serves a self-submitting form that POSTs the manifest to
+  `github.com/settings/apps/new` (or the `--org` variant), the browser redirect delivers a single-use
+  code (1h validity), and the unauthenticated `POST /app-manifests/{code}/conversions` returns the app
+  id, private-key PEM, and webhook secret in one response. The wizard then shows the exact `.env`
+  lines and writes them only on one explicit consent; the PEM lands beside `.env` with mode `0600`
+  (an existing key file refuses — never clobbered); an already-set `WEBHOOK_SECRET` is kept
+  (`setEnvKeyIfEmpty` — replacing it would invalidate working deliveries); the installation id is
+  discovered via an app JWT against `GET /app/installations` after the operator confirms installing.
+  `--no-webhook` creates the App with `hook_attributes.active:false` — the no-public-URL shape the
+  polling transport consumes.
+- **Why**: The App source is the strongest credential this system supports (SECURITY.md prefers it),
+  but acquiring it was the most manual mile in the whole setup: five settings pages, a hand-invented
+  webhook secret, and an installation id hunted from URLs. The manifest flow compresses all of it into
+  one click **without changing whose infrastructure is trusted**: the listener is the operator's own
+  loopback, GitHub is the only remote party, and no maintainer-controlled service ever sees a
+  credential. The JWT for installation discovery is ~15 lines of `node:crypto` RS256 on purpose —
+  auditable, dependency-light, and used once at setup time (job-time minting stays `@octokit/auth-app`
+  in `get-token.mjs`, unchanged).
+- **Gate ladder fit** (`DES-CLI-SURFACE`): operator-typed, and every write individually consented with
+  the content shown first; secrets never printed, redacted in every error path. There is deliberately
+  no `--yes` here — unlike `up`'s docker actions, these writes carry credentials.
+- **Rejected**: shipping a maintainer-registered OAuth client for device flow (inserts a maintainer
+  dependency into a self-hosted trust chain); auto-installing the App (the install page is a GitHub
+  consent screen — automating a consent screen defeats it).
+- **Traces to**: `DES-CLI-SURFACE`, `REQ-DEPLOYMENT-BOOTSTRAP`, `CONST-TOKEN-SCOPED-PER-JOB`,
+  `SECURITY.md` (auth-source ladder)
+
+## DES-GH-POLLING-TRANSPORT
+
+- **Decision**: `pi-dispatch-receiver poll` is an **alternative producer** for GitHub triggers that
+  needs no public URL: it polls issue events, issue comments, and open PRs per serviced repo (ETag
+  conditional requests, ~60s cadence honoring `x-poll-interval`), synthesizes the exact
+  `INT-WEBHOOK-PAYLOAD-SUBSET` shapes, and feeds the **unchanged** pure `filter()` and the shared
+  enqueue path with `poll-*` delivery ids. **The webhook receiver stays the default and the
+  documented low-latency path** — polling is for hosts that cannot (or should not) expose a port.
+  Repos come from an explicit `POLL_REPOS` allowlist or, under App auth, the installation's repo
+  list. A fresh poller initializes cursors to *now* and never replays history — a label applied
+  months ago was an approval for a different moment. One repo's API failure skips that repo for the
+  cycle, never the loop. `WEBHOOK_SECRET` is not required in poll mode (there is no inbound delivery
+  to verify); `serve` still hard-requires it.
+- **Why**: The public HTTPS endpoint was the single hardest setup mile for home deployments (tunnel
+  or DNS, both punted to the operator), and it defends a surface polling simply does not have: TLS
+  with the operator's own credential against api.github.com replaces HMAC-over-raw-body because the
+  authentication points the other way. Every author/label/bot-loop/dedup/spend gate evaluates
+  identically — parity is pinned by tests running webhook-shaped and REST-synthesized subsets through
+  the same gate. The accepted cost is ~60s trigger latency, cheap against jobs that run for minutes.
+  Conditional 304s are rate-limit-free, so a handful of repos polls within a fraction of the 5000/hr
+  budget.
+  **The polling credential is not a job token.** Under App auth the poller mints an *unscoped*
+  installation token for itself — it must call `GET /installation/repositories` and read every
+  serviced repo, which a per-repo-scoped mint cannot. That token never reaches a job:
+  `CONST-TOKEN-SCOPED-PER-JOB` governs what jobs receive, and the worker's per-repo mint is untouched.
+- **Rejected**: **a GitHub Actions self-hosted runner as the transport** — outbound-only networking,
+  yes, but it executes merge-gated workflow code on the worker's host, converting merge-to-default
+  into host-level code execution *outside the container boundary*; the one transport that removes the
+  same friction while making the trust model strictly worse. Also rejected: polling as the default
+  (latency and rate-limit budgets are real; the receiver remains first), and any body interpretation
+  in the poller (`CONST-ISSUE-TEXT-IS-DATA` — text stays data all the way through).
+- **Traces to**: `DES-GH-APP-MANIFEST-SETUP` (`--no-webhook` mints the hook-inactive App this mode
+  pairs with), `INT-WEBHOOK-PAYLOAD-SUBSET`, `REQ-DEDUP-BY-DELIVERY-GUID`, `DES-TRIGGER-OUTSIDE-PI`
+
 ## DES-WORKER-ON-HOST
 
 - **Decision**: The worker runs **on the host** (a Node process, `pi-dispatch worker` / `npm start`), not
@@ -561,6 +666,10 @@ money with no upstream turn limit (`REQ-RUNNER-TURN-BUDGET`).
   longer runs everything; the operator also runs `pi-dispatch worker`. That is the honest price of
   local-folder jobs working on Windows/macOS/Linux without fragile path math. The receiver is Node too,
   so it is one install story (`npm ci`), with Docker running Valkey and the job containers.
+  Since issue #80, `pi-dispatch up` *sequences* the surrounding chores (image pull+tag, Valkey start,
+  scaffold, preflight) behind explicit per-action consent — the price above is unchanged (the worker is
+  still a host process the operator runs); only the amount of typing shrank
+  (`REQ-DEPLOYMENT-BOOTSTRAP`).
 - **Evidence**: verified first-hand this session — `docker context` (`npipe` endpoint, `linux/x86_64`
   daemon) · `moby/for-win#14271` (VM prefix `/run/desktop/mnt/host/…`) and `docker/compose#5563`
   (older `/host_mnt/…`), i.e. the prefix moved · `docker/compose#4240`
@@ -1464,9 +1573,11 @@ pi-dispatch/
   image/          # Dockerfile + entrypoint + /runner (SDK job runner)
   flows/          # frontend-fix.md, bug-fix.md, triage.md — DEFAULTS, seeded into the data volume
   persona/        # hard rules; baked into the image. Not runtime-editable
-  deploy/         # docker-compose runs Valkey only; worker/receiver are host Node processes
-                  #   (DES-WORKER-ON-HOST). The systemd unit is a verified-structure per-host template;
-                  #   launchd (.plist) and Windows (nssm) units are added as untested examples.
+  deploy/         # docker-compose runs Valkey by default; `--profile receiver` adds the containerised
+                  #   receiver (issue #82 — it has zero docker dependency and is the internet-facing
+                  #   piece). The WORKER is always a host Node process (DES-WORKER-ON-HOST); no service
+                  #   mounts docker.sock. Unit templates: systemd verified-structure; launchd/nssm
+                  #   worked examples — all render-installable via `pi-dispatch service` (issue #80).
   .env.example    # provider key, spend/concurrency knobs, VALKEY_URL, PI_JOB_IMAGE
   docs/
 ```
@@ -1497,6 +1608,12 @@ a tunnel.
 
 | Date | Change |
 |---|---|
+| 2026-08-02 | The public URL becomes optional (issue #81, second half). Added **DES-GH-POLLING-TRANSPORT**: `pi-dispatch-receiver poll` synthesizes INT-WEBHOOK-PAYLOAD-SUBSET shapes from REST responses (issue events / comments / open PRs; ETag 304s are rate-limit-free; first boot never replays history; per-repo failures never kill the loop) and feeds the unchanged pure `filter()` + shared enqueue with `poll-*` delivery ids — the receiver stays the default and the low-latency path. Trust framing recorded: TLS with the operator's own credential replaces HMAC because authentication points the other way; `WEBHOOK_SECRET` is not required in poll mode, still hard-required for `serve`. The Actions-runner transport is rejected on the record (merge-gated workflow code executing on the worker host = merge-to-default becomes host code execution outside the container boundary). **DES-TRIGGER-OUTSIDE-PI UNCHANGED, checked**: the poller is the same always-on process class, just a different transport. **CONST-ISSUE-TEXT-IS-DATA UNCHANGED, checked**: the poller never interprets bodies. |
+| 2026-08-02 | The App path becomes the easy path (issue #81). Added **DES-GH-APP-MANIFEST-SETUP**: `pi-dispatch setup github` runs GitHub's App Manifest flow against a throwaway loopback listener — one browser click returns app id + PEM + webhook secret via the unauthenticated single-use conversion endpoint; every `.env` line is shown before one explicit consent, the PEM lands 0600 and never clobbers, an existing `WEBHOOK_SECRET` is kept (replacing it would invalidate working deliveries), installation-id discovery uses a deliberately hand-rolled ~15-line `node:crypto` RS256 JWT (auditable, once-at-setup; job-time minting stays `@octokit/auth-app`, unchanged), and `--no-webhook` creates the hook-inactive shape the polling transport will consume. No `--yes` on this wizard — these writes carry credentials. Rejected on the record: a maintainer-registered device-flow client (maintainer dependency in a self-hosted trust chain) and auto-installing the App (automating a consent screen defeats it). **CONST-TOKEN-SCOPED-PER-JOB UNCHANGED, checked**: the wizard changes how credentials are *acquired*, not how job tokens are minted or scoped. **CONST-HMAC-OVER-RAW-BODY UNCHANGED, checked**: the webhook secret the flow mints feeds the same verify path. |
+| 2026-08-02 | The receiver gets a container story (issue #82). Repo-layout `deploy/` line updated: `docker compose --profile receiver up` runs the receiver beside Valkey from a prebuilt `ghcr.io/edgehero/pi-dispatch-receiver` image (multi-arch, GITHUB_TOKEN-published like pi-job); the default `docker compose up` stays Valkey-only. The receiver was the natural candidate — `grep docker receiver/src` is empty, it is the only internet-facing process, and containerising it costs nothing the trust model cares about. **DES-WORKER-ON-HOST UNCHANGED, checked**: the worker remains a host process — no service in the compose file mounts docker.sock, and the profile's existence changes nothing about why the worker cannot be containerised (client-side path translation, local-folder bind mounts). SECURITY.md's trusted-components row holds verbatim: a containerised receiver still never executes agent-authored content, and HMAC-before-parse is unchanged. |
+| 2026-08-02 | The clone stops being the only distribution (issue #80). **DES-NAME-KEEP-PI-DISPATCH amended, on its own terms**: its change trigger ("wanting to publish *any* npm artifact under this name — a management CLI") fired, and the resolution is scoped publishing (`@edgehero/pi-dispatch` = worker + CLI, `@edgehero/pi-dispatch-receiver`), not the rename — the collision only ever bound the bare name. The amendment also retro-records `@edgehero/pi-dispatch-admin`, which shipped 2026-07 without a row here: practice had diverged from the entry's unqualified "Do not publish to npm" line, and a constitution that quietly diverges from what ships is worse than none. The two checkout-relative runtime escapes are closed package-relative (worker/.env.example, worker/deploy/ mirrors with byte-equality sync tests against the root copies — the root files stay the documented, edited source). Bare `npx pi-dispatch` outside a checkout resolves to the squatter's package; docs use scoped forms everywhere. **DES-WORKER-ON-HOST UNCHANGED, checked**: npm-on-host is the architecturally correct distribution for a worker that must drive the host docker CLI. **CONST-PI-VERSION-PINNED UNCHANGED, checked**: the pins travel into the published packages byte-identical. |
+| 2026-08-02 | Durable running becomes a subcommand (issue #80). **DES-CONCURRENCY-3 amended**: the one-worker-per-docker-daemon boot-reaper invariant is now *enforced* at unit-mint time — `pi-dispatch service install` refuses a worker unit when one exists in the other scope; previously the invariant was one unenforced paragraph. `service` renders the shipped deploy/ templates by substituting their documented literals (`/usr/bin/node` → `process.execPath`, `/opt/pi-dispatch` → the real repo root) rather than introducing marker syntax, so the templates stay byte-usable examples and deploy-lint keeps checking exactly what ships; a pin test asserts every substitution literal is still present, making template drift a build failure instead of a broken render. The launchd gap is closed in the wrapper, not the plist: `KeepAlive/SuccessfulExit=false` cannot express exit-code-conditional restart, so `worker-env-wrapper.sh`/`.cmd` convert EXIT_POLICY (2) to a clean exit with a loud refusal note — launchd never relaunches a determinate policy refusal, mirroring systemd's `RestartPreventExitStatus=2` and nssm's `AppExit 2 Exit` (**CONST-RETRY-INFRA-ONLY UNCHANGED, checked**: the conversion is where the *supervisor* learns what the exit space already meant; the exit protocol itself is untouched). The wrapper's `exec` gave way to a trap/double-wait form because exit-2 interception needs a live parent — SIGTERM still reaches node via the trap. **DES-WORKER-ON-HOST UNCHANGED, checked**: `service` supervises the host process the entry mandates; nothing moves into a container. |
+| 2026-08-02 | The CLI surface gets a recorded gate ladder (issue #80). Added **DES-CLI-SURFACE**: read-only (`doctor`, `status`) / operator-typed-ungated (`run`, `pause`, `resume`, `sandbox`, `import-pi`) / create-only (`init`) / consented host mutations (`up`, `doctor --fix` — each action shown verbatim, y/N default No incl. non-TTY), plus the load-bearing never-tier (no malformed-config rewrites, no triggers/pause-windows content, no trigger-named `run.image` pulls — only the deployment default, where the consent keypress is SECURITY.md's "pulled it yourself" act). `init`/`doctor` had no recorded surface at all, and the ladder makes "may this be automated?" a lookup. **DES-WORKER-ON-HOST amended** (Accepted cost): `up` sequences the surrounding chores behind consent; the price — the worker is a host process the operator runs — is unchanged, only the typing shrank. **DES-CLI-TRIGGER-FOR-LOCAL UNCHANGED, checked**: `up` is not a producer; it enqueues nothing. **INT-CONFIG-OVERLAY-CONTRACT UNCHANGED, checked**: its repair-write precedent is cited by the fix-tier reasoning, not extended — `--fix` never rewrites an invalid overlay; that stays the admin write path's documented repair. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (dashboard polish): run targets render as OSC-8 hyperlinks **only when the URL is derivable from id-only fields** (github `repo#N`; other forges' instance hosts are unknowable from the record, so no URL is ever guessed) — display-only escapes, byte-identical passthrough under the plain theme, and `visibleLen` already strips OSC-8. `y`/`Y` in RUN_DETAIL copy the job id / target URL via a new injected `copyText` seam whose OSC-52 emission lives in index.ts (the dashboard stays I/O-free); operator-initiated, id-only strings, nothing read back — recorded in SECURITY.md. LIVE_TAIL gains `/` search over the captured tail (a line-input layer above the view, popping on the established one-Esc-per-layer discipline; matches jump and suspend follow exactly as manual scrolling does; **untrusted bytes still pass only through `clip`** — the match highlight colors post-clip). The LIST and COSTS frames become height-aware through an injected `terminalRows` seam: sections collapse to their divider-plus-count by fixed priority (pause windows → settings → triggers → spend; COSTS: by-model → plans → daily), the cursor's section and the verdict block never collapse, and an absent seam renders byte-identically to before. The fs ban and every width invariant **UNCHANGED, checked**. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (issue #53, `REQ-COST-ANALYTICS`): the overlay gains its fifth view, **COSTS** (`c`) — verdict-first analytics over one `DES-COST-FOLD-BY-SCAN` fold: per-plan verdicts with the API-rate comparison line, a daily sparkline, by-flow/by-model tables whose money cells all funnel through the typed-cost formatter, plan blocks with amortized $/run and peak-window facts (never burn-down), a provenance footer naming the pi-ai pin, and the keyboard what-if (`w` shortlist cycle; `/` type-to-filter over the full priced catalog via the line-input primitive — the long tail lives in the TUI now that the primitive exists, and in `/dispatch costs whatif` for scripting). The costs data path is lazy and throttled (view entry + window change + stale-tick refresh): the fold is cheap, but a per-second full-directory scan is the quiet load a dashboard must not add. `/dispatch costs [7d\|30d\|mtd]` renders the same fold plain for the degraded path; `dispatch_costs` returns it as JSON with `class` on every monetary value, so the model-facing surface cannot launder an estimate any more than the human-facing one. `PI_DISPATCH_ASCII=1` flips every panel/overlay glyph table to the ASCII twins at extension load (the switch the primitives shipped; the env decision lives at the entry point, keeping panel.mjs pure). The dashboard's source-regex fs ban is **UNCHANGED, checked** — the costs data arrives through `createDashboardDeps` seams over the read-model, like every other byte the overlay renders. |
 | 2026-08-01 | **`DES-ADMIN-VIA-PI-EXTENSION` amended** (issue #71, dashboard usability): the LIST runs list becomes a cursor-following 10-row viewport over the read model's 50-record window with `↑/↓ N more` edge markers (raising the fetch from 10 to 50 without growing the frame); `Tab` jumps between the trigger and run section heads; `o` cycles the runs sort (time → tokens → cost → outcome — absent numbers sort last because a pre-metering record is unknown, not cheap, and Enter opens the row the sorted list shows because cursor and renderer share one rows model); the long-advertised-but-unbound `l` now opens the live tail of the active job and stays inert without one; LIVE_TAIL opens pinned to the bottom in follow mode (scroll-up pauses, bottom re-arms, footer names the state — it previously opened ~180 lines behind the head at the top of the tail window); RUN_DETAIL gains `←`/`→` in-place record walking with the LIST cursor following; a cron trigger row in LIST carries the amber `⚠ overdue`/`⚠ stalled` badge previously visible only in TRIGGER_DETAIL; and `x` delete arms an in-frame y/n whose `y` alone signals `deleteTrigger` with `confirmed: true`, letting `deleteTriggerEntry` skip the duplicate `ctx.ui.confirm` while still writing through the shared validator — the dialog path is unchanged for the model-initiated `dispatch_trigger_delete` tool, whose `confirmedWrite` gate is **UNCHANGED, checked**. The fallback `matchesKey` in `keys.mjs` learned `left`/`right`/`home`/`end`/`backspace` so the overlays' new keys cannot be silently eaten when pi-tui is unresolvable. No new read-model surface, no new fs access; the dashboard's source-regex fs ban is **UNCHANGED, checked**. |

@@ -3,9 +3,9 @@
  * a misconfigured receiver refuses to start with a clear message rather than booting into a state
  * where webhooks silently go unverified or untriggered.
  *
- * The security-sensitive GitHub auth block is single-sourced from `@pi-dispatch/worker/config` --
+ * The security-sensitive GitHub auth block is single-sourced from `@edgehero/pi-dispatch/config` --
  * `loadGitHubAuth` is parsed once, in one place, so the receiver and worker cannot drift on it. The
- * trigger schema is likewise single-sourced from `@pi-dispatch/worker/triggers` -- both services validate
+ * trigger schema is likewise single-sourced from `@edgehero/pi-dispatch/triggers` -- both services validate
  * the WHOLE unified triggers file and each selects the `on.type` it owns (issue #20).
  *
  * - `webhookSecret` is REQUIRED: without it the receiver cannot verify `X-Hub-Signature-256` over the
@@ -24,8 +24,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { configError, loadGitHubAuth, positiveInt } from "@pi-dispatch/worker/config";
-import { FORGE_KINDS, parseTriggers } from "@pi-dispatch/worker/triggers";
+import { configError, loadGitHubAuth, positiveInt } from "@edgehero/pi-dispatch/config";
+import { FORGE_KINDS, parseTriggers } from "@edgehero/pi-dispatch/triggers";
 
 // Cwd-relative, matching what `pi-dispatch init` scaffolds (and the admin's default): the receiver's
 // default must be the file init just told the operator it created, not a demo buried in the repo.
